@@ -1261,7 +1261,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         ),
       ]);
 
-      const reconcilePromise = svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
+      const reconcileErrorPromise = svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
         mode: "override",
         reason: "operator override still requires stopped services",
         actor: {
@@ -1270,10 +1270,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           agentId: null,
           runId: null,
         },
-      });
+      }).then(
+        () => {
+          throw new Error("Branch reconciliation unexpectedly succeeded while a runtime service was starting");
+        },
+        (error) => error,
+      );
 
       startedServices = await startPromise;
-      await expect(reconcilePromise).rejects.toMatchObject({
+      await expect(reconcileErrorPromise).resolves.toMatchObject({
         status: 422,
         message: "Execution workspace branch reconciliation requires all runtime services to be stopped",
         details: {
@@ -1286,7 +1291,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
             expect.objectContaining({
               id: startedServices[0]?.id,
               serviceName: "web",
-              status: "running",
+              status: "starting",
             }),
           ],
         },

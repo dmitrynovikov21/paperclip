@@ -11,6 +11,11 @@ import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
+import {
+  IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS,
+  resolveDefaultImportTransferSpoolRoot,
+  sweepAbandonedImportTransferSpools,
+} from "./services/company-import-transfers.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
@@ -672,6 +677,28 @@ export async function createApp(
   if (opts.feedbackExportService) {
     void flushPendingFeedbackExports();
   }
+  // Abandoned chunked-import spool sweep: hourly (plus once at startup),
+  // deleting spool dirs whose transfer saw no activity for 24h and failing
+  // their still-open ledger runs. Same setInterval + unref + shutdown-clear
+  // shape as the feedback export flush above.
+  const importTransferSpoolRoot = resolveDefaultImportTransferSpoolRoot();
+  const sweepImportTransferSpools = () => {
+    sweepAbandonedImportTransferSpools(db, importTransferSpoolRoot)
+      .then((result) => {
+        if (result.swept > 0) {
+          logger.info(result, "swept abandoned company import transfer spools");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "abandoned company import transfer spool sweep failed");
+      });
+  };
+  let importTransferSweepTimer: ReturnType<typeof setInterval> | null = setInterval(
+    sweepImportTransferSpools,
+    IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS,
+  );
+  importTransferSweepTimer.unref?.();
+  sweepImportTransferSpools();
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
@@ -736,6 +763,10 @@ export async function createApp(
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     disableFeedbackExportFlushes();
+    if (importTransferSweepTimer) {
+      clearInterval(importTransferSweepTimer);
+      importTransferSweepTimer = null;
+    }
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
     hostServiceCleanup.disposeAll();

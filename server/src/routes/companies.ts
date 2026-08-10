@@ -798,12 +798,17 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     });
   });
 
-  // Assemble the spooled parts back into the original zip, verify it against
-  // the declared whole-file hash, and run it through the exact import path a
-  // single-shot zip upload takes. The body carries the same meta fields the
-  // multipart route's `meta` field does (include/target/collisionStrategy/...).
-  router.post("/import/transfers/:transferId/apply", async (req, res) => {
-    assertBoard(req);
+  /**
+   * Resolve a completed transfer into the same raw preview/import body a
+   * single-shot zip upload produces: load the run, require every part, then
+   * assemble the spool and verify it against the declared whole-file hash.
+   * Shared by the transfer preview and apply routes; returns null after
+   * responding 409 when parts are still missing. A whole-file mismatch fails
+   * closed for both callers: every part verified individually but the whole
+   * does not match the declaration, so the spool is deleted and a resume
+   * re-uploads every part instead of re-assembling the same corrupt bytes.
+   */
+  async function resolveImportTransferBody(req: Request, res: Response) {
     const run = await requireImportTransferRun(req);
     if (run.status === "completed") {
       throw conflict("Import transfer has already been applied");
@@ -815,24 +820,48 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
         error: "Import transfer is missing parts",
         missingParts,
       });
-      return;
+      return null;
     }
     const zipBytes = await assembleImportTransferZip(importTransferSpoolRoot, run.id, manifest.parts.length);
     const zipSha256 = createHash("sha256").update(zipBytes).digest("hex");
     if (zipBytes.length !== manifest.totalBytes || zipSha256 !== manifest.zipSha256) {
-      // Fail closed: every part verified individually but the whole does not
-      // match the declaration. The spool is deleted so a resume re-uploads
-      // every part instead of re-assembling the same corrupt bytes.
       await companyTransferRunService.fail(db, run.id, "Assembled import package failed whole-file verification");
       await removeImportTransferSpool(importTransferSpoolRoot, run.id);
       throw unprocessable("Assembled import package failed verification; upload the transfer again");
     }
     const archive = await readImportZipArchive(zipBytes);
-    const meta = importTransferApplyMeta(req.body);
-    const rawImportBody = {
-      ...meta,
-      source: { type: "inline", rootPath: archive.rootPath, files: archive.files },
+    return {
+      run,
+      rawBody: {
+        ...importTransferApplyMeta(req.body),
+        source: { type: "inline", rootPath: archive.rootPath, files: archive.files },
+      },
     };
+  }
+
+  // Run the import preview against the assembled spool without consuming the
+  // transfer: the ledger run stays open and the parts stay spooled, so the
+  // subsequent apply reuses them instead of re-uploading. The body carries the
+  // same meta fields the multipart preview route's `meta` field does.
+  router.post("/import/transfers/:transferId/preview", async (req, res) => {
+    assertBoard(req);
+    const resolved = await resolveImportTransferBody(req, res);
+    if (!resolved) return;
+    const body = companyPortabilityPreviewSchema.parse(resolved.rawBody);
+    assertImportTargetAccess(req, body.target);
+    const preview = await portability.previewImport(body);
+    res.json(preview);
+  });
+
+  // Assemble the spooled parts back into the original zip, verify it against
+  // the declared whole-file hash, and run it through the exact import path a
+  // single-shot zip upload takes. The body carries the same meta fields the
+  // multipart route's `meta` field does (include/target/collisionStrategy/...).
+  router.post("/import/transfers/:transferId/apply", async (req, res) => {
+    assertBoard(req);
+    const resolved = await resolveImportTransferBody(req, res);
+    if (!resolved) return;
+    const { run, rawBody: rawImportBody } = resolved;
     await executeImportRequest(req, res, rawImportBody, {
       onSuccess: async (result) => {
         await companyTransferRunService.attachCompany(db, run.id, result.company.id);

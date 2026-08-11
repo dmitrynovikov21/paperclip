@@ -111,6 +111,13 @@ export function resolveViteHmrHost(bindHost: string): string | undefined {
   return bindHost;
 }
 
+// Cache-Control for hashed `/assets/*` files. `no-cache` means "store, but
+// revalidate before use" — paired with express.static's default ETag it yields
+// cheap 304s for unchanged chunks while letting in-place hotpatches (new
+// size/mtime => new ETag, same filename) reach browsers on the next load.
+// See the /assets middleware in createApp for the full rationale.
+export const HASHED_ASSET_CACHE_CONTROL = "no-cache";
+
 export function shouldServeViteDevHtml(req: ExpressRequest): boolean {
   const pathname = req.path;
   if (VITE_DEV_STATIC_PATHS.has(pathname)) return false;
@@ -352,13 +359,22 @@ export async function createApp(
     ];
     const uiDist = candidates.find((p) => fs.existsSync(path.join(p, "index.html")));
     if (uiDist) {
-      // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
-      // never change once built, so they can be cached aggressively.
+      // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>).
+      // In the normal Vite flow their content is immutable, so aggressive
+      // caching is safe. BUT this deployment also supports *in-place hotpatches*
+      // of individual chunks (a customized UI build that cannot be regenerated
+      // from source is patched surgically, keeping the same filename). Under
+      // `Cache-Control: immutable, max-age=1y` such a hotpatch is invisible:
+      // the browser keeps the year-cached copy for the unchanged filename and
+      // never refetches. Serve assets with revalidation (`no-cache` + ETag)
+      // instead: unchanged assets still return a cheap 304, but a hotpatched
+      // chunk (new size/mtime => new ETag) is refetched on the next load.
       app.use(
         "/assets",
         express.static(path.join(uiDist, "assets"), {
-          maxAge: "1y",
-          immutable: true,
+          setHeaders(res) {
+            res.set("Cache-Control", HASHED_ASSET_CACHE_CONTROL);
+          },
         }),
       );
       // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):

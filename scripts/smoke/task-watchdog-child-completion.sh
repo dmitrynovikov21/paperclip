@@ -53,9 +53,36 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 cd "$repo_root"
 
+scratch_root="${PAPERCLIP_RUN_SCRATCH_DIR:-${PAPERCLIP_SCRATCH_DIR:-${TMPDIR:-/tmp}}}"
+[[ -d "$scratch_root" ]] || {
+  echo "Smoke scratch directory not found: $scratch_root" >&2
+  exit 2
+}
+smoke_tmp_dir="$(mktemp -d "$scratch_root/task-watchdog-child-completion.XXXXXX")"
+trap 'rm -rf "$smoke_tmp_dir"' EXIT
+vitest_report="$smoke_tmp_dir/vitest-report.json"
+
 pnpm exec vitest run \
   server/src/__tests__/task-watchdog-child-completion-e2e.test.ts \
-  --reporter=verbose
+  --reporter=verbose \
+  --reporter=json \
+  --outputFile.json="$vitest_report"
+
+node -e '
+  const fs = require("node:fs");
+  const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const total = report.numTotalTests;
+  const passed = report.numPassedTests;
+  const failed = report.numFailedTests;
+  const pending = report.numPendingTests;
+  if (![total, passed, failed, pending].every(Number.isInteger)
+      || total < 1
+      || passed !== total
+      || failed !== 0
+      || pending !== 0) {
+    throw new Error(`Watchdog smoke did not execute every test: ${JSON.stringify({ total, passed, failed, pending })}`);
+  }
+' "$vitest_report"
 
 if [[ -n "$health_url" ]]; then
   [[ "$health_url" == */api/health ]] || {

@@ -15,6 +15,7 @@ import {
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
+  sanitizeInheritedPaperclipEnv,
   sanitizeSshRemoteEnv,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
@@ -145,6 +146,28 @@ describe("sanitizeSshRemoteEnv", () => {
         },
       ),
     ).toEqual({ PATH: "/explicit/remote/bin" });
+  });
+});
+
+describe("sanitizeInheritedPaperclipEnv", () => {
+  it("drops server-only credentials, including ones without the PAPERCLIP_ prefix", () => {
+    expect(
+      sanitizeInheritedPaperclipEnv({
+        PATH: "/usr/bin:/bin",
+        BETTER_AUTH_SECRET: "better-auth-secret",
+        PAPERCLIP_AGENT_JWT_SECRET: "jwt-signing-secret",
+        PAPERCLIP_SECRETS_MASTER_KEY: "secrets-master-key",
+        PAPERCLIP_API_KEY: "another-run-key",
+        PAPERCLIP_RUNTIME_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_LISTEN_HOST: "127.0.0.1",
+        PAPERCLIP_LISTEN_PORT: "3100",
+      }),
+    ).toEqual({
+      PATH: "/usr/bin:/bin",
+      PAPERCLIP_RUNTIME_API_URL: "http://127.0.0.1:3100",
+      PAPERCLIP_LISTEN_HOST: "127.0.0.1",
+      PAPERCLIP_LISTEN_PORT: "3100",
+    });
   });
 });
 

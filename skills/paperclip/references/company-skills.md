@@ -78,7 +78,9 @@ Browse, inspect, and install catalog skills before reaching for an external
 source. Bundled skills are the curated defaults for any company; optional
 skills are role- or domain-specific.
 
-```sh
+Run the authenticated curl examples in Bash. They use Bash process substitution to keep the bearer out of argv.
+
+```bash
 curl -sS "$PAPERCLIP_API_URL/api/skills/catalog?kind=bundled" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY")
 
@@ -115,7 +117,7 @@ Import using a **skills.sh URL**, a key-style source string, a GitHub URL, or a 
 
 ### Example: skills.sh import (preferred)
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/import" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -126,7 +128,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/
 
 Or equivalently using the key-style string:
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/import" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -137,7 +139,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/
 
 ### Example: GitHub import
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/import" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -154,7 +156,7 @@ You can also use source strings such as:
 
 If the task is to discover skills from the company project workspaces first:
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/scan-projects" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -163,14 +165,14 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/
 
 ## Inspect What Was Installed
 
-```sh
+```bash
 curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY")
 ```
 
 Read the skill entry and its `SKILL.md`:
 
-```sh
+```bash
 curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/skills/<skill-id>" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY")
 
@@ -194,7 +196,7 @@ The request must include a merge mode:
 - `remove` removes only the named skills.
 - `replace` overwrites the complete desired skill set. Use it only after explicit confirmation.
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills/sync" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -208,7 +210,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills/sync" \
 
 If you need the current state first:
 
-```sh
+```bash
 curl -sS "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY")
 ```
@@ -217,7 +219,7 @@ curl -sS "$PAPERCLIP_API_URL/api/agents/<agent-id>/skills" \
 
 Use the same company skill keys or references in `desiredSkills` when hiring or creating an agent:
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \
@@ -236,7 +238,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
 
 For direct create without approval:
 
-```sh
+```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents" \
   -H @<(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY") \
   -H "Content-Type: application/json" \

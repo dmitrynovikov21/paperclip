@@ -1047,8 +1047,9 @@ pnpm --filter @paperclipai/paperclip-runner trace:standalone -- \
 
 First real Paperclip tracer and inspection (against an isolated local dev
 instance with the five `PAPERCLIP_*` identifiers/auth variables already set):
+Use Bash for the process substitution in the curl command.
 
-```sh
+```bash
 pnpm --filter @paperclipai/paperclip-runner trace:standalone -- \
   --target paperclip --scenario happy-path
 

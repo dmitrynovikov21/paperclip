@@ -373,7 +373,9 @@ paperclipai pipelines case resolve-suggestion \
 
 The draft can still change while dependent work exists. A material update to the upstream case posts a drift comment on dependent linked work issues.
 
-```sh
+Run the following curl example in Bash. Its process substitution keeps the bearer out of argv.
+
+```bash
 export TWEET_WORK_ISSUE="$(
   paperclipai issue create \
     -C "$PAPERCLIP_COMPANY_ID" \

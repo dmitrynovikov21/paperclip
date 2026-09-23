@@ -39,36 +39,32 @@ pc_api_base() {
   printf '%s' "${base%/api}"
 }
 
-# Emit the curl config for one request on stdout. Never called with the
-# credential as an argument -- it is read from the environment here.
-_pc_api_config() {
-  local method="$1" url="$2" body_file="$3" out_file="$4" form="$5"
-  printf 'url = "%s"\n' "$url"
-  printf 'request = "%s"\n' "$method"
-  printf 'header = "Authorization: Bearer %s"\n' "$PAPERCLIP_API_KEY"
-  if [ -n "${PAPERCLIP_RUN_ID-}" ]; then
-    printf 'header = "X-Paperclip-Run-Id: %s"\n' "$PAPERCLIP_RUN_ID"
-  fi
-  if [ -n "$body_file" ]; then
-    printf 'header = "Content-Type: application/json"\n'
-    printf 'data = "@%s"\n' "$body_file"
-  fi
-  if [ -n "$form" ]; then
-    printf 'form = "%s"\n' "$form"
-  fi
-  printf 'silent\nshow-error\nmax-time = %s\n' "${PC_API_MAX_TIME:-90}"
-  printf 'output = "%s"\n' "$out_file"
-  printf 'write-out = "%%{http_code}"\n'
-}
-
 _pc_api_run() {
   local method="$1" path="$2" body_file="$3" form="$4"
-  local url out
+  local url out curl_status=0
+  local -a options=(--disable --silent --show-error --globoff --request "$method"
+    --max-time "${PC_API_MAX_TIME:-90}" --write-out '%{http_code}' --header @-)
   url="$(pc_api_base)$path"
   out="$(mktemp "${PAPERCLIP_RUN_SCRATCH_DIR:-${TMPDIR:-/tmp}}/pc-api.XXXXXX")" || return 1
-  PC_API_STATUS="$(_pc_api_config "$method" "$url" "$body_file" "$out" "$form" | curl --config -)"
+  options+=(--output "$out")
+  if [ -n "${PAPERCLIP_RUN_ID-}" ]; then
+    options+=(--header "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID")
+  fi
+  if [ -n "$body_file" ]; then
+    options+=(--header 'Content-Type: application/json' --data-binary "@$body_file")
+  fi
+  if [ -n "$form" ]; then
+    options+=(--form "$form")
+  fi
+  # Only the bearer uses stdin. Every caller-controlled value is a separate
+  # argument, so quotes and newlines cannot add curl config directives.
+  PC_API_STATUS="$(printf 'Authorization: Bearer %s' "$PAPERCLIP_API_KEY" |
+    curl "${options[@]}" -- "$url")" || curl_status=$?
   cat "$out"
   rm -f "$out"
+  if [ "$curl_status" -ne 0 ]; then
+    return "$curl_status"
+  fi
   case "$PC_API_STATUS" in
     2*) return 0 ;;
     *) return 1 ;;
@@ -85,7 +81,9 @@ pc_api_upload() {
   local path="${1:?usage: pc_api_upload PATH FILE [MIME_TYPE]}"
   local file="${2:?usage: pc_api_upload PATH FILE [MIME_TYPE]}"
   local type="${3-application/octet-stream}"
-  _pc_api_run POST "$path" "" "file=@${file};type=${type}"
+  local escaped_file="${file//\\/\\\\}"
+  escaped_file="${escaped_file//\"/\\\"}"
+  _pc_api_run POST "$path" "" "file=@\"${escaped_file}\";type=${type}"
 }
 
 # After changing this file, prove the property still holds by running the

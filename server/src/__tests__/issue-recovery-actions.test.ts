@@ -2051,6 +2051,164 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  async function seedPeerRecoveryOwnerHandBack() {
+    const seeded = await seedCompany();
+    const { companyId, coderId, sourceIssueId } = seeded;
+    const qaId = randomUUID();
+    const bystanderId = randomUUID();
+    // Peers of the coder: neither reports to it nor manages it, so no
+    // management override can stand in for recovery ownership.
+    await db.insert(agents).values([
+      {
+        id: qaId,
+        companyId,
+        name: "QA",
+        role: "qa",
+        status: "idle",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: bystanderId,
+        companyId,
+        name: "Bystander",
+        role: "engineer",
+        status: "idle",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // The source issue already sits with the recorded return owner, e.g. after
+    // the recovery owner reassigned it back before resolving.
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: coderId })
+      .where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: qaId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:peer-owner-hand-back",
+      evidence: { latestRunErrorCode: "provider_quota" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner", ownerAgentId: qaId },
+    });
+    return { ...seeded, qaId, bystanderId, action };
+  }
+
+  // Each agent acts from a run on its own home issue, so touching the source
+  // issue is a counted cross-issue write, as in production.
+  async function seedRunOnHomeIssue(input: {
+    companyId: string;
+    prefix: string;
+    agentId: string;
+    issueNumber: number;
+  }) {
+    const homeIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: homeIssueId,
+      companyId: input.companyId,
+      title: "Recovery work order",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: input.agentId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.prefix}-${input.issueNumber}`,
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      runId,
+      issueId: homeIssueId,
+    });
+    return runId;
+  }
+
+  it("lets a peer recovery owner hand restored work back to the assigned return owner", async () => {
+    const { companyId, prefix, coderId, qaId, sourceIssueId, action } =
+      await seedPeerRecoveryOwnerHandBack();
+    const runId = await seedRunOnHomeIssue({ companyId, prefix, agentId: qaId, issueNumber: 2 });
+    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    const app = createApp(
+      { type: "agent", agentId: qaId, companyId, runId, source: "agent_jwt" },
+      { recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup },
+    );
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Provider quota recovered.",
+      });
+
+    expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      assigneeAgentId: coderId,
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "handed_back",
+    });
+    expect(enqueueRecoveryActionWakeup).toHaveBeenCalledWith(
+      coderId,
+      expect.objectContaining({ reason: "issue_recovery_action_restored" }),
+    );
+    expect(enqueueRecoveryActionWakeup).not.toHaveBeenCalledWith(qaId, expect.anything());
+  });
+
+  it("keeps rejecting resolution by a peer that owns neither the source issue nor its recovery action", async () => {
+    const { companyId, prefix, coderId, bystanderId, sourceIssueId, action } =
+      await seedPeerRecoveryOwnerHandBack();
+    const runId = await seedRunOnHomeIssue({
+      companyId,
+      prefix,
+      agentId: bystanderId,
+      issueNumber: 3,
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: bystanderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "A bystander must not clear this recovery.",
+      })
+      .expect(403);
+
+    expect(rejected.body.error).toBe("Agent cannot resolve another owner's recovery action");
+
+    const [sourceAfter, actionAfter] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0]),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)).then((rows) => rows[0]),
+    ]);
+    expect(sourceAfter).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    expect(actionAfter).toMatchObject({ status: "active", outcome: null, resolvedAt: null });
+  });
+
   it("does not enqueue a restored wake when todo status and assignee are unchanged", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db

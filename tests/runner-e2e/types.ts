@@ -12,6 +12,7 @@ export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
   | "everyday_workflow"
 
+  | "continuation"
   | "first_task"
   | "agent_chat"
   | "governed_tool_review"
@@ -124,6 +125,8 @@ export interface RunnerTaskFixture {
   workMode: RunnerTaskWorkMode;
   flow: RunnerTaskFlow;
   expectedRunCount: number;
+  /** Optional lower bound; expectedRunCount remains the maximum/cost estimate. */
+  minimumExpectedRunCount?: number;
   attemptTimeoutMs: Readonly<Record<RunnerEnvironmentId, number>>;
   expectedTerminalState: {
     issue: "done" | "in_review" | "blocked";

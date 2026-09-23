@@ -181,9 +181,7 @@ const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
     riskTier: "S3",
     scopes: [
       googleScope("chat.spaces.readonly"),
-      googleScope("chat.memberships.readonly"),
       googleScope("chat.messages.readonly"),
-      googleScope("chat.users.readstate.readonly"),
     ],
     writeTools: [],
   },
@@ -195,9 +193,7 @@ const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
     riskTier: "S4",
     scopes: [
       googleScope("chat.spaces.readonly"),
-      googleScope("chat.memberships.readonly"),
       googleScope("chat.messages.readonly"),
-      googleScope("chat.users.readstate.readonly"),
       googleScope("chat.messages.create"),
     ],
     writeTools: ["send_message"],
@@ -278,7 +274,7 @@ describe("AppDefinition catalog", () => {
         "google-workspace-search",
       ]),
     );
-    expect(SELF_SERVE_MCP_CANDIDATES).toHaveLength(43);
+    expect(SELF_SERVE_MCP_CANDIDATES).toHaveLength(44);
     expect(BLOCKED_MCP_PROVIDERS.map((entry) => entry.slug)).toEqual([
       "g2",
       "vercel",
@@ -431,12 +427,15 @@ describe("AppDefinition catalog", () => {
     expect(channel("slack")?.guidanceMd).toContain("reactions");
     expect(channel("slack")?.guidanceMd).toContain("direct messages");
   });
-  it("keeps a complete, unique, dated evidence ledger for all 46 researched MCP providers", () => {
+  it("keeps a complete, unique, dated evidence ledger for all 47 researched MCP providers", () => {
+    // Ledger-wide date reflects the last full re-verification (2026-08-26);
+    // the You.com entry added here carries its own research evidence, but
+    // bumping the shared date would overstate freshness for the other providers.
     expect(SELF_SERVE_MCP_RESEARCH.verifiedAt).toBe("2026-08-26");
-    expect(SELF_SERVE_MCP_RESEARCH.entries).toHaveLength(46);
+    expect(SELF_SERVE_MCP_RESEARCH.entries).toHaveLength(47);
     expect(
       new Set(SELF_SERVE_MCP_RESEARCH.entries.map((entry) => entry.slug)),
-    ).toHaveProperty("size", 46);
+    ).toHaveProperty("size", 47);
     for (const entry of SELF_SERVE_MCP_RESEARCH.entries) {
       expect(new URL(entry.docsUrl).protocol).toBe("https:");
       expect(new URL(entry.serverUrl).protocol).toBe("https:");
@@ -566,6 +565,25 @@ describe("AppDefinition catalog", () => {
       defaults: {},
     });
     expect(method("zapier")?.credentialFields).toBeUndefined();
+    expect(
+      APP_DEFINITIONS.find((app) => app.slug === "youcom")?.methods.map(
+        (candidate) => candidate.key,
+      ),
+    ).toEqual(["mcp-oauth", "mcp-api-key", "mcp-free"]);
+    expect(method("youcom")?.defaults?.serverUrl).toBe("https://api.you.com/mcp");
+    expect(method("youcom", "mcp-api-key")).toMatchObject({
+      auth: "api_key",
+      keyPlacement: {
+        location: "header",
+        name: "Authorization",
+        prefix: "Bearer ",
+      },
+    });
+    expect(method("youcom", "mcp-free")).toMatchObject({
+      auth: "none",
+      defaults: { serverUrl: "https://api.you.com/mcp?profile=free" },
+    });
+    expect(method("youcom", "mcp-free")?.credentialFields).toBeUndefined();
   });
   it("uses discovery-first Notion MCP OAuth metadata", () => {
     const notion = APP_DEFINITIONS.find((app) => app.slug === "notion");
@@ -670,7 +688,6 @@ describe("AppDefinition catalog", () => {
       "brex",
       "candid",
       "coda",
-      "composio",
       "context7",
       "egnyte",
       "embat",
@@ -687,7 +704,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(47);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(51);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );

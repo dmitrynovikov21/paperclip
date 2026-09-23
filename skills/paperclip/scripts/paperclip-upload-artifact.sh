@@ -113,7 +113,7 @@ sha256_text() {
   fi
 }
 
-# Emit the authenticated request headers as a curl config on stdout.
+# Emit only the bearer header as a curl config on stdout.
 #
 # The credential must never be a command-line argument: /proc/<pid>/cmdline is
 # world-readable (0444) and `ps -ww -eo args` shows it to every process on the
@@ -122,7 +122,6 @@ sha256_text() {
 # this into `curl --config -` keeps the value out of every process's argv.
 auth_config() {
   printf 'header = "Authorization: Bearer %s"\n' "$PAPERCLIP_API_KEY"
-  printf 'header = "X-Paperclip-Run-Id: %s"\n' "$PAPERCLIP_RUN_ID"
 }
 
 request_json() {
@@ -135,17 +134,19 @@ request_json() {
   response_file="$(mktemp)"
   if [[ -n "$body" ]]; then
     status_code="$(
-      auth_config | curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
+      auth_config | curl --disable -sS -X "$method" -w '%{http_code}' -o "$response_file" \
         "$url" \
         --config - \
+        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
         -H 'Content-Type: application/json' \
         --data-binary "$body"
     )"
   else
     status_code="$(
-      auth_config | curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
+      auth_config | curl --disable -sS -X "$method" -w '%{http_code}' -o "$response_file" \
         "$url" \
-        --config -
+        --config - \
+        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"
     )"
   fi
 
@@ -175,9 +176,10 @@ upload_file() {
   escaped_path="${escaped_path//\"/\\\"}"
   response_file="$(mktemp)"
   status_code="$(
-    auth_config | curl -sS -X POST -w '%{http_code}' -o "$response_file" \
+    auth_config | curl --disable -sS -X POST -w '%{http_code}' -o "$response_file" \
       "$url" \
       --config - \
+      -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
       -F "file=@\"${escaped_path}\";type=${content_type}"
   )" || curl_status=$?
 
@@ -409,6 +411,13 @@ fi
 
 if [[ -z "${PAPERCLIP_API_URL:-}" || -z "${PAPERCLIP_API_KEY:-}" || -z "${PAPERCLIP_RUN_ID:-}" ]]; then
   printf 'Missing PAPERCLIP_API_URL, PAPERCLIP_API_KEY, or PAPERCLIP_RUN_ID.\n' >&2
+  exit 1
+fi
+
+# A run id is not secret, but control characters can split an HTTP header.
+# Keep it out of curl's config stream and reject malformed headers before I/O.
+if [[ "$PAPERCLIP_RUN_ID" =~ [[:cntrl:]] ]]; then
+  printf 'PAPERCLIP_RUN_ID contains a control character.\n' >&2
   exit 1
 fi
 

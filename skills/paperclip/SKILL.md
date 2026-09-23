@@ -44,7 +44,7 @@ Ready-made helpers ship with this skill:
 . scripts/paperclip-api.sh
 pc_api GET  /api/agents/me
 pc_api POST "/api/issues/$PAPERCLIP_TASK_ID/comments" body.json      # $PC_API_STATUS holds the HTTP status
-pc_api_upload "/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" ./evidence.png image/png
+bash scripts/paperclip-upload-artifact.sh ./evidence.png --title "Evidence" --summary "Screenshot for review"
 
 python3 scripts/paperclip-api.py GET /api/agents/me                  # same rule, without the shell
 ```

@@ -3660,6 +3660,53 @@ export function issueRoutes(
     return false;
   }
 
+  // Once the source issue is assigned back to its recorded return owner, the
+  // assignee boundary no longer admits the recovery owner, which would leave it
+  // unable to resolve its own action. A restore to todo is the one resolution
+  // that stays the recovery owner's call; everything else keeps the boundary.
+  function isRecoveryOwnerHandBack(
+    req: Request,
+    issue: { status: string; assigneeAgentId: string | null },
+    activeRecoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>,
+  ) {
+    const body = req.body as { outcome?: string; sourceIssueStatus?: string };
+    return (
+      req.actor.type === "agent" &&
+      !!req.actor.agentId &&
+      !!activeRecoveryAction?.returnOwnerAgentId &&
+      activeRecoveryAction.ownerAgentId === req.actor.agentId &&
+      issue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId &&
+      issue.assigneeAgentId !== req.actor.agentId &&
+      issue.status !== "done" &&
+      issue.status !== "cancelled" &&
+      body.outcome === "restored" &&
+      body.sourceIssueStatus === "todo"
+    );
+  }
+
+  function assertRecoveryHandBackNotRunLocked(
+    req: Request,
+    res: Response,
+    issue: { id: string; checkoutRunId: string | null; executionRunId: string | null },
+  ) {
+    const actorRunId = req.actor.type === "agent" ? req.actor.runId?.trim() || null : null;
+    const lockingRunId = [issue.checkoutRunId, issue.executionRunId].find(
+      (runId) => runId && runId !== actorRunId,
+    );
+    if (!lockingRunId) return true;
+    res.status(409).json({
+      error: "Recovery hand-back is locked by another active checkout or run",
+      details: {
+        code: "recovery_source_run_lock",
+        issueId: issue.id,
+        actorRunId,
+        checkoutRunId: issue.checkoutRunId,
+        executionRunId: issue.executionRunId,
+      },
+    });
+    return false;
+  }
+
   async function resolveActiveIssueRun(issue: {
     id: string;
     assigneeAgentId: string | null;
@@ -4833,8 +4880,12 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
+    if (isRecoveryOwnerHandBack(req, existing, activeRecoveryAction)) {
+      if (!assertRecoveryHandBackNotRunLocked(req, res, existing)) return;
+    } else if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
+      return;
+    }
     if (
       !(await assertRecoveryActionAuthority(
         req,

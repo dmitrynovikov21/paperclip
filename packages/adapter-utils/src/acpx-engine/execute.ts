@@ -24,6 +24,7 @@ import {
   ensureAbsoluteDirectory,
   ensurePathInEnv,
   ensurePaperclipSkillSymlink,
+  isPaperclipServerOnlyEnvKey,
   joinPromptSections,
   materializePaperclipSkillCopy,
   parseObject,
@@ -819,6 +820,124 @@ async function writePaperclipClaudeSettings(input: {
   };
 }
 
+// ACPX runs inside the long-lived Paperclip server process and gives every agent
+// it spawns a copy of the server's complete process.env. That environment holds
+// control-plane credentials (see PAPERCLIP_SERVER_ONLY_ENV_KEYS) and server
+// configuration no agent needs. A local agent gets an explicit launch
+// environment instead: this closed projection of the host environment (PATH,
+// locale, certificate/proxy settings, and the provider's own authentication)
+// plus the run's explicit env. The agent wrapper discards everything else.
+const ACPX_INHERITED_HOST_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PATH",
+  "PATHEXT",
+  "SYSTEMROOT",
+  "WINDIR",
+  "COMSPEC",
+  "HOME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "USER",
+  "USERNAME",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LANGUAGE",
+  "TZ",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "ALL_PROXY",
+]);
+
+const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
+  codex: new Set(["OPENAI_API_KEY", "CODEX_API_KEY"]),
+  claude: new Set([
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+  ]),
+  gemini: new Set([
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_GCA",
+  ]),
+};
+
+/**
+ * Project the server environment onto the closed set a local ACPX agent may
+ * inherit. Explicit adapter/runtime env is merged on top by
+ * `buildAcpxLaunchEnvironment` and is not restricted by this projection.
+ */
+export function projectAcpxInheritedHostEnvironment(
+  inheritedEnv: NodeJS.ProcessEnv,
+  acpxAgent: string,
+): Record<string, string> {
+  const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
+  const projected: Record<string, string> = {};
+  for (const [key, value] of Object.entries(inheritedEnv)) {
+    if (typeof value !== "string") continue;
+    const normalizedKey = key.toUpperCase();
+    const allowed =
+      ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
+      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
+      providerKeys?.has(normalizedKey) === true;
+    if (allowed) projected[key] = value;
+  }
+  return projected;
+}
+
+/**
+ * The complete environment of a locally launched ACPX agent: the host
+ * projection overlaid with the run's explicit env (adapter config, runtime
+ * variables, the run-scoped API key). Server-only credentials are dropped even
+ * when adapter config names them.
+ */
+export function buildAcpxLaunchEnvironment(
+  env: Record<string, string>,
+  acpxAgent: string,
+  inheritedEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const merged = ensurePathInEnv({
+    ...projectAcpxInheritedHostEnvironment(inheritedEnv, acpxAgent),
+    ...env,
+  });
+  const launchEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(merged)) {
+    if (typeof value === "string" && !isPaperclipServerOnlyEnvKey(key)) launchEnv[key] = value;
+  }
+  return launchEnv;
+}
+
+// The wrapper restarts itself once with an empty environment and marks that
+// restart with this first argument. ACPX starts the wrapper without arguments.
+const ACPX_WRAPPER_CLEAN_ENV_ARG = "--paperclip-clean-env";
+
 async function writeAgentWrapper(input: {
   stateDir: string;
   acpxAgent: string;
@@ -843,12 +962,16 @@ async function writeAgentWrapper(input: {
   const script = [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
-    `env_file=${shellQuote(envFilePath)}`,
-    "if [[ -f \"$env_file\" ]]; then",
-    "  set -a",
-    "  source \"$env_file\"",
-    "  set +a",
+    // ACPX spawns this script with the Paperclip server's complete environment.
+    // `exec -c` restarts it with an empty one, so the agent sees only env_file.
+    `if [[ "\${1:-}" != ${shellQuote(ACPX_WRAPPER_CLEAN_ENV_ARG)} ]]; then`,
+    `  exec -c "$BASH" "$0" ${shellQuote(ACPX_WRAPPER_CLEAN_ENV_ARG)} "$@"`,
     "fi",
+    "shift",
+    `env_file=${shellQuote(envFilePath)}`,
+    "set -a",
+    "source \"$env_file\"",
+    "set +a",
     `stderr_dir=${shellQuote(input.childStderrDir)}`,
     "if [[ -n \"${PAPERCLIP_RUN_ID:-}\" ]]; then",
     "  mkdir -p \"$stderr_dir\"",
@@ -1061,15 +1184,13 @@ async function buildRuntime(input: {
     }
   }
 
+  const launchEnv = buildAcpxLaunchEnvironment(env, acpxAgent);
   const configuredCommand = asString(config.agentCommand, "").trim();
   const builtInCommand = await resolveBuiltInAgentCommand(acpxAgent, input.engine.packageRootDir);
   let agentCommand = configuredCommand || builtInCommand?.command || null;
   let agentCommandShell = configuredCommand || builtInCommand?.shellCommand || "";
   if (acpxAgent === "gemini" && agentCommandShell) {
-    const normalized = await normalizeGeminiAcpCommandShell(
-      agentCommandShell,
-      ensurePathInEnv({ ...process.env, ...env }),
-    );
+    const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, launchEnv);
     if (normalized !== agentCommandShell) {
       agentCommandShell = normalized;
       agentCommand = normalized;
@@ -1082,7 +1203,7 @@ async function buildRuntime(input: {
         stateDir,
         acpxAgent,
         agentCommandShell,
-        env,
+        env: launchEnv,
         childStderrDir,
       })
     : null;
@@ -1113,9 +1234,8 @@ async function buildRuntime(input: {
   });
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
   const sessionKey = `paperclip:${agent.companyId}:${agent.id}:${taskKey}:${fingerprint}`;
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
   const loggedEnv = buildInvocationEnvForLogs(env, {
-    runtimeEnv,
+    runtimeEnv: launchEnv,
     includeRuntimeKeys: ["HOME"],
     resolvedCommand: wrapperPath ?? agentCommand ?? acpxAgent,
   });

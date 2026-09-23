@@ -1884,6 +1884,21 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Control-plane credentials of the Paperclip server. No agent process may
+// receive them: the agent JWT signing secret (and its BETTER_AUTH_SECRET
+// fallback) can mint a token for any agent of any company, and the secrets
+// master key decrypts every stored company secret.
+export const PAPERCLIP_SERVER_ONLY_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+]);
+
+export function isPaperclipServerOnlyEnvKey(key: string): boolean {
+  return PAPERCLIP_SERVER_ONLY_ENV_KEYS.has(key.toUpperCase());
+}
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   for (const key of Object.keys(env)) {

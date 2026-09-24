@@ -16,7 +16,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
-import { issueExecutionAttestationRoutes } from "../routes/issue-execution-attestation.js";
+import {
+  issueExecutionAttestationRoutes,
+  parseAttestationReaderAgentIds,
+} from "../routes/issue-execution-attestation.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -36,14 +39,14 @@ type AgentRow = typeof agents.$inferSelect;
 const REPO = "acme-print/backend";
 const HEAD_SHA = "0123456789abcdef0123456789abcdef01234567";
 
-function createApp(db: Db, actor: Express.Request["actor"]) {
+function createApp(db: Db, actor: Express.Request["actor"], readerAgentIds: string[] = []) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     req.actor = actor;
     next();
   });
-  app.use("/api", issueExecutionAttestationRoutes(db));
+  app.use("/api", issueExecutionAttestationRoutes(db, { readerAgentIds }));
   app.use(errorHandler);
   return app;
 }
@@ -342,8 +345,15 @@ describeEmbeddedPostgres("issue execution attestation routes", () => {
     expect((await request(foreign).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(403);
     expect((await request(foreign).get(`/api/companies/${company.id}/execution-attestations?repo=${REPO}&pr=1151`)).status).toBe(403);
 
-    const own = createApp(db, agentActor(company, ownAgent));
-    expect((await request(own).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(200);
+    // Ordinary agent keys of the same company do not read the chain; the configured reader does.
+    const unlisted = createApp(db, agentActor(company, ownAgent));
+    expect((await request(unlisted).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(403);
+    expect((await request(unlisted).get(`/api/companies/${company.id}/execution-attestations?repo=${REPO}&pr=1151`)).status).toBe(403);
+    const listed = createApp(db, agentActor(company, ownAgent), [ownAgent.id.toUpperCase()]);
+    expect((await request(listed).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(200);
+    // Being listed does not cross the company boundary.
+    const listedStranger = createApp(db, agentActor(stranger, strangerAgent), [strangerAgent.id]);
+    expect((await request(listedStranger).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(403);
 
     // The board key still lists the company, but the membership behind it is gone.
     await db.update(companyMemberships).set({ status: "suspended" });
@@ -380,6 +390,45 @@ describeEmbeddedPostgres("issue execution attestation routes", () => {
     const none = await request(app).get(`/api/companies/${company.id}/execution-attestations`).query({ repo: REPO, pr: "1150" });
     expect(none.status).toBe(200);
     expect(none.body.attestations).toEqual([]);
+  });
+
+  it("lets the listed verifier read with a task_bridge key that has no company-wide read grant", async () => {
+    const company = await seedCompany(db, "Attestation bridge key");
+    const bridgeAgent = await seedAgent(db, company.id, "Typed review bridge");
+    const findingsRoot = await seedIssue(db, { companyId: company.id, identifier: "EAT-30", title: "findings root" });
+    const fixture = await seedReviewedIssue(db, company, "EAT-31");
+    await seedPullRequest(db, { companyId: company.id, issueId: fixture.issue.id, externalId: `${REPO}#1151` });
+    const bridgeKeyActor: Express.Request["actor"] = {
+      type: "agent",
+      agentId: bridgeAgent.id,
+      companyId: company.id,
+      keyId: randomUUID(),
+      keyScope: {
+        kind: "task_bridge",
+        parentIssueIds: [findingsRoot.id],
+        allowedAssigneeAgentIds: [fixture.executor.id],
+      },
+      source: "agent_key",
+    } as Express.Request["actor"];
+
+    const listed = createApp(db, bridgeKeyActor, [bridgeAgent.id]);
+    const lookup = await request(listed).get(`/api/companies/${company.id}/execution-attestations`).query({ repo: REPO, pr: "1151" });
+    expect(lookup.status).toBe(200);
+    expect(lookup.body.withheld).toBe(0);
+    expect(lookup.body.attestations.map((item: { issue: { identifier: string } }) => item.issue.identifier)).toEqual(["EAT-31"]);
+    const single = await request(listed).get(`/api/issues/${fixture.issue.id}/execution-attestation`);
+    expect(single.status).toBe(200);
+    expect(single.body.decisions).toHaveLength(3);
+
+    const unlisted = createApp(db, bridgeKeyActor, [fixture.reviewerA.id]);
+    expect((await request(unlisted).get(`/api/companies/${company.id}/execution-attestations`).query({ repo: REPO, pr: "1151" })).status).toBe(403);
+    expect((await request(unlisted).get(`/api/issues/${fixture.issue.id}/execution-attestation`)).status).toBe(403);
+  });
+
+  it("parses the reader allowlist from the environment value", () => {
+    const id = randomUUID();
+    expect(parseAttestationReaderAgentIds(undefined)).toEqual([]);
+    expect(parseAttestationReaderAgentIds(` ${id.toUpperCase()} , not-a-uuid,, ${id} `)).toEqual([id, id]);
   });
 
   it("rejects malformed lookup queries", async () => {

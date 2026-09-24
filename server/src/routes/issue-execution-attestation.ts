@@ -22,6 +22,8 @@ import { assertCompanyAccess } from "./authz.js";
 
 export const EXECUTION_ATTESTATION_SCHEMA_VERSION = 1;
 export const EXECUTION_ATTESTATION_MAX_ISSUES = 20;
+/** Comma-separated agent ids allowed to read attestations (the verifier's service identity). */
+export const EXECUTION_ATTESTATION_READERS_ENV = "PAPERCLIP_EXECUTION_ATTESTATION_READER_AGENT_IDS";
 
 const GITHUB_REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -127,9 +129,40 @@ function parseGithubPullRequestExternalId(externalId: string | null) {
   return { repo: match[1]!, number: Number(match[2]) };
 }
 
-export function issueExecutionAttestationRoutes(db: Db) {
+export function parseAttestationReaderAgentIds(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => UUID_PATTERN.test(value));
+}
+
+/**
+ * Board members read through the regular company and issue read decisions. Agents read only
+ * when listed as readers: a verifier runs under a narrow (for example `task_bridge`) key that
+ * has no company-wide read grant, and ordinary agent keys have no reason to read the chain.
+ */
+export function issueExecutionAttestationRoutes(
+  db: Db,
+  opts: { readerAgentIds?: readonly string[] } = {},
+) {
   const router = Router();
   const access = accessService(db);
+  const readerAgentIds = new Set(
+    (opts.readerAgentIds ?? parseAttestationReaderAgentIds(process.env[EXECUTION_ATTESTATION_READERS_ENV])).map(
+      (id) => id.toLowerCase(),
+    ),
+  );
+
+  function isReaderAgent(req: Request) {
+    return req.actor.type === "agent" && !!req.actor.agentId && readerAgentIds.has(req.actor.agentId.toLowerCase());
+  }
+
+  function rejectUnlistedAgent(req: Request, res: Response) {
+    if (req.actor.type !== "agent" || isReaderAgent(req)) return false;
+    res.status(403).json({ error: "Execution attestation is limited to its configured reader agents" });
+    return true;
+  }
 
   async function issueReadAllowed(req: Request, issue: IssueAttestationRow) {
     const decision = await access.decide({
@@ -253,7 +286,8 @@ export function issueExecutionAttestationRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await issueReadAllowed(req, issue))) {
+    if (rejectUnlistedAgent(req, res)) return;
+    if (!isReaderAgent(req) && !(await issueReadAllowed(req, issue))) {
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return;
     }
@@ -268,7 +302,8 @@ export function issueExecutionAttestationRoutes(db: Db) {
   router.get("/companies/:companyId/execution-attestations", async (req: Request, res: Response) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    if (!(await companyScopeReadAllowed(req, companyId))) {
+    if (rejectUnlistedAgent(req, res)) return;
+    if (!isReaderAgent(req) && !(await companyScopeReadAllowed(req, companyId))) {
       res.status(403).json({ error: "Company is outside this actor's authorization boundary" });
       return;
     }
@@ -310,7 +345,7 @@ export function issueExecutionAttestationRoutes(db: Db) {
     const readable: IssueAttestationRow[] = [];
     let withheld = 0;
     for (const row of rows) {
-      if (await issueReadAllowed(req, row)) readable.push(row);
+      if (isReaderAgent(req) || (await issueReadAllowed(req, row))) readable.push(row);
       else withheld += 1;
     }
 

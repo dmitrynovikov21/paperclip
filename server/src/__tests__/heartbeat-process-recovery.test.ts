@@ -3562,6 +3562,109 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
+  async function insertRecoveryCandidateAgent(input: {
+    companyId: string;
+    name: string;
+    role: string;
+    heartbeat?: Record<string, unknown>;
+  }) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId: input.companyId,
+      name: input.name,
+      role: input.role,
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: input.heartbeat ? { heartbeat: input.heartbeat } : {},
+      permissions: {},
+    });
+    return id;
+  }
+
+  it.each([
+    ["wakeOnDemand: false", { wakeOnDemand: false }, "ceo"],
+    ["legacy wakeOnAssignment: false", { wakeOnAssignment: false }, "ceo"],
+    ["wakeOnDemand: \"false\" (not a boolean)", { wakeOnDemand: "false" }, "manager"],
+    ["wakeOnDemand: true over wakeOnAssignment: false", { wakeOnDemand: true, wakeOnAssignment: false }, "manager"],
+    ["timer disabled only", { enabled: false }, "manager"],
+  ] as const)(
+    "picks the stranded recovery owner by on-demand wakeability (manager %s)",
+    async (_label, managerHeartbeat, expectedOwner) => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+        retryReason: "assignment_recovery",
+      });
+      const managerId = await insertRecoveryCandidateAgent({
+        companyId,
+        name: "Manager",
+        role: "engineer",
+        heartbeat: managerHeartbeat,
+      });
+      const ceoId = await insertRecoveryCandidateAgent({ companyId, name: "Chief", role: "ceo" });
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, agentId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(1);
+
+      const ownerId = expectedOwner === "ceo" ? ceoId : managerId;
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(action).toMatchObject({
+        ownerType: "agent",
+        ownerAgentId: ownerId,
+        returnOwnerAgentId: agentId,
+      });
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: ownerId });
+    },
+  );
+
+  it("escalates to the board instead of parking recovery on an assignee that cannot be woken", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } })
+      .where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action).toMatchObject({
+      companyId,
+      status: "active",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: agentId,
+      returnOwnerAgentId: agentId,
+      wakePolicy: { type: "board_escalation", reason: "no_invokable_recovery_owner" },
+    });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Recovery owner: board escalation");
+    const recoveryWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "source_scoped_recovery_action")));
+    expect(recoveryWakes).toHaveLength(0);
+  });
+
   it("blocks an already stranded recovery issue without creating a recovery child", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "todo",

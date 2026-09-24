@@ -53,7 +53,7 @@ import {
   type AcpRuntimeOptions,
   type AcpRuntimeTurn,
   type AcpRuntimeTurnResult,
-} from "acpx/runtime";
+} from "./runtime.js";
 import {
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,

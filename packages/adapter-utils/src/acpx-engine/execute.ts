@@ -64,6 +64,7 @@ import {
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const WRAPPER_CLEANUP_RETENTION_MS = 15 * 60 * 1000;
+const ACPX_CANCEL_FALLBACK_MS = 5_000;
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
 
 type AcpxRuntimeFactory = (options: AcpRuntimeOptions) => AcpRuntime;
@@ -89,6 +90,7 @@ export interface AcpxEngineExecutorOptions {
   adapterType?: string;
   moduleDir?: string;
   packageRootDir?: string;
+  cancelFallbackMs?: number;
 }
 
 interface AcpxPreparedRuntime {
@@ -1413,10 +1415,10 @@ function describeErrorDiagnostics(err: unknown): {
   return { errorName, acpCode, causeMessage, retryable, stackPreview };
 }
 
-function classifyError(
+export function classifyAcpxExecutionError(
   err: unknown,
   phase?: AcpxExecutionPhase,
-): Pick<AdapterExecutionResult, "errorCode" | "errorMeta"> {
+): Pick<AdapterExecutionResult, "errorCode" | "errorFamily" | "errorMeta"> {
   const message = err instanceof Error ? err.message : String(err);
   const diagnostics = describeErrorDiagnostics(err);
   const { acpCode, errorName, causeMessage, retryable, stackPreview } = diagnostics;
@@ -1428,12 +1430,30 @@ function classifyError(
     ...(stackPreview ? { stackPreview } : {}),
     ...(phase ? { phase } : {}),
   };
-  const lower = message.toLowerCase();
+  const classificationText = [message, causeMessage].filter(Boolean).join("\n");
+  const lower = classificationText.toLowerCase();
+  const quotaLike = /(?:hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+(?:limit|cap)\s+reached|servicequotaexceededexception)/i.test(classificationText);
+  if (quotaLike) {
+    return {
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      errorMeta: { category: "quota", ...baseMeta },
+    };
+  }
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
   if (authLike) {
     return {
       errorCode: "acpx_auth_required",
+      errorFamily: "auth_required",
       errorMeta: { category: "auth", ...baseMeta },
+    };
+  }
+  const transientLike = /(?:\bECONNRESET\b|\bETIMEDOUT\b|\bENETUNREACH\b|\bEHOSTUNREACH\b|\bEAI_AGAIN\b|socket\s+hang\s+up|connection\s+(?:reset|timed?\s*out)|network\s+(?:unreachable|timeout)|upstream\s+(?:timeout|unavailable)|gateway\s+timeout|rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|throttl(?:ed|ing)|throttlingexception|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|temporarily\s+unavailable)/i.test(classificationText);
+  if (transientLike) {
+    return {
+      errorCode: "acpx_transient_upstream",
+      errorFamily: "transient_upstream",
+      errorMeta: { category: "transient_upstream", ...baseMeta },
     };
   }
   const phaseCode = (() => {
@@ -1497,14 +1517,14 @@ async function emitAcpxFailure(input: {
   // adapter execution timeout message instead of the raw underlying error.
   messageOverride?: string;
 }): Promise<{
-  classified: Pick<AdapterExecutionResult, "errorCode" | "errorMeta">;
+  classified: Pick<AdapterExecutionResult, "errorCode" | "errorFamily" | "errorMeta">;
   message: string;
   childStderrTail: string | null;
 }> {
   const { ctx, prepared, err, phase, messageOverride } = input;
   const rawMessage = err instanceof Error ? err.message : String(err);
   const message = messageOverride ?? rawMessage;
-  const classified = classifyError(err, phase);
+  const classified = classifyAcpxExecutionError(err, phase);
   const childStderrTail = await readChildStderrTail({ logPath: prepared.childStderrLogPath });
   if (childStderrTail) {
     await ctx.onLog(
@@ -1609,6 +1629,14 @@ function warmHandleMatches(
   handle: AcpRuntimeHandle,
 ): boolean {
   return entry !== undefined && entry.runtime === runtime && entry.handle === handle;
+}
+
+function createDrainSignal(): { drained: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const drained = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { drained, resolve };
 }
 
 export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
@@ -1808,6 +1836,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     }
 
     let cancelActiveTurn: ((reason: string) => Promise<void>) | null = null;
+    let cancelFallbackTimer: NodeJS.Timeout | null = null;
+    let cancellationStarted: Promise<void> | null = null;
     let controller: AbortController | null = null;
     let timeout: NodeJS.Timeout | null = null;
     let timedOut = false;
@@ -1830,14 +1860,61 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         timeoutMs,
         signal: controller?.signal,
       });
-      cancelActiveTurn = async (reason: string) => {
-        await turn.cancel({ reason });
+      cancelActiveTurn = (reason: string) => {
+        if (cancellationStarted) return cancellationStarted;
+        cancellationStarted = (async () => {
+          let resolveFallbackStarted!: () => void;
+          const fallbackStarted = new Promise<void>((resolve) => {
+            resolveFallbackStarted = resolve;
+          });
+          cancelFallbackTimer = setTimeout(() => {
+            void runtime.close({
+              handle: sessionHandle,
+              reason: `paperclip cancellation fallback: ${reason}`,
+              discardPersistentState: true,
+            }).catch(() => {});
+            // Resolving means the bounded fallback was dispatched, not that
+            // the runtime is drained. `drained` remains the safety barrier.
+            resolveFallbackStarted();
+          }, Math.max(0, deps.cancelFallbackMs ?? ACPX_CANCEL_FALLBACK_MS));
+          cancelFallbackTimer.unref?.();
+          const cancelAttempt = turn.cancel({ reason }).then(() => undefined, () => undefined);
+          await Promise.race([cancelAttempt, fallbackStarted]);
+        })();
+        return cancellationStarted;
       };
-      for await (const event of turn.events) {
-        if (event.type === "text_delta") textParts.push(event.text);
-        await emitRuntimeEvent(ctx, event);
+      const drainSignal = createDrainSignal();
+      let terminal: AcpRuntimeTurnResult;
+      try {
+        let registrationError: unknown = null;
+        try {
+          await ctx.onCancellationHandle?.({
+            cancel: cancelActiveTurn,
+            drained: drainSignal.drained,
+          });
+        } catch (error) {
+          // If the control plane cannot own the handle, keep consuming until
+          // the turn is actually drained. The bounded cancellation start will
+          // dispatch runtime.close as a fallback without falsely resolving
+          // the drain barrier.
+          registrationError = error;
+          await cancelActiveTurn("Paperclip failed to register the active turn cancellation handle");
+        }
+        for await (const event of turn.events) {
+          if (event.type === "text_delta") textParts.push(event.text);
+          await emitRuntimeEvent(ctx, event);
+        }
+        terminal = await turn.result;
+        if (registrationError) throw registrationError;
+      } finally {
+        if (cancelFallbackTimer) {
+          clearTimeout(cancelFallbackTimer);
+          cancelFallbackTimer = null;
+        }
+        // The control plane may release the run's concurrency slot only after
+        // the event stream and terminal result are fully drained.
+        drainSignal.resolve();
       }
-      const terminal = await turn.result;
       if (timeout) clearTimeout(timeout);
       if (terminal.status === "failed" || terminal.status === "cancelled" || timedOut) {
         const existing = warmHandles.get(prepared.sessionKey);
@@ -1901,6 +1978,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const errorMessage = timedOut
         ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
         : resultErrorMessage(terminal);
+      const terminalClassification = terminal.status === "failed" && errorMessage
+        ? classifyAcpxExecutionError(new Error(errorMessage), "turn")
+        : null;
       const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
       await emitAcpxLog(ctx, {
         type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
@@ -1913,7 +1993,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         signal: timedOut ? "SIGTERM" : null,
         timedOut,
         errorMessage,
-        errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+        errorCode: timedOut
+          ? "acpx_timeout"
+          : terminal.status === "failed"
+          ? (terminalClassification?.errorCode ?? "acpx_turn_failed")
+          : null,
+        errorFamily: terminalClassification?.errorFamily ?? null,
+        errorMeta: terminalClassification?.errorMeta,
         sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
         sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
         sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -1965,6 +2051,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         timedOut,
         errorMessage: message,
         errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
+        errorFamily: timedOut ? null : classified.errorFamily,
         errorMeta: classified.errorMeta,
         provider: "acpx",
         model: prepared.requestedModel || null,

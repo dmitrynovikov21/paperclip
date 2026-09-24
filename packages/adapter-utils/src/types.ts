@@ -65,7 +65,24 @@ export interface AdapterRuntimeServiceReport {
   healthStatus?: "unknown" | "healthy" | "unhealthy";
 }
 
-export type AdapterExecutionErrorFamily = "transient_upstream" | "provider_quota" | "model_refusal";
+export type AdapterExecutionErrorFamily =
+  | "transient_upstream"
+  | "provider_quota"
+  | "auth_required"
+  | "model_refusal";
+
+/**
+ * A cancellation hook for adapters whose work is not represented by the
+ * legacy child-process registry (for example, an embedded ACPX turn).
+ *
+ * `drained` must settle only after the adapter can no longer emit output or
+ * perform work for the turn. The control plane keeps the concurrency slot
+ * occupied until this promise settles.
+ */
+export interface AdapterExecutionCancellationHandle {
+  cancel: (reason: string) => Promise<void>;
+  drained: Promise<void>;
+}
 
 export interface AdapterExecutionResult {
   exitCode: number | null;
@@ -139,6 +156,7 @@ export interface AdapterExecutionContext {
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  onCancellationHandle?: (handle: AdapterExecutionCancellationHandle) => Promise<void>;
   authToken?: string;
 }
 

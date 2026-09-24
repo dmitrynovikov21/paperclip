@@ -3,11 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpRuntimeOptions } from "acpx/runtime";
 import { DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
 import {
   createAcpxEngineExecutor,
+  classifyAcpxExecutionError,
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
@@ -17,6 +18,14 @@ import {
 const execFileAsync = promisify(execFile);
 
 const tempRoots: string[] = [];
+
+function deferredForTest<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 async function makeTempRoot() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-skills-"));
@@ -112,6 +121,165 @@ async function runExecutor(
 }
 
 describe("shared ACPX engine runtime behavior", () => {
+  it.each([
+    ["You've hit your session limit; resets at 4pm", "provider_quota", "provider_quota"],
+    ["Weekly limit reached", "provider_quota", "provider_quota"],
+    ["Authentication failed: please login", "acpx_auth_required", "auth_required"],
+    ["upstream service unavailable (503)", "acpx_transient_upstream", "transient_upstream"],
+    ["permission denied", "acpx_turn_failed", null],
+  ])("classifies ACPX failure %s", (message, errorCode, errorFamily) => {
+    const result = classifyAcpxExecutionError(new Error(message), "turn");
+    expect(result.errorCode).toBe(errorCode);
+    expect(result.errorFamily ?? null).toBe(errorFamily);
+  });
+
+  it("classifies quota text carried by an ACP runtime error cause", () => {
+    const error = new Error("ACP turn failed") as Error & { cause: Error };
+    error.cause = new Error("Weekly limit reached");
+    const result = classifyAcpxExecutionError(error, "turn");
+    expect(result.errorCode).toBe("provider_quota");
+    expect(result.errorFamily).toBe("provider_quota");
+  });
+
+  it("registers turn cancellation before reading events and drains after the terminal result", async () => {
+    const eventGate = deferredForTest();
+    const resultGate = deferredForTest<{ status: "cancelled"; stopReason: string }>();
+    const cancel = vi.fn(async () => {
+      eventGate.resolve();
+      resultGate.resolve({ status: "cancelled", stopReason: "cancelled" });
+    });
+    let eventReadAfterRegistration = false;
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            eventReadAfterRegistration = handleRegistered;
+            await eventGate.promise;
+          })(),
+          result: resultGate.promise,
+          cancel,
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    let handleRegistered = false;
+    let handleDrained = false;
+    let drainedAtRegistration = true;
+    const execution = execute({
+      runId: "run-cancel",
+      agent: { id: "agent-1", companyId: "company-1", name: "A", adapterType: "acp_engine", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+      context: {},
+      onLog: async () => {},
+      onCancellationHandle: async (handle) => {
+        handleRegistered = true;
+        void handle.drained.then(() => { handleDrained = true; });
+        drainedAtRegistration = handleDrained;
+        await handle.cancel("test cancellation");
+      },
+    });
+
+    await vi.waitFor(() => expect(handleRegistered).toBe(true));
+    const result = await execution;
+    expect(result.exitCode).toBe(1);
+    expect(cancel).toHaveBeenCalledWith({ reason: "test cancellation" });
+    expect(drainedAtRegistration).toBe(false);
+    expect(eventReadAfterRegistration).toBe(true);
+    expect(handleDrained).toBe(true);
+  });
+
+  it("closes the ACPX runtime when turn cancellation does not drain promptly", async () => {
+    const eventGate = deferredForTest();
+    const resultGate = deferredForTest<{ status: "cancelled"; stopReason: string }>();
+    const close = vi.fn(async () => {
+      eventGate.resolve();
+      resultGate.resolve({ status: "cancelled", stopReason: "fallback close" });
+    });
+    const execute = createAcpxEngineExecutor({
+      cancelFallbackMs: 1,
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () { await eventGate.promise; })(),
+          result: resultGate.promise,
+          // Simulate an ACP backend whose cancel RPC never settles. The
+          // bounded runtime-close fallback must still break the drain.
+          cancel: () => new Promise<never>(() => {}),
+        }),
+        close,
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-cancel-fallback",
+      agent: { id: "agent-1", companyId: "company-1", name: "A", adapterType: "acp_engine", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+      context: {},
+      onLog: async () => {},
+      onCancellationHandle: async (handle) => {
+        await handle.cancel("stuck cancellation");
+      },
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(close).toHaveBeenCalledWith(expect.objectContaining({
+      reason: expect.stringContaining("paperclip cancellation fallback"),
+      discardPersistentState: true,
+    }));
+  });
+
+  it("drains the ACPX turn before surfacing cancellation-handle registration failure", async () => {
+    const eventGate = deferredForTest();
+    const resultGate = deferredForTest<{ status: "cancelled"; stopReason: string }>();
+    const close = vi.fn(async () => {
+      eventGate.resolve();
+      resultGate.resolve({ status: "cancelled", stopReason: "registration fallback" });
+    });
+    const execute = createAcpxEngineExecutor({
+      cancelFallbackMs: 1,
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () { await eventGate.promise; })(),
+          result: resultGate.promise,
+          cancel: () => new Promise<never>(() => {}),
+        }),
+        close,
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-registration-failure",
+      agent: { id: "agent-1", companyId: "company-1", name: "A", adapterType: "acp_engine", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+      context: {},
+      onLog: async () => {},
+      onCancellationHandle: async () => {
+        throw new Error("registry unavailable");
+      },
+    });
+
+    expect(close).toHaveBeenCalled();
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("registry unavailable");
+  });
   it("includes Paperclip env and API access notes in the ACPX prompt without leaking the token", async () => {
     const { meta } = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js" },
@@ -492,7 +660,8 @@ describe("shared ACPX engine runtime behavior", () => {
     } as never);
 
     expect(result.exitCode).toBe(1);
-    expect(result.errorCode).toBe("acpx_session_init_failed");
+    expect(result.errorCode).toBe("acpx_transient_upstream");
+    expect(result.errorFamily).toBe("transient_upstream");
     const meta = result.errorMeta ?? {};
     expect(meta.errorName).toBe("AcpRuntimeError");
     expect(meta.acpCode).toBe("ACP_SESSION_INIT_FAILED");

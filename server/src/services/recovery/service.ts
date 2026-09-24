@@ -34,6 +34,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { shouldSuppressManagerRecoveryWake } from "../agent-wake-routing.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
@@ -240,7 +241,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
   "claude_transient_upstream",
-  "provider_quota",
+  "acpx_transient_upstream",
   "timeout",
 ]);
 
@@ -251,6 +252,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  "provider_quota",
+  "claude_auth_required",
+  "acpx_auth_required",
+  "auth_required",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run
@@ -527,7 +532,10 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(db: Db, deps: {
+  enqueueWakeup: RecoveryWakeup;
+  onRunningRunTerminal?: (agentId: string, reason: string) => void;
+}) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -1373,6 +1381,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return updatedRun;
     });
     if (!finalizedRun) return { kind: "skipped" as const };
+    // The transaction above owns the running -> terminal transition. Notify the
+    // scheduler only after commit so the newly free slot is observable.
+    deps.onRunningRunTerminal?.(
+      finalizedRun.agentId,
+      `source_resolved_watchdog_fold:${finalRunStatus}`,
+    );
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
       await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
@@ -2166,6 +2180,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       seen.add(agentId);
       const candidate = await getAgent(agentId);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
+      if (
+        candidate.id !== issue.assigneeAgentId &&
+        shouldSuppressManagerRecoveryWake(candidate.metadata, candidate.adapterConfig)
+      ) {
+        continue;
+      }
       const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,

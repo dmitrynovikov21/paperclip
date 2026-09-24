@@ -20,6 +20,13 @@ describe("pause durability: continuation retry classification", () => {
     expect(classifyContinuationFailure(run("agent_not_invokable")).kind).toBe("non_retryable");
   });
 
+  it.each(["provider_quota", "claude_auth_required", "acpx_auth_required", "auth_required"])(
+    "does not create generic continuation retries for %s",
+    (errorCode) => {
+      expect(classifyContinuationFailure(run(errorCode)).kind).toBe("non_retryable");
+    },
+  );
+
   it("timed_out (timeout) still retries as transient infra", () => {
     const c = classifyContinuationFailure(run("timeout"));
     expect(c.kind).toBe("transient_infra");

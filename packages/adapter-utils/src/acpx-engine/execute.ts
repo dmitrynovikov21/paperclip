@@ -1432,7 +1432,7 @@ export function classifyAcpxExecutionError(
   };
   const classificationText = [message, causeMessage].filter(Boolean).join("\n");
   const lower = classificationText.toLowerCase();
-  const quotaLike = /(?:hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+(?:limit|cap)\s+reached|servicequotaexceededexception)/i.test(classificationText);
+  const quotaLike = /(?:hit\s+your\s+(?:session|weekly)\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+(?:limit|cap)\s+reached|servicequotaexceededexception)/i.test(classificationText);
   if (quotaLike) {
     return {
       errorCode: "provider_quota",

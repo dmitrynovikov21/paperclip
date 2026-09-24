@@ -123,9 +123,13 @@ async function runExecutor(
 describe("shared ACPX engine runtime behavior", () => {
   it.each([
     ["You've hit your session limit; resets at 4pm", "provider_quota", "provider_quota"],
+    ["Internal error: You've hit your session limit · resets 4:50pm (UTC)", "provider_quota", "provider_quota"],
+    ["Internal error: You've hit your weekly limit · resets Sep 28, 6pm (UTC)", "provider_quota", "provider_quota"],
     ["Weekly limit reached", "provider_quota", "provider_quota"],
     ["Authentication failed: please login", "acpx_auth_required", "auth_required"],
+    ["Authentication required", "acpx_auth_required", "auth_required"],
     ["upstream service unavailable (503)", "acpx_transient_upstream", "transient_upstream"],
+    ["ACP agent disconnected during request", "acpx_turn_failed", null],
     ["permission denied", "acpx_turn_failed", null],
   ])("classifies ACPX failure %s", (message, errorCode, errorFamily) => {
     const result = classifyAcpxExecutionError(new Error(message), "turn");

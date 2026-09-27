@@ -62,6 +62,7 @@ interface SpawnTarget {
   args: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
+  inheritedFds?: number[];
   cleanup?: () => Promise<void>;
 }
 
@@ -3269,13 +3270,19 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+        let child: ChildProcessWithEvents;
+        try {
+          child = spawn(target.command, target.args, {
+            cwd: target.cwd ?? opts.cwd,
+            env: childEnv,
+            detached: process.platform !== "win32",
+            shell: false,
+            stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe", ...(target.inheritedFds ?? [])],
+          }) as ChildProcessWithEvents;
+        } catch (error) {
+          void target.cleanup?.();
+          throw error;
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

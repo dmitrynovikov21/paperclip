@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -36,6 +37,7 @@ export interface LocalProcessSandboxSpawnTarget {
   args: string[];
   cwd: string;
   env?: Record<string, string | undefined>;
+  inheritedFds?: number[];
   cleanup?: () => Promise<void>;
 }
 
@@ -379,6 +381,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts"];
   const env: Record<string, string | undefined> = {};
   let cleanup: (() => Promise<void>) | undefined;
+  const aliasHandles: FileHandle[] = [];
   let executable = input.executable;
   let executableArgs = input.args;
 
@@ -421,6 +424,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
     const realWorkspaceDir = await fs.realpath(workspaceDir);
+    const aliasFdMounts: Array<{ source: string; destination: string; fdArgIndex: number }> = [];
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
@@ -442,7 +446,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       }
       await rejectServiceCredentialMount(realAliasTarget);
       addParentDirectories(args, created, aliasPath);
-      args.push("--bind", realAliasTarget, aliasPath);
+      aliasFdMounts.push({ source: realAliasTarget, destination: aliasPath, fdArgIndex: args.length + 1 });
+      args.push("--bind-fd", "", aliasPath);
       created.add(aliasPath);
     }
 
@@ -466,6 +471,32 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         await proxy.close();
         await fs.rm(tempDir, { recursive: true, force: true });
       };
+    }
+
+    try {
+      for (const alias of aliasFdMounts) {
+        // Keep the checked inode alive until Bubblewrap binds it. The source
+        // path can be replaced by an agent in the writable workspace.
+        const handle = await fs.open(
+          alias.source,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+        );
+        aliasHandles.push(handle);
+        const openedSource = `/proc/self/fd/${handle.fd}`;
+        const realOpenedSource = await fs.realpath(openedSource);
+        const relativeOpenedSource = path.relative(realWorkspaceDir, realOpenedSource);
+        if (relativeOpenedSource.startsWith("..") || path.isAbsolute(relativeOpenedSource)) {
+          throw new Error(
+            `Sandbox path alias "${alias.destination}" must target the synchronized workspace "${workspaceDir}".`,
+          );
+        }
+        await rejectServiceCredentialMount(openedSource);
+        args[alias.fdArgIndex] = String(3 + aliasHandles.length - 1);
+      }
+    } catch (error) {
+      await Promise.all(aliasHandles.map((handle) => handle.close()));
+      await cleanup?.();
+      throw error;
     }
   } else {
     args.push("--bind", "/", "/");
@@ -506,7 +537,27 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   }
 
   args.push("--chdir", cwd, "--", executable, ...executableArgs);
-  return { command: bwrapCommand, args, cwd: "/", env, cleanup };
+  if (aliasHandles.length > 0) {
+    const previousCleanup = cleanup;
+    let cleaned = false;
+    cleanup = async () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        await Promise.all(aliasHandles.map((handle) => handle.close()));
+      } finally {
+        await previousCleanup?.();
+      }
+    };
+  }
+  return {
+    command: bwrapCommand,
+    args,
+    cwd: "/",
+    env,
+    inheritedFds: aliasHandles.map((handle) => handle.fd),
+    cleanup,
+  };
 }
 
 export function parseLocalProcessSandboxExtraPaths(value: unknown): LocalProcessSandboxPath[] {

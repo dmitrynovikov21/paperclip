@@ -1,6 +1,9 @@
 // Runs only inside the disposable Bubblewrap test container. No secret values are logged.
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { buildLocalProcessSandboxSpawnTarget } from "../../packages/adapter-utils/src/local-process-sandbox.js";
 import {
   assertFileBackedDbAgentExecutionAllowed,
   runAdapterExecutionTargetProcess,
@@ -113,3 +116,50 @@ if (result.exitCode !== 0 || !result.stdout.includes("Launched agent: credential
   throw new Error(`workspace sandbox agent check failed (exit ${result.exitCode ?? "unknown"})${diagnostic ? `: ${diagnostic}` : ""}`);
 }
 console.log("workspace sandbox: credential path hidden; DB/signing env keys 0; JWT API HTTP 200");
+
+const aliasSource = join(workspaceDir, "alias-source");
+const preservedAlias = join(workspaceDir, "preserved-alias-source");
+await fs.mkdir(aliasSource);
+await fs.writeFile(join(aliasSource, "allowed-marker"), "safe");
+const aliasTarget = await buildLocalProcessSandboxSpawnTarget({
+  executable: "/usr/bin/python3",
+  args: ["-c", `from pathlib import Path
+alias = Path('/checked-alias')
+if (alias / 'allowed-marker').read_text() != 'safe':
+    raise RuntimeError('alias did not bind the checked directory')
+if (alias / 'database-url').exists():
+    raise RuntimeError('alias exposed the service credential')
+print('alias race: pinned directory visible; credential read denied')`],
+  cwd: workspaceDir,
+  options: {
+    workspaceDir,
+    filesystemScope: "workspace",
+    pathAliases: [{ path: "/checked-alias", target: aliasSource }],
+  },
+});
+try {
+  // Swap the canonical source after target construction and before bwrap spawn.
+  await fs.rename(aliasSource, preservedAlias);
+  await fs.symlink(dirname(credentialPath), aliasSource);
+  const aliasResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(aliasTarget.command, aliasTarget.args, {
+      cwd: aliasTarget.cwd,
+      env: { PATH: "/usr/bin:/bin", HOME: workspaceDir },
+      stdio: ["ignore", "pipe", "pipe", ...(aliasTarget.inheritedFds ?? [])],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (chunk) => { stdout += chunk; });
+    child.stderr!.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+  if (aliasResult.code !== 0 || !aliasResult.stdout.includes("alias race: pinned directory visible; credential read denied")) {
+    throw new Error(`alias race sandbox failed (exit ${aliasResult.code ?? "unknown"}): ${aliasResult.stderr.slice(-400)}`);
+  }
+  console.log("alias race: pinned directory visible; credential read denied");
+} finally {
+  await aliasTarget.cleanup?.();
+  await fs.rm(aliasSource, { recursive: true, force: true });
+  await fs.rm(preservedAlias, { recursive: true, force: true });
+}

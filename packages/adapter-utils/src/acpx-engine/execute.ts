@@ -55,6 +55,7 @@ import {
   resolvePaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
+  sanitizeInheritedPaperclipEnv,
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
   type PaperclipSkillEntry,

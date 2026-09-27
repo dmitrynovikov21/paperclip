@@ -352,11 +352,12 @@ export async function ensureServerWorkspaceLinksCurrent(
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   for (const key of Object.keys(env)) {
-    if (key.startsWith("PAPERCLIP_")) {
+    if (key.startsWith("PAPERCLIP_") || /^PG[A-Z0-9_]+$/.test(key)) {
       delete env[key];
     }
   }
   delete env.DATABASE_URL;
+  delete env.DATABASE_MIGRATION_URL;
   delete env.npm_config_tailscale_auth;
   delete env.npm_config_authenticated_private;
   return env;

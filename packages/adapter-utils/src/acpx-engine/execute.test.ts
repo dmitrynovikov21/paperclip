@@ -1485,8 +1485,12 @@ describe("shared ACPX engine runtime behavior", () => {
       }) as never,
     });
     const previousApiKey = process.env.PAPERCLIP_API_KEY;
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    const previousDatabaseFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
     try {
       delete process.env.PAPERCLIP_API_KEY;
+      process.env.DATABASE_URL = "postgres://synthetic:synthetic@localhost/db";
+      process.env.PAPERCLIP_DATABASE_URL_FILE = "/private/database-url";
       const result = await execute({
         runId: "run-1",
         agent: { id: "agent-1", companyId: "company-1" },
@@ -1499,10 +1503,16 @@ describe("shared ACPX engine runtime behavior", () => {
       } as never);
       expect(result.exitCode).toBe(0);
       expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedSessionEnv?.DATABASE_URL).toBeUndefined();
+      expect(observedSessionEnv?.PAPERCLIP_DATABASE_URL_FILE).toBeUndefined();
       expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
     } finally {
       if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
+      if (previousDatabaseFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousDatabaseFile;
     }
   });
 

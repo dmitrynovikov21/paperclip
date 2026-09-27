@@ -96,6 +96,38 @@ describe("local process sandbox", () => {
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
   });
 
+  it.runIf(process.platform === "linux")("rejects mounts that contain a file-backed service credential", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-credential-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const credential = path.join(root, "database-url");
+    await fs.mkdir(workspace);
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: root, access: "ro" }],
+        },
+      })).rejects.toThrow("mount would expose the service database credential");
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace" },
+      })).resolves.toMatchObject({ command: "bwrap" });
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
   it("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
     cleanup.push(root);

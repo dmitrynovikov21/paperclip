@@ -65,6 +65,14 @@ function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function resolveConfiguredDatabaseConnectionString(configConnectionString: string | null | undefined): string | undefined {
+  // This command mutates the database selected by --config. An inherited
+  // DATABASE_URL from the operator's shell must not silently redirect it.
+  const configUrl = nonEmpty(configConnectionString);
+  if (configUrl && !nonEmpty(process.env.PAPERCLIP_DATABASE_URL_FILE)) return configUrl;
+  return resolveDatabaseConnectionString({ configConnectionString });
+}
+
 async function isPortAvailable(port: number): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     const server = net.createServer();
@@ -212,7 +220,7 @@ async function openConfiguredDb(configPath: string): Promise<{
       };
     }
 
-    const connectionString = resolveDatabaseConnectionString({ configConnectionString: config.database.connectionString });
+    const connectionString = resolveConfiguredDatabaseConnectionString(config.database.connectionString);
     if (!connectionString) {
       throw new Error(`Config at ${configPath} does not define a database connection string.`);
     }
@@ -265,7 +273,7 @@ export async function disableAllRoutinesInConfig(
       await applyPendingMigrations(connectionString);
       db = createDb(connectionString) as ClosableDb;
     } else {
-      const connectionString = resolveDatabaseConnectionString({ configConnectionString: config.database.connectionString });
+      const connectionString = resolveConfiguredDatabaseConnectionString(config.database.connectionString);
       if (!connectionString) {
         throw new Error(`Config at ${configPath} does not define a database connection string.`);
       }

@@ -17,15 +17,18 @@ def main() -> None:
     if forbidden:
         raise RuntimeError("agent inherited database or signing keys: " + ",".join(forbidden))
 
-    if os.geteuid() == int(os.environ["EXPECTED_SERVICE_UID"]):
+    hidden_by_sandbox = os.environ.get("EXPECTED_CREDENTIAL_VISIBILITY") == "hidden"
+    if not hidden_by_sandbox and os.geteuid() == int(os.environ["EXPECTED_SERVICE_UID"]):
         raise RuntimeError("agent still has the service UID")
     credential_path = os.environ["KNOWN_CREDENTIAL_PATH"]
-    if not os.path.isfile(credential_path):
+    if hidden_by_sandbox and os.path.exists(credential_path):
+        raise RuntimeError("workspace sandbox exposed the service credential path")
+    if not hidden_by_sandbox and not os.path.isfile(credential_path):
         raise RuntimeError("credential fixture is not visible at the known path")
     try:
         with open(credential_path, "rb") as credential:
             credential.read(1)
-    except PermissionError:
+    except (FileNotFoundError, PermissionError):
         pass
     else:
         raise RuntimeError("agent can read the service database credential")

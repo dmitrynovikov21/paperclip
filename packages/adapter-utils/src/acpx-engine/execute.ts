@@ -13,6 +13,7 @@ import type {
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 import {
+  assertFileBackedDbAgentExecutionAllowed,
   adapterExecutionTargetSessionIdentity,
   describeAdapterExecutionTarget,
   formatAdapterExecutionTimeoutErrorMessage,
@@ -1413,14 +1414,19 @@ export function buildAcpxLaunchEnvironment(
   acpxAgent: string,
   inheritedEnv: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
+  const fileBackedDb = Boolean(process.env.PAPERCLIP_DATABASE_URL_FILE?.trim());
   const merged = ensurePathInEnv({
-    ...projectAcpxInheritedHostEnvironment(inheritedEnv, acpxAgent),
+    ...projectAcpxInheritedHostEnvironment(sanitizeInheritedPaperclipEnv(inheritedEnv), acpxAgent),
     ...env,
   });
   return Object.fromEntries(
     Object.entries(merged).filter(
-      (entry): entry is [string, string] =>
-        typeof entry[1] === "string" && !isPaperclipServerOnlyEnvKey(entry[0]),
+      (entry): entry is [string, string] => {
+        const [key, value] = entry;
+        if (typeof value !== "string" || isPaperclipServerOnlyEnvKey(key)) return false;
+        if (!fileBackedDb) return true;
+        return key !== "DATABASE_URL" && key !== "DATABASE_MIGRATION_URL" && !/^PG[A-Z0-9_]+$/.test(key);
+      },
     ),
   );
 }
@@ -1525,6 +1531,7 @@ async function buildRuntime(input: {
     executionTarget: input.ctx.executionTarget,
     legacyRemoteExecution: input.ctx.executionTransport?.remoteExecution,
   });
+  assertFileBackedDbAgentExecutionAllowed(executionTarget, null, "acpx");
   const remoteExecutionIdentity = adapterExecutionTargetSessionIdentity(executionTarget);
   const effectiveExecutionCwd =
     remoteExecutionIdentity && typeof remoteExecutionIdentity.remoteCwd === "string"

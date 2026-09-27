@@ -58,8 +58,12 @@ printf 'postgres://paperclip:%s@127.0.0.1:%s/paperclip?application_name=credenti
 chmod 0600 "$scratch/database-url"
 cp "$repo_root/scripts/smoke/paperclip-db-credential-agent-probe.py" "$scratch/agent-probe.py"
 chmod 0644 "$scratch/agent-probe.py"
+mkdir -m 0755 "$scratch/workspace"
+cp "$scratch/agent-probe.py" "$scratch/workspace/agent-probe.py"
 docker build -q -f "$repo_root/ops/paperclip-db-credential/Dockerfile.e2e" \
   -t paperclip-db-credential-e2e:local "$repo_root/ops/paperclip-db-credential" >/dev/null
+docker build -q -f "$repo_root/ops/paperclip-db-credential/Dockerfile.local-sandbox-e2e" \
+  -t paperclip-db-credential-local-sandbox-e2e:local "$repo_root/ops/paperclip-db-credential" >/dev/null
 setsid env -i PATH="$PATH" HOME="$scratch/home" \
   PAPERCLIP_HOME="$scratch/home" PAPERCLIP_CONFIG="$scratch/config.json" \
   PAPERCLIP_DATABASE_URL_FILE="$scratch/database-url" \
@@ -90,5 +94,5 @@ env -i PATH="$PATH" HOME="$scratch/home" \
   PAPERCLIP_AGENT_JWT_SECRET=synthetic-jwt-signing-key-for-e2e-only \
   "$repo_root/server/node_modules/.bin/tsx" \
   "$repo_root/server/scripts/paperclip-db-credential-jwt-probe.ts" \
-  "http://127.0.0.1:$server_port" "$scratch"
-echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, local+sandbox launcher/UID/JWT API 6 checks"
+  "http://127.0.0.1:$server_port" "$scratch" "$repo_root"
+echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, Docker UID and remote sandbox 6 checks, local bwrap 6 denials + JWT API pass"

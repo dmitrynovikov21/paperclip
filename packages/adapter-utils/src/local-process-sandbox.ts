@@ -49,11 +49,9 @@ interface NetworkAllowlistProxy {
 }
 
 const SYSTEM_READ_PATHS = [
-  "/bin",
-  "/sbin",
   "/usr",
-  "/lib",
-  "/lib64",
+  // /bin, /sbin and /lib* are aliases into /usr in the sandbox below.
+  // Binding onto those symlink destinations makes Bubblewrap fail to start.
   "/etc/ca-certificates",
   "/etc/ssl",
   "/etc/resolv.conf",
@@ -397,6 +395,15 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     const mount = async (source: string, access: LocalProcessSandboxAccess) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
       if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      const credentialPath = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim();
+      if (credentialPath) {
+        const realSource = await fs.realpath(normalized).catch(() => normalized);
+        const realCredential = await fs.realpath(credentialPath).catch(() => path.resolve(credentialPath));
+        const relativeCredential = path.relative(realSource, realCredential);
+        if (!relativeCredential || (!relativeCredential.startsWith("..") && !path.isAbsolute(relativeCredential))) {
+          throw new Error("Local filesystem sandbox mount would expose the service database credential.");
+        }
+      }
       addParentDirectories(args, created, normalized);
       args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
       mounted.add(normalized);

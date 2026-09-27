@@ -6,6 +6,7 @@ import {
   runAdapterExecutionTargetProcess,
   type AdapterSandboxExecutionTarget,
 } from "../../packages/adapter-utils/src/execution-target.js";
+import { runChildProcess } from "../../packages/adapter-utils/src/server-utils.js";
 import {
   agents,
   closeRegisteredClients,
@@ -21,8 +22,9 @@ import { createLocalAgentJwt } from "../src/agent-auth-jwt.js";
 
 const apiUrl = process.argv[2];
 const agentFixtureDir = process.argv[3];
-if (!apiUrl || !/^http:\/\/127\.0\.0\.1:\d+$/.test(apiUrl) || !agentFixtureDir) {
-  throw new Error("Expected a loopback API URL and agent fixture directory");
+const repoRoot = process.argv[4];
+if (!apiUrl || !/^http:\/\/127\.0\.0\.1:\d+$/.test(apiUrl) || !agentFixtureDir || !repoRoot) {
+  throw new Error("Expected a loopback API URL, agent fixture directory and repository root");
 }
 const dbUrl = resolveDatabaseConnectionString({});
 if (!dbUrl || !process.env.PAPERCLIP_DATABASE_URL_FILE || process.env.DATABASE_URL) {
@@ -72,8 +74,8 @@ try {
   const jwt = createLocalAgentJwt(agent.id, company.id, "codex_local", runId);
   if (!jwt) throw new Error("Run-scoped JWT issuance failed");
 
-  // Local and sandbox transport both launch a real process under a distinct
-  // Docker UID. -e NAME forwards only values supplied by the launcher.
+  // Docker UID and remote sandbox transport both launch a real process under
+  // a distinct UID. -e NAME forwards only values supplied by the launcher.
   const forwardedEnv = {
     PAPERCLIP_API_URL: apiUrl,
     PAPERCLIP_API_KEY: jwt,
@@ -99,7 +101,7 @@ try {
     "paperclip-db-credential-e2e:local",
   ];
   const launchInDocker = async (processRunId: string, command: string, args: string[], env: Record<string, string>) =>
-    runAdapterExecutionTargetProcess(processRunId, { kind: "local" }, "docker", [
+    runChildProcess(processRunId, "docker", [
       ...dockerPrefix, command, ...args,
     ], {
       cwd: agentFixtureDir,
@@ -120,11 +122,11 @@ try {
     },
   };
   for (const [label, target] of [
-    ["local", { kind: "local" }],
+    ["docker-uid", { kind: "local" }],
     ["sandbox", sandboxTarget],
   ] as const) {
-    const result = label === "local"
-      ? await launchInDocker(`${runId}-local-container`, "python3", ["/probe/agent-probe.py"], forwardedEnv)
+    const result = label === "docker-uid"
+      ? await launchInDocker(`${runId}-docker-uid`, "python3", ["/probe/agent-probe.py"], forwardedEnv)
       : await runAdapterExecutionTargetProcess(runId, target, "python3", ["/probe/agent-probe.py"], {
         cwd: agentFixtureDir,
         env: forwardedEnv,
@@ -141,6 +143,45 @@ try {
       throw new Error(`${label} agent credential and JWT check failed (exit ${result.exitCode ?? "unknown"})${diagnostic ? `: ${diagnostic}` : ""}`);
     }
     console.log(`${label} launcher: credential read denied; DB/signing env keys 0; JWT API HTTP 200`);
+  }
+  const localEnv = {
+    ...forwardedEnv,
+    PAPERCLIP_COMPANY_ID: company.id,
+    PAPERCLIP_DATABASE_URL_FILE: process.env.PAPERCLIP_DATABASE_URL_FILE,
+    PAPERCLIP_AGENT_JWT_SECRET: process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "",
+    KNOWN_CREDENTIAL_PATH: join(agentFixtureDir, "database-url"),
+    WORKSPACE_DIR: join(agentFixtureDir, "workspace"),
+  };
+  if (!localEnv.PAPERCLIP_AGENT_JWT_SECRET) throw new Error("Synthetic JWT signing source missing");
+  const localResult = await runChildProcess(`${runId}-local-bwrap-container`, "docker", [
+    "run", "--rm", "--privileged", "--network", "host",
+    "--mount", `type=bind,src=${repoRoot},dst=${repoRoot},readonly`,
+    "--mount", `type=bind,src=${agentFixtureDir},dst=${agentFixtureDir}`,
+    "--workdir", repoRoot,
+    ...Object.keys(localEnv).flatMap((key) => ["--env", key]),
+    "paperclip-db-credential-local-sandbox-e2e:local",
+    join(repoRoot, "server/node_modules/.bin/tsx"),
+    join(repoRoot, "server/scripts/paperclip-db-credential-local-sandbox-probe.ts"),
+  ], {
+    cwd: repoRoot,
+    env: localEnv,
+    timeoutSec: 60,
+    graceSec: 3,
+    onLog: async () => {},
+  });
+  if (localResult.exitCode !== 0 || !localResult.stdout.includes("workspace sandbox: credential path hidden; DB/signing env keys 0; JWT API HTTP 200")) {
+    const diagnostic = localResult.stderr.replaceAll(dbUrl, "[redacted database URL]")
+      .replaceAll(new URL(dbUrl).password, "[redacted password]")
+      .replaceAll(jwt, "[redacted API token]")
+      .split("\n").filter(Boolean).slice(-8).join("; ");
+    const passed = localResult.stdout.split("\n").filter((line) =>
+      /^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|missing Bubblewrap|workspace sandbox):/.test(line)).length;
+    throw new Error(`workspace sandbox container check failed (exit ${localResult.exitCode ?? "unknown"}; passed ${passed}/7)${diagnostic ? `: ${diagnostic}` : ""}`);
+  }
+  for (const line of localResult.stdout.split("\n")) {
+    if (/^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|missing Bubblewrap|workspace sandbox):/.test(line)) {
+      console.log(line);
+    }
   }
   console.log("Run-scoped JWT issuance with file-backed DB source passed");
 } finally {

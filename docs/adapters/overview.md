@@ -133,6 +133,10 @@ Rough tiers, richest first:
 
 **Recommendation:** use the native ACP engine on `claude_local`, `codex_local`, or `gemini_local` when the selected execution environment supports it. Rich ACP status events (including context usage) and incremental tool-call updates give the closest thing to watching the agent work locally.
 
+### ACP terminal environment
+
+For these local ACP adapters, `terminal/create` receives the agent's projected host environment and explicit run/adapter environment. An ACP terminal request may override names already present in that environment; additional names are ignored. Control-plane signing credentials stay out of the terminal and its child processes. Configure variables needed by agent tools in adapter `env` (using secret references for sensitive values), rather than relying on the Paperclip server's environment. The selected ACP permission mode still controls whether a terminal command may run.
+
 ## UI Parser Contract
 
 External adapters can ship a self-contained UI parser that tells the Paperclip web UI how to render their stdout. Without it, the UI uses a generic shell parser. See the [UI Parser Contract](/adapters/adapter-ui-parser) for details.

@@ -53,7 +53,7 @@ import {
   type AcpRuntimeOptions,
   type AcpRuntimeTurn,
   type AcpRuntimeTurnResult,
-} from "acpx/runtime";
+} from "./runtime.js";
 import {
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
@@ -72,6 +72,7 @@ type AcpxRuntimeFactory = (options: AcpRuntimeOptions) => AcpRuntime;
 export interface RuntimeCacheEntry {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
+  terminalEnv: Record<string, string>;
   fingerprint: string;
   lastUsedAt: number;
   cleanupTimer?: NodeJS.Timeout;
@@ -100,6 +101,7 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  terminalEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -1248,6 +1250,7 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    terminalEnv: launchEnv,
     loggedEnv,
     stateDir,
     permissionMode,
@@ -1754,10 +1757,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     const canResume = isCompatibleSession(previousParams, prepared);
     const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
     const cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+    // The runtime and its ACP client may survive between runs. Keep the shared
+    // base object current so terminal/create cannot receive a prior run's key.
+    const terminalEnv = cached?.terminalEnv ?? Object.create(null) as Record<string, string>;
+    for (const key of Object.keys(terminalEnv)) delete terminalEnv[key];
+    Object.assign(terminalEnv, prepared.terminalEnv);
     const runtimeOptions: AcpRuntimeOptions = {
       cwd: prepared.cwd,
       sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
       agentRegistry: prepared.agentRegistry,
+      terminalEnv,
       permissionMode: prepared.permissionMode,
       nonInteractivePermissions: prepared.nonInteractivePermissions,
       timeoutMs: prepared.timeoutSec > 0 ? prepared.timeoutSec * 1000 : undefined,
@@ -1988,6 +1997,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           const entry: RuntimeCacheEntry = {
             runtime,
             handle: sessionHandle,
+            terminalEnv,
             fingerprint: prepared.fingerprint,
             lastUsedAt: now(),
           };

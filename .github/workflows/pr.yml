@@ -248,6 +248,9 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Verify published adapter-utils ACPX runtime
+        run: pnpm test:adapter-utils-acpx-tarball
+
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
     needs: [policy]

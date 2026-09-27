@@ -12,9 +12,11 @@ import {
   buildAcpxLaunchEnvironment,
   createAcpxEngineExecutor,
   projectAcpxInheritedHostEnvironment,
+  type RuntimeCacheEntry,
 } from "./execute.js";
 
 const probeAgentPath = fileURLToPath(new URL("./fixtures/env-probe-acp-agent.mjs", import.meta.url));
+const terminalProbeAgentPath = fileURLToPath(new URL("./fixtures/terminal-probe-acp-agent.mjs", import.meta.url));
 
 const tempRoots: string[] = [];
 
@@ -44,6 +46,22 @@ const EXPECTED_AGENT_ENV = ["PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "ENV_PROBE_
 
 function probeCommand(serverEnv: Record<string, string>): string {
   return ["node", probeAgentPath, ...Object.keys(serverEnv), ...EXPECTED_AGENT_ENV].map(shellQuote).join(" ");
+}
+
+function terminalProbeCommand(
+  serverEnv: Record<string, string>,
+  variant: "absent" | "empty" | "nonempty",
+  markerPath?: string,
+): string {
+  return [
+    "node",
+    terminalProbeAgentPath,
+    variant,
+    ...(markerPath ? [`--marker=${markerPath}`] : []),
+    ...Object.keys(serverEnv),
+    ...EXPECTED_AGENT_ENV,
+    "UNLISTED_CLIENT_VAR",
+  ].map(shellQuote).join(" ");
 }
 
 function setProcessEnv(values: Record<string, string>): () => void {
@@ -88,10 +106,25 @@ type ProbeReport = {
   apiStatus: number | null;
 };
 
-async function runProbe(input: {
+type TerminalProbeReport = {
+  agent: Record<string, boolean>;
+  terminal: Record<string, boolean> | null;
+  shell: Record<string, boolean> | null;
+  shellOk?: boolean;
+  denied: boolean;
+  exitOk: boolean;
+  apiStatus: number | null;
+};
+
+async function runProbe<TReport = ProbeReport>(input: {
   root: string;
   serverEnv: Record<string, string>;
   createRuntime?: (options: AcpRuntimeOptions) => AcpRuntime;
+  agentCommand?: string;
+  permissionMode?: "approve-all" | "deny-all";
+  mode?: "persistent" | "oneshot";
+  warmHandles?: Map<string, RuntimeCacheEntry>;
+  sessionParams?: Record<string, unknown>;
 }) {
   const runId = `run-${randomUUID()}`;
   const apiKey = `run-scoped-key-${randomUUID()}`;
@@ -109,17 +142,19 @@ async function runProbe(input: {
   try {
     const cwd = path.join(input.root, "workspace");
     await fs.mkdir(cwd, { recursive: true });
-    const execute = createAcpxEngineExecutor({ warmHandles: new Map(), createRuntime: input.createRuntime });
+    const execute = createAcpxEngineExecutor({ warmHandles: input.warmHandles ?? new Map(), createRuntime: input.createRuntime });
     const result = await execute({
       runId,
       agent: { id: "agent-1", companyId: "company-1" },
-      runtime: {},
+      runtime: input.sessionParams ? { sessionParams: input.sessionParams } : {},
       config: {
         agent: "claude",
-        agentCommand: probeCommand(input.serverEnv),
+        agentCommand: input.agentCommand ?? probeCommand(input.serverEnv),
         stateDir: path.join(input.root, "state"),
         cwd,
-        mode: "oneshot",
+        mode: input.mode ?? "oneshot",
+        warmHandleIdleMs: input.mode === "persistent" ? 60_000 : undefined,
+        permissionMode: input.permissionMode,
         env: { ENV_PROBE_EXPLICIT: "explicit-adapter-env" },
       },
       context: {},
@@ -134,9 +169,10 @@ async function runProbe(input: {
     expect(result.exitCode).toBe(0);
     const persisted = [logs.join(""), JSON.stringify(meta), JSON.stringify(result), await readTree(input.root)].join("\n");
     return {
-      report: JSON.parse(String(result.summary)) as ProbeReport,
+      report: JSON.parse(String(result.summary)) as TReport,
       apiRequests: api.requests,
       persisted,
+      sessionParams: result.sessionParams,
     };
   } finally {
     restoreEnv();
@@ -251,5 +287,130 @@ describe("ACPX agent launch environment", () => {
       expect(report.apiStatus).toBe(401);
     },
     30_000,
+  );
+
+  for (const variant of ["absent", "empty", "nonempty"] as const) {
+    it.skipIf(process.platform === "win32")(
+      `terminal/create with ${variant} env gives the terminal and its shell only host/run names`,
+      async () => {
+        const root = await makeTempRoot();
+        const serverEnv = serverOnlyEnv();
+        const { report, persisted } = await runProbe<TerminalProbeReport>({
+          root,
+          serverEnv,
+          agentCommand: terminalProbeCommand(serverEnv, variant),
+          permissionMode: "approve-all",
+        });
+
+        expect(report.denied).toBe(false);
+        expect(report.exitOk).toBe(true);
+        expect(report.shellOk).toBe(true);
+        expect(report.apiStatus).toBe(200);
+        for (const name of Object.keys(serverEnv)) {
+          expect(report.agent[name], `agent sees ${name}`).toBe(false);
+          expect(report.terminal?.[name], `terminal sees ${name}`).toBe(false);
+          expect(report.shell?.[name], `terminal shell sees ${name}`).toBe(false);
+        }
+        for (const name of EXPECTED_AGENT_ENV) {
+          expect(report.terminal?.[name], `terminal sees ${name}`).toBe(true);
+          expect(report.shell?.[name], `terminal shell sees ${name}`).toBe(true);
+        }
+        expect(report.terminal?.UNLISTED_CLIENT_VAR).toBe(false);
+        expect(report.shell?.UNLISTED_CLIENT_VAR).toBe(false);
+        for (const value of Object.values(serverEnv)) {
+          expect(persisted.includes(value)).toBe(false);
+        }
+      },
+      30_000,
+    );
+  }
+
+  it.skipIf(process.platform === "win32")(
+    "control: unpatched ACPX terminal/create inherits server-only names with absent, empty and nonempty env",
+    async () => {
+      for (const variant of ["absent", "empty", "nonempty"] as const) {
+        const root = await makeTempRoot();
+        const serverEnv = serverOnlyEnv();
+        const { report } = await runProbe<TerminalProbeReport>({
+          root,
+          serverEnv,
+          agentCommand: terminalProbeCommand(serverEnv, variant),
+          permissionMode: "approve-all",
+          createRuntime: (options) => {
+            const unpatchedOptions = { ...options } as AcpRuntimeOptions & { terminalEnv?: Record<string, string> };
+            delete unpatchedOptions.terminalEnv;
+            return createAcpRuntime(unpatchedOptions);
+          },
+        });
+        expect(report.agent.PAPERCLIP_AGENT_JWT_SECRET).toBe(false);
+        expect(report.terminal?.PAPERCLIP_AGENT_JWT_SECRET).toBe(true);
+        expect(report.shell?.PAPERCLIP_AGENT_JWT_SECRET).toBe(true);
+        expect(report.apiStatus).toBe(401);
+      }
+    },
+    60_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "deny-all rejects terminal/create without launching a child",
+    async () => {
+      const root = await makeTempRoot();
+      const serverEnv = serverOnlyEnv();
+      const markerPath = path.join(root, "terminal-executed");
+      const { report } = await runProbe<TerminalProbeReport>({
+        root,
+        serverEnv,
+        agentCommand: terminalProbeCommand(serverEnv, "absent", markerPath),
+        permissionMode: "deny-all",
+      });
+      expect(report.denied).toBe(true);
+      expect(report.terminal).toBeNull();
+      expect(report.shell).toBeNull();
+      await expect(fs.access(markerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "a warm ACPX runtime gives the terminal the current run's API key",
+    async () => {
+      const root = await makeTempRoot();
+      const serverEnv = serverOnlyEnv();
+      const warmHandles = new Map<string, RuntimeCacheEntry>();
+      const command = terminalProbeCommand(serverEnv, "absent");
+      try {
+        const first = await runProbe<TerminalProbeReport>({
+          root,
+          serverEnv,
+          agentCommand: command,
+          permissionMode: "approve-all",
+          mode: "persistent",
+          warmHandles,
+        });
+        expect(first.report.apiStatus).toBe(200);
+        expect(first.sessionParams).toBeTruthy();
+        expect(warmHandles.size).toBe(1);
+
+        const second = await runProbe<TerminalProbeReport>({
+          root,
+          serverEnv,
+          agentCommand: command,
+          permissionMode: "approve-all",
+          mode: "persistent",
+          warmHandles,
+          sessionParams: first.sessionParams ?? undefined,
+        });
+        expect(second.report.apiStatus).toBe(200);
+        expect(second.report.terminal?.PAPERCLIP_AGENT_JWT_SECRET).toBe(false);
+        expect(warmHandles.size).toBe(1);
+      } finally {
+        await Promise.all([...warmHandles.values()].map(async (entry) => {
+          if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+          await entry.runtime.close({ handle: entry.handle, reason: "test cleanup", discardPersistentState: true }).catch(() => {});
+        }));
+        warmHandles.clear();
+      }
+    },
+    60_000,
   );
 });

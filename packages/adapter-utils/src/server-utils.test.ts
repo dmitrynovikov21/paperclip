@@ -466,6 +466,40 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it.skipIf(process.platform !== "linux")("pins the host SSH launcher despite agent PATH and loader overrides in file-backed mode", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launcher-"));
+    const marker = path.join(dir, "fake-ssh-ran");
+    const priorSource = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    await fs.writeFile(path.join(dir, "ssh"), `#!/bin/sh\ntouch '${marker}'\nexit 0\n`, { mode: 0o700 });
+    process.env.PAPERCLIP_DATABASE_URL_FILE = "/synthetic/missing";
+    try {
+      const result = await runChildProcess("trusted-ssh-launcher", "agent-cli", [], {
+        cwd: dir,
+        env: { PATH: `${dir}:/usr/bin:/bin`, LD_PRELOAD: "/synthetic/missing-preload.so" },
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 9,
+          username: "nobody",
+          remoteCwd: "/tmp",
+          remoteWorkspacePath: "/tmp",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: false,
+        },
+        timeoutSec: 3,
+        graceSec: 1,
+        onLog: async () => {},
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).not.toContain("missing-preload.so");
+      await expect(fs.stat(marker)).rejects.toThrow();
+    } finally {
+      if (priorSource === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = priorSource;
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),

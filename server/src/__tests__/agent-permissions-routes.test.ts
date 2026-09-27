@@ -742,6 +742,22 @@ describe.sequential("agent permission routes", () => {
     );
   });
 
+  it("blocks agent-authenticated self-updates that select the Bubblewrap launcher", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { filesystemSandboxCommand: "/workspace/fake-bwrap" } }));
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.filesystemSandboxCommand");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
     const app = await createApp({
       type: "agent",

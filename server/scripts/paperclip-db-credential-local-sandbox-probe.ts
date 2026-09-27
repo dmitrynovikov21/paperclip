@@ -92,21 +92,35 @@ try {
 }
 console.log("credential-bearing mount: denied before agent launch");
 
+const substitutedLauncher = join(workspaceDir, "fake-bwrap");
+const substitutedMarker = join(workspaceDir, "fake-bwrap-ran");
+await fs.writeFile(substitutedLauncher, `#!/bin/sh\ntouch '${substitutedMarker}'\nexit 0\n`, { mode: 0o700 });
 try {
   await runAdapterExecutionTargetProcess(runId, target, "python3", [join(workspaceDir, "agent-probe.py")], {
     ...options,
-    localProcessSandbox: { workspaceDir, filesystemScope: "workspace", command: join(workspaceDir, "missing-bwrap") },
+    localProcessSandbox: { workspaceDir, filesystemScope: "workspace", command: substitutedLauncher },
   });
-  throw new Error("missing Bubblewrap unexpectedly allowed");
+  throw new Error("substituted Bubblewrap unexpectedly allowed");
 } catch (error) {
-  if (!String(error).includes("requires Bubblewrap")) throw error;
+  if (!String(error).includes("trusted /usr/bin/bwrap launcher")) throw error;
 }
-console.log("missing Bubblewrap: denied before agent launch");
+if (await fs.stat(substitutedMarker).then(() => true).catch(() => false)) {
+  throw new Error("substituted Bubblewrap executed before sandboxing");
+}
+console.log("substituted Bubblewrap: denied before launcher execution");
+
+const pathLauncher = join(workspaceDir, "bwrap");
+const pathMarker = join(workspaceDir, "path-bwrap-ran");
+await fs.writeFile(pathLauncher, `#!/bin/sh\ntouch '${pathMarker}'\nexit 0\n`, { mode: 0o700 });
 
 const result = await runAdapterExecutionTargetProcess(runId, target, "python3", [join(workspaceDir, "agent-probe.py")], {
   ...options,
+  env: { ...env, PATH: `${workspaceDir}:/usr/bin:/bin`, LD_PRELOAD: "/synthetic/missing-preload.so" },
   localProcessSandbox: { workspaceDir, filesystemScope: "workspace" },
 });
+if (await fs.stat(pathMarker).then(() => true).catch(() => false)) {
+  throw new Error("PATH-selected Bubblewrap executed before sandboxing");
+}
 if (result.exitCode !== 0 || !result.stdout.includes("Launched agent: credential read denied; DB/signing env keys 0; JWT API HTTP 200")) {
   const diagnostic = result.stderr.replaceAll(serviceUrl, "[redacted database URL]")
     .replaceAll(new URL(serviceUrl).password, "[redacted password]")
@@ -115,7 +129,10 @@ if (result.exitCode !== 0 || !result.stdout.includes("Launched agent: credential
     .split("\n").filter(Boolean).slice(-5).join("; ");
   throw new Error(`workspace sandbox agent check failed (exit ${result.exitCode ?? "unknown"})${diagnostic ? `: ${diagnostic}` : ""}`);
 }
-console.log("workspace sandbox: credential path hidden; DB/signing env keys 0; JWT API HTTP 200");
+if (result.stderr.includes("missing-preload.so")) {
+  throw new Error("Agent-supplied dynamic loader environment reached Bubblewrap");
+}
+console.log("workspace sandbox: trusted Bubblewrap despite agent PATH; loader override stripped; credential path hidden; DB/signing env keys 0; JWT API HTTP 200");
 
 const aliasSource = join(workspaceDir, "alias-source");
 const preservedAlias = join(workspaceDir, "preserved-alias-source");

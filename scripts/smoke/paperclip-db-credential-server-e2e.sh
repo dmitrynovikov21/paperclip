@@ -95,4 +95,4 @@ env -i PATH="$PATH" HOME="$scratch/home" \
   "$repo_root/server/node_modules/.bin/tsx" \
   "$repo_root/server/scripts/paperclip-db-credential-jwt-probe.ts" \
   "http://127.0.0.1:$server_port" "$scratch" "$repo_root"
-echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, Docker UID and remote sandbox 6 checks, local bwrap 6 denials + JWT API pass + alias race denial"
+echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, Docker UID and remote sandbox 6 checks, local bwrap 6 denials + substituted launcher denial + PATH/loader denial + JWT API pass + alias race denial"

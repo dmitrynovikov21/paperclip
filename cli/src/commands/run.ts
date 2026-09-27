@@ -8,7 +8,7 @@ import { bootstrapCeoInvite } from "./auth-bootstrap-ceo.js";
 import { onboard } from "./onboard.js";
 import { doctor } from "./doctor.js";
 import { loadPaperclipEnvFile } from "../config/env.js";
-import { applyServerSecretHardening } from "../config/server-secret-hardening.js";
+import { applyServerSecretHardening, closeInspectorAndInstallSignalGuard } from "../config/server-secret-hardening.js";
 import { configExists, resolveConfigPath } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { readConfig } from "../config/store.js";
@@ -34,6 +34,7 @@ interface StartedServer {
 }
 
 export async function runCommand(opts: RunOptions): Promise<void> {
+  closeInspectorAndInstallSignalGuard();
   const instanceId = resolvePaperclipInstanceId(opts.instance);
   process.env.PAPERCLIP_INSTANCE_ID = instanceId;
 

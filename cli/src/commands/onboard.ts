@@ -19,7 +19,7 @@ import {
 } from "@paperclipai/shared";
 import { configExists, readConfig, resolveConfigPath, writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
-import { ensureAgentJwtSecret, resolveAgentJwtEnvFile } from "../config/env.js";
+import { ensureAgentJwtSecret, isEphemeralAgentJwtSecretEnabled, resolveAgentJwtEnvFile } from "../config/env.js";
 import { ensureLocalSecretsKeyFile } from "../config/secrets-key.js";
 import { promptDatabase } from "../prompts/database.js";
 import { promptLlm } from "../prompts/llm.js";
@@ -360,7 +360,9 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
 
     const jwtSecret = ensureAgentJwtSecret(configPath);
     const envFilePath = resolveAgentJwtEnvFile(configPath);
-    if (jwtSecret.created) {
+    if (isEphemeralAgentJwtSecretEnabled(configPath)) {
+      p.log.info("Agent JWT signing secret is ephemeral and held in memory");
+    } else if (jwtSecret.created) {
       p.log.success(`Created ${pc.cyan("PAPERCLIP_AGENT_JWT_SECRET")} in ${pc.dim(envFilePath)}`);
     } else if (process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim()) {
       p.log.info(`Using existing ${pc.cyan("PAPERCLIP_AGENT_JWT_SECRET")} from environment`);
@@ -592,7 +594,9 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
 
   const jwtSecret = ensureAgentJwtSecret(configPath);
   const envFilePath = resolveAgentJwtEnvFile(configPath);
-  if (jwtSecret.created) {
+  if (isEphemeralAgentJwtSecretEnabled(configPath)) {
+    p.log.info("Agent JWT signing secret is ephemeral and held in memory");
+  } else if (jwtSecret.created) {
     p.log.success(`Created ${pc.cyan("PAPERCLIP_AGENT_JWT_SECRET")} in ${pc.dim(envFilePath)}`);
   } else if (process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim()) {
     p.log.info(`Using existing ${pc.cyan("PAPERCLIP_AGENT_JWT_SECRET")} from environment`);

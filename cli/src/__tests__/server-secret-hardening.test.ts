@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureAgentJwtSecret, resolveAgentJwtEnvFile } from "../config/env.js";
 import { applyServerSecretHardening, isTruthyEnvFlag } from "../config/server-secret-hardening.js";
+import { createLocalAgentJwt, verifyLocalAgentJwt } from "../../../server/src/agent-auth-jwt.js";
 
 const doctorMock = vi.hoisted(() => vi.fn());
 
@@ -13,6 +14,7 @@ vi.mock("../commands/doctor.js", () => ({ doctor: doctorMock }));
 
 const ORIGINAL_ENV = { ...process.env };
 const HARDENING_MODULE = fileURLToPath(new URL("../config/server-secret-hardening.ts", import.meta.url));
+const EARLY_GUARD_MODULE = fileURLToPath(new URL("../config/early-inspector-guard.ts", import.meta.url));
 const SYNTHETIC_PERSISTENT_SECRET = "synthetic-persistent-secret-for-tests";
 
 function tempDir(prefix: string): string {
@@ -146,16 +148,33 @@ describe("server secret hardening", () => {
     expect(fs.readFileSync(envPath, "utf-8")).toBe(envFileBefore);
     expect(process.listeners("SIGUSR1").length).toBe(sigusr1ListenersBefore.length + 1);
   });
+
+  it("passes an in-memory key to the server signer and invalidates its run JWT on rotation", () => {
+    const configPath = tempConfigPath();
+    const envPath = resolveAgentJwtEnvFile(configPath);
+    fs.writeFileSync(envPath, "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n", { mode: 0o600 });
+
+    ensureAgentJwtSecret(configPath);
+    const token = createLocalAgentJwt("synthetic-agent", "synthetic-company", "codex_local", "synthetic-run");
+    expect(token).not.toBeNull();
+    expect(verifyLocalAgentJwt(token!)?.run_id).toBe("synthetic-run");
+    expect(fs.readFileSync(envPath, "utf8")).toBe("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n");
+
+    applyServerSecretHardening();
+    expect(verifyLocalAgentJwt(token!)).toBeNull();
+    const nextToken = createLocalAgentJwt("synthetic-agent", "synthetic-company", "codex_local", "next-run");
+    expect(verifyLocalAgentJwt(nextToken!)?.run_id).toBe("next-run");
+  });
 });
 
-async function inspectorUrlAfterSigusr1(applyHardening: boolean): Promise<string> {
+async function inspectorOpenAfterSigusr1(applyHardening: boolean): Promise<boolean> {
   const script = [
     `import inspector from "node:inspector";`,
     applyHardening
       ? `const { applyServerSecretHardening } = await import(${JSON.stringify(HARDENING_MODULE)}); applyServerSecretHardening();`
       : "",
     `process.kill(process.pid, "SIGUSR1");`,
-    `setTimeout(() => { console.log(JSON.stringify({ url: inspector.url() ?? null })); process.exit(0); }, 1500);`,
+    `setTimeout(() => { console.log(JSON.stringify({ open: Boolean(inspector.url()) })); process.exit(0); }, 1500);`,
   ].join("\n");
   const child = spawn(
     process.execPath,
@@ -169,15 +188,76 @@ async function inspectorUrlAfterSigusr1(applyHardening: boolean): Promise<string
     child.on("close", () => resolve());
   });
   const line = stdout.trim().split("\n").pop() ?? "";
-  return (JSON.parse(line) as { url: string | null }).url ?? "none";
+  return (JSON.parse(line) as { open: boolean }).open;
 }
 
 describe("SIGUSR1 inspector activation", () => {
+  it("installs the CLI entry guard before a later signal can open the inspector", async () => {
+    const script = [
+      `import inspector from "node:inspector";`,
+      `await import(${JSON.stringify(EARLY_GUARD_MODULE)});`,
+      `process.kill(process.pid, "SIGUSR1");`,
+      `setTimeout(() => console.log(JSON.stringify({ open: Boolean(inspector.url()) })), 300);`,
+    ].join("\n");
+    const child = spawn(
+      process.execPath,
+      ["--inspect-port=127.0.0.1:0", "--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: path.dirname(HARDENING_MODULE), env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+
+    expect(code).toBe(0);
+    expect(JSON.parse(stdout.trim().split("\n").pop() ?? "{}")).toEqual({ open: false });
+  }, 20_000);
+
   it("does not open the inspector once hardening is applied", async () => {
-    expect(await inspectorUrlAfterSigusr1(true)).toBe("none");
+    expect(await inspectorOpenAfterSigusr1(true)).toBe(false);
   }, 20_000);
 
   it("negative control: opens the inspector without hardening", async () => {
-    expect(await inspectorUrlAfterSigusr1(false)).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\//);
+    expect(await inspectorOpenAfterSigusr1(false)).toBe(true);
+  }, 20_000);
+
+  it("closes an inspector opened before hardening and before creating a signing key", async () => {
+    const script = [
+      `import inspector from "node:inspector";`,
+      `import crypto from "node:crypto";`,
+      `import { syncBuiltinESMExports } from "node:module";`,
+      `process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL = "true";`,
+      `process.kill(process.pid, "SIGUSR1");`,
+      `await new Promise((resolve) => setTimeout(resolve, 300));`,
+      `const openedBefore = Boolean(inspector.url());`,
+      `let openAtKeyCreation = null;`,
+      `const randomBytes = crypto.randomBytes;`,
+      `crypto.randomBytes = (...args) => { openAtKeyCreation = Boolean(inspector.url()); return randomBytes(...args); };`,
+      `syncBuiltinESMExports();`,
+      `const { applyServerSecretHardening } = await import(${JSON.stringify(HARDENING_MODULE)});`,
+      `applyServerSecretHardening();`,
+      `console.log(JSON.stringify({ openedBefore, openAtKeyCreation, openAfter: Boolean(inspector.url()), keyCreated: /^[0-9a-f]{64}$/.test(process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "") }));`,
+    ].join("\n");
+    const child = spawn(
+      process.execPath,
+      ["--inspect-port=127.0.0.1:0", "--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: path.dirname(HARDENING_MODULE), env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+
+    expect(code).toBe(0);
+    expect(JSON.parse(stdout.trim().split("\n").pop() ?? "{}")).toEqual({
+      openedBefore: true,
+      openAtKeyCreation: false,
+      openAfter: false,
+      keyCreated: true,
+    });
   }, 20_000);
 });

@@ -353,6 +353,8 @@ Seeded worktree instances quarantine copied live execution by default for both `
 
 After `worktree init`, both the server and the CLI auto-load the repo-local `.paperclip/.env` when run inside that worktree, so normal commands like `pnpm dev`, `paperclipai doctor`, and `paperclipai db:backup` stay scoped to the worktree instance.
 
+If the source `.env` or invoking process enables `PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true`, `worktree init` carries the flag into the target `.env` and omits `PAPERCLIP_AGENT_JWT_SECRET`, including any inherited or previously written value. Standalone `doctor --repair` and `onboard` also keep the signing key in memory in this mode. `paperclipai run` rotates the key on each start, so outstanding run JWTs and sessions signed with that key stop working after a restart. This mode prevents CLI persistence of the signing key; process and agent isolation still require the separate deployment security checks.
+
 `pnpm dev` now fails fast in a linked git worktree when `.paperclip/.env` is missing, instead of silently booting against the default instance/port. If that happens, run `paperclipai worktree init` in the worktree first.
 
 Provisioned git worktrees also pause seeded routines that still have enabled schedule triggers in the isolated worktree database by default. This prevents copied daily/cron routines from firing unexpectedly inside the new workspace instance during development without disabling webhook/API-only routines.

@@ -543,6 +543,46 @@ describe("worktree helpers", () => {
     }
   });
 
+  it.each(["source env file", "inherited process env"])(
+    "omits source and inherited signing keys in ephemeral mode from %s",
+    async (flagSource) => {
+      const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-ephemeral-jwt-"));
+      const repoRoot = path.join(tempRoot, "repo");
+      const sourceConfigPath = path.join(tempRoot, "source", "config.json");
+      fs.mkdirSync(repoRoot, { recursive: true });
+      fs.mkdirSync(path.dirname(sourceConfigPath), { recursive: true });
+      fs.writeFileSync(
+        path.join(path.dirname(sourceConfigPath), ".env"),
+        `PAPERCLIP_AGENT_JWT_SECRET=synthetic-source-sentinel\n${flagSource === "source env file" ? "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n" : ""}`,
+        { mode: 0o600 },
+      );
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-inherited-sentinel";
+      if (flagSource === "inherited process env") {
+        process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL = "true";
+      } else {
+        delete process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL;
+      }
+      process.chdir(repoRoot);
+
+      try {
+        await worktreeInitCommand({
+          seed: false,
+          fromConfig: sourceConfigPath,
+          home: path.join(tempRoot, ".paperclip-worktrees"),
+        });
+
+        const envContents = fs.readFileSync(path.join(repoRoot, ".paperclip", ".env"), "utf8");
+        expect(envContents).toContain("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true");
+        expect(envContents).not.toMatch(/^PAPERCLIP_AGENT_JWT_SECRET=/m);
+        expect(envContents).not.toContain("synthetic-source-sentinel");
+        expect(envContents).not.toContain("synthetic-inherited-sentinel");
+      } finally {
+        process.chdir(ORIGINAL_CWD);
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("preserves repo-managed worktree checkouts when --force re-runs from the source repo", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-force-preserve-"));
     const repoRoot = path.join(tempRoot, "repo");

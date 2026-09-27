@@ -1,7 +1,31 @@
 import { randomBytes } from "node:crypto";
+import inspector from "node:inspector";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
 const EPHEMERAL_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL";
+let activeEphemeralSecret: string | undefined;
+
+function ignoreSigusr1(): void {
+  console.warn("[paperclip] SIGUSR1 ignored: inspector activation by signal is disabled");
+}
+
+export function closeInspectorAndInstallSignalGuard(): void {
+  // This must run before reading the instance env and again before creating a signing key.
+  // An inspector opened during CLI module loading would otherwise expose the new key.
+  if (!process.listeners("SIGUSR1").includes(ignoreSigusr1)) {
+    process.on("SIGUSR1", ignoreSigusr1);
+  }
+  if (inspector.url()) inspector.close();
+}
+
+export function ensureEphemeralAgentJwtSecret(): string {
+  closeInspectorAndInstallSignalGuard();
+  if (!activeEphemeralSecret || process.env[JWT_SECRET_ENV_KEY] !== activeEphemeralSecret) {
+    activeEphemeralSecret = randomBytes(32).toString("hex");
+    process.env[JWT_SECRET_ENV_KEY] = activeEphemeralSecret;
+  }
+  return activeEphemeralSecret;
+}
 
 // Keep the agent-JWT / session signing secret off disk.
 // PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true in the instance env file makes `run` generate a
@@ -15,17 +39,13 @@ export function isTruthyEnvFlag(value: string | undefined): boolean {
 }
 
 export function applyServerSecretHardening(): void {
-  // A process of the same uid can send SIGUSR1 to open the Node inspector on 127.0.0.1:9229
-  // and evaluate code inside the server, secrets included. With a listener installed, Node
-  // does not start the inspector on that signal.
-  process.on("SIGUSR1", () => {
-    console.warn("[paperclip] SIGUSR1 ignored: inspector activation by signal is disabled");
-  });
+  closeInspectorAndInstallSignalGuard();
   if (!isTruthyEnvFlag(process.env[EPHEMERAL_SECRET_ENV_KEY])) return;
-  if (process.env[JWT_SECRET_ENV_KEY]?.trim()) {
+  if (process.env[JWT_SECRET_ENV_KEY]?.trim() && process.env[JWT_SECRET_ENV_KEY] !== activeEphemeralSecret) {
     console.warn(
       `[paperclip] ${EPHEMERAL_SECRET_ENV_KEY} is set: ignoring the persistent ${JWT_SECRET_ENV_KEY}, remove it from the env file`,
     );
   }
-  process.env[JWT_SECRET_ENV_KEY] = randomBytes(32).toString("hex");
+  activeEphemeralSecret = randomBytes(32).toString("hex");
+  process.env[JWT_SECRET_ENV_KEY] = activeEphemeralSecret;
 }

@@ -3,8 +3,10 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { config as loadDotenv, parse as parseEnvFileContents } from "dotenv";
 import { resolveConfigPath } from "./store.js";
+import { ensureEphemeralAgentJwtSecret, isTruthyEnvFlag } from "./server-secret-hardening.js";
 
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
+const EPHEMERAL_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL";
 function resolveEnvFilePath(configPath?: string) {
   return path.resolve(path.dirname(resolveConfigPath(configPath)), ".env");
 }
@@ -74,7 +76,15 @@ export function readAgentJwtSecretFromEnvFile(filePath = resolveEnvFilePath()): 
   return isNonEmpty(value) ? value!.trim() : null;
 }
 
+export function isEphemeralAgentJwtSecretEnabled(configPath?: string): boolean {
+  loadAgentJwtEnvFile(resolveEnvFilePath(configPath));
+  return isTruthyEnvFlag(process.env[EPHEMERAL_SECRET_ENV_KEY]);
+}
+
 export function ensureAgentJwtSecret(configPath?: string): { secret: string; created: boolean } {
+  if (isEphemeralAgentJwtSecretEnabled(configPath)) {
+    return { secret: ensureEphemeralAgentJwtSecret(), created: false };
+  }
   const existingEnv = readAgentJwtSecretFromEnv(configPath);
   if (existingEnv) {
     return { secret: existingEnv, created: false };

@@ -48,7 +48,8 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
 } from "@paperclipai/db";
 import type { Command } from "commander";
-import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
+import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile, writePaperclipEnvEntries } from "../config/env.js";
+import { isTruthyEnvFlag } from "../config/server-secret-hardening.js";
 import { expandHomePrefix } from "../config/home.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { readConfig, resolveConfigPath, writeConfig } from "../config/store.js";
@@ -1413,16 +1414,33 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
 
   writeConfig(targetConfig, paths.configPath);
   const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
-  const existingAgentJwtSecret =
-    nonEmpty(sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET) ??
-    nonEmpty(process.env.PAPERCLIP_AGENT_JWT_SECRET);
-  mergePaperclipEnvEntries(
-    {
+  const targetEnvEntries = readPaperclipEnvEntries(paths.envPath);
+  const ephemeralSecret = [
+    sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL,
+    targetEnvEntries.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL,
+    process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL,
+  ].some(isTruthyEnvFlag);
+  if (ephemeralSecret) {
+    const nextEntries: Record<string, string> = {
+      ...targetEnvEntries,
       ...buildWorktreeEnvEntries(paths, branding),
-      ...(existingAgentJwtSecret ? { PAPERCLIP_AGENT_JWT_SECRET: existingAgentJwtSecret } : {}),
-    },
-    paths.envPath,
-  );
+      PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL: "true",
+    };
+    delete nextEntries.PAPERCLIP_AGENT_JWT_SECRET;
+    writePaperclipEnvEntries(nextEntries, paths.envPath);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL = "true";
+  } else {
+    const existingAgentJwtSecret =
+      nonEmpty(sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET) ??
+      nonEmpty(process.env.PAPERCLIP_AGENT_JWT_SECRET);
+    mergePaperclipEnvEntries(
+      {
+        ...buildWorktreeEnvEntries(paths, branding),
+        ...(existingAgentJwtSecret ? { PAPERCLIP_AGENT_JWT_SECRET: existingAgentJwtSecret } : {}),
+      },
+      paths.envPath,
+    );
+  }
   ensureAgentJwtSecret(paths.configPath);
   loadPaperclipEnvFile(paths.configPath);
   const copiedGitHooks = copyGitHooksToWorktreeGitDir(cwd);

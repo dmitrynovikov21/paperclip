@@ -103,6 +103,7 @@ printf '%s\\n' "$PGSERVICEFILE" > "$PAPERCLIP_SERVICE_CAPTURE"
 test "$PGSERVICE" = paperclip && test -r "$PGSERVICEFILE" || exit 40
 if [ "$PAPERCLIP_FORCE_CLI_FAILURE" = 1 ]; then
   cat "$PGSERVICEFILE" >&2
+  printf '%s\\n' 'FATAL: password authentication failed for user synthetic' >&2
   exit 41
 fi
 case "$0" in
@@ -149,12 +150,14 @@ esac
         .then(() => null, (error: unknown) => error);
       expect(backupFailure).toBeInstanceOf(Error);
       expect(String(backupFailure)).toContain("failed with exit code 41");
+      expect(String(backupFailure)).toContain("authentication failed");
       expect(String(backupFailure)).not.toContain(connectionString);
       expect(String(backupFailure)).not.toContain(new URL(connectionString).password);
       assertNoArgvSecret();
       const restoreFailure = await runDatabaseRestore({ connectionString: resolved!, backupFile: backup.backupFile })
         .then(() => null, (error: unknown) => error);
       expect(restoreFailure).toBeInstanceOf(Error);
+      expect(String(restoreFailure)).toContain("authentication failed");
       expect(String(restoreFailure)).not.toContain(connectionString);
       expect(String(restoreFailure)).not.toContain(new URL(connectionString).password);
       assertNoArgvSecret();

@@ -16,6 +16,10 @@ const apiKey = process.env.PAPERCLIP_API_KEY;
 const runId = process.env.PAPERCLIP_RUN_ID;
 const agentId = process.env.EXPECTED_AGENT_ID;
 const companyId = process.env.PAPERCLIP_COMPANY_ID;
+const effectiveCaps = readFileSync("/proc/self/status", "utf8").match(/^CapEff:\s*([0-9a-f]+)$/m);
+if (!effectiveCaps || BigInt(`0x${effectiveCaps[1]}`) !== (1n << 21n)) {
+  throw new Error("Unexpected smoke container effective capability set");
+}
 if (!workspaceDir || !credentialPath || !apiKey || !runId || !agentId || !companyId ||
     !process.env.PAPERCLIP_AGENT_JWT_SECRET) {
   throw new Error("Missing synthetic service source or run identity");

@@ -21,9 +21,10 @@ def candidates(carriers: list[Path], worktree_roots: list[Path]):
             continue
         walk_errors = []
         for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_errors.append):
-            # A hidden Paperclip directory may itself be a link to a copy.
+            # os.walk leaves symlinked directories in dirs without visiting them.
+            # Report every one so an agent-readable copy cannot hide behind it.
             for name in dirs:
-                if name == ".paperclip" and (Path(directory) / name).is_symlink():
+                if (Path(directory) / name).is_symlink():
                     yield Path(directory) / name, False
             for name in files:
                 yield Path(directory) / name, False
@@ -71,9 +72,8 @@ def main() -> int:
             failures += 1
             continue
         if stat.S_ISLNK(info.st_mode):
-            if is_carrier or path.name in {".paperclip", ".env", "config.json"}:
-                print(f"SYMLINK {path}")
-                failures += 1
+            print(f"SYMLINK {path}")
+            failures += 1
             continue
         if not stat.S_ISREG(info.st_mode):
             print(f"NONFILE {path}")

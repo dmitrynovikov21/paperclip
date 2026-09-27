@@ -23,8 +23,8 @@ import { createLocalAgentJwt } from "../src/agent-auth-jwt.js";
 const apiUrl = process.argv[2];
 const agentFixtureDir = process.argv[3];
 const repoRoot = process.argv[4];
-if (!apiUrl || !/^http:\/\/127\.0\.0\.1:\d+$/.test(apiUrl) || !agentFixtureDir || !repoRoot) {
-  throw new Error("Expected a loopback API URL, agent fixture directory and repository root");
+if (!apiUrl || !/^http:\/\/(?:127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):\d+$/.test(apiUrl) || !agentFixtureDir || !repoRoot) {
+  throw new Error("Expected a synthetic API URL, agent fixture directory and repository root");
 }
 const dbUrl = resolveDatabaseConnectionString({});
 if (!dbUrl || !process.env.PAPERCLIP_DATABASE_URL_FILE || process.env.DATABASE_URL) {
@@ -85,8 +85,8 @@ try {
     KNOWN_CREDENTIAL_PATH: "/probe/database-url",
   };
   const dockerPrefix = [
-    "run", "--rm", "--network", "host", "--user", "65534:65534",
-    "--mount", `type=bind,src=${agentFixtureDir},dst=/probe,readonly`,
+    "run", "--rm", "--network", process.env.PAPERCLIP_E2E_DOCKER_NETWORK ?? "none", "--user", "65534:65534",
+    "--mount", `type=bind,src=${join(agentFixtureDir, "agent-probe.py")},dst=/probe/agent-probe.py,readonly`,
     "--env", "PAPERCLIP_API_URL",
     "--env", "PAPERCLIP_API_KEY",
     "--env", "PAPERCLIP_RUN_ID",
@@ -147,16 +147,19 @@ try {
   const localEnv = {
     ...forwardedEnv,
     PAPERCLIP_COMPANY_ID: company.id,
-    PAPERCLIP_DATABASE_URL_FILE: process.env.PAPERCLIP_DATABASE_URL_FILE,
+    PAPERCLIP_DATABASE_URL_FILE: "/run/credentials/paperclip/database-url",
     PAPERCLIP_AGENT_JWT_SECRET: process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "",
-    KNOWN_CREDENTIAL_PATH: join(agentFixtureDir, "database-url"),
+    KNOWN_CREDENTIAL_PATH: "/run/credentials/paperclip/database-url",
     WORKSPACE_DIR: join(agentFixtureDir, "workspace"),
   };
   if (!localEnv.PAPERCLIP_AGENT_JWT_SECRET) throw new Error("Synthetic JWT signing source missing");
   const localResult = await runChildProcess(`${runId}-local-bwrap-container`, "docker", [
-    "run", "--rm", "--privileged", "--network", "host",
+    "run", "--rm", "--network", process.env.PAPERCLIP_E2E_DOCKER_NETWORK ?? "none",
+    "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+    "--cap-drop", "ALL", "--cap-add", "SYS_ADMIN",
+    "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined",
     "--mount", `type=bind,src=${repoRoot},dst=${repoRoot},readonly`,
-    "--mount", `type=bind,src=${agentFixtureDir},dst=${agentFixtureDir}`,
+    "--mount", `type=bind,src=${join(agentFixtureDir, "workspace")},dst=${join(agentFixtureDir, "workspace")}`,
     "--workdir", repoRoot,
     ...Object.keys(localEnv).flatMap((key) => ["--env", key]),
     "paperclip-db-credential-local-sandbox-e2e:local",

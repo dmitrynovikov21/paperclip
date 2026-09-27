@@ -293,9 +293,17 @@ function formatSqlValue(
 }
 
 async function waitForChildExit(child: ReturnType<typeof spawn>, label: string): Promise<void> {
-  // libpq can echo connection details in its diagnostics. Drain stderr, but do
-  // not propagate it into application errors or logs.
-  child.stderr?.resume();
+  // libpq and psql may include the service file, SQL values, or connection URL
+  // in stderr. Keep only a small sample for classification, never raw output.
+  const stderrChunks: Buffer[] = [];
+  let stderrBytes = 0;
+  child.stderr?.on("data", (chunk: Buffer) => {
+    const remaining = 8192 - stderrBytes;
+    if (remaining <= 0) return;
+    const sample = Buffer.from(chunk.subarray(0, remaining));
+    stderrChunks.push(sample);
+    stderrBytes += sample.length;
+  });
 
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
@@ -306,7 +314,19 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
     throw new Error(`${label} exited via ${result.signal}`);
   }
   if (result.code !== 0) {
-    throw new Error(`${label} failed with exit code ${result.code ?? "unknown"}`);
+    const stderr = Buffer.concat(stderrChunks).toString("utf8");
+    const reason = /password authentication failed|no password supplied|authentication failed/i.test(stderr)
+      ? "authentication failed"
+      : /permission denied|must be owner of|insufficient privilege/i.test(stderr)
+        ? "insufficient privileges"
+        : /connection refused|could not connect to server|could not translate host name|timeout expired/i.test(stderr)
+          ? "connection unavailable"
+          : /no space left on device|disk full/i.test(stderr)
+            ? "storage full"
+            : /syntax error at or near/i.test(stderr)
+              ? "SQL syntax error"
+              : "unclassified database client error";
+    throw new Error(`${label} failed with exit code ${result.code ?? "unknown"} (${reason})`);
   }
 }
 

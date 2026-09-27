@@ -21,4 +21,20 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q 'reasons=old-url-copy' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree and nested secret copy'
+mv "$scratch/worktree/nested/notes.txt" "$scratch/outside-secret"
+ln -s "$scratch/outside-secret" "$scratch/worktree/nested/notes.txt"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject an agent-readable symlink to an external credential copy' >&2
+  exit 1
+fi
+grep -q '^SYMLINK ' "$scratch/scan-result"
+rm "$scratch/worktree/nested/notes.txt"
+ln -s "$scratch" "$scratch/worktree/nested/external-directory"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a symlinked directory outside the worktree' >&2
+  exit 1
+fi
+grep -q '^SYMLINK ' "$scratch/scan-result"
+echo 'Worktree copy scan assertions passed: clean tree, nested copy, external file symlink, external directory symlink'

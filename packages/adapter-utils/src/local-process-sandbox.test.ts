@@ -146,6 +146,52 @@ describe("local process sandbox", () => {
     });
 
     expect(target.args).toEqual(expect.arrayContaining(["--bind", workspace, "/app"]));
+
+    const source = path.join(workspace, "source");
+    const inWorkspaceLink = path.join(workspace, "source-link");
+    await fs.mkdir(source);
+    await fs.symlink(source, inWorkspaceLink);
+    const linkedTarget = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: [],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        pathAliases: [{ path: "/app", target: inWorkspaceLink }],
+      },
+    });
+    expect(linkedTarget.args).toEqual(expect.arrayContaining(["--bind", source, "/app"]));
+  });
+
+  it.runIf(process.platform === "linux")("rejects an alias symlink to a service credential outside the workspace before launch", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-escape-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const serviceDir = path.join(root, "service");
+    const credential = path.join(serviceDir, "database-url");
+    const aliasTarget = path.join(workspace, "service-link");
+    await fs.mkdir(workspace);
+    await fs.mkdir(serviceDir);
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    await fs.symlink(serviceDir, aliasTarget);
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          pathAliases: [{ path: "/app", target: aliasTarget }],
+        },
+      })).rejects.toThrow("must target the synchronized workspace");
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
   });
 
   it("rejects writable out-of-tree paths without an outbound restore mapping", async () => {

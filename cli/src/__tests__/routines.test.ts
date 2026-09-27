@@ -282,6 +282,45 @@ describeEmbeddedPostgres("disableAllRoutinesInConfig", () => {
     }
   }, 30_000);
 
+  it("rejects a config without a DB source and leaves both configured and ambient databases unchanged", async () => {
+    const emptyConfigPath = path.join(tempRoot, "no-database-source-config.json");
+    const ambientDatabaseName = `routines_ambient_${randomUUID().replace(/-/g, "")}`;
+    const adminUrl = new URL(tempDb!.connectionString);
+    adminUrl.pathname = "/postgres";
+    await ensurePostgresDatabase(adminUrl.toString(), ambientDatabaseName);
+    const ambientUrl = new URL(tempDb!.connectionString);
+    ambientUrl.pathname = `/${ambientDatabaseName}`;
+    const ambientConnectionString = ambientUrl.toString();
+    await applyPendingMigrations(ambientConnectionString);
+    const ambientDb = createDb(ambientConnectionString);
+    const companyId = randomUUID();
+    const configuredRoutineId = randomUUID();
+    const ambientRoutineId = randomUUID();
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    writeTestConfig(emptyConfigPath, tempRoot);
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Configured DB", issuePrefix: "NODB" });
+      await ambientDb.insert(companies).values({ id: companyId, name: "Ambient DB", issuePrefix: "AMDB" });
+      await db.insert(routines).values({ id: configuredRoutineId, companyId, title: "Configured routine" });
+      await ambientDb.insert(routines).values({ id: ambientRoutineId, companyId, title: "Ambient routine" });
+
+      process.env.DATABASE_URL = ambientConnectionString;
+      delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      await expect(disableAllRoutinesInConfig({ config: emptyConfigPath, companyId }))
+        .rejects.toThrow("does not define a database connection string");
+      expect((await db.select({ status: routines.status }).from(routines)
+        .where(eq(routines.id, configuredRoutineId)))[0]?.status).toBe("active");
+      expect((await ambientDb.select({ status: routines.status }).from(routines)
+        .where(eq(routines.id, ambientRoutineId)))[0]?.status).toBe("active");
+    } finally {
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  }, 30_000);
+
   it("uses a file-backed database source when config has no inline URL", async () => {
     const fileConfigPath = path.join(tempRoot, "file-backed-config.json");
     const credentialPath = path.join(tempRoot, "database-url");

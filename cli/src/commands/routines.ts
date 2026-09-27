@@ -69,7 +69,9 @@ function resolveConfiguredDatabaseConnectionString(configConnectionString: strin
   // This command mutates the database selected by --config. An inherited
   // DATABASE_URL from the operator's shell must not silently redirect it.
   const configUrl = nonEmpty(configConnectionString);
-  if (configUrl && !nonEmpty(process.env.PAPERCLIP_DATABASE_URL_FILE)) return configUrl;
+  const filePath = nonEmpty(process.env.PAPERCLIP_DATABASE_URL_FILE);
+  if (!configUrl && !filePath) return undefined;
+  if (configUrl && !filePath) return configUrl;
   return resolveDatabaseConnectionString({ configConnectionString });
 }
 

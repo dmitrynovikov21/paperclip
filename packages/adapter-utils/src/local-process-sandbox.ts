@@ -392,18 +392,21 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     );
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
-    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
-      const normalized = normalizeAbsolutePath(source, "Sandbox path");
-      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+    const rejectServiceCredentialMount = async (source: string) => {
       const credentialPath = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim();
       if (credentialPath) {
-        const realSource = await fs.realpath(normalized).catch(() => normalized);
+        const realSource = await fs.realpath(source).catch(() => source);
         const realCredential = await fs.realpath(credentialPath).catch(() => path.resolve(credentialPath));
         const relativeCredential = path.relative(realSource, realCredential);
         if (!relativeCredential || (!relativeCredential.startsWith("..") && !path.isAbsolute(relativeCredential))) {
           throw new Error("Local filesystem sandbox mount would expose the service database credential.");
         }
       }
+    };
+    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
+      const normalized = normalizeAbsolutePath(source, "Sandbox path");
+      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      await rejectServiceCredentialMount(normalized);
       addParentDirectories(args, created, normalized);
       args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
       mounted.add(normalized);
@@ -417,6 +420,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
     for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
     await mount(workspaceDir, "rw");
+    const realWorkspaceDir = await fs.realpath(workspaceDir);
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
       const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
       const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
@@ -429,8 +433,16 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       if (!(await pathExists(aliasTarget))) {
         throw new Error(`Sandbox path alias target "${aliasTarget}" does not exist.`);
       }
+      const realAliasTarget = await fs.realpath(aliasTarget);
+      const relativeRealTarget = path.relative(realWorkspaceDir, realAliasTarget);
+      if (relativeRealTarget.startsWith("..") || path.isAbsolute(relativeRealTarget)) {
+        throw new Error(
+          `Sandbox path alias "${aliasPath}" must target the synchronized workspace "${workspaceDir}".`,
+        );
+      }
+      await rejectServiceCredentialMount(realAliasTarget);
       addParentDirectories(args, created, aliasPath);
-      args.push("--bind", aliasTarget, aliasPath);
+      args.push("--bind", realAliasTarget, aliasPath);
       created.add(aliasPath);
     }
 

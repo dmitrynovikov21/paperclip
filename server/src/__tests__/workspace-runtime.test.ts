@@ -365,6 +365,9 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     const sanitized = sanitizeRuntimeServiceBaseEnv({
       PATH: process.env.PATH,
       DATABASE_URL: "postgres://example.test/paperclip",
+      DATABASE_MIGRATION_URL: "postgres://migration.example.test/paperclip",
+      PGPASSWORD: "synthetic",
+      PAPERCLIP_DATABASE_URL_FILE: "/private/database-url",
       PAPERCLIP_HOME: "/tmp/paperclip-home",
       PAPERCLIP_INSTANCE_ID: "runtime-instance",
       npm_config_tailscale_auth: "true",
@@ -375,6 +378,9 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.PAPERCLIP_HOME).toBeUndefined();
     expect(sanitized.PAPERCLIP_INSTANCE_ID).toBeUndefined();
     expect(sanitized.DATABASE_URL).toBeUndefined();
+    expect(sanitized.DATABASE_MIGRATION_URL).toBeUndefined();
+    expect(sanitized.PGPASSWORD).toBeUndefined();
+    expect(sanitized.PAPERCLIP_DATABASE_URL_FILE).toBeUndefined();
     expect(sanitized.npm_config_tailscale_auth).toBeUndefined();
     expect(sanitized.npm_config_authenticated_private).toBeUndefined();
     expect(sanitized.HOST).toBe("0.0.0.0");

@@ -10,6 +10,7 @@ import {
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
   prepareEmbeddedPostgresNativeRuntime,
+  resolveDatabaseConnectionString,
   routines,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
@@ -211,7 +212,7 @@ async function openConfiguredDb(configPath: string): Promise<{
       };
     }
 
-    const connectionString = nonEmpty(config.database.connectionString);
+    const connectionString = resolveDatabaseConnectionString({ configConnectionString: config.database.connectionString });
     if (!connectionString) {
       throw new Error(`Config at ${configPath} does not define a database connection string.`);
     }
@@ -264,7 +265,7 @@ export async function disableAllRoutinesInConfig(
       await applyPendingMigrations(connectionString);
       db = createDb(connectionString) as ClosableDb;
     } else {
-      const connectionString = nonEmpty(config.database.connectionString);
+      const connectionString = resolveDatabaseConnectionString({ configConnectionString: config.database.connectionString });
       if (!connectionString) {
         throw new Error(`Config at ${configPath} does not define a database connection string.`);
       }

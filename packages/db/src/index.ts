@@ -12,6 +12,7 @@ export {
   type MigrationBootstrapResult,
   type Db,
 } from "./client.js";
+export { resolveDatabaseConnectionString } from "./credential-source.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,

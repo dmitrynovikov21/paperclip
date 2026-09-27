@@ -17,6 +17,7 @@ import {
   selectPaperclipTaskMarkdown,
   runningProcesses,
   runChildProcess,
+  sanitizeInheritedPaperclipEnv,
   sanitizeSshRemoteEnv,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
@@ -26,6 +27,47 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+describe("control-plane DB environment isolation", () => {
+  it("removes inherited DB sources while retaining an explicit run-scoped API key", async () => {
+    const inherited = sanitizeInheritedPaperclipEnv({
+      DATABASE_URL: "postgres://synthetic:synthetic@localhost/db",
+      DATABASE_MIGRATION_URL: "postgres://synthetic:synthetic@localhost/db",
+      PGPASSWORD: "synthetic",
+      PGPASSFILE: "/private/pgpass",
+      PAPERCLIP_DATABASE_URL_FILE: "/private/database-url",
+      PAPERCLIP_AGENT_JWT_SECRET: "synthetic-signing-key",
+      SAFE_VALUE: "kept",
+    });
+    expect(inherited).toEqual({ SAFE_VALUE: "kept" });
+    const previous = {
+      DATABASE_URL: process.env.DATABASE_URL,
+      PAPERCLIP_DATABASE_URL_FILE: process.env.PAPERCLIP_DATABASE_URL_FILE,
+      PGPASSWORD: process.env.PGPASSWORD,
+    };
+    try {
+      process.env.DATABASE_URL = "postgres://synthetic:synthetic@localhost/db";
+      process.env.PAPERCLIP_DATABASE_URL_FILE = "/private/database-url";
+      process.env.PGPASSWORD = "synthetic";
+      const result = await runChildProcess("db-env-isolation", process.execPath, ["-e", [
+        "if (process.env.DATABASE_URL || process.env.DATABASE_MIGRATION_URL || process.env.PGPASSWORD || process.env.PAPERCLIP_DATABASE_URL_FILE) process.exit(4);",
+        "if (process.env.PAPERCLIP_API_KEY !== 'run-scoped-synthetic') process.exit(5);",
+      ].join("\n")], {
+        cwd: process.cwd(),
+        env: { PAPERCLIP_API_KEY: "run-scoped-synthetic" },
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
 
 function isPidAlive(pid: number) {
   try {
@@ -74,6 +116,16 @@ describe("buildInvocationEnvForLogs", () => {
 });
 
 describe("sanitizeSshRemoteEnv", () => {
+  it("does not forward inherited control-plane DB sources with a run-scoped JWT", () => {
+    expect(sanitizeSshRemoteEnv(
+      { PAPERCLIP_API_KEY: "run-scoped-jwt" },
+      {
+        DATABASE_URL: "postgres://synthetic:synthetic@localhost/db",
+        PAPERCLIP_DATABASE_URL_FILE: "/private/database-url",
+      },
+    )).toEqual({ PAPERCLIP_API_KEY: "run-scoped-jwt" });
+  });
+
   it("drops inherited host shell identity variables for SSH remote execution", () => {
     expect(
       sanitizeSshRemoteEnv(
@@ -2552,13 +2604,14 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     expect(env.PAPERCLIP_CLOUD_PROVIDER_TOKEN).toBe("cloud-token");
   });
 
-  it("never accepts PAPERCLIP_API_KEY from config env", () => {
+  it("never accepts control-plane API or database file sources from config env", () => {
     const env: Record<string, string> = {};
 
     refreshPaperclipWorkspaceEnvForExecution({
       env,
       envConfig: {
         PAPERCLIP_API_KEY: "explicit-key",
+        PAPERCLIP_DATABASE_URL_FILE: "/private/database-url",
       },
       workspaceCwd: null,
     });
@@ -2566,6 +2619,7 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
     // The harness-minted run token is the only PAPERCLIP_API_KEY source;
     // a configured value is dropped even when Paperclip has not set one.
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_DATABASE_URL_FILE).toBeUndefined();
   });
 });
 

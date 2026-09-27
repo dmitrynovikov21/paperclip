@@ -765,14 +765,15 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
 // PAPERCLIP_* env binding policy:
-// 1. PAPERCLIP_API_KEY is never accepted from user/adapter/project/routine
-//    config — the harness-minted run token is the only source.
+// 1. PAPERCLIP_API_KEY and PAPERCLIP_DATABASE_URL_FILE are never accepted
+//    from user/adapter/project/routine config — these belong to the control
+//    plane, not to a run.
 // 2. A PAPERCLIP_* runtime var the harness assigns for the run (RUN_ID,
 //    AGENT_ID, wake/workspace vars, ...) always wins over a same-named
 //    binding; adapters enforce this at env-merge time.
 // 3. Any other PAPERCLIP_*-named binding is user data and flows through to
 //    the run env like any non-prefixed binding.
-const FORBIDDEN_ENV_BINDING_KEYS = new Set(["PAPERCLIP_API_KEY"]);
+const FORBIDDEN_ENV_BINDING_KEYS = new Set(["PAPERCLIP_API_KEY", "PAPERCLIP_DATABASE_URL_FILE"]);
 
 function stripForbiddenEnvBindings(envValue: unknown): Record<string, unknown> | null {
   const record = parseObject(envValue);

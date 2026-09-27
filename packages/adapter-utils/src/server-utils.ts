@@ -121,12 +121,12 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
   return key.startsWith("PAPERCLIP_");
 }
 
-// PAPERCLIP_API_KEY is never accepted from adapter/user config env: the
-// harness-minted run token is the only source of Paperclip API identity.
+// The run token and service DB file path are never accepted from
+// adapter/user config env. Their only sources are the control plane.
 // Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
 // not assigned the same key for the run (runtime vars always win).
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY";
+  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_DATABASE_URL_FILE";
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -2244,7 +2244,15 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  // The service may carry database credentials for its own connection. An
+  // agent receives only its run-scoped API token, never the service DB identity.
+  delete env.DATABASE_URL;
+  delete env.DATABASE_MIGRATION_URL;
   for (const key of Object.keys(env)) {
+    if (/^PG[A-Z0-9_]+$/.test(key)) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;

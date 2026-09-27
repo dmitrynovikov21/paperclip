@@ -28,7 +28,7 @@ admin -c 'REVOKE ALL ON DATABASE synthetic FROM PUBLIC;'
 new_password() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 old_password=$(new_password)
 service_password=$(new_password)
-admin -c "CREATE ROLE old_agent LOGIN PASSWORD '$old_password'; ALTER ROLE old_agent NOLOGIN;"
+admin -c "CREATE ROLE old_agent LOGIN PASSWORD '$old_password'; GRANT CONNECT ON DATABASE synthetic TO old_agent;"
 admin -c "CREATE ROLE pc_service LOGIN PASSWORD '$service_password'; GRANT CONNECT ON DATABASE synthetic TO pc_service;"
 runuser -u postgres -- psql -h "$socket" -p "$port" -U postgres -d synthetic -X -q -v ON_ERROR_STOP=1 -c 'CREATE TABLE protected (id integer); GRANT USAGE ON SCHEMA public TO pc_service; GRANT SELECT ON protected TO pc_service;' >/dev/null
 
@@ -71,16 +71,39 @@ for index in "${!jobs[@]}"; do
 done
 
 # A distinct agent UID cannot read any service/job credential, including
-# through the worktree path; the old password fails even when supplied to it.
+# through the worktree path.
 for credential in "$root"/credentials/*/database-url; do
   runuser -u pc-agent -- test ! -r "$credential"
   assertions=$((assertions + 1))
 done
 printf 'postgres://old_agent:%s@127.0.0.1:%s/synthetic\n' "$old_password" "$port" > "$root/old-url"
-chmod 0644 "$root/old-url"
-if runuser -u pc-agent -- /work/probe-credential.sh "$root/old-url" old_agent >/dev/null 2>&1; then
+chmod 0600 "$root/old-url"
+cp "$root/old-url" "$root/old-url-agent-copy"
+chmod 0644 "$root/old-url-agent-copy"
+gate=/work/verify-old-url-revoked.py
+if python3 "$gate" --old-url-file "$root/old-url" \
+    --service-url-file "$root/credentials/service/database-url" > "$root/gate-result"; then
+  echo 'Pre-dispatch gate allowed an active old DB role' >&2
   exit 1
 fi
+grep -q 'old DB URL still authenticates' "$root/gate-result"
+assertions=$((assertions + 1))
+runuser -u pc-agent -- /work/probe-credential.sh "$root/old-url-agent-copy" old_agent >/dev/null
+assertions=$((assertions + 1))
+
+# Only after the old jobs have been replaced may dispatch reopen. Model the
+# revoke/rotation/session-termination order before testing the leaked old URL.
+rotated_password=$(new_password)
+admin -c "ALTER ROLE old_agent NOLOGIN; ALTER ROLE old_agent PASSWORD '$rotated_password';"
+admin -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'old_agent' AND pid <> pg_backend_pid();"
+if runuser -u pc-agent -- /work/probe-credential.sh "$root/old-url-agent-copy" old_agent >/dev/null 2>&1; then
+  echo 'Old DB URL still connects after revocation' >&2
+  exit 1
+fi
+assertions=$((assertions + 1))
+python3 "$gate" --old-url-file "$root/old-url" \
+  --service-url-file "$root/credentials/service/database-url" > "$root/gate-result"
+grep -q '^PASS:' "$root/gate-result"
 assertions=$((assertions + 1))
 if grep -R -F "$old_password" "$root/worktree" >/dev/null; then exit 1; fi
 assertions=$((assertions + 1))

@@ -373,6 +373,25 @@ describe("sandbox adapter execution targets", () => {
     })).rejects.toThrow("require a workspace filesystem sandbox");
   });
 
+  it.skipIf(process.platform !== "linux")("rejects a workspace Bubblewrap override before its executable runs", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-fake-bwrap-"));
+    cleanupDirs.push(workspaceDir);
+    const marker = path.join(workspaceDir, "launcher-ran");
+    const launcher = path.join(workspaceDir, "fake-bwrap");
+    await writeFile(launcher, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o700 });
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/synthetic/missing-database-url");
+
+    await expect(runAdapterExecutionTargetProcess("run-fake-bwrap", { kind: "local" }, process.execPath, ["-e", "process.exit(0)"], {
+      cwd: workspaceDir,
+      env: { PAPERCLIP_API_KEY: "run-scoped-synthetic-jwt" },
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+      localProcessSandbox: { workspaceDir, filesystemScope: "workspace", command: launcher },
+    })).rejects.toThrow("trusted /usr/bin/bwrap launcher");
+    await expect(stat(marker)).rejects.toThrow();
+  });
+
   it("preserves stdin when wrapping sandbox adapter commands for run-log streaming", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-log-stdin-"));
     cleanupDirs.push(rootDir);

@@ -7264,6 +7264,78 @@ it("resolves explicit skills to the remote provider home and rejects unassigned 
 });
 
 
+async function withPreparedOpenCodeCleanup(input: {
+  run: () => Promise<void>;
+  closeSession: () => Promise<void>;
+  closeTransport: () => Promise<void>;
+  removeRoot: () => Promise<void>;
+  evidence: () => Pick<
+    ReturnType<ReturnType<typeof createCapabilityRunnerdCodexTransport>["evidence"]>,
+    "runnerPid" | "runnerExited" | "runnerExitCode" | "runnerSignal" | "diagnostics"
+  >;
+}): Promise<void> {
+  const failures: { stage: string; error: unknown }[] = [];
+  for (const [stage, operation] of [
+    ["run", input.run],
+    ["session.close", input.closeSession],
+    ["transport.close", input.closeTransport],
+    ["removeRoot", input.removeRoot],
+  ] as const) {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push({ stage, error });
+    }
+  }
+  if (failures.length === 0) return;
+  const evidence = input.evidence();
+  // Never dump stderr, environment values, prompts, paths, or arbitrary
+  // diagnostic text. Keep only bounded process/settlement facts alongside
+  // the original errors, so a finally failure cannot hide the primary one.
+  const summary = {
+    failedStages: failures.map(({ stage }) => stage),
+    runnerStarted: evidence.runnerPid !== null,
+    runnerExited: evidence.runnerExited,
+    runnerExitCode: evidence.runnerExitCode,
+    runnerSignalled: evidence.runnerSignal !== null,
+    diagnosticCount: evidence.diagnostics.length,
+    suspensionRejected: evidence.diagnostics.includes(
+      "runner did not prove durable suspension before checkpoint",
+    ),
+  };
+  throw new AggregateError(
+    failures.map(({ error }) => error),
+    `Prepared OpenCode fixture failed: ${JSON.stringify(summary)}`,
+    { cause: failures[0]!.error },
+  );
+}
+
+it.each([true, false])("preserves prepared OpenCode cleanup errors (primary failure: %s)", async (failRun) => {
+  const primary = new Error("prepared input assertion failed");
+  const cleanup = new NativeSessionCloseUnrecoverableError();
+  const calls: string[] = [];
+  const evidence = {
+    runnerPid: 123,
+    runnerExited: true,
+    runnerExitCode: 1,
+    runnerSignal: null,
+    diagnostics: ["Bearer fixture-secret", "runner did not prove durable suspension before checkpoint"],
+  };
+  const failure = await withPreparedOpenCodeCleanup({
+    run: async () => { calls.push("run"); if (failRun) throw primary; },
+    closeSession: async () => { calls.push("session.close"); throw cleanup; },
+    closeTransport: async () => { calls.push("transport.close"); },
+    removeRoot: async () => { calls.push("removeRoot"); },
+    evidence: () => evidence,
+  }).catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(AggregateError);
+  expect((failure as AggregateError).errors).toEqual(failRun ? [primary, cleanup] : [cleanup]);
+  expect((failure as AggregateError).cause).toBe(failRun ? primary : cleanup);
+  expect(calls).toEqual(["run", "session.close", "transport.close", "removeRoot"]);
+  expect((failure as Error).message).toContain('"suspensionRejected":true');
+  expect((failure as Error).message).not.toContain("fixture-secret");
+});
+
 it("preserves prepared input through runnerd and the real OpenCode proxy boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-prepared-opencode-"));
   // The qualified launch boundary unlinks its executable after exec. Use a
@@ -7319,19 +7391,21 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     task: { prompt: "Keep this request unchanged." },
     completionContract: { revision: "prepared-v1", criteria: task.completionContract.criteria },
   });
-  try {
-    session = await driver.openSession({ runId: "prepared-opencode", normalizedSessionId: "prepared-opencode", workingDirectory: root });
-    await session.startTurn({ message: { role: "user", text: prepared } });
-    for await (const event of session.events()) {
-      if (event.eventType === "turn.completed") break;
-    }
-    const sessionRoots = (await readdir(runtime, { withFileTypes: true })).filter((entry) => entry.isDirectory());
-    expect(sessionRoots).toHaveLength(1);
-    const requests = (await readFile(join(runtime, sessionRoots[0]!.name, "data/fake-prompt-requests.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    expect(requests.map((request) => request.parts)).toEqual([[{ type: "text", text: prepared }]]);
-  } finally {
-    await session?.close();
-    await bundle.transport.close();
-    await rm(root, { recursive: true, force: true });
-  }
+  await withPreparedOpenCodeCleanup({
+    run: async () => {
+      session = await driver.openSession({ runId: "prepared-opencode", normalizedSessionId: "prepared-opencode", workingDirectory: root });
+      await session.startTurn({ message: { role: "user", text: prepared } });
+      for await (const event of session.events()) {
+        if (event.eventType === "turn.completed") break;
+      }
+      const sessionRoots = (await readdir(runtime, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+      expect(sessionRoots).toHaveLength(1);
+      const requests = (await readFile(join(runtime, sessionRoots[0]!.name, "data/fake-prompt-requests.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(requests.map((request) => request.parts)).toEqual([[{ type: "text", text: prepared }]]);
+    },
+    closeSession: async () => { await session?.close(); },
+    closeTransport: () => bundle.transport.close(),
+    removeRoot: () => rm(root, { recursive: true, force: true }),
+    evidence: () => bundle.evidence(),
+  });
 }, 30_000);

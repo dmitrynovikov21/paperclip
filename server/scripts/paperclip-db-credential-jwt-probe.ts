@@ -175,17 +175,19 @@ try {
   if (localResult.exitCode !== 0 ||
       !localResult.stdout.includes("substituted Bubblewrap: denied before launcher execution") ||
       !localResult.stdout.includes("workspace sandbox: trusted Bubblewrap despite agent PATH; loader override stripped; credential path hidden; DB/signing env keys 0; JWT API HTTP 200") ||
+      !localResult.stdout.includes("codex-home remote staging: planted service link denied; partial asset 0; credential bytes/log 0; JWT API HTTP 200") ||
+      !localResult.stdout.includes("codex-home positive staging: bound auth and selected skill copied; JWT API HTTP 200") ||
       !localResult.stdout.includes("alias race: pinned directory visible; credential read denied")) {
     const diagnostic = localResult.stderr.replaceAll(dbUrl, "[redacted database URL]")
       .replaceAll(new URL(dbUrl).password, "[redacted password]")
       .replaceAll(jwt, "[redacted API token]")
       .split("\n").filter(Boolean).slice(-8).join("; ");
     const passed = localResult.stdout.split("\n").filter((line) =>
-      /^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|alias race):/.test(line)).length;
-    throw new Error(`workspace sandbox container check failed (exit ${localResult.exitCode ?? "unknown"}; passed ${passed}/8)${diagnostic ? `: ${diagnostic}` : ""}`);
+      /^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|codex-home remote staging|codex-home positive staging|alias race):/.test(line)).length;
+    throw new Error(`workspace sandbox container check failed (exit ${localResult.exitCode ?? "unknown"}; passed ${passed}/10)${diagnostic ? `: ${diagnostic}` : ""}`);
   }
   for (const line of localResult.stdout.split("\n")) {
-    if (/^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|alias race):/.test(line)) {
+    if (/^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|codex-home remote staging|codex-home positive staging|alias race):/.test(line)) {
       console.log(line);
     }
   }

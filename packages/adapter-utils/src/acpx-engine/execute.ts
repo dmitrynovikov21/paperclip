@@ -315,6 +315,8 @@ export interface AcpxRemoteManagedHomeContext {
    * value only when its own bundle holds symbolic links.
    */
   skillsBundleDir: string | null;
+  /** Exact selected runtime skill names from the host preparation step. */
+  selectedSkillNames: string[];
   /**
    * Runs the shared workspace+assets staging seam and returns the prepared
    * runtime. The seam passes its per-adapter home `assets` here; the returned
@@ -2325,6 +2327,9 @@ async function buildRuntime(input: {
               onLog: input.ctx.onLog,
               onRuntimeProgress: input.ctx.onRuntimeProgress,
               skillsBundleDir: claudeSkillsBundleDir,
+              selectedSkillNames: Array.isArray(skillsIdentity.selectedSkills)
+                ? skillsIdentity.selectedSkills.filter((name): name is string => typeof name === "string")
+                : [],
               stage,
             });
             return {

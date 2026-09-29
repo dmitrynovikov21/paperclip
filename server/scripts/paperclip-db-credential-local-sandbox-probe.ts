@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildLocalProcessSandboxSpawnTarget } from "../../packages/adapter-utils/src/local-process-sandbox.js";
 import {
@@ -9,6 +10,7 @@ import {
   runAdapterExecutionTargetProcess,
 } from "../../packages/adapter-utils/src/execution-target.js";
 import { buildPaperclipEnv } from "../../packages/adapter-utils/src/server-utils.js";
+import { stageCodexHomeForSync } from "../../packages/adapters/codex-local/src/server/codex-home.js";
 
 const workspaceDir = process.env.WORKSPACE_DIR;
 const credentialPath = process.env.PAPERCLIP_DATABASE_URL_FILE;
@@ -137,6 +139,89 @@ if (result.stderr.includes("missing-preload.so")) {
   throw new Error("Agent-supplied dynamic loader environment reached Bubblewrap");
 }
 console.log("workspace sandbox: trusted Bubblewrap despite agent PATH; loader override stripped; credential path hidden; DB/signing env keys 0; JWT API HTTP 200");
+
+// The agent cannot read the synthetic service credential in Bubblewrap, but
+// can plant a link in its writable CODEX_HOME. A later host-side remote-home
+// staging pass must reject that link before any sandbox asset is prepared.
+const codexHome = await fs.mkdtemp(join(tmpdir(), "paperclip-codex-home-agent-"));
+const linkScript = join(workspaceDir, "plant-codex-home-link.py");
+await fs.writeFile(linkScript, `from pathlib import Path
+import os
+import runpy
+home = Path(os.environ["CODEX_HOME"])
+credential = Path(os.environ["KNOWN_CREDENTIAL_PATH"])
+if credential.exists():
+    raise RuntimeError("service credential became visible in Bubblewrap")
+(home / "instructions.md").symlink_to(credential)
+runpy.run_path(str(Path(os.environ["WORKSPACE_DIR"]) / "agent-probe.py"), run_name="__main__")
+print("codex-home link planted without credential read")
+`, { mode: 0o600 });
+try {
+  const planted = await runAdapterExecutionTargetProcess(runId, target, "python3", [linkScript], {
+    ...options,
+    env: { ...env, CODEX_HOME: codexHome, WORKSPACE_DIR: workspaceDir },
+    localProcessSandbox: {
+      workspaceDir,
+      filesystemScope: "workspace",
+      managedPaths: [{ path: codexHome, access: "rw" }],
+      homeDir: codexHome,
+    },
+  });
+  if (planted.exitCode !== 0 ||
+      !planted.stdout.includes("codex-home link planted without credential read") ||
+      !planted.stdout.includes("JWT API HTTP 200") ||
+      !(await fs.lstat(join(codexHome, "instructions.md"))).isSymbolicLink()) {
+    throw new Error("Bubblewrap agent did not plant the CODEX_HOME link and retain JWT access");
+  }
+  const stagePrefix = `paperclip-codex-home-sync-${runId}-`;
+  const stagesBefore = (await fs.readdir(tmpdir())).filter((name) => name.startsWith(stagePrefix));
+  let refused = false;
+  try {
+    await stageCodexHomeForSync(codexHome, { runId, authSourcePaths: [], skillSources: [] });
+  } catch (error) {
+    const message = String(error);
+    if (message.includes(serviceUrl) || !message.includes("not a regular file")) {
+      throw new Error("Remote Codex home staging produced an unsafe diagnostic");
+    }
+    refused = true;
+  }
+  if (!refused) throw new Error("Remote Codex home staging followed the planted service link");
+  const stagesAfter = (await fs.readdir(tmpdir())).filter((name) => name.startsWith(stagePrefix));
+  if (stagesAfter.length !== stagesBefore.length) {
+    throw new Error("Rejected remote Codex home staging left a partial asset");
+  }
+  console.log("codex-home remote staging: planted service link denied; partial asset 0; credential bytes/log 0; JWT API HTTP 200");
+
+  await fs.unlink(join(codexHome, "instructions.md"));
+  const sharedAuth = join(workspaceDir, "synthetic-shared-auth.json");
+  const skillSource = join(workspaceDir, "synthetic-skill");
+  await fs.writeFile(sharedAuth, '{"OPENAI_API_KEY":"synthetic-only"}\n', { mode: 0o600 });
+  await fs.mkdir(skillSource);
+  await fs.writeFile(join(skillSource, "SKILL.md"), "# Synthetic skill\n", { mode: 0o600 });
+  await fs.mkdir(join(codexHome, "skills"));
+  await fs.symlink(sharedAuth, join(codexHome, "auth.json"));
+  await fs.symlink(skillSource, join(codexHome, "skills", "synthetic-skill"));
+  const staged = await stageCodexHomeForSync(codexHome, {
+    runId,
+    authSourcePaths: [sharedAuth],
+    skillSources: [{ name: "synthetic-skill", source: skillSource }],
+  });
+  try {
+    if ((await fs.lstat(join(staged, "auth.json"))).isSymbolicLink() ||
+        (await fs.readFile(join(staged, "auth.json"), "utf8")) !== '{"OPENAI_API_KEY":"synthetic-only"}\n' ||
+        (await fs.readFile(join(staged, "skills", "synthetic-skill", "SKILL.md"), "utf8")) !== "# Synthetic skill\n") {
+      throw new Error("Bound auth and selected skill were not staged as regular content");
+    }
+  } finally {
+    await fs.rm(staged, { recursive: true, force: true });
+  }
+  console.log("codex-home positive staging: bound auth and selected skill copied; JWT API HTTP 200");
+} finally {
+  await fs.rm(codexHome, { recursive: true, force: true });
+  await fs.rm(join(workspaceDir, "synthetic-skill"), { recursive: true, force: true });
+  await fs.rm(join(workspaceDir, "synthetic-shared-auth.json"), { force: true });
+  await fs.rm(linkScript, { force: true });
+}
 
 const aliasSource = join(workspaceDir, "alias-source");
 const preservedAlias = join(workspaceDir, "preserved-alias-source");

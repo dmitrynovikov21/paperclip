@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -89,6 +89,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
 
   afterEach(async () => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     if (savedCodexHomeEnv === undefined) {
       delete process.env.CODEX_HOME;
     } else {
@@ -191,6 +192,95 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(homeAsset).toBeDefined();
     expect(homeAsset?.provision).toBeTruthy();
     expect(typeof homeAsset?.restore).toBe("function");
+  });
+
+  it("passes a run-scoped JWT and the default workspace Bubblewrap to the local launcher in file-backed mode", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-file-backed-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHome = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir);
+    await mkdir(codexHome);
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/synthetic/missing-database-url");
+
+    await execute({
+      runId: "run-file-backed-bwrap",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "codex",
+        engine: "cli",
+        filesystemScope: "workspace",
+        outputInactivityTimeoutMs: null,
+        env: { CODEX_HOME: codexHome, OPENAI_API_KEY: "synthetic-api-key" },
+      },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      authToken: "run-scoped-synthetic-jwt",
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledWith(
+      "run-file-backed-bwrap",
+      "codex",
+      expect.any(Array),
+      expect.objectContaining({
+        env: expect.objectContaining({ PAPERCLIP_API_KEY: "run-scoped-synthetic-jwt" }),
+        localProcessSandbox: expect.objectContaining({
+          workspaceDir,
+          filesystemScope: "workspace",
+          command: "bwrap",
+        }),
+      }),
+    );
+  });
+
+  it.skipIf(process.platform !== "linux")("does not run a workspace Bubblewrap override from Codex config", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-fake-bwrap-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHome = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir);
+    await mkdir(codexHome);
+    const fakeCodex = path.join(workspaceDir, "codex");
+    const fakeBwrap = path.join(workspaceDir, "bwrap");
+    const marker = path.join(workspaceDir, "launcher-ran");
+    await writeFile(fakeCodex, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await writeFile(fakeBwrap, `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o700 });
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/synthetic/missing-database-url");
+    const actual = await vi.importActual<typeof import("@paperclipai/adapter-utils/server-utils")>(
+      "@paperclipai/adapter-utils/server-utils",
+    );
+    runChildProcess.mockImplementationOnce(actual.runChildProcess as never);
+
+    await expect(execute({
+      runId: "run-fake-bwrap",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: fakeCodex,
+        engine: "cli",
+        filesystemScope: "workspace",
+        filesystemSandboxCommand: fakeBwrap,
+        outputInactivityTimeoutMs: null,
+        env: { CODEX_HOME: codexHome, OPENAI_API_KEY: "synthetic-api-key" },
+      },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      authToken: "run-scoped-synthetic-jwt",
+      onLog: async () => {},
+    })).rejects.toThrow("trusted /usr/bin/bwrap launcher");
+    await expect(stat(marker)).rejects.toThrow();
   });
 
   it("round-trips a strictly-newer same-identity sandbox auth.json to the shared host at 0600 on teardown", async () => {

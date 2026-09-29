@@ -70,6 +70,7 @@ const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", 
 const SANDBOX_PROXY_PORT = 31_337;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const NETWORK_PROXY_TEMP_PREFIX = "paperclip-network-sandbox-";
+const PROC_SUPER_MAGIC = 0x9fa0;
 
 function normalizeAbsolutePath(candidate: string, label: string): string {
   const trimmed = candidate.trim();
@@ -81,6 +82,29 @@ function normalizeAbsolutePath(candidate: string, label: string): string {
 
 async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
+}
+
+// A procfs magic link such as /proc/<pid>/root can resolve to an ordinary
+// directory. Check every path component (and symlink target) before realpath
+// erases the procfs traversal. statfs also catches procfs bind mounts.
+async function rejectHostProcMount(candidate: string, seen = new Set<string>()): Promise<void> {
+  const normalized = path.resolve(candidate);
+  if (normalized === "/") throw new Error("Local filesystem sandbox mount would expose host root.");
+  if (seen.has(normalized)) throw new Error("Local filesystem sandbox mount has a symlink cycle.");
+  seen.add(normalized);
+  const parts = normalized.split(path.sep).filter(Boolean);
+  for (let index = 0; index < parts.length; index += 1) {
+    const prefix = path.join("/", ...parts.slice(0, index + 1));
+    const entry = await fs.lstat(prefix);
+    if (entry.isSymbolicLink()) {
+      const destination = path.resolve(path.dirname(prefix), await fs.readlink(prefix), ...parts.slice(index + 1));
+      await rejectHostProcMount(destination, seen);
+      return;
+    }
+    if ((await fs.statfs(prefix)).type === PROC_SUPER_MAGIC) {
+      throw new Error("Local filesystem sandbox mount would expose host procfs.");
+    }
+  }
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -386,6 +410,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   let executableArgs = input.args;
 
   if (filesystemScope === "workspace") {
+    const fileBackedDb = Boolean(process.env.PAPERCLIP_DATABASE_URL_FILE?.trim());
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
     args.push(
       "--symlink", "usr/bin", "/bin",
@@ -406,23 +431,32 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         }
       }
     };
-    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
+    const pinnedMounts: Array<{ source: string; fdArgIndex: number }> = [];
+    const mount = async (source: string, access: LocalProcessSandboxAccess, pinSource = false) => {
       const normalized = normalizeAbsolutePath(source, "Sandbox path");
       if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+      await rejectHostProcMount(normalized);
       await rejectServiceCredentialMount(normalized);
       addParentDirectories(args, created, normalized);
-      args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
+      if (fileBackedDb && pinSource) {
+        const realSource = await fs.realpath(normalized);
+        await rejectHostProcMount(realSource);
+        pinnedMounts.push({ source: realSource, fdArgIndex: args.length + 1 });
+        args.push(access === "rw" ? "--bind-fd" : "--ro-bind-fd", "", normalized);
+      } else {
+        args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
+      }
       mounted.add(normalized);
       created.add(normalized);
     };
     for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
-    for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
+    for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro", true);
     if (networkScope === "allowlist") {
       for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");
     }
-    for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
-    for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
-    await mount(workspaceDir, "rw");
+    for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access, true);
+    for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access, true);
+    await mount(workspaceDir, "rw", true);
     const realWorkspaceDir = await fs.realpath(workspaceDir);
     const aliasFdMounts: Array<{ source: string; destination: string; fdArgIndex: number }> = [];
     for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
@@ -464,7 +498,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         await fs.rm(tempDir, { recursive: true, force: true });
         throw error;
       });
-      await mount(tempDir, "rw");
+      await mount(tempDir, "rw", true);
       executable = process.execPath;
       executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
       cleanup = async () => {
@@ -492,6 +526,22 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         }
         await rejectServiceCredentialMount(openedSource);
         args[alias.fdArgIndex] = String(3 + aliasHandles.length - 1);
+      }
+      for (const pinned of pinnedMounts) {
+        const handle = await fs.open(
+          pinned.source,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+        );
+        aliasHandles.push(handle);
+        const openedSource = `/proc/self/fd/${handle.fd}`;
+        if ((await fs.statfs(openedSource)).type === PROC_SUPER_MAGIC) {
+          throw new Error("Local filesystem sandbox mount would expose host procfs.");
+        }
+        if (await fs.realpath(openedSource) !== pinned.source) {
+          throw new Error("Local filesystem sandbox mount source changed before launch.");
+        }
+        await rejectServiceCredentialMount(openedSource);
+        args[pinned.fdArgIndex] = String(3 + aliasHandles.length - 1);
       }
     } catch (error) {
       await Promise.all(aliasHandles.map((handle) => handle.close()));

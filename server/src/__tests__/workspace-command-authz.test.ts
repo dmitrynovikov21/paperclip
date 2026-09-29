@@ -48,6 +48,15 @@ describe("workspace host-command mutation detection", () => {
       expected: "assigneeAdapterOverrides.adapterConfig.filesystemSandboxCommand",
     },
     {
+      name: "issue adapter host mount paths",
+      actual: () => collectIssueWorkspaceCommandPaths({
+        assigneeAdapterOverrides: {
+          adapterConfig: { filesystemExtraPaths: ["/proc"] },
+        },
+      }),
+      expected: "assigneeAdapterOverrides.adapterConfig.filesystemExtraPaths",
+    },
+    {
       name: "execution workspace config commands",
       actual: () => collectExecutionWorkspaceCommandPaths({
         config: { workspaceRuntime: { commands: [{ name: "seed", command: "pnpm seed" }] } },

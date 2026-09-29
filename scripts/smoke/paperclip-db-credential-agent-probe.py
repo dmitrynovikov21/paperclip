@@ -23,6 +23,24 @@ def main() -> None:
     credential_path = os.environ["KNOWN_CREDENTIAL_PATH"]
     if hidden_by_sandbox and os.path.exists(credential_path):
         raise RuntimeError("workspace sandbox exposed the service credential path")
+    if hidden_by_sandbox:
+        host_pid = os.environ["HOST_SERVICE_PID"]
+        proc_credential = f"/proc/{host_pid}/root{credential_path}"
+        try:
+            with open(proc_credential, "rb") as proc_source:
+                proc_source.read(1)
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            pass
+        else:
+            raise RuntimeError("host proc exposed the service database credential")
+        try:
+            with open(f"/proc/{host_pid}/environ", "rb") as proc_env:
+                parent_env = proc_env.read()
+        except (FileNotFoundError, PermissionError):
+            parent_env = b""
+        if b"PAPERCLIP_DATABASE_URL_FILE=" in parent_env or b"PAPERCLIP_AGENT_JWT_SECRET=" in parent_env:
+            raise RuntimeError("host proc exposed the parent service environment")
+        print("Host proc: parent env and credential denied")
     if not hidden_by_sandbox and not os.path.isfile(credential_path):
         raise RuntimeError("credential fixture is not visible at the known path")
     try:

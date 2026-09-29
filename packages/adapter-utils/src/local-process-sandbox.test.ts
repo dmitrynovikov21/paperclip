@@ -124,12 +124,86 @@ describe("local process sandbox", () => {
           extraPaths: [{ path: root, access: "ro" }],
         },
       })).rejects.toThrow("mount would expose the service database credential");
-      await expect(buildLocalProcessSandboxSpawnTarget({
+      const allowed = await buildLocalProcessSandboxSpawnTarget({
         executable: process.execPath,
         args: [],
         cwd: workspace,
         options: { workspaceDir: workspace, filesystemScope: "workspace" },
-      })).resolves.toMatchObject({ command: "bwrap" });
+      });
+      expect(allowed.command).toBe("bwrap");
+      expect(allowed.args).toContain("--bind-fd");
+      await allowed.cleanup?.();
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects host procfs and magic-link mounts from saved config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-proc-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const procAlias = path.join(workspace, "host-root");
+    await fs.mkdir(workspace);
+    await fs.symlink("/proc/self/root", procAlias);
+    for (const source of ["/proc", "/proc/self/root", procAlias]) {
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: source, access: "ro" }],
+        },
+      })).rejects.toThrow("mount would expose host procfs");
+    }
+    await expect(buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: [],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        extraPaths: [{ path: "/", access: "ro" }],
+      },
+    })).rejects.toThrow("mount would expose host root");
+  });
+
+  it.runIf(process.platform === "linux")("pins a saved extra mount before an agent swaps its symlink to procfs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-extra-race-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const safeSource = path.join(workspace, "safe-source");
+    const extraLink = path.join(root, "extra-link");
+    const credential = path.join(root, "database-url");
+    await fs.mkdir(safeSource, { recursive: true });
+    await fs.writeFile(path.join(safeSource, "marker"), "safe");
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    await fs.symlink(safeSource, extraLink);
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: extraLink, access: "ro" }],
+        },
+      });
+      try {
+        const destinationIndex = target.args.indexOf(extraLink);
+        expect(target.args[destinationIndex - 2]).toBe("--ro-bind-fd");
+        const descriptor = target.inheritedFds![Number(target.args[destinationIndex - 1]) - 3];
+        await fs.unlink(extraLink);
+        await fs.symlink("/proc", extraLink);
+        expect(await fs.readFile(`/proc/self/fd/${descriptor}/marker`, "utf8")).toBe("safe");
+      } finally {
+        await target.cleanup?.();
+      }
     } finally {
       if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
       else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;

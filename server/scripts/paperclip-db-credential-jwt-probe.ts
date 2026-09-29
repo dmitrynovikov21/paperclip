@@ -1,7 +1,8 @@
 // One-shot operator-side smoke. Never prints the DB URL or issued JWT.
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import {
   runAdapterExecutionTargetProcess,
   type AdapterSandboxExecutionTarget,
@@ -13,6 +14,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
   resolveDatabaseConnectionString,
   ensurePostgresDatabase,
   runDatabaseBackup,
@@ -73,6 +75,63 @@ try {
   });
   const jwt = createLocalAgentJwt(agent.id, company.id, "codex_local", runId);
   if (!jwt) throw new Error("Run-scoped JWT issuance failed");
+
+  // Exercise the real API and disposable PostgreSQL before the local launcher
+  // probe. A workspace executable must not enter the heartbeat override source.
+  const [issue] = await db.insert(issues).values({
+    companyId: company.id,
+    title: "Synthetic launcher override attempt",
+    status: "in_progress",
+    assigneeAgentId: agent.id,
+  }).returning({ id: issues.id });
+  if (!issue) throw new Error("Issue seed failed");
+  const workspaceLauncher = join(agentFixtureDir, "workspace", "api-fake-bwrap");
+  writeFileSync(workspaceLauncher, "#!/bin/sh\ntouch api-fake-bwrap-ran\n", { mode: 0o700 });
+  const overrideResponse = await fetch(`${apiUrl}/api/issues/${issue.id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      "X-Paperclip-Run-Id": runId,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      assigneeAdapterOverrides: {
+        adapterConfig: { filesystemSandboxCommand: workspaceLauncher },
+      },
+    }),
+  });
+  const overrideBody = await overrideResponse.json() as { error?: string };
+  if (overrideResponse.status !== 403 ||
+      !overrideBody.error?.includes("assigneeAdapterOverrides.adapterConfig.filesystemSandboxCommand")) {
+    throw new Error(`Agent launcher override was not rejected by the API (HTTP ${overrideResponse.status})`);
+  }
+  const procOverrideResponse = await fetch(`${apiUrl}/api/issues/${issue.id}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      "X-Paperclip-Run-Id": runId,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      assigneeAdapterOverrides: {
+        adapterConfig: { filesystemExtraPaths: ["/proc"] },
+      },
+    }),
+  });
+  const procOverrideBody = await procOverrideResponse.json() as { error?: string };
+  if (procOverrideResponse.status !== 403 ||
+      !procOverrideBody.error?.includes("assigneeAdapterOverrides.adapterConfig.filesystemExtraPaths")) {
+    throw new Error(`Agent host proc mount override was not rejected by the API (HTTP ${procOverrideResponse.status})`);
+  }
+  const [storedIssue] = await db.select({ overrides: issues.assigneeAdapterOverrides })
+    .from(issues).where(eq(issues.id, issue.id));
+  if (!storedIssue || storedIssue.overrides !== null) {
+    throw new Error("Rejected launcher override entered the heartbeat issue source");
+  }
+  if (existsSync(join(agentFixtureDir, "workspace", "api-fake-bwrap-ran"))) {
+    throw new Error("Workspace launcher executed after rejected agent override");
+  }
+  console.log("Agent JWT issue PATCH: launcher and /proc override HTTP 403; heartbeat override source unchanged; workspace launcher marker absent");
 
   // Docker UID and remote sandbox transport both launch a real process under
   // a distinct UID. -e NAME forwards only values supplied by the launcher.
@@ -174,6 +233,8 @@ try {
   });
   if (localResult.exitCode !== 0 ||
       !localResult.stdout.includes("substituted Bubblewrap: denied before launcher execution") ||
+      !localResult.stdout.includes("host procfs mounts: denied before launch; marker absent") ||
+      !localResult.stdout.includes("Host proc: parent env and credential denied") ||
       !localResult.stdout.includes("workspace sandbox: trusted Bubblewrap despite agent PATH; loader override stripped; credential path hidden; DB/signing env keys 0; JWT API HTTP 200") ||
       !localResult.stdout.includes("alias race: pinned directory visible; credential read denied")) {
     const diagnostic = localResult.stderr.replaceAll(dbUrl, "[redacted database URL]")
@@ -181,11 +242,11 @@ try {
       .replaceAll(jwt, "[redacted API token]")
       .split("\n").filter(Boolean).slice(-8).join("; ");
     const passed = localResult.stdout.split("\n").filter((line) =>
-      /^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|alias race):/.test(line)).length;
-    throw new Error(`workspace sandbox container check failed (exit ${localResult.exitCode ?? "unknown"}; passed ${passed}/8)${diagnostic ? `: ${diagnostic}` : ""}`);
+      /^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|host procfs mounts|Host proc|workspace sandbox|alias race):/.test(line)).length;
+    throw new Error(`workspace sandbox container check failed (exit ${localResult.exitCode ?? "unknown"}; passed ${passed}/10)${diagnostic ? `: ${diagnostic}` : ""}`);
   }
   for (const line of localResult.stdout.split("\n")) {
-    if (/^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|workspace sandbox|alias race):/.test(line)) {
+    if (/^(?:unconfined local|local network-only|unconfined ACPX|explicit DB source|credential-bearing mount|substituted Bubblewrap|host procfs mounts|Host proc|workspace sandbox|alias race):/.test(line)) {
       console.log(line);
     }
   }

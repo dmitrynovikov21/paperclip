@@ -87,6 +87,9 @@ export function collectAgentAdapterWorkspaceCommandPaths(
     ...(hasOwn(adapterConfig, "filesystemSandboxCommand")
       ? [`${prefix}.filesystemSandboxCommand`]
       : []),
+    ...(hasOwn(adapterConfig, "filesystemExtraPaths")
+      ? [`${prefix}.filesystemExtraPaths`]
+      : []),
   ];
 }
 

@@ -307,7 +307,8 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
 
   const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal }));
+    // "close" follows stdio drain, so stderr classification is complete.
+    child.once("close", (code, signal) => resolve({ code, signal }));
   });
 
   if (result.signal) {
@@ -439,10 +440,14 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       ? createReadStream(opts.backupFile).pipe(createGunzip())
       : createReadStream(opts.backupFile);
 
-    await Promise.all([
+    const [inputResult, psqlResult] = await Promise.allSettled([
       pipeline(input, child.stdin),
       waitForChildExit(child, psqlBin),
     ]);
+    // psql can reject credentials and close stdin before the stream finishes.
+    // Prefer its classified exit error over the resulting write EPIPE.
+    if (psqlResult.status === "rejected") throw psqlResult.reason;
+    if (inputResult.status === "rejected") throw inputResult.reason;
   } finally {
     service.cleanup();
   }

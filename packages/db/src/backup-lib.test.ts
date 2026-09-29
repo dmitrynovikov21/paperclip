@@ -102,6 +102,7 @@ printf '%s\\n' "$@" > "$PAPERCLIP_ARGV_CAPTURE"
 printf '%s\\n' "$PGSERVICEFILE" > "$PAPERCLIP_SERVICE_CAPTURE"
 test "$PGSERVICE" = paperclip && test -r "$PGSERVICEFILE" || exit 40
 if [ "$PAPERCLIP_FORCE_CLI_FAILURE" = 1 ]; then
+  case "$0" in *psql) exec 0<&-; sleep 1 ;; esac
   cat "$PGSERVICEFILE" >&2
   printf '%s\\n' 'FATAL: password authentication failed for user synthetic' >&2
   exit 41
@@ -160,6 +161,16 @@ esac
       expect(String(restoreFailure)).toContain("authentication failed");
       expect(String(restoreFailure)).not.toContain(connectionString);
       expect(String(restoreFailure)).not.toContain(new URL(connectionString).password);
+      assertNoArgvSecret();
+
+      const largeBackupFile = path.join(tempDir, "synthetic-large-restore.sql");
+      fs.writeFileSync(largeBackupFile, "SELECT 1;\n".repeat(131_072), { mode: 0o600 });
+      const largeRestoreFailure = await runDatabaseRestore({ connectionString: resolved!, backupFile: largeBackupFile })
+        .then(() => null, (error: unknown) => error);
+      expect(largeRestoreFailure).toBeInstanceOf(Error);
+      expect(String(largeRestoreFailure)).toContain("authentication failed");
+      expect(String(largeRestoreFailure)).not.toContain(connectionString);
+      expect(String(largeRestoreFailure)).not.toContain(new URL(connectionString).password);
       assertNoArgvSecret();
     } finally {
       for (const [key, value] of Object.entries(previous)) {

@@ -2153,6 +2153,15 @@ export function agentRoutes(
     return adapterType;
   }
 
+  function assertFileBackedDbAdapterTypeAllowed(adapterType: string): void {
+    if (adapterType === "process" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+      throw unprocessable(
+        "Process adapter cannot run with file-backed database credentials; select an isolated adapter.",
+        { code: "process_adapter_requires_isolation" },
+      );
+    }
+  }
+
   /**
    * Adapter validation for the paths that CHOOSE a harness for a new agent
    * (hire + create), as opposed to the paths that operate on an existing one.
@@ -2172,6 +2181,7 @@ export function agentRoutes(
    */
   async function assertSelectableAdapterType(type: string | null | undefined): Promise<string> {
     const adapterType = assertKnownAdapterType(type);
+    assertFileBackedDbAdapterTypeAllowed(adapterType);
     if (adapterType === "paperclip_runner") {
       const experimental = await instanceSettings.getExperimental();
       if (experimental.enableNativeRunner !== true) {
@@ -5277,6 +5287,7 @@ export function agentRoutes(
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
     if (touchesAdapterConfiguration) {
+      assertFileBackedDbAdapterTypeAllowed(requestedAdapterType);
       assertExternalInstructionsAdmin(req, existing);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
       const changingAdapterType =

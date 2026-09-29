@@ -339,4 +339,23 @@ describe("issue workspace command authorization", () => {
     expect(res.body.error).toContain("assigneeAdapterOverrides.adapterConfig.filesystemSandboxCommand");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
+
+  it("rejects an agent-authenticated issue override of host mount paths", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .patch("/api/issues/issue-1")
+      .send({ assigneeAdapterOverrides: { adapterConfig: { filesystemExtraPaths: ["/proc"] } } });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("assigneeAdapterOverrides.adapterConfig.filesystemExtraPaths");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
 });

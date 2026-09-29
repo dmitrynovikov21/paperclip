@@ -37,6 +37,7 @@ const env = {
   EXPECTED_SERVICE_UID: String(process.getuid?.() ?? -1),
   KNOWN_CREDENTIAL_PATH: credentialPath,
   EXPECTED_CREDENTIAL_VISIBILITY: "hidden",
+  HOST_SERVICE_PID: String(process.pid),
 };
 const target = { kind: "local" } as const;
 const options = {
@@ -96,6 +97,29 @@ try {
 }
 console.log("credential-bearing mount: denied before agent launch");
 
+const procAttemptMarker = join(workspaceDir, "host-proc-mount-ran");
+for (const procSource of ["/proc", "/proc/self/root"]) {
+  try {
+    await runAdapterExecutionTargetProcess(runId, target, "python3", [
+      "-c", `from pathlib import Path; Path(${JSON.stringify(procAttemptMarker)}).touch()`,
+    ], {
+      ...options,
+      localProcessSandbox: {
+        workspaceDir,
+        filesystemScope: "workspace",
+        extraPaths: [{ path: procSource, access: "ro" }],
+      },
+    });
+    throw new Error("host procfs mount unexpectedly allowed");
+  } catch (error) {
+    if (!String(error).includes("mount would expose host procfs")) throw error;
+  }
+}
+if (await fs.stat(procAttemptMarker).then(() => true).catch(() => false)) {
+  throw new Error("Agent executable ran after rejected host procfs mount");
+}
+console.log("host procfs mounts: denied before launch; marker absent");
+
 const substitutedLauncher = join(workspaceDir, "fake-bwrap");
 const substitutedMarker = join(workspaceDir, "fake-bwrap-ran");
 await fs.writeFile(substitutedLauncher, `#!/bin/sh\ntouch '${substitutedMarker}'\nexit 0\n`, { mode: 0o700 });
@@ -125,7 +149,9 @@ const result = await runAdapterExecutionTargetProcess(runId, target, "python3", 
 if (await fs.stat(pathMarker).then(() => true).catch(() => false)) {
   throw new Error("PATH-selected Bubblewrap executed before sandboxing");
 }
-if (result.exitCode !== 0 || !result.stdout.includes("Launched agent: credential read denied; DB/signing env keys 0; JWT API HTTP 200")) {
+if (result.exitCode !== 0 ||
+    !result.stdout.includes("Host proc: parent env and credential denied") ||
+    !result.stdout.includes("Launched agent: credential read denied; DB/signing env keys 0; JWT API HTTP 200")) {
   const diagnostic = result.stderr.replaceAll(serviceUrl, "[redacted database URL]")
     .replaceAll(new URL(serviceUrl).password, "[redacted password]")
     .replaceAll(apiKey, "[redacted API token]")
@@ -136,6 +162,7 @@ if (result.exitCode !== 0 || !result.stdout.includes("Launched agent: credential
 if (result.stderr.includes("missing-preload.so")) {
   throw new Error("Agent-supplied dynamic loader environment reached Bubblewrap");
 }
+console.log("Host proc: parent env and credential denied");
 console.log("workspace sandbox: trusted Bubblewrap despite agent PATH; loader override stripped; credential path hidden; DB/signing env keys 0; JWT API HTTP 200");
 
 const aliasSource = join(workspaceDir, "alias-source");

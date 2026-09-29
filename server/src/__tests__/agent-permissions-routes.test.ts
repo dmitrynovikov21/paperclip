@@ -936,6 +936,24 @@ describe.sequential("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
+  it("blocks agent-authenticated self-updates that add host mount paths", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { filesystemExtraPaths: ["/proc"] } }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.filesystemExtraPaths");
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
     const app = await createApp({
       type: "agent",

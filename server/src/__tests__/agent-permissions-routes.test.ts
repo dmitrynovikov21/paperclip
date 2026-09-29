@@ -968,6 +968,13 @@ describe.sequential("agent permission routes", () => {
       expect(createRes.status).toBe(422);
       expect(createRes.body.error).toContain("Process adapter cannot run with file-backed database credentials");
       expect(mockAgentService.create).not.toHaveBeenCalled();
+
+      const hermesRes = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({ name: "Unsafe Hermes agent", role: "engineer", adapterType: "hermes_local", adapterConfig: {} }));
+      expect(hermesRes.status).toBe(422);
+      expect(hermesRes.body.error).toContain("Hermes local adapter cannot run with file-backed database credentials");
+      expect(mockAgentService.create).not.toHaveBeenCalled();
     } finally {
       if (previous === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
       else process.env.PAPERCLIP_DATABASE_URL_FILE = previous;

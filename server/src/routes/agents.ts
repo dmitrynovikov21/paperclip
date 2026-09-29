@@ -2154,12 +2154,14 @@ export function agentRoutes(
   }
 
   function assertFileBackedDbAdapterTypeAllowed(adapterType: string): void {
-    if (adapterType === "process" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
-      throw unprocessable(
-        "Process adapter cannot run with file-backed database credentials; select an isolated adapter.",
-        { code: "process_adapter_requires_isolation" },
-      );
-    }
+    if (!process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) return;
+    const label = adapterType === "process" ? "Process adapter"
+      : adapterType === "hermes_local" ? "Hermes local adapter" : null;
+    if (!label) return;
+    throw unprocessable(
+      `${label} cannot run with file-backed database credentials; select an isolated adapter.`,
+      { code: adapterType === "process" ? "process_adapter_requires_isolation" : "hermes_local_requires_isolation" },
+    );
   }
 
   /**

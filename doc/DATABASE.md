@@ -19,6 +19,8 @@ That's it. On first start the server:
 
 Data persists across restarts in `~/.paperclip/instances/default/db/`. To reset local dev data, delete that directory.
 
+The embedded `initdb` and `postgres` processes receive only the OS and native-runtime environment settings they need, including `PATH` and `LD_LIBRARY_PATH`. The server keeps its signing keys and other control-plane credentials out of those child environments.
+
 If you need to apply pending migrations manually, run:
 
 ```sh

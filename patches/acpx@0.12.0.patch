@@ -1,0 +1,138 @@
+diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
+index 243c9d13bcba520923b63adfddad75cf2d94362d..b1a3055497a76ec3a0a3927e7ca655d203f15878 100644
+--- a/dist/live-checkpoint-ClPCSdrW.js
++++ b/dist/live-checkpoint-ClPCSdrW.js
+@@ -3124,14 +3124,21 @@ function toCommandLine(command, args) {
+ 	const renderedArgs = (args ?? []).map((arg) => JSON.stringify(arg)).join(" ");
+ 	return renderedArgs.length > 0 ? `${command} ${renderedArgs}` : command;
+ }
+-function toEnvObject(env) {
++function toEnvObject(env, baseEnv) {
++	if (baseEnv !== void 0) {
++		const merged = { ...baseEnv };
++		for (const entry of env ?? []) {
++			if (Object.hasOwn(baseEnv, entry.name)) merged[entry.name] = entry.value;
++		}
++		return merged;
++	}
+ 	if (!env || env.length === 0) return;
+ 	const merged = { ...process.env };
+ 	for (const entry of env) merged[entry.name] = entry.value;
+ 	return merged;
+ }
+-function buildTerminalSpawnOptions(command, cwd, env, platform = process.platform) {
+-	const resolvedEnv = toEnvObject(env);
++function buildTerminalSpawnOptions(command, cwd, env, baseEnv, platform = process.platform) {
++	const resolvedEnv = toEnvObject(env, baseEnv);
+ 	return buildSpawnCommandOptions(command, {
+ 		cwd,
+ 		env: resolvedEnv,
+@@ -3178,6 +3185,7 @@ function waitMs(ms) {
+ }
+ var TerminalManager = class {
+ 	cwd;
++	baseEnv;
+ 	permissionMode;
+ 	nonInteractivePermissions;
+ 	onOperation;
+@@ -3187,6 +3195,7 @@ var TerminalManager = class {
+ 	terminals = /* @__PURE__ */ new Map();
+ 	constructor(options) {
+ 		this.cwd = options.cwd;
++		this.baseEnv = options.baseEnv;
+ 		this.permissionMode = options.permissionMode;
+ 		this.nonInteractivePermissions = options.nonInteractivePermissions ?? "deny";
+ 		this.onOperation = options.onOperation;
+@@ -3210,7 +3219,7 @@ var TerminalManager = class {
+ 		try {
+ 			if (!await this.isExecuteApproved(commandLine)) throw new PermissionDeniedError("Permission denied for terminal/create");
+ 			const outputByteLimit = Math.max(0, Math.round(params.outputByteLimit ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES));
+-			const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd);
++			const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd, this.baseEnv);
+ 			let resolveExit = () => {};
+ 			const exitPromise = new Promise((resolve) => {
+ 				resolveExit = resolve;
+@@ -3455,24 +3464,24 @@ var TerminalManager = class {
+ 		while (hasLivePid(terminal.descendantPids)) await waitMs(25);
+ 	}
+ };
+-async function spawnTerminalProcess(params, defaultCwd) {
++async function spawnTerminalProcess(params, defaultCwd, baseEnv) {
+ 	const directCommand = buildTerminalSpawnCommand(params.command, params.args);
+ 	try {
+ 		return {
+-			proc: await spawnAndWait(directCommand, params, defaultCwd),
++			proc: await spawnAndWait(directCommand, params, defaultCwd, baseEnv),
+ 			spawnCommand: directCommand
+ 		};
+ 	} catch (error) {
+ 		const fallbackCommand = params.args === void 0 && isNotFoundSpawnError(error) ? buildTerminalFallbackSpawnCommand(params.command, params.cwd ?? defaultCwd) : void 0;
+ 		if (!fallbackCommand) throw error;
+ 		return {
+-			proc: await spawnAndWait(fallbackCommand, params, defaultCwd),
++			proc: await spawnAndWait(fallbackCommand, params, defaultCwd, baseEnv),
+ 			spawnCommand: fallbackCommand
+ 		};
+ 	}
+ }
+-async function spawnAndWait(spawnCommand, params, defaultCwd) {
+-	const spawnOptions = buildTerminalSpawnOptions(spawnCommand.command, params.cwd ?? defaultCwd, params.env);
++async function spawnAndWait(spawnCommand, params, defaultCwd, baseEnv) {
++	const spawnOptions = buildTerminalSpawnOptions(spawnCommand.command, params.cwd ?? defaultCwd, params.env, baseEnv);
+ 	if (spawnCommand.killProcessGroup) spawnOptions.detached = true;
+ 	const proc = spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
+ 	await waitForSpawn(proc);
+@@ -3878,6 +3887,7 @@ var AcpClient = class {
+ 		});
+ 		this.terminalManager = new TerminalManager({
+ 			cwd: this.options.cwd,
++			baseEnv: this.options.terminalEnv,
+ 			permissionMode: this.options.permissionMode,
+ 			nonInteractivePermissions: this.options.nonInteractivePermissions,
+ 			onOperation: (operation) => {
+diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
+index ccdbe5b032521518022223733049b8b38793473b..4c5a45a6f121e888680717263957e3ea88c669fb 100644
+--- a/dist/runtime.d.ts
++++ b/dist/runtime.d.ts
+@@ -260,6 +260,7 @@ type AcpRuntimeOptions = {
+   cwd: string;
+   sessionStore: AcpSessionStore;
+   agentRegistry: AcpAgentRegistry;
++  terminalEnv?: Record<string, string>;
+   mcpServers?: McpServer$1[];
+   permissionMode: PermissionMode;
+   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+diff --git a/dist/runtime.js b/dist/runtime.js
+index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..cf37f537b63f3f4a0b93492e774a8bbf6103080b 100644
+--- a/dist/runtime.js
++++ b/dist/runtime.js
+@@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
+ 		this.deps = deps;
+ 	}
+ 	createClient(options) {
+-		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
++		const clientOptions = { ...options, terminalEnv: this.options.terminalEnv };
++		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
+ 	}
+ 	async readPendingPersistentClient(record, options) {
+ 		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
+@@ -1496,6 +1497,7 @@ function createProbeClient(options, agentCommand, deps) {
+ 	const clientOptions = {
+ 		agentCommand,
+ 		cwd: options.cwd,
++		terminalEnv: options.terminalEnv,
+ 		mcpServers: [...options.mcpServers ?? []],
+ 		permissionMode: options.permissionMode,
+ 		nonInteractivePermissions: options.nonInteractivePermissions,
+diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
+index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..2f9ae3be287372e571a89fdc14b3380ccb5dfcd1 100644
+--- a/dist/session-options-jkYbBxGE.d.ts
++++ b/dist/session-options-jkYbBxGE.d.ts
+@@ -75,6 +75,7 @@ type SessionEventLog = {
+ type AcpClientOptions = {
+   agentCommand: string;
+   cwd: string;
++  terminalEnv?: Record<string, string>;
+   mcpServers?: McpServer[];
+   permissionMode: PermissionMode;
+   nonInteractivePermissions?: NonInteractivePermissionPolicy;

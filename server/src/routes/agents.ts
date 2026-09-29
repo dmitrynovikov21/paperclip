@@ -2896,6 +2896,17 @@ export function agentRoutes(
     path = "adapterConfig",
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    if (req.actor.type === "agent" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+      const env = asRecord(adapterConfig.env);
+      const protectedPaths = [
+        ...(env && Object.hasOwn(env, "CODEX_HOME") ? [`${path}.env.CODEX_HOME`] : []),
+        ...(Object.hasOwn(adapterConfig, "paperclipConnectorSkillDigest") ? [`${path}.paperclipConnectorSkillDigest`] : []),
+        ...(Object.hasOwn(adapterConfig, "managedAiConnection") ? [`${path}.managedAiConnection`] : []),
+      ];
+      if (protectedPaths.length > 0) {
+        throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${protectedPaths.join(", ")})`);
+      }
+    }
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),

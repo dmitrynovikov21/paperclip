@@ -68,6 +68,7 @@ import {
   isCodexUnknownSessionError,
 } from "./parse.js";
 import {
+  assertTrustedConnectorAuthSourceHome,
   codexHomeHasUsableAuth,
   evaluateCodexCredentialReadiness,
   isManagedCodexHomePath,
@@ -643,6 +644,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
     && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
   if (connectorSkillDigest) {
+    await assertTrustedConnectorAuthSourceHome({
+      env: process.env,
+      companyId: agent.companyId,
+      agentId: agent.id,
+      sourceHome: connectorSourceHome,
+      managedAiConnection: Boolean(config.managedAiConnection),
+    });
     // Never mount assignment-specific skills into the shared company/user home.
     // A different skill revision gets a new home, so revoked/changed resources
     // cannot survive as stale symlinks or bleed into another agent's session.

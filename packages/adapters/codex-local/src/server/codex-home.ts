@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
-import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
+import { isCodexAuthCachePath, readSubscriptionAccountId, resolveCodexAuthCacheDir } from "./codex-auth-cache.js";
 import {
+  type SafeHandle,
   lstatChild,
   listPinnedDirectory,
   openChildNoFollow,
@@ -173,6 +173,42 @@ export function isManagedCodexHomePath(
   const companyRoot = path.resolve(instanceRoot, "companies", companyId);
   const resolved = path.resolve(homePath);
   return resolved === companyRoot || resolved.startsWith(companyRoot + path.sep);
+}
+
+/** A connector run may only seed auth from a server-selected home when the
+ * service itself holds file-backed database credentials. The digest and the
+ * agent's CODEX_HOME are not proof that a path is a credential source. */
+export async function assertTrustedConnectorAuthSourceHome(input: {
+  env: NodeJS.ProcessEnv;
+  companyId: string;
+  agentId: string;
+  sourceHome: string | null;
+  managedAiConnection: boolean;
+}): Promise<void> {
+  const { env, companyId, agentId, sourceHome, managedAiConnection } = input;
+  if (!env.PAPERCLIP_DATABASE_URL_FILE?.trim() || sourceHome === null) return;
+  const source = path.resolve(sourceHome);
+  const companyHome = resolveManagedCodexHomeDir(env, companyId);
+  const agentHome = path.join(path.dirname(companyHome), "agents", agentId, "codex-home");
+  const cacheRoot = resolveCodexAuthCacheDir(env, companyId);
+  const isCacheEntry = path.dirname(source) === cacheRoot && path.basename(source) !== ".";
+  if ([resolveSharedCodexHomeDir(env), companyHome, agentHome].some((home) => source === path.resolve(home)) || isCacheEntry) {
+    return;
+  }
+  // A managed AI connection gets a short-lived credential home created by the
+  // server. Its private root is owned by this service, not by the local agent.
+  if (managedAiConnection && path.basename(source) === "provider") {
+    const sessionHome = path.dirname(source);
+    const serviceUid = process.getuid?.();
+    if (serviceUid !== undefined && path.dirname(sessionHome) === path.resolve(os.tmpdir())
+      && path.basename(sessionHome).startsWith(`paperclip-ai-${companyId}-`)) {
+      const [rootStat, sourceStat] = await Promise.all([fs.lstat(sessionHome), fs.lstat(source)]);
+      if (rootStat.isDirectory() && sourceStat.isDirectory()
+        && rootStat.uid === serviceUid && sourceStat.uid === serviceUid
+        && (rootStat.mode & 0o077) === 0 && (sourceStat.mode & 0o077) === 0) return;
+    }
+  }
+  throw new Error("Connector CODEX_HOME is not a trusted auth source in file-backed database mode");
 }
 
 /**
@@ -384,7 +420,7 @@ export interface StageCodexHomeForSyncOptions {
 
 /** Copy bytes from an already-open inode. An agent replacing its path cannot
  * redirect the service read after this point. */
-async function stagePinnedEntry(source: FileHandle, target: string): Promise<void> {
+async function stagePinnedEntry(source: SafeHandle, target: string): Promise<void> {
   const stat = await source.stat();
   if (stat.isDirectory()) {
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
@@ -439,7 +475,7 @@ async function readBoundAuthSource(sources: readonly string[], index = 0): Promi
 }
 
 async function stageCodexHomeEntry(
-  sourceHome: FileHandle,
+  sourceHome: SafeHandle,
   sourceHomePath: string,
   stagedHome: string,
   entry: (typeof CODEX_SYNC_ALLOWLIST)[number],

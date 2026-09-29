@@ -1,8 +1,7 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
 
 // Remote staging runs on the host. A local agent can change its mounted home
 // while the service is preparing a later run, so paths below that home must be
@@ -11,28 +10,88 @@ const fdRoot = process.platform === "linux" ? "/proc/self/fd" :
   process.platform === "darwin" ? "/dev/fd" : null;
 const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
-function fdPath(dir: FileHandle, name?: string): string {
-  if (!fdRoot) throw new Error("Safe Codex home staging requires a POSIX descriptor filesystem");
+export type SafeHandle = {
+  fd: number | null;
+  path: string;
+  stat: () => Promise<Stats>;
+  readFile: () => Promise<Buffer>;
+  close: () => Promise<void>;
+};
+
+function wrapHandle(handle: FileHandle, candidate: string): SafeHandle {
+  return {
+    fd: handle.fd,
+    path: candidate,
+    stat: () => handle.stat(),
+    readFile: () => handle.readFile(),
+    close: () => handle.close(),
+  };
+}
+
+function wrapUnconfinedPath(candidate: string): SafeHandle {
+  return {
+    fd: null,
+    path: candidate,
+    stat: () => fs.stat(candidate),
+    readFile: () => fs.readFile(candidate),
+    close: async () => {},
+  };
+}
+
+function fdPath(dir: SafeHandle, name?: string): string {
   if (name && (name === "." || name === ".." || path.basename(name) !== name)) {
     throw new Error("Invalid Codex home entry name");
   }
-  return name ? path.join(fdRoot, String(dir.fd), name) : path.join(fdRoot, String(dir.fd));
+  const base = fdRoot && dir.fd !== null ? path.join(fdRoot, String(dir.fd)) : dir.path;
+  return name ? path.join(base, name) : base;
 }
 
-export async function openDirectoryNoFollow(directory: string): Promise<FileHandle> {
-  if (!fdRoot || !path.isAbsolute(directory)) {
-    throw new Error("Safe Codex home staging requires an absolute POSIX path");
+export async function openDirectoryNoFollow(directory: string): Promise<SafeHandle> {
+  if (!path.isAbsolute(directory)) throw new Error("Codex home path must be absolute");
+  if (!fdRoot) {
+    // Windows has no /proc/self/fd-style directory anchor. Preserve normal
+    // Codex home behavior there; never use that fallback with a service DB file.
+    if (process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+      throw new Error("File-backed database credentials require descriptor-based Codex home staging");
+    }
+    if (!(await fs.stat(directory)).isDirectory()) throw new Error("Codex home path is not a directory");
+    return wrapUnconfinedPath(directory);
   }
-  const parts = path.resolve(directory).split(path.sep).filter(Boolean);
-  let current = await fs.open(path.parse(directory).root, constants.O_RDONLY | constants.O_DIRECTORY);
+  // Traverse from a pinned root so a local agent cannot replace an ancestor
+  // after a path check. A service/root-owned volume link in a protected parent
+  // is safe to follow; an agent-owned link or an agent-writable parent is not.
+  const root = path.parse(directory).root;
+  const parts = path.resolve(directory).slice(root.length).split(path.sep).filter(Boolean);
+  let current = wrapHandle(await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY), root);
   try {
-    for (const part of parts) {
-      const next = await fs.open(
-        fdPath(current, part),
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
+    for (const [index, part] of parts.entries()) {
+      const candidate = fdPath(current, part);
+      let next: FileHandle;
+      try {
+        next = await fs.open(candidate, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      } catch (error) {
+        const linked = await lstatChild(current, part);
+        if (!linked?.isSymbolicLink()) throw error;
+        if (index === parts.length - 1) {
+          throw new Error("Codex home path ends at a directory symlink");
+        }
+        const parent = await current.stat();
+        const uid = process.getuid?.();
+        const serviceOwned = (owner: number) => owner === 0 || owner === uid;
+        const protectedParent = serviceOwned(parent.uid)
+          && ((parent.mode & 0o022) === 0 || (parent.mode & 0o1000) !== 0);
+        if (!serviceOwned(linked.uid) || !protectedParent) {
+          throw new Error("Codex home path contains an untrusted directory symlink");
+        }
+        next = await fs.open(candidate, constants.O_RDONLY | constants.O_DIRECTORY);
+        const target = await next.stat();
+        if (!serviceOwned(target.uid) || (target.mode & 0o022) !== 0) {
+          await next.close();
+          throw new Error("Codex home directory symlink has an untrusted target");
+        }
+      }
       await current.close();
-      current = next;
+      current = wrapHandle(next, candidate);
     }
     return current;
   } catch (error) {
@@ -41,9 +100,19 @@ export async function openDirectoryNoFollow(directory: string): Promise<FileHand
   }
 }
 
-export async function openChildNoFollow(dir: FileHandle, name: string): Promise<FileHandle | null> {
+export async function openChildNoFollow(dir: SafeHandle, name: string): Promise<SafeHandle | null> {
+  const candidate = fdPath(dir, name);
+  if (!fdRoot) {
+    const stat = await fs.lstat(candidate).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat || stat.isSymbolicLink()) return null;
+    if (stat.isDirectory()) return wrapUnconfinedPath(candidate);
+    return wrapHandle(await fs.open(candidate, constants.O_RDONLY), candidate);
+  }
   try {
-    return await fs.open(fdPath(dir, name), readFlags);
+    return wrapHandle(await fs.open(candidate, readFlags), candidate);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ELOOP") return null;
@@ -51,7 +120,7 @@ export async function openChildNoFollow(dir: FileHandle, name: string): Promise<
   }
 }
 
-export async function lstatChild(dir: FileHandle, name: string): Promise<Stats | null> {
+export async function lstatChild(dir: SafeHandle, name: string): Promise<Stats | null> {
   try {
     return await fs.lstat(fdPath(dir, name));
   } catch (error) {
@@ -60,7 +129,7 @@ export async function lstatChild(dir: FileHandle, name: string): Promise<Stats |
   }
 }
 
-export async function openPathNoFollow(candidate: string): Promise<FileHandle | null> {
+export async function openPathNoFollow(candidate: string): Promise<SafeHandle | null> {
   const dir = await openDirectoryNoFollow(path.dirname(candidate));
   try {
     return await openChildNoFollow(dir, path.basename(candidate));
@@ -80,7 +149,7 @@ export async function readRegularFileNoFollow(candidate: string): Promise<Buffer
   }
 }
 
-export async function readChildLink(dir: FileHandle, name: string): Promise<string | null> {
+export async function readChildLink(dir: SafeHandle, name: string): Promise<string | null> {
   try {
     return await fs.readlink(fdPath(dir, name));
   } catch (error) {
@@ -89,7 +158,7 @@ export async function readChildLink(dir: FileHandle, name: string): Promise<stri
   }
 }
 
-export async function listPinnedDirectory(dir: FileHandle): Promise<string[]> {
+export async function listPinnedDirectory(dir: SafeHandle): Promise<string[]> {
   return fs.readdir(fdPath(dir));
 }
 

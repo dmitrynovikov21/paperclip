@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  assertTrustedConnectorAuthSourceHome,
   CODEX_SYNC_ALLOWLIST,
   codexHomeHasUsableAuth,
   ensureSymlink,
@@ -30,6 +31,46 @@ describe("mergeManagedCodexMcpGateways", () => {
       { name: "runtime", endpointPath: "/runtime", bearerToken: "runtime-token" },
       { name: "manual", endpointPath: "/manual", bearerToken: "manual-token" },
     ]);
+  });
+});
+
+describe("connector auth source binding", () => {
+  it("rejects agent-selected homes in file-backed mode but permits server-owned homes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-source-"));
+    const sessionHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ai-company-1-test-"));
+    try {
+      const env = {
+        PAPERCLIP_HOME: root,
+        PAPERCLIP_INSTANCE_ID: "test",
+        PAPERCLIP_DATABASE_URL_FILE: path.join(root, "service", "database-url"),
+        CODEX_HOME: path.join(root, "shared-home"),
+      };
+      const base = { env, companyId: "company-1", agentId: "agent-1", managedAiConnection: false };
+      const serviceDir = path.join(root, "service");
+      await fs.mkdir(serviceDir);
+      await fs.writeFile(path.join(serviceDir, "auth.json"), "synthetic-db-url-only");
+      const agentPicked = path.join(root, "agent-picked");
+      await fs.symlink(serviceDir, agentPicked, "dir");
+      await expect(assertTrustedConnectorAuthSourceHome({
+        ...base, sourceHome: agentPicked,
+      })).rejects.toThrow("not a trusted auth source");
+      await expect(stageCodexHomeForSync(agentPicked)).rejects.toThrow();
+      await expect(assertTrustedConnectorAuthSourceHome({
+        ...base, sourceHome: env.CODEX_HOME,
+      })).resolves.toBeUndefined();
+      await expect(assertTrustedConnectorAuthSourceHome({
+        ...base,
+        sourceHome: path.join(root, "instances", "test", "companies", "company-1", "agents", "agent-1", "codex-home"),
+      })).resolves.toBeUndefined();
+      const providerHome = path.join(sessionHome, "provider");
+      await fs.mkdir(providerHome, { mode: 0o700 });
+      await expect(assertTrustedConnectorAuthSourceHome({
+        ...base, sourceHome: providerHome, managedAiConnection: true,
+      })).resolves.toBeUndefined();
+    } finally {
+      await fs.rm(sessionHome, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1154,6 +1195,30 @@ describe("stageCodexHomeForSync", () => {
       },
     };
   }
+
+  it("stages through a trusted symlinked parent while keeping the home directory pinned", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-parent-"));
+    let staged: string | null = null;
+    try {
+      const realRoot = path.join(root, "real");
+      await fs.mkdir(realRoot);
+      const { home, stageOptions } = await buildFakeHome(realRoot);
+      const alias = path.join(root, "volume");
+      await fs.symlink(realRoot, alias, "dir");
+      staged = await stageCodexHomeForSync(path.join(alias, path.basename(home)), stageOptions);
+      expect(await fs.readFile(path.join(staged, "instructions.md"), "utf8")).toBe("hi\n");
+      const writableParent = path.join(root, "agent-writable");
+      await fs.mkdir(writableParent, { mode: 0o777 });
+      await fs.chmod(writableParent, 0o777);
+      const untrustedAlias = path.join(writableParent, "volume");
+      await fs.symlink(realRoot, untrustedAlias, "dir");
+      await expect(stageCodexHomeForSync(path.join(untrustedAlias, path.basename(home)), stageOptions))
+        .rejects.toThrow("untrusted directory symlink");
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("stages exactly the allowlist, derefs auth.json to bytes, and excludes decoys", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-"));

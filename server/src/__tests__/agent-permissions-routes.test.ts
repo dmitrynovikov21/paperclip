@@ -981,6 +981,29 @@ describe.sequential("agent permission routes", () => {
     }
   });
 
+  it("blocks agent changes to connector auth source fields in file-backed database mode", async () => {
+    const previous = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    process.env.PAPERCLIP_DATABASE_URL_FILE = "/synthetic/service/credential";
+    try {
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      for (const adapterConfig of [
+        { env: { CODEX_HOME: "/synthetic/service" } },
+        { paperclipConnectorSkillDigest: "a".repeat(64) },
+        { managedAiConnection: { method: "subscription" } },
+      ]) {
+        const res = await requestApp(app, (baseUrl) => request(baseUrl)
+          .patch(`/api/agents/${agentId}`)
+          .send({ adapterConfig }));
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("connector authentication sources");
+      }
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous;
+    }
+  });
+
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
     const app = await createApp({
       type: "agent",

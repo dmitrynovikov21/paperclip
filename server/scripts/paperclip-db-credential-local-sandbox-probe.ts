@@ -144,6 +144,10 @@ console.log("workspace sandbox: trusted Bubblewrap despite agent PATH; loader ov
 // can plant a link in its writable CODEX_HOME. A later host-side remote-home
 // staging pass must reject that link before any sandbox asset is prepared.
 const codexHome = await fs.mkdtemp(join(tmpdir(), "paperclip-codex-home-agent-"));
+const serviceOnlyHome = await fs.mkdtemp(join(tmpdir(), "paperclip-codex-service-only-"));
+const aliasMarker = "SYNTHETIC_SERVICE_ALIAS_SECRET";
+await fs.mkdir(join(serviceOnlyHome, "home"), { mode: 0o700 });
+await fs.writeFile(join(serviceOnlyHome, "home", "instructions.md"), aliasMarker, { mode: 0o600 });
 const linkScript = join(workspaceDir, "plant-codex-home-link.py");
 await fs.writeFile(linkScript, `from pathlib import Path
 import os
@@ -152,14 +156,20 @@ home = Path(os.environ["CODEX_HOME"])
 credential = Path(os.environ["KNOWN_CREDENTIAL_PATH"])
 if credential.exists():
     raise RuntimeError("service credential became visible in Bubblewrap")
+alias_target = Path(os.environ["KNOWN_ALIAS_TARGET"])
+if alias_target.exists():
+    raise RuntimeError("service-only alias target became visible in Bubblewrap")
 (home / "instructions.md").symlink_to(credential)
+agent_writable = home / "agent-writable"
+agent_writable.mkdir(mode=0o700)
+(agent_writable / "volume").symlink_to(alias_target, target_is_directory=True)
 runpy.run_path(str(Path(os.environ["WORKSPACE_DIR"]) / "agent-probe.py"), run_name="__main__")
-print("codex-home link planted without credential read")
+print("codex-home links planted without service-only read")
 `, { mode: 0o600 });
 try {
   const planted = await runAdapterExecutionTargetProcess(runId, target, "python3", [linkScript], {
     ...options,
-    env: { ...env, CODEX_HOME: codexHome, WORKSPACE_DIR: workspaceDir },
+    env: { ...env, CODEX_HOME: codexHome, WORKSPACE_DIR: workspaceDir, KNOWN_ALIAS_TARGET: serviceOnlyHome },
     localProcessSandbox: {
       workspaceDir,
       filesystemScope: "workspace",
@@ -168,10 +178,18 @@ try {
     },
   });
   if (planted.exitCode !== 0 ||
-      !planted.stdout.includes("codex-home link planted without credential read") ||
+      !planted.stdout.includes("codex-home links planted without service-only read") ||
       !planted.stdout.includes("JWT API HTTP 200") ||
-      !(await fs.lstat(join(codexHome, "instructions.md"))).isSymbolicLink()) {
-    throw new Error("Bubblewrap agent did not plant the CODEX_HOME link and retain JWT access");
+      !(await fs.lstat(join(codexHome, "instructions.md"))).isSymbolicLink() ||
+      !(await fs.lstat(join(codexHome, "agent-writable", "volume"))).isSymbolicLink()) {
+    throw new Error("Bubblewrap agent did not plant the CODEX_HOME links and retain JWT access");
+  }
+  const agentWritableStat = await fs.stat(join(codexHome, "agent-writable"));
+  const aliasFileStat = await fs.stat(join(serviceOnlyHome, "home", "instructions.md"));
+  if (agentWritableStat.uid !== process.getuid?.() ||
+      (agentWritableStat.mode & 0o777) !== 0o700 ||
+      (aliasFileStat.mode & 0o777) !== 0o600) {
+    throw new Error("Directory alias fixture lacks the shared UID and private modes");
   }
   const stagePrefix = `paperclip-codex-home-sync-${runId}-`;
   const stagesBefore = (await fs.readdir(tmpdir())).filter((name) => name.startsWith(stagePrefix));
@@ -191,6 +209,26 @@ try {
     throw new Error("Rejected remote Codex home staging left a partial asset");
   }
   console.log("codex-home remote staging: planted service link denied; partial asset 0; credential bytes/log 0; JWT API HTTP 200");
+
+  refused = false;
+  try {
+    await stageCodexHomeForSync(join(codexHome, "agent-writable", "volume", "home"), {
+      runId, authSourcePaths: [], skillSources: [],
+    });
+  } catch (error) {
+    const message = String(error);
+    if (message.includes(aliasMarker) || message.includes(serviceUrl) ||
+        !message.includes("untrusted directory symlink")) {
+      throw new Error("Directory alias staging produced an unsafe diagnostic");
+    }
+    refused = true;
+  }
+  if (!refused) throw new Error("Remote Codex home staging followed the agent-planted directory alias");
+  const stagesAfterAlias = (await fs.readdir(tmpdir())).filter((name) => name.startsWith(stagePrefix));
+  if (stagesAfterAlias.length !== stagesBefore.length) {
+    throw new Error("Rejected directory alias staging left a partial asset");
+  }
+  console.log("codex-home directory alias: same-UID 0700 parent denied; partial asset 0; credential bytes/log 0; JWT API HTTP 200");
 
   await fs.unlink(join(codexHome, "instructions.md"));
   const sharedAuth = join(workspaceDir, "synthetic-shared-auth.json");
@@ -218,6 +256,7 @@ try {
   console.log("codex-home positive staging: bound auth and selected skill copied; JWT API HTTP 200");
 } finally {
   await fs.rm(codexHome, { recursive: true, force: true });
+  await fs.rm(serviceOnlyHome, { recursive: true, force: true });
   await fs.rm(join(workspaceDir, "synthetic-skill"), { recursive: true, force: true });
   await fs.rm(join(workspaceDir, "synthetic-shared-auth.json"), { force: true });
   await fs.rm(linkScript, { force: true });

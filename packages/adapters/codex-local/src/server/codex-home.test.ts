@@ -1196,29 +1196,47 @@ describe("stageCodexHomeForSync", () => {
     };
   }
 
-  it("stages through a trusted symlinked parent while keeping the home directory pinned", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-parent-"));
-    let staged: string | null = null;
-    try {
-      const realRoot = path.join(root, "real");
-      await fs.mkdir(realRoot);
-      const { home, stageOptions } = await buildFakeHome(realRoot);
-      const alias = path.join(root, "volume");
-      await fs.symlink(realRoot, alias, "dir");
-      staged = await stageCodexHomeForSync(path.join(alias, path.basename(home)), stageOptions);
-      expect(await fs.readFile(path.join(staged, "instructions.md"), "utf8")).toBe("hi\n");
-      const writableParent = path.join(root, "agent-writable");
-      await fs.mkdir(writableParent, { mode: 0o777 });
-      await fs.chmod(writableParent, 0o777);
-      const untrustedAlias = path.join(writableParent, "volume");
-      await fs.symlink(realRoot, untrustedAlias, "dir");
-      await expect(stageCodexHomeForSync(path.join(untrustedAlias, path.basename(home)), stageOptions))
-        .rejects.toThrow("untrusted directory symlink");
-    } finally {
-      if (staged) await fs.rm(staged, { recursive: true, force: true });
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
+  it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+    "rejects a same-UID 0700 parent alias to service-only files without leaving an asset",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-parent-"));
+      let staged: string | null = null;
+      try {
+        const realRoot = path.join(root, "real");
+        await fs.mkdir(realRoot);
+        const { home, stageOptions } = await buildFakeHome(realRoot);
+        staged = await stageCodexHomeForSync(home, stageOptions);
+        expect(await fs.readFile(path.join(staged, "instructions.md"), "utf8")).toBe("hi\n");
+        const agentWritable = path.join(root, "agent-writable");
+        const serviceOnly = path.join(root, "service-only");
+        await fs.mkdir(agentWritable, { mode: 0o700 });
+        await fs.mkdir(path.join(serviceOnly, "home"), { recursive: true, mode: 0o700 });
+        const marker = "SYNTHETIC_SERVICE_CREDENTIAL";
+        await fs.writeFile(path.join(serviceOnly, "home", "instructions.md"), marker, { mode: 0o600 });
+        const alias = path.join(agentWritable, "volume");
+        await fs.symlink(serviceOnly, alias, "dir");
+        expect((await fs.stat(agentWritable)).uid).toBe(process.getuid?.());
+        expect((await fs.stat(agentWritable)).mode & 0o777).toBe(0o700);
+
+        let partialAsset: string | null = null;
+        const realMkdtemp = fs.mkdtemp.bind(fs);
+        vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix: string, ...rest: unknown[]) => {
+          const dir = await (realMkdtemp as typeof fs.mkdtemp)(prefix, ...(rest as []));
+          partialAsset = dir as string;
+          return dir;
+        });
+        const error = await stageCodexHomeForSync(path.join(alias, "home"), stageOptions)
+          .then(() => null, (caught: unknown) => caught);
+        expect(String(error)).toContain("untrusted directory symlink");
+        expect(String(error)).not.toContain(marker);
+        expect(partialAsset).not.toBeNull();
+        await expect(fs.access(partialAsset as unknown as string)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        if (staged) await fs.rm(staged, { recursive: true, force: true });
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("stages exactly the allowlist, derefs auth.json to bytes, and excludes decoys", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-"));

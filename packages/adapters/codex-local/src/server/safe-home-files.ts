@@ -58,37 +58,23 @@ export async function openDirectoryNoFollow(directory: string): Promise<SafeHand
     return wrapUnconfinedPath(directory);
   }
   // Traverse from a pinned root so a local agent cannot replace an ancestor
-  // after a path check. A service/root-owned volume link in a protected parent
-  // is safe to follow; an agent-owned link or an agent-writable parent is not.
+  // after a path check. Never follow a directory link here: a local agent and
+  // the service may share a UID, so ownership and mode cannot establish whether
+  // the link was planted inside the agent's writable mount namespace.
   const root = path.parse(directory).root;
   const parts = path.resolve(directory).slice(root.length).split(path.sep).filter(Boolean);
   let current = wrapHandle(await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY), root);
   try {
-    for (const [index, part] of parts.entries()) {
+    for (const part of parts) {
       const candidate = fdPath(current, part);
       let next: FileHandle;
       try {
         next = await fs.open(candidate, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       } catch (error) {
-        const linked = await lstatChild(current, part);
-        if (!linked?.isSymbolicLink()) throw error;
-        if (index === parts.length - 1) {
-          throw new Error("Codex home path ends at a directory symlink");
-        }
-        const parent = await current.stat();
-        const uid = process.getuid?.();
-        const serviceOwned = (owner: number) => owner === 0 || owner === uid;
-        const protectedParent = serviceOwned(parent.uid)
-          && ((parent.mode & 0o022) === 0 || (parent.mode & 0o1000) !== 0);
-        if (!serviceOwned(linked.uid) || !protectedParent) {
+        if ((await lstatChild(current, part))?.isSymbolicLink()) {
           throw new Error("Codex home path contains an untrusted directory symlink");
         }
-        next = await fs.open(candidate, constants.O_RDONLY | constants.O_DIRECTORY);
-        const target = await next.stat();
-        if (!serviceOwned(target.uid) || (target.mode & 0o022) !== 0) {
-          await next.close();
-          throw new Error("Codex home directory symlink has an untrusted target");
-        }
+        throw error;
       }
       await current.close();
       current = wrapHandle(next, candidate);

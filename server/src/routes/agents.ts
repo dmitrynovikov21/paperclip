@@ -983,6 +983,15 @@ export function agentRoutes(
     return adapterType;
   }
 
+  function assertFileBackedDbAdapterTypeAllowed(adapterType: string): void {
+    if (adapterType === "process" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+      throw unprocessable(
+        "Process adapter cannot run with file-backed database credentials; select an isolated adapter.",
+        { code: "process_adapter_requires_isolation" },
+      );
+    }
+  }
+
   async function assertAgentDefaultEnvironmentSelection(
     companyId: string,
     environmentId: string | null | undefined,
@@ -2528,6 +2537,7 @@ export function agentRoutes(
       ...hireInput
     } = req.body;
     hireInput.adapterType = assertKnownAdapterType(hireInput.adapterType);
+    assertFileBackedDbAdapterTypeAllowed(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
@@ -2724,6 +2734,7 @@ export function agentRoutes(
       ...createInput
     } = req.body;
     createInput.adapterType = assertKnownAdapterType(createInput.adapterType);
+    assertFileBackedDbAdapterTypeAllowed(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
@@ -3152,6 +3163,7 @@ export function agentRoutes(
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
     if (touchesAdapterConfiguration) {
+      assertFileBackedDbAdapterTypeAllowed(requestedAdapterType);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
       const changingAdapterType =
         typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType;

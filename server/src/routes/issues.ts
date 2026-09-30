@@ -1746,6 +1746,9 @@ async function assertCanManageIssueMonitor(
     throw forbidden(runtimeDecision.explanation, authorizationDeniedDetails(runtimeDecision));
   }
   if (req.actor.type === "agent" && req.actor.agentId && req.actor.agentId === assigneeAgentId) return;
+  if (req.actor.type === "agent" && req.actor.source === "agent_key"
+    && req.actor.keyScope?.kind === "cron_service"
+    && req.actor.keyScope.service === "agent_watchdog") return;
   throw forbidden("Only the assignee agent or a board user can manage issue monitors");
 }
 
@@ -3885,6 +3888,10 @@ export function issueRoutes(
       res.status(403).json({ error: "Agent authentication required" });
       return false;
     }
+    // The host key's exact route/body/issue boundary was already enforced by
+    // cronServiceKeyGuard. Its three jobs must write their own incidents or the
+    // configured alarm issues even when another agent has the checkout.
+    if (req.actor.source === "agent_key" && req.actor.keyScope?.kind === "cron_service") return true;
     // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
     // watched subtree. This must be evaluated before the base assignee-ownership
     // boundary below: that boundary denies an agent mutating an issue owned by a

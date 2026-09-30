@@ -160,15 +160,37 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().uuid(),
 }).strict();
 
+// Host cron keys are never handed to an agent run. The HTTP guard applies an
+// additional method/path/body boundary before the normal route authorization.
+export const cronServiceAgentKeyScopeSchema = z.discriminatedUnion("service", [
+  z.object({
+    kind: z.literal("cron_service"),
+    service: z.literal("agent_watchdog"),
+    alarmIssueIds: z.array(z.string().uuid()).min(1).max(20),
+  }).strict(),
+  z.object({
+    kind: z.literal("cron_service"),
+    service: z.literal("deploy_frontend"),
+    projectId: z.string().uuid(),
+    assigneeAgentId: z.string().uuid(),
+  }).strict(),
+  z.object({
+    kind: z.literal("cron_service"),
+    service: z.literal("quota_rewake"),
+  }).strict(),
+]);
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  cronServiceAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type CronServiceAgentKeyScope = z.infer<typeof cronServiceAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);

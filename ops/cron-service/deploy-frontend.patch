@@ -1,0 +1,61 @@
+--- deploy-frontend.sh
++++ deploy-frontend.sh
+@@ -86,29 +86,22 @@
+ # и заведённый инцидент HELA-12898 так никто и не закрыл.
+ PIXEL_STATE_MIRROR="$HOME/.cache/helloprint-deploy-frontend/pixel-incident"
+ 
+-CRON_TOKEN_FILE="$HOME/.secrets/paperclip-cron-deploy-frontend.token"
++CRON_SOCKET="/run/paperclip-cron-deploy/api.sock"
++CRON_API_CLIENT="/opt/paperclip-cron/api_client.py"
+ 
+-# HELA-12078 (27.09.2026): агентский API-ключ Alpha (выпущен HELA-12625, файл 0600) вместо JWT,
+-# переподписанного ключом подписи control plane. Ключ подписи убирается из файлов и ротируется, а
+-# API-ключ можно отозвать, и ротацию он переживает. Из bridge.env берётся только адрес API.
++# HELA-12871: the deploy build stays under the agent UID. A separate service UID
++# holds the scoped API key; this script receives only a Unix socket capability.
+ pc_env() {
+-  PC_TOK=""; PC_URL=""
+-  [ -f "$BRIDGE_ENV" ] && [ -r "$CRON_TOKEN_FILE" ] || return 1
+-  PC_URL=$(grep -E '^PAPERCLIP_API_URL=' "$BRIDGE_ENV" | head -1 | cut -d= -f2- | tr -d '[:space:]')
+-  PC_TOK=$(tr -d '[:space:]' < "$CRON_TOKEN_FILE")
+-  [ -n "$PC_TOK" ] && [ -n "$PC_URL" ]
++  [ -S "$CRON_SOCKET" ] && [ -r "$CRON_API_CLIENT" ]
+ }
+ 
+-# HELA-12989 REQ-4: код ответа каждого вызова идёт в лог. Раньше `-o /dev/null … || true` глотал отказ:
+-# 29.09 лог записал «инцидент HELA-12997 закрыт», а в карту не легло ничего. Агентский ключ на карте
+-# чужого ассайни получает 403 и на коммент, и на PATCH (authorization.js: у issue:mutate нет гранта).
+-# Ключ передаём curl через stdin (-H @-), а не в argv: argv виден в ps любому пользователю хоста.
+-pc_call() {  # $1=METHOD $2=путь API [$3=JSON] -> PC_CODE (000 = нет ответа), PC_BODY; 0 = 2xx
++pc_call() {  # $1=METHOD $2=API path [$3=JSON] -> PC_CODE, PC_BODY; 0 = 2xx
+   local out
+-  local -a args=(-s -m 25 -X "$1" -H @- -w '\n%{http_code}')
+-  [ -n "${3:-}" ] && args+=(-H "Content-Type: application/json" --data "$3")
+-  out=$(printf 'Authorization: Bearer %s\n' "$PC_TOK" | curl "${args[@]}" "$PC_URL$2" 2>/dev/null)
+-  PC_CODE="${out##*$'\n'}"; PC_BODY="${out%$'\n'*}"
++  out=$(printf '%s' "${3:-}" | CRON_SERVICE_SOCKET="$CRON_SOCKET" /usr/bin/python3 "$CRON_API_CLIENT" "$1" "$2" 2>/dev/null) || {
++    PC_CODE="000"; PC_BODY=""; return 1
++  }
++  PC_CODE=$(printf '%s' "$out" | jq -r '.status // empty' 2>/dev/null)
++  PC_BODY=$(printf '%s' "$out" | jq -r '.body // empty' 2>/dev/null)
+   [[ "$PC_CODE" =~ ^[0-9]{3}$ ]] || { PC_CODE="000"; PC_BODY=""; }
+   [[ "$PC_CODE" == 2* ]]
+ }
+@@ -163,7 +156,7 @@
+ 
+ notify_pixel_failure() {  # $1=origin_sha  $2=markdown-детали (лог); зовётся только на сбой КОДА
+   local sha="$1" details="$2" sha7="${1:0:7}" st
+-  pc_env || { log "Pixel UI notify: нет сервис-ключа $CRON_TOKEN_FILE -> фолбэк TG"; return 1; }
++  pc_env || { log "Pixel UI notify: нет сервис-ключа $CRON_SOCKET -> фолбэк TG"; return 1; }
+   if state_read; then
+     pc_call GET "/api/issues/$ST_ID"
+     st=$(pc_status)
+@@ -226,7 +219,7 @@
+     return 0
+   fi
+   [ "$ST_SRC" = "$PIXEL_STATE" ] || log "Pixel UI recovered: основной state отсутствует или битый, $ST_IDENT взят из копии $ST_SRC"
+-  pc_env || { log "Pixel UI recovered: нет сервис-ключа $CRON_TOKEN_FILE -> $ST_IDENT не закрыт, state оставлен"; return 1; }
++  pc_env || { log "Pixel UI recovered: нет сервис-ключа $CRON_SOCKET -> $ST_IDENT не закрыт, state оставлен"; return 1; }
+   pc_call GET "/api/issues/$ST_ID"
+   st=$(pc_status)
+   case "$PC_CODE" in

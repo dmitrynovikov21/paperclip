@@ -13,7 +13,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { agentApiKeyScopeSchema, isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
@@ -337,6 +337,14 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    // A future/unknown scope must never silently become a standard key on an
+    // older server during rolling upgrades. Only legacy NULL means standard.
+    const parsedScope = agentApiKeyScopeSchema.safeParse(key.scopeConfig ?? { kind: "standard" });
+    if (!parsedScope.success) {
+      next(forbidden("Agent API key has an invalid scope"));
+      return;
+    }
+
     await db
       .update(agentApiKeys)
       .set({ lastUsedAt: new Date() })
@@ -373,7 +381,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope: parsedScope.data,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,

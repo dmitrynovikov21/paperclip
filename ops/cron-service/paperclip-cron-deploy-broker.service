@@ -1,0 +1,26 @@
+[Unit]
+Description=Scoped Paperclip API broker for frontend deploy cron
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pc-cron-deploy
+Group=paperclip-user
+Environment=CRON_SERVICE_SOCKET=/run/paperclip-cron-deploy/api.sock
+Environment=CRON_SERVICE_TOKEN_FILE=/etc/paperclip-cron/deploy-frontend.token
+EnvironmentFile=/etc/paperclip-cron/deploy.env
+RuntimeDirectory=paperclip-cron-deploy
+RuntimeDirectoryMode=0750
+WorkingDirectory=/opt/paperclip-cron
+ExecStart=/usr/bin/python3 /opt/paperclip-cron/api_broker.py
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/paperclip-cron-deploy
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1883,6 +1883,19 @@ export function authorizationService(db: Db | DbTransaction) {
       if (skillTestDecision) return skillTestDecision;
     }
 
+    if (input.actor.keyScope?.kind === "host_watcher") {
+      // The HTTP guard checks the exact method, path, body and target row.
+      // This branch only supplies the route-level actions that those requests
+      // need; a run-scoped JWT cannot inherit a host key's authority.
+      const action = input.action;
+      const issueAction = action === "issue:read" || action === "issue:comment" || action === "issue:mutate";
+      const fleetCreateAction = input.actor.keyScope.service === "fleet_hourly"
+        && (action === "company_scope:read" || action === "tasks:assign");
+      return input.actor.source === "agent_key" && (issueAction || fleetCreateAction)
+        ? allow({ action, reason: "allow_explicit_grant", explanation: "Allowed by the scoped host watcher key." })
+        : deny({ action, reason: "deny_scope", explanation: "Action is outside the host watcher key scope." });
+    }
+
     if (input.actor.keyScope?.kind === "task_bridge") {
       const keyId = input.actor.keyId ?? null;
       if (!keyId) {

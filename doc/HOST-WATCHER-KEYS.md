@@ -1,0 +1,35 @@
+# Host watcher API keys
+
+The board issues a `host_watcher` key through `POST /api/agents/:id/keys`. Each
+service identity may have exactly one active API key. The service cannot create
+or edit its own key or scope. Revoke the old key before issuing a replacement.
+
+Every request must use that API key, match the key's company, and pass both the
+HTTP scope guard and the ordinary route checks. An agent run JWT, even with a
+`host_watcher` claim, cannot use these operations. The target UUIDs and
+assignee UUIDs are configured by the board at issuance; the example contract
+fixtures live in `server/src/__tests__/host-watcher-key-routes.integration.test.ts`.
+
+| `service` | Allowed routes and bodies | Row conditions |
+| --- | --- | --- |
+| `disk_guard` | `PATCH /api/issues/{issueId}` with exactly `{status:"todo",comment}` | Fixed issue in key's company, fixed assignee, nonterminal status, comment 1–4,000 chars. |
+| `pr_923` | `GET /api/issues/{issueId}`; `POST /api/issues/{issueId}/comments` with exactly `{body}`; `PATCH /api/issues/{issueId}` with exactly `{status:"todo",comment}` | Fixed issue and assignee; PATCH only from `blocked`; writes reject `in_review` and terminal issues. Comment 1–16,000 chars. |
+| `be_1198`, `fe_1042` | Same read/comment routes; PATCH body has `status:"in_progress"` | Same row conditions as `pr_923`. |
+| `fleet_hourly` | `POST /api/issues/{issueId}/comments` with exactly `{body}`; `POST /api/companies/{companyId}/issues` with exactly `{title,description,status:"todo",priority:"high",assigneeAgentId,parentId}` | Comment goes only to the fixed parent in the fixed project. Create requires the fixed parent and assignee, a bounded `[watch][hourly] ` title and description, and no other open work order from that service identity. |
+
+The fleet order's `originKind` and `originId` are set by the server to
+`host_watcher` and the service agent UUID. A partial unique index prevents two
+open orders from the same service identity, including concurrent requests and
+key rotation. The key can create another order after the prior order is closed.
+
+Any other method, path, query string, body field, target, assignee or company
+is denied. The service cannot call an HTTP proxy or arbitrary control-plane
+route. The separate `cron_service` scope used by the agent watchdog, quota
+rewake and frontend deploy services remains a distinct contract.
+
+Run the focused verification with:
+
+```sh
+pnpm exec vitest run server/src/__tests__/host-watcher-key-routes.integration.test.ts server/src/__tests__/agent-auth-middleware.test.ts
+pnpm exec tsc --noEmit -p server/tsconfig.json
+```

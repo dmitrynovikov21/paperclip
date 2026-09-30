@@ -92,6 +92,7 @@ import type {
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
+  HostWatcherAgentKeyScope,
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
@@ -10569,6 +10570,7 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        hostWatcherScope?: HostWatcherAgentKeyScope;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10616,6 +10618,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        hostWatcherScope,
         ...issueData
       } = data;
       if (
@@ -10887,6 +10890,21 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (hostWatcherScope) {
+          const isDiskGuard = hostWatcherScope.service === "disk_guard";
+          const expectedStatus = isDiskGuard ? "todo"
+            : hostWatcherScope.service === "pr_923" ? "todo" : "in_progress";
+          if (!companyGuard || receiptExisting.companyId !== companyGuard
+            || receiptExisting.id !== hostWatcherScope.issueId
+            || receiptExisting.assigneeAgentId !== hostWatcherScope.assigneeAgentId
+            || hostWatcherScope.service === "fleet_hourly"
+            || issueData.status !== expectedStatus
+            || (isDiskGuard
+              ? ["done", "cancelled", "in_review"].includes(receiptExisting.status)
+              : receiptExisting.status !== "blocked")) {
+            throw conflict("Host watcher target changed before the issue update");
+          }
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

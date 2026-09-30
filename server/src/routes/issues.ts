@@ -8761,6 +8761,12 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    // The full issue view embeds ancestor, relation, project, and document
+    // content. A host watcher may read only its pinned issue row.
+    if (isHostWatcherKeyActor(req)) {
+      res.json(issue);
+      return;
+    }
     const inboxArchiveFieldsPromise =
       req.actor.type === "board" && req.actor.userId
         ? svc.getActiveInboxArchiveFields(issue, req.actor.userId)

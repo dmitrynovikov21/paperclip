@@ -158,6 +158,27 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       .send({ status, comment: "repeat" })).status).toBe(403);
   });
 
+  it("does not embed ancestor content in the fixed issue read", async () => {
+    const parentId = randomUUID();
+    await db.insert(issues).values({
+      id: parentId, companyId, issueNumber: 998, identifier: "HWT-998",
+      title: "Private ancestor", description: "Private ancestor content", status: "backlog",
+    });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, targets.pr923.issueId));
+    try {
+      const result = await request(app).get(`/api/issues/${targets.pr923.issueId}`)
+        .set("Authorization", auth("pr923"));
+      expect(result.status).toBe(200);
+      expect(result.body).toMatchObject({ id: targets.pr923.issueId });
+      expect(result.body).not.toHaveProperty("ancestors");
+      expect(result.body).not.toHaveProperty("relatedWork");
+      expect(JSON.stringify(result.body)).not.toContain("Private ancestor content");
+    } finally {
+      await db.update(issues).set({ parentId: null }).where(eq(issues.id, targets.pr923.issueId));
+      await db.delete(issues).where(eq(issues.id, parentId));
+    }
+  });
+
   it("fleet can comment on its parent and create one bounded work order", async () => {
     const parentUrl = `/api/issues/${targets.fleet.issueId}`;
     expect((await request(app).post(`${parentUrl}/comments`).set("Authorization", auth("fleet"))
@@ -196,6 +217,10 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       parentId: targets.fleet.issueId, projectId: fleetProjectId,
       assigneeAgentId: targets.fleet.assigneeAgentId,
     })).rejects.toThrow();
+    await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, order!.id));
+    const replacement = await request(app).post(path).set("Authorization", auth("fleet"))
+      .send({ ...body, title: "[watch][hourly] replacement after board hide" });
+    expect(replacement.status, JSON.stringify(replacement.body)).toBe(201);
     expect((await request(app).patch(parentUrl).set("Authorization", auth("fleet"))
       .send({ status: "done" })).status).toBe(403);
   });

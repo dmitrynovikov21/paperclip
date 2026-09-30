@@ -5,7 +5,8 @@ service identity may have exactly one active API key. The service cannot create
 or edit its own key or scope. Revoke the old key before issuing a replacement.
 
 Every request must use that API key, match the key's company, and pass both the
-HTTP scope guard and the ordinary route checks. An agent run JWT, even with a
+HTTP scope guard and the ordinary route checks. A GET returns only the pinned
+issue row, without expanded ancestors, related work, or documents. An agent run JWT, even with a
 `host_watcher` claim, cannot use these operations. The target UUIDs and
 assignee UUIDs are configured by the board at issuance; the example contract
 fixtures live in `server/src/__tests__/host-watcher-key-routes.integration.test.ts`.
@@ -19,8 +20,8 @@ fixtures live in `server/src/__tests__/host-watcher-key-routes.integration.test.
 
 The fleet order's `originKind` and `originId` are set by the server to
 `host_watcher` and the service agent UUID. A partial unique index prevents two
-open orders from the same service identity, including concurrent requests and
-key rotation. The key can create another order after the prior order is closed.
+visible open orders from the same service identity, including concurrent requests and
+key rotation. The key can create another order after the prior order is closed or hidden by the board.
 
 Any other method, path, query string, body field, target, assignee or company
 is denied. The service cannot call an HTTP proxy or arbitrary control-plane

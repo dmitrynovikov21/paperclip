@@ -1,5 +1,5 @@
 import type { RequestHandler } from "express";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
 
@@ -117,6 +117,7 @@ export function hostWatcherKeyGuard(db: Db): RequestHandler {
           eq(issues.companyId, actor.companyId!),
           eq(issues.originKind, "host_watcher"),
           eq(issues.originId, serviceAgentId),
+          isNull(issues.hiddenAt),
           inArray(issues.status, OPEN_STATUSES),
         )).limit(1).then((rows) => rows.length > 0));
       if (!allowed) {

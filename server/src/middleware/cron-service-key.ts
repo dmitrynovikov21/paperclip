@@ -72,7 +72,9 @@ export async function hostWatcherRequestAllowed(
   }
 
   if (issue.assigneeAgentId !== scope.assigneeAgentId) return false;
-  if (scope.service !== "disk_guard" && request.method === "GET" && !issuePath?.[2]) return true;
+  if (scope.service !== "disk_guard" && request.method === "GET" && !issuePath?.[2]) {
+    return request.body === undefined || request.body === null;
+  }
   if (issue.status === "done" || issue.status === "cancelled" || issue.status === "in_review") return false;
 
   if (scope.service !== "disk_guard" && request.method === "POST" && issuePath?.[2] === "/comments") {

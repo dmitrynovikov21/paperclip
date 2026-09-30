@@ -139,6 +139,8 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
   ] as const)("%s can read/comment and perform only its blocked transition", async (name, issueId, status) => {
     const url = `/api/issues/${issueId}`;
     expect((await request(app).get(url).set("Authorization", auth(name))).status).toBe(200);
+    expect((await request(app).get(url).set("Authorization", auth(name))
+      .send({ unrelated: true })).status).toBe(403);
     expect((await request(app).post(`${url}/comments`).set("Authorization", auth(name))
       .send({ body: "Fixed PR watcher observation" })).status).toBe(201);
     expect((await request(app).patch(url).set("Authorization", auth(name))

@@ -1884,14 +1884,27 @@ export function authorizationService(db: Db | DbTransaction) {
     }
 
     if (input.actor.keyScope?.kind === "host_watcher") {
-      // The HTTP guard checks the exact method, path, body and target row.
-      // This branch only supplies the route-level actions that those requests
-      // need; a run-scoped JWT cannot inherit a host key's authority.
+      // Keep the service-level resource boundary as narrow as the HTTP guard.
+      // The guard also checks the exact method, path, body and current row.
       const action = input.action;
+      const scope = input.actor.keyScope;
       const issueAction = action === "issue:read" || action === "issue:comment" || action === "issue:mutate";
-      const fleetCreateAction = input.actor.keyScope.service === "fleet_hourly"
-        && (action === "company_scope:read" || action === "tasks:assign");
-      return input.actor.source === "agent_key" && (issueAction || fleetCreateAction)
+      const targetMatches = input.resource.type === "issue"
+        && input.resource.issueId === scope.issueId
+        && (scope.service === "fleet_hourly"
+          ? input.resource.projectId === scope.projectId
+          : input.resource.assigneeAgentId === scope.assigneeAgentId);
+      const issueAllowed = issueAction && targetMatches
+        && (scope.service !== "disk_guard" || action === "issue:mutate");
+      const fleetAssignmentAllowed = scope.service === "fleet_hourly"
+        && action === "tasks:assign"
+        && input.resource.type === "issue"
+        && input.resource.parentIssueId === scope.issueId
+        && input.resource.projectId === scope.projectId
+        && input.resource.assigneeAgentId === scope.assigneeAgentId
+        && !input.resource.assigneeUserId;
+      return input.actor.source === "agent_key" && input.actor.keyId
+        && (issueAllowed || fleetAssignmentAllowed)
         ? allow({ action, reason: "allow_explicit_grant", explanation: "Allowed by the scoped host watcher key." })
         : deny({ action, reason: "deny_scope", explanation: "Action is outside the host watcher key scope." });
     }

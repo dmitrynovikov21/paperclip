@@ -145,6 +145,19 @@ describe("onboard", () => {
     expect(fs.existsSync(`${configPath}.backup`)).toBe(false);
   });
 
+  it("onboard leaves no signing key on disk when the env file enables ephemeral mode", async () => {
+    const fixture = createExistingConfigFixture();
+    const envPath = path.join(path.dirname(fixture.configPath), ".env");
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL;
+    fs.writeFileSync(envPath, "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n", { mode: 0o600 });
+
+    await onboard({ config: fixture.configPath, yes: true, invokedByRun: true });
+
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toMatch(/^[0-9a-f]{64}$/);
+    expect(fs.readFileSync(envPath, "utf8")).toBe("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n");
+  });
+
   it("keeps --yes onboarding on local trusted loopback defaults", async () => {
     const configPath = createFreshConfigPath();
     process.env.HOST = "0.0.0.0";

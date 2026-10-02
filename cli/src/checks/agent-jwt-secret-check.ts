@@ -1,5 +1,6 @@
 import {
   ensureAgentJwtSecret,
+  isEphemeralAgentJwtSecretEnabled,
   readAgentJwtSecretFromEnv,
   readAgentJwtSecretFromEnvFile,
   resolveAgentJwtEnvFile,
@@ -7,6 +8,14 @@ import {
 import type { CheckResult } from "./index.js";
 
 export function agentJwtSecretCheck(configPath?: string): CheckResult {
+  if (isEphemeralAgentJwtSecretEnabled(configPath)) {
+    ensureAgentJwtSecret(configPath);
+    return {
+      name: "Agent JWT secret",
+      status: "pass",
+      message: "Ephemeral agent JWT signing secret is held in memory for this process",
+    };
+  }
   if (readAgentJwtSecretFromEnv(configPath)) {
     return {
       name: "Agent JWT secret",

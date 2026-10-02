@@ -50,6 +50,7 @@ import {
   sanitizeWorktreeInstanceId,
 } from "../commands/worktree-lib.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import { readPaperclipEnvEntries } from "../config/env.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -861,7 +862,7 @@ describe("worktree helpers", () => {
     fs.mkdirSync(path.dirname(envPath), { recursive: true });
     fs.writeFileSync(
       envPath,
-      "# keep this comment\nPAPERCLIP_AGENT_JWT_SECRET=synthetic-old-target\nexport PAPERCLIP_AGENT_JWT_SECRET=synthetic-duplicate\nPAPERCLIP_AGENT_JWT_SECRET: synthetic-colon\nPAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n",
+      "\uFEFFPAPERCLIP_AGENT_JWT_SECRET=synthetic-bom-target\n# keep this comment\nPAPERCLIP_AGENT_JWT_SECRET=synthetic-old-target\nexport PAPERCLIP_AGENT_JWT_SECRET=synthetic-duplicate\nPAPERCLIP_AGENT_JWT_SECRET: synthetic-colon\nPAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n",
       { mode: 0o600 },
     );
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
@@ -878,10 +879,53 @@ describe("worktree helpers", () => {
       const envContents = fs.readFileSync(envPath, "utf8");
       expect(envContents).toContain("# keep this comment");
       expect(envContents).toContain("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true");
-      expect(envContents).not.toMatch(/^[ \t]*(?:export[ \t]+)?PAPERCLIP_AGENT_JWT_SECRET(?:[ \t]*=|:[ \t]+)/m);
+      expect(readPaperclipEnvEntries(envPath).PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(envContents).not.toContain("synthetic-bom-target");
       expect(envContents).not.toContain("synthetic-old-target");
       expect(envContents).not.toContain("synthetic-duplicate");
       expect(envContents).not.toContain("synthetic-colon");
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a target-only ephemeral flag when --force replaces the worktree env file", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-force-ephemeral-jwt-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const envPath = path.join(repoRoot, ".paperclip", ".env");
+    const sourceConfigPath = path.join(tempRoot, "source", "config.json");
+    fs.mkdirSync(path.dirname(envPath), { recursive: true });
+    fs.mkdirSync(path.dirname(sourceConfigPath), { recursive: true });
+    fs.writeFileSync(
+      envPath,
+      "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\nPAPERCLIP_AGENT_JWT_SECRET=synthetic-target-sentinel\n",
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(path.dirname(sourceConfigPath), ".env"),
+      "PAPERCLIP_AGENT_JWT_SECRET=synthetic-source-sentinel\n",
+      { mode: 0o600 },
+    );
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL;
+    process.chdir(repoRoot);
+
+    try {
+      await worktreeInitCommand({
+        seed: false,
+        force: true,
+        fromConfig: sourceConfigPath,
+        home: path.join(tempRoot, ".paperclip-worktrees"),
+      });
+
+      const envContents = fs.readFileSync(envPath, "utf8");
+      const envEntries = readPaperclipEnvEntries(envPath);
+      expect(envEntries.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL).toBe("true");
+      expect(envEntries.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(envContents).not.toContain("PAPERCLIP_AGENT_JWT_SECRET=");
+      expect(envContents).not.toContain("synthetic-source-sentinel");
+      expect(envContents).not.toContain("synthetic-target-sentinel");
     } finally {
       process.chdir(ORIGINAL_CWD);
       fs.rmSync(tempRoot, { recursive: true, force: true });

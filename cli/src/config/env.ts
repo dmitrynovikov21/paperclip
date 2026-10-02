@@ -124,7 +124,7 @@ export function removeAgentJwtSecretFromEnvFile(filePath = resolveEnvFilePath())
   if (!fs.existsSync(filePath)) return;
   const previousContents = fs.readFileSync(filePath, "utf8");
   const nextContents = previousContents.replace(
-    /^[ \t]*(?:export[ \t]+)?PAPERCLIP_AGENT_JWT_SECRET(?:[ \t]*=|:[ \t]+)[^\r\n]*(?:\r\n|\n|\r|$)/gm,
+    /^[^\S\r\n]*(?:export[^\S\r\n]+)?PAPERCLIP_AGENT_JWT_SECRET(?:[^\S\r\n]*=|:[^\S\r\n]+)[^\r\n]*(?:\r\n|\n|\r|$)/gm,
     "",
   );
   writeEnvFileAtomicallyIfChanged(filePath, previousContents, nextContents);

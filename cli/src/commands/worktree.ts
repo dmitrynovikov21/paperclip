@@ -1646,6 +1646,7 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     );
   }
 
+  const targetEnvEntries = readPaperclipEnvEntries(paths.envPath);
   if (opts.force) {
     // Only remove the specific files we're about to rewrite, not the whole
     // repoConfigDir — that directory can contain sibling state such as
@@ -1680,7 +1681,6 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     sourceConfigPath,
   });
   const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
-  const targetEnvEntries = readPaperclipEnvEntries(paths.envPath);
   const ephemeralSecret = [
     sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL,
     targetEnvEntries.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL,
@@ -1688,7 +1688,7 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
   ].some(isTruthyEnvFlag);
   if (ephemeralSecret) {
     const nextEntries: Record<string, string> = {
-      ...targetEnvEntries,
+      ...(opts.force ? {} : targetEnvEntries),
       ...buildWorktreeEnvEntries(paths, branding),
       PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL: "true",
     };

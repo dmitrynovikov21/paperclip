@@ -1,3 +1,4 @@
+import "./config/early-inspector-guard.js";
 import { Command } from "commander";
 import { onboard } from "./commands/onboard.js";
 import { doctor } from "./commands/doctor.js";

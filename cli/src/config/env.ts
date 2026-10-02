@@ -9,6 +9,9 @@ import { ensureEphemeralAgentJwtSecret, isTruthyEnvFlag } from "./server-secret-
 const JWT_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET";
 const PAPERCLIP_OWNED_ENV_KEY_PATTERN = /^PAPERCLIP_[A-Z0-9_]+$/;
 const EPHEMERAL_SECRET_ENV_KEY = "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL";
+// Match the assignments accepted by dotenv, including whitespace around the separator
+// and quoted values that span lines. A post-write parse check catches parser drift.
+const DOTENV_ASSIGNMENT_PATTERN = /^[^\S\r\n]*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?[^\S\r\n]*(?:#[^\r\n]*)?(?:\r\n|\n|\r|$)/gm;
 function resolveEnvFilePath(configPath?: string) {
   return path.resolve(path.dirname(resolveConfigPath(configPath)), ".env");
 }
@@ -123,11 +126,16 @@ export function writePaperclipEnvEntries(entries: Record<string, string>, filePa
 export function removeAgentJwtSecretFromEnvFile(filePath = resolveEnvFilePath()): void {
   if (!fs.existsSync(filePath)) return;
   const previousContents = fs.readFileSync(filePath, "utf8");
-  const nextContents = previousContents.replace(
-    /^[^\S\r\n]*(?:export[^\S\r\n]+)?PAPERCLIP_AGENT_JWT_SECRET(?:[^\S\r\n]*=|:[^\S\r\n]+)[^\r\n]*(?:\r\n|\n|\r|$)/gm,
-    "",
+  const nextContents = previousContents.replace(DOTENV_ASSIGNMENT_PATTERN, (match, key: string) =>
+    key === JWT_SECRET_ENV_KEY ? "" : match,
   );
+  if (Object.hasOwn(parseEnvFile(nextContents), JWT_SECRET_ENV_KEY)) {
+    throw new Error("Cannot remove agent JWT signing secret from env file");
+  }
   writeEnvFileAtomicallyIfChanged(filePath, previousContents, nextContents);
+  if (Object.hasOwn(readPaperclipEnvEntries(filePath), JWT_SECRET_ENV_KEY)) {
+    throw new Error("Agent JWT signing secret remains in env file after removal");
+  }
 }
 
 export function mergePaperclipEnvEntries(

@@ -1695,6 +1695,9 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
     delete nextEntries.PAPERCLIP_AGENT_JWT_SECRET;
     removeAgentJwtSecretFromEnvFile(paths.envPath);
     writePaperclipEnvEntries(nextEntries, paths.envPath);
+    if (Object.hasOwn(readPaperclipEnvEntries(paths.envPath), "PAPERCLIP_AGENT_JWT_SECRET")) {
+      throw new Error("Agent JWT signing secret remains in worktree env file in ephemeral mode");
+    }
     process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL = "true";
   } else {
     const existingAgentJwtSecret =

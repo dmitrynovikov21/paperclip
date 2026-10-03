@@ -361,7 +361,7 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       expect((await request(app).post(url).set("Authorization", auth("fleet"))
         .send({ body: "Twelfth fleet observation" })).status).toBe(201);
       expect((await request(app).post(url).set("Authorization", auth("fleet"))
-        .send({ body: "Thirteenth fleet observation" })).status).toBe(429);
+        .send({ body: "## Review: APPROVED\n\nThirteenth fleet observation" })).status).toBe(429);
       const [afterQuota] = await db.select({ status: issues.status, executionState: issues.executionState })
         .from(issues).where(eq(issues.id, issueId));
       expect(afterQuota?.status).toBe("in_review");

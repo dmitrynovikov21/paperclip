@@ -237,6 +237,18 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
 }
 
+// Mirrors parseHeartbeatPolicy(agent).wakeOnDemand in heartbeat.ts: the first non-null of
+// wakeOnDemand/wakeOnAssignment/wakeOnOnDemand/wakeOnAutomation, and only a real boolean
+// false disables. heartbeat.wakeup() skips every non-timer wake of such an agent
+// ("heartbeat.wakeOnDemand.disabled"), so a recovery wake can never reach it.
+function isOnDemandWakeDisabled(agent: Pick<typeof agents.$inferSelect, "runtimeConfig">) {
+  const heartbeat = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+  return !asBoolean(
+    heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation,
+    true,
+  );
+}
+
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "codex_transient_upstream",
@@ -2186,6 +2198,10 @@ export function recoveryService(db: Db, deps: {
       ) {
         continue;
       }
+      // Unlike managerRecovery this is not a routing preference: the owner would never get
+      // the recovery wake. The assignee is skipped too, so with no wakeable candidate left
+      // the action escalates to the board instead of parking on an agent that cannot wake.
+      if (isOnDemandWakeDisabled(candidate)) continue;
       const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
@@ -2765,7 +2781,7 @@ export function recoveryService(db: Db, deps: {
       : [
         "",
         `- Recovery action: \`${recoveryAction.id}\``,
-        "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
+        "- Recovery owner: board escalation, because Paperclip could not find an invokable, wakeable manager, creator, executive, or assignee owner with budget available.",
         "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
       ].join("\n");
 

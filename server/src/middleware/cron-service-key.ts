@@ -4,6 +4,8 @@ import { issueComments, issues, type Db } from "@paperclipai/db";
 import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
 import { conflict, tooManyRequests } from "../errors.js";
 
+export { cronServiceKeyGuard, cronServiceRequestAllowed } from "./cron-service-scope.js";
+
 type WatchedIssue = {
   companyId: string;
   status: string;

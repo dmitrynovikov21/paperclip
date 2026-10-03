@@ -1950,6 +1950,24 @@ export function authorizationService(db: Db | DbTransaction) {
         : deny({ action, reason: "deny_scope", explanation: "Action is outside the host watcher key scope." });
     }
 
+    if (input.actor.keyScope?.kind === "cron_service") {
+      const service = input.actor.keyScope.service;
+      const action = input.action;
+      const common = action === "issue:read" || action === "issue:comment"
+        || action === "issue:mutate" || action === "company_scope:read";
+      const watchdog = service === "agent_watchdog" && (
+        action === "agent:read" || action === "agent_config:update" || action === "runtime:manage"
+      );
+      const incident = service !== "agent_watchdog" && action === "tasks:assign";
+      // The HTTP guard checks the exact route, body and issue ownership.
+      // An agent JWT must never inherit these host-only capabilities.
+      const permitted = input.actor.source === "agent_key" && Boolean(input.actor.keyId)
+        && (common || watchdog || incident);
+      return permitted
+        ? allow({ action, reason: "allow_explicit_grant", explanation: "Allowed by the scoped host cron key." })
+        : deny({ action, reason: "deny_scope", explanation: "Action is outside the host cron key scope." });
+    }
+
     if (input.actor.keyScope?.kind === "task_bridge") {
       const keyId = input.actor.keyId ?? null;
       if (!keyId) {

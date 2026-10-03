@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import express from "express";
 import request from "supertest";
 import WebSocket from "ws";
@@ -7,13 +12,14 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentApiKeys, agents, authUsers, companies, companyMemberships, createDb,
-  heartbeatRuns, issueComments, issueExecutionDecisions, issues, projects,
+  heartbeatRuns, issueComments, issueExecutionDecisions, issues, principalPermissionGrants, projects,
 } from "@paperclipai/db";
-import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
+import type { CronServiceAgentKeyScope, HostWatcherAgentKeyScope } from "@paperclipai/shared";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
-import { HOST_WATCHER_COMMENT_LIMIT_PER_HOUR, hostWatcherKeyGuard } from "../middleware/cron-service-key.js";
+import { HOST_WATCHER_COMMENT_LIMIT_PER_HOUR, cronServiceKeyGuard, hostWatcherKeyGuard } from "../middleware/cron-service-key.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { agentService } from "../services/agents.js";
@@ -40,6 +46,8 @@ const supported = await getEmbeddedPostgresTestSupport();
 const describeDb = supported.supported ? describe : describe.skip;
 const companyId = "ac917a45-e6ea-4696-a85c-991147084939";
 const fleetProjectId = "dce756cc-51b5-4ed1-9fed-57596f6b3eb8";
+const watchdogAlarmIssueId = "95f08a55-6b5c-4183-b3de-5f151818607d";
+const watchdogRecoverAgentId = "b98de8dc-9e6e-4f2a-8c19-2202b4720675";
 const targets = {
   disk: { issueId: "f6775544-fb1c-4380-906c-66e4f5fb7028", assigneeAgentId: "5549a5f4-935d-43a5-a90d-d452d77dd1ea" },
   pr923: { issueId: "9118f56f-3e9c-48e1-86b8-dea7488cfe71", assigneeAgentId: "1e95ea6e-1965-4df3-8a3b-4bb26b5231f1" },
@@ -55,8 +63,12 @@ const scopes: Record<string, HostWatcherAgentKeyScope> = {
   fe1042: { kind: "host_watcher", service: "fe_1042", ...targets.fe1042 },
   fleet: { kind: "host_watcher", service: "fleet_hourly", ...targets.fleet, projectId: fleetProjectId },
 };
+const cronScopes: Record<string, CronServiceAgentKeyScope> = {
+  watchdog: { kind: "cron_service", service: "agent_watchdog", alarmIssueIds: [watchdogAlarmIssueId] },
+  quota: { kind: "cron_service", service: "quota_rewake" },
+};
 
-describeDb("host watcher scoped keys on real issue routes and test DB", () => {
+describeDb("seven host service keys on real issue routes and test DB", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let app: express.Express;
@@ -78,8 +90,8 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       status: "active", membershipRole: "owner",
     });
     await db.insert(projects).values({ id: fleetProjectId, companyId, name: "Fleet fixture" });
-    const targetAgentIds = Object.values(targets).map((target) => target.assigneeAgentId);
-    for (const [name, scope] of Object.entries(scopes)) {
+    const targetAgentIds = [...Object.values(targets).map((target) => target.assigneeAgentId), watchdogRecoverAgentId];
+    for (const [name, scope] of Object.entries({ ...scopes, ...cronScopes })) {
       const serviceAgentId = randomUUID();
       serviceAgents[name] = serviceAgentId;
       tokens[name] = `pc_host_fixture_${name}`;
@@ -97,6 +109,10 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       id, companyId, name: `Target ${id.slice(0, 8)}`,
       adapterType: "process", adapterConfig: {}, runtimeConfig: {}, status: "idle" as const,
     })));
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "user", principalId: responsibleUserId,
+      permissionKey: "agents:configure",
+    });
     const fixtureIssues = [targets.disk, targets.pr923, targets.be1198, targets.fe1042, targets.fleet];
     await db.insert(issues).values(fixtureIssues.map((target, index) => ({
       id: target.issueId, companyId, issueNumber: index + 1, identifier: `HWT-${index + 1}`,
@@ -105,10 +121,18 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
       assigneeAgentId: index === 4 ? null : target.assigneeAgentId,
       projectId: index === 4 ? fleetProjectId : null,
     })));
+    await db.insert(issues).values({
+      id: watchdogAlarmIssueId, companyId, issueNumber: 6, identifier: "HWT-6",
+      title: "Fixed watchdog alarm", status: "in_progress",
+      assigneeAgentId: targets.disk.assigneeAgentId,
+      executionPolicy: { mode: "normal", stages: [] },
+    });
     app = express();
     app.use(express.json());
     app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
     app.use(hostWatcherKeyGuard(db));
+    app.use(cronServiceKeyGuard(db));
+    app.use("/api", agentRoutes(db, { deploymentMode: "authenticated" }));
     app.use("/api", issueRoutes(db, {} as never));
     app.use(errorHandler);
   }, 90_000);
@@ -122,6 +146,131 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
   function auth(name: string) {
     return `Bearer ${tokens[name]}`;
   }
+
+  it("watchdog can comment on and rearm its fixed alarm, but cannot touch a foreign issue", async () => {
+    const url = `/api/issues/${watchdogAlarmIssueId}`;
+    const allowedComment = await request(app).post(`${url}/comments`)
+      .set("Authorization", auth("watchdog")).send({ body: "Fixed alarm observation" });
+    expect(allowedComment.status, JSON.stringify(allowedComment.body)).toBe(201);
+    const monitor = {
+      kind: "external_service", serviceName: "paperclip-board", recoveryPolicy: "wake_owner",
+      maxAttempts: 100, nextCheckAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    };
+    const rearmed = await request(app).patch(url).set("Authorization", auth("watchdog"))
+      .send({ executionPolicy: { mode: "normal", stages: [], monitor } });
+    expect(rearmed.status, JSON.stringify(rearmed.body)).toBe(200);
+    expect((await request(app).post(`/api/issues/${targets.disk.issueId}/comments`)
+      .set("Authorization", auth("watchdog")).send({ body: "foreign alarm" })).status).toBe(403);
+    expect((await request(app).get(`/api/agents/${serviceAgents.quota}/keys`)
+      .set("Authorization", auth("watchdog"))).status).toBe(403);
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, watchdogRecoverAgentId));
+    expect((await request(app).get(`/api/companies/${companyId}/agents`)
+      .set("Authorization", auth("watchdog"))).status).toBe(200);
+    const recovered = await request(app).patch(`/api/agents/${watchdogRecoverAgentId}`)
+      .set("Authorization", auth("watchdog")).send({ status: "idle" });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    expect((await request(app).patch(`/api/agents/${watchdogRecoverAgentId}`)
+      .set("Authorization", auth("watchdog")).send({ status: "terminated" })).status).toBe(403);
+  });
+
+  it("quota can create a scoped nudge and cannot act on a foreign issue", async () => {
+    const path = `/api/companies/${companyId}/issues`;
+    const body = {
+      title: "[quota-rewake] fixture: return", description: "quota restored",
+      status: "todo", priority: "high", assigneeAgentId: targets.disk.assigneeAgentId,
+    };
+    const allowed = await request(app).post(path).set("Authorization", auth("quota")).send(body);
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(201);
+    expect((await request(app).post(path).set("Authorization", auth("quota"))
+      .send({ ...body, title: "unrelated order" })).status).toBe(403);
+    expect((await request(app).get(`/api/issues/${targets.disk.issueId}`)
+      .set("Authorization", auth("quota"))).status).toBe(403);
+    expect((await request(app).post(`/api/issues/${targets.disk.issueId}/comments`)
+      .set("Authorization", auth("quota")).send({ body: "foreign comment" })).status).toBe(403);
+  });
+
+  it.skipIf(!process.env.PAPERCLIP_HOST_UID_HTTP_PROBE)("runs seven private UID credentials through real HTTP routes", async () => {
+    const fixtureDir = await mkdtemp(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "hela14382-uid-http-"));
+    const server = createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("UID HTTP fixture has no port");
+    const issue = (id: string) => `/api/issues/${id}`;
+    const foreignIssue = issue(targets.disk.issueId);
+    const names = {
+      "pc-cron-watchdog": "watchdog",
+      "pc-disk-guard": "disk",
+      "pc-watch-12320": "pr923",
+      "pc-watch-12340": "be1198",
+      "pc-watch-12359": "fe1042",
+      "pc-cron-quota": "quota",
+      "pc-fleet-watch": "fleet",
+    } as const;
+    const manifest = {
+      origin: `http://127.0.0.1:${address.port}`,
+      services: {
+        "pc-cron-watchdog": {
+          allowed: { method: "POST", path: `${issue(watchdogAlarmIssueId)}/comments`,
+            body: { body: "UID watchdog observation" }, status: 201 },
+          denied: { method: "POST", path: `${foreignIssue}/comments`,
+            body: { body: "foreign alarm" }, status: 403 },
+        },
+        "pc-disk-guard": {
+          allowed: { method: "PATCH", path: foreignIssue,
+            body: { status: "todo", comment: "UID disk signal" }, status: 200 },
+          denied: { method: "POST", path: `${foreignIssue}/comments`,
+            body: { body: "wrong method" }, status: 403 },
+        },
+        "pc-watch-12320": {
+          allowed: { method: "GET", path: issue(targets.pr923.issueId), status: 200 },
+          denied: { method: "GET", path: foreignIssue, status: 403 },
+        },
+        "pc-watch-12340": {
+          allowed: { method: "GET", path: issue(targets.be1198.issueId), status: 200 },
+          denied: { method: "GET", path: foreignIssue, status: 403 },
+        },
+        "pc-watch-12359": {
+          allowed: { method: "GET", path: issue(targets.fe1042.issueId), status: 200 },
+          denied: { method: "GET", path: foreignIssue, status: 403 },
+        },
+        "pc-cron-quota": {
+          allowed: { method: "POST", path: `/api/companies/${companyId}/issues`,
+            body: { title: "[quota-rewake] UID fixture: return", description: "quota restored",
+              status: "todo", priority: "high", assigneeAgentId: targets.disk.assigneeAgentId }, status: 201 },
+          denied: { method: "GET", path: foreignIssue, status: 403 },
+        },
+        "pc-fleet-watch": {
+          allowed: { method: "POST", path: `${issue(targets.fleet.issueId)}/comments`,
+            body: { body: "UID fleet observation" }, status: 201 },
+          denied: { method: "GET", path: issue(targets.fleet.issueId), status: 403 },
+        },
+      },
+      agentDenied: { method: "GET", path: foreignIssue, status: 401 },
+    };
+    const packageDir = join(process.cwd(), "ops/cron-service/board-watchers");
+    try {
+      for (const [uid, name] of Object.entries(names)) {
+        await writeFile(join(fixtureDir, `${uid}.token`), `${tokens[name]}\n`, { mode: 0o600 });
+      }
+      await writeFile(join(fixtureDir, "manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+      const { stdout } = await promisify(execFile)("docker", [
+        "run", "--rm", "--network", "host",
+        "--mount", `type=bind,src=${packageDir},dst=/package,readonly`,
+        "--mount", `type=bind,src=${fixtureDir},dst=/root/fixture,readonly`,
+        "python:3.12-alpine", "sh", "-c",
+        "mkdir -p /opt/paperclip-cron && cp /package/probe_uid_fixture.py /package/service_http.py /package/verify_boundary.py /opt/paperclip-cron/ && exec python3 /opt/paperclip-cron/probe_uid_fixture.py /root/fixture",
+      ], { timeout: 90_000 });
+      for (const [uid, action] of Object.entries(manifest.services)) {
+        expect(stdout).toContain(`${uid}: allowed=${action.allowed.status} denied=${action.denied.status}`);
+      }
+      expect(stdout).toContain("uid1000: denied=401");
+      expect(stdout).toContain("42 cross-source reads denied");
+    } finally {
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, targets.disk.issueId));
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await rm(fixtureDir, { recursive: true, force: true });
+    }
+  }, 90_000);
 
   it("keeps host watcher keys out of company-wide WebSocket events", async () => {
     const standardAgentId = randomUUID();
@@ -167,6 +316,7 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     try {
       expect(await rejectedStatus(url, { Authorization: auth("disk") })).toBe(403);
       expect(await rejectedStatus(`${url}?token=${encodeURIComponent(tokens.fleet!)}`)).toBe(403);
+      expect(await rejectedStatus(url, { Authorization: auth("watchdog") })).toBe(403);
       expect(await rejectedStatus(url, { Authorization: `Bearer ${unsupportedToken}` })).toBe(403);
 
       standardSocket = new WebSocket(url, { headers: { Authorization: `Bearer ${standardToken}` } });
@@ -312,6 +462,12 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     await expect(agentService(db).createApiKey(diskAgentId, "broad key", { kind: "standard" }, {
       responsibleUserId,
     })).rejects.toThrow("exactly one active API key");
+    await expect(agentService(db).createApiKey(serviceAgents.watchdog!, "broad cron companion", { kind: "standard" }, {
+      responsibleUserId,
+    })).rejects.toThrow("exactly one active API key");
+    await expect(agentService(db).createApiKey(serviceAgents.quota!, "second cron key", cronScopes.quota!, {
+      responsibleUserId,
+    })).rejects.toThrow("exactly one active API key");
     await expect(db.insert(agentApiKeys).values({
       companyId, agentId: diskAgentId, name: "concurrent key",
       keyHash: createHash("sha256").update("second-test-only-key").digest("hex"),
@@ -364,6 +520,23 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     expect((await request(app).patch(`/api/issues/${targets.pr923.issueId}`)
       .set("Authorization", `Bearer ${forgedScope}`)
       .send({ status: "todo", comment: "JWT cannot use host scope" })).status).toBe(403);
+
+    const cronRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: cronRunId, companyId, agentId: serviceAgents.watchdog!, status: "running", contextSnapshot: {},
+      responsibleUserId,
+    });
+    const ordinaryCron = createLocalAgentJwt(serviceAgents.watchdog!, companyId,
+      "process", cronRunId, responsibleUserId);
+    expect(ordinaryCron).toBeTruthy();
+    expect((await request(app).get(`/api/issues/${watchdogAlarmIssueId}`)
+      .set("Authorization", `Bearer ${ordinaryCron}`)).status).toBe(200);
+    const forgedCronScope = createLocalAgentJwt(serviceAgents.watchdog!, companyId,
+      "process", cronRunId, responsibleUserId, cronScopes.watchdog);
+    expect(forgedCronScope).toBeTruthy();
+    expect((await request(app).post(`/api/issues/${watchdogAlarmIssueId}/comments`)
+      .set("Authorization", `Bearer ${forgedCronScope}`)
+      .send({ body: "JWT cannot use cron scope" })).status).toBe(403);
   });
 
   async function seedCommentsToOneBelowLimit(name: string, issueId: string) {
@@ -465,4 +638,72 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     const [signal] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
     expect(signal?.status).toBe("blocked");
   });
+
+  it.skipIf(!process.env.PAPERCLIP_HOST_PACKAGE)("accepts the staged host Python transport with five distinct fixture keys", async () => {
+    const hostPackage = process.env.PAPERCLIP_HOST_PACKAGE;
+    if (!hostPackage) throw new Error("PAPERCLIP_HOST_PACKAGE must point to the staged board-watchers package");
+    const temporarySources = await mkdtemp(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "hela13399-api-"));
+    const tokenFile = join(temporarySources, "service.token");
+    const server = createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("host fixture has no port");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const runPython = promisify(execFile);
+    const program = `import json,sys,urllib.error
+from service_http import request
+try:
+    request(sys.argv[1], sys.argv[2], json.loads(sys.argv[3]))
+    print(200)
+except urllib.error.HTTPError as error:
+    print(error.code)
+`;
+    async function call(method: string, path: string, body: unknown = null) {
+      const { stdout } = await runPython("python3", ["-c", program, method, path, JSON.stringify(body)], {
+        timeout: 15_000,
+        env: { ...process.env, PYTHONPATH: hostPackage, PAPERCLIP_API_URL: origin, PAPERCLIP_TOKEN_FILE: tokenFile },
+      });
+      return Number(stdout.trim());
+    }
+    try {
+      for (const [name, scope] of Object.entries(scopes)) {
+        const serviceId = randomUUID();
+        const token = `pc_host_transport_fixture_${name}`;
+        await db.insert(agents).values({
+          id: serviceId, companyId, name: `Transport ${name}`,
+          adapterType: "process", adapterConfig: {}, runtimeConfig: {}, status: "idle",
+        });
+        await db.insert(agentApiKeys).values({
+          agentId: serviceId, companyId, name: `transport ${name}`,
+          keyHash: createHash("sha256").update(token).digest("hex"),
+          responsibleUserId, scopeConfig: scope,
+        });
+        await writeFile(tokenFile, `${token}\n`, { mode: 0o600 });
+        if (name === "disk") {
+          await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, targets.disk.issueId));
+          expect(await call("PATCH", `/api/issues/${targets.disk.issueId}`,
+            { status: "todo", comment: "Host disk escalation fixture" })).toBe(200);
+          expect(await call("POST", `/api/issues/${targets.disk.issueId}/comments`,
+            { body: "Routine note is local only" })).toBe(403);
+        } else if (name === "fleet") {
+          await db.update(issues).set({ status: "backlog", assigneeAgentId: null })
+            .where(eq(issues.id, targets.fleet.issueId));
+          expect(await call("POST", `/api/issues/${targets.fleet.issueId}/comments`,
+            { body: "Host fleet observation fixture" })).toBe(200);
+          expect(await call("GET", `/api/issues/${targets.fleet.issueId}`)).toBe(403);
+        } else {
+          const target = name === "pr923" ? targets.pr923 : name === "be1198" ? targets.be1198 : targets.fe1042;
+          const resume = name === "pr923" ? "todo" : "in_progress";
+          await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, target.issueId));
+          expect(await call("GET", `/api/issues/${target.issueId}`)).toBe(200);
+          expect(await call("PATCH", `/api/issues/${target.issueId}`,
+            { status: resume, comment: `Host ${name} wake fixture` })).toBe(200);
+          expect(await call("GET", `/api/issues/${targets.disk.issueId}`)).toBe(403);
+        }
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await rm(temporarySources, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

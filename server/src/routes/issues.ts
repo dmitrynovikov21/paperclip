@@ -2207,6 +2207,9 @@ async function assertCanManageIssueMonitor(
     req.actor.agentId === assigneeAgentId
   )
     return;
+  if (req.actor.type === "agent" && req.actor.source === "agent_key" && req.actor.keyId
+    && req.actor.keyScope?.kind === "cron_service"
+    && req.actor.keyScope.service === "agent_watchdog") return;
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
   );
@@ -3774,6 +3777,10 @@ export function issueRoutes(
     // Host keys have no heartbeat run. Their exact operation and target are
     // bounded by hostWatcherKeyGuard before a route reaches this check.
     if (isHostWatcherKeyActor(req)) return true;
+    // The host cron key's route, body and issue boundary was already checked
+    // by cronServiceKeyGuard before this assignee ownership shortcut.
+    if (req.actor.source === "agent_key" && req.actor.keyId
+      && req.actor.keyScope?.kind === "cron_service") return true;
     if (req.actor.type !== "agent") return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
@@ -5263,6 +5270,10 @@ export function issueRoutes(
       return false;
     }
     if (isHostWatcherKeyActor(req)) return true;
+    // The cron guard checked the exact method, body and issue before this
+    // assignee run lock. Host service keys have no heartbeat run of their own.
+    if (req.actor.source === "agent_key" && req.actor.keyId
+      && req.actor.keyScope?.kind === "cron_service") return true;
     // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
     // watched subtree. This must be evaluated before the base assignee-ownership
     // boundary below: that boundary denies an agent mutating an issue owned by a

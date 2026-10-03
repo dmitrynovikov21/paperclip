@@ -1247,9 +1247,10 @@ export function agentService(db: Db) {
         if (existing.status === "terminated") throw conflict("Cannot create keys for terminated agents");
         const activeKeys = await tx.select({ scopeConfig: agentApiKeys.scopeConfig })
           .from(agentApiKeys).where(and(eq(agentApiKeys.agentId, id), isNull(agentApiKeys.revokedAt)));
-        const hasHostKey = activeKeys.some((row) => row.scopeConfig?.kind === "host_watcher");
-        if ((scope.kind === "host_watcher" && activeKeys.length > 0) || hasHostKey) {
-          throw conflict("Host watcher identities require exactly one active API key");
+        const isHostScope = (kind: string | undefined) => kind === "host_watcher" || kind === "cron_service";
+        const hasHostKey = activeKeys.some((row) => isHostScope(row.scopeConfig?.kind));
+        if ((isHostScope(scope.kind) && activeKeys.length > 0) || hasHostKey) {
+          throw conflict("Host service identities require exactly one active API key");
         }
         return tx.insert(agentApiKeys).values({
           agentId: id,

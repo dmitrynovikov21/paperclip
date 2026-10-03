@@ -39,7 +39,7 @@ delegated; it cannot read the reporter key or choose another issue/API path.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are
 healthy. If a critical farm sweep leaves the volume below its threshold, its
 second alarm uses the reporter's fixed escalation action. A successful alarm
-sets a two-hour cooldown in the agent-side disk state directory.
+sets a two-hour cooldown for that volume in the agent-side disk state directory.
 
 On 03.10.2026 the uid-1000 crontab has no active row for any of the three PR
 watchers. PR #1198's old source path is absent; PR #1042's source is in
@@ -69,6 +69,7 @@ bash ops/cron-service/prepare-host.sh --check
 bash ops/cron-service/board-watchers/prepare-host.sh --check
 python3 -m unittest discover -s ops/cron-service/board-watchers -p 'test_*.py' -v
 bash ops/cron-service/board-watchers/probe_uid_boundary.sh
+bash ops/cron-service/board-watchers/probe_disk_wrapper.sh
 systemd-analyze verify ops/cron-service/board-watchers/*.service \
   ops/cron-service/board-watchers/*.timer ops/cron-service/board-watchers/*.socket
 PAPERCLIP_TEST_POSTGRES_RESERVED_PORTS=5432,54330 \

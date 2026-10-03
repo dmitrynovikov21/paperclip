@@ -185,7 +185,10 @@ log "tier=$TIER done: ${FREE_GB}G -> ${AFTER:-?}G (tightest GC-root volume)"
 # that stretch was missing.
 if [ "$TIER" = CRITICAL ] && [ -n "$AFTER" ] && [ "$AFTER" -lt "$CRIT_GB" ]; then
   log "STILL CRITICAL after full sweep (${AFTER}G) — farm GC has no headroom left to reclaim"
-  alarm_state=/home/paperclip-user/.disk-guard-state/last-critical-farm-alarm
+  # Keep separate cooldowns for distinct farm volumes: pressure on sdb must
+  # not be hidden by a recent root-volume alarm (or the reverse).
+  volume_key=$(printf '%s' "$TIGHTEST" | sha256sum | cut -c1-64)
+  alarm_state=/home/paperclip-user/.disk-guard-state/last-critical-farm-alarm-$volume_key
   alarm_gap_s=7200
   last_alarm=$(cat "$alarm_state" 2>/dev/null || true)
   now_epoch=$(date +%s)

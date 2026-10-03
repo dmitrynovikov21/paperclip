@@ -1,16 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentApiKeys, agents, authUsers, companies, companyMemberships, createDb,
-  heartbeatRuns, issues, projects,
+  heartbeatRuns, issueComments, issues, projects,
 } from "@paperclipai/db";
 import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
-import { hostWatcherKeyGuard } from "../middleware/cron-service-key.js";
+import { HOST_WATCHER_COMMENT_LIMIT_PER_HOUR, hostWatcherKeyGuard } from "../middleware/cron-service-key.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentService } from "../services/agents.js";
@@ -285,5 +285,55 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     expect((await request(app).patch(`/api/issues/${targets.pr923.issueId}`)
       .set("Authorization", `Bearer ${forgedScope}`)
       .send({ status: "todo", comment: "JWT cannot use host scope" })).status).toBe(403);
+  });
+
+  async function seedCommentsToOneBelowLimit(name: string, issueId: string) {
+    const existing = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId),
+      eq(issueComments.issueId, issueId),
+      eq(issueComments.authorAgentId, serviceAgents[name]!),
+    ));
+    const needed = HOST_WATCHER_COMMENT_LIMIT_PER_HOUR - 1 - existing.length;
+    expect(needed).toBeGreaterThanOrEqual(0);
+    if (needed > 0) await db.insert(issueComments).values(Array.from({ length: needed }, (_, index) => ({
+      companyId, issueId, authorAgentId: serviceAgents[name]!,
+      authorType: "agent" as const, body: `Prior watcher observation ${index}`,
+    })));
+  }
+
+  it("atomically caps repeated and concurrent comment requests from one service key", async () => {
+    const issueId = targets.pr923.issueId;
+    await seedCommentsToOneBelowLimit("pr923", issueId);
+    const url = `/api/issues/${issueId}/comments`;
+    const responses = await Promise.all([
+      request(app).post(url).set("Authorization", auth("pr923")).send({ body: "Concurrent watcher A" }),
+      request(app).post(url).set("Authorization", auth("pr923")).send({ body: "Concurrent watcher B" }),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([201, 429]);
+    expect((await request(app).post(url).set("Authorization", auth("pr923"))
+      .send({ body: "Repeated watcher message" })).status).toBe(429);
+    const persisted = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId),
+      eq(issueComments.issueId, issueId),
+      eq(issueComments.authorAgentId, serviceAgents.pr923!),
+    ));
+    expect(persisted).toHaveLength(HOST_WATCHER_COMMENT_LIMIT_PER_HOUR);
+    await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, persisted[0]!.id));
+    expect((await request(app).post(url).set("Authorization", auth("pr923"))
+      .send({ body: "Deleted comment cannot reset quota" })).status).toBe(429);
+  });
+
+  it("caps PATCH comments and rolls back the signal status when quota is exhausted", async () => {
+    const issueId = targets.disk.issueId;
+    await seedCommentsToOneBelowLimit("disk", issueId);
+    const url = `/api/issues/${issueId}`;
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    expect((await request(app).patch(url).set("Authorization", auth("disk"))
+      .send({ status: "todo", comment: "Last permitted disk signal" })).status).toBe(200);
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    expect((await request(app).patch(url).set("Authorization", auth("disk"))
+      .send({ status: "todo", comment: "Disk signal over quota" })).status).toBe(429);
+    const [signal] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(signal?.status).toBe("blocked");
   });
 });

@@ -1,7 +1,8 @@
 import type { RequestHandler } from "express";
-import { and, eq, inArray, isNull } from "drizzle-orm";
-import { issues, type Db } from "@paperclipai/db";
+import { and, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { issueComments, issues, type Db } from "@paperclipai/db";
 import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
+import { conflict, tooManyRequests } from "../errors.js";
 
 type WatchedIssue = {
   companyId: string;
@@ -23,6 +24,36 @@ const UUID = "[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}";
 const ISSUE_PATH = new RegExp(`^/api/issues/(${UUID})(/comments)?$`);
 const CREATE_PATH = new RegExp(`^/api/companies/(${UUID})/issues$`);
 const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+export const HOST_WATCHER_COMMENT_LIMIT_PER_HOUR = 12;
+
+/** Call inside the write transaction, before inserting a watcher comment. */
+export async function assertHostWatcherCommentQuota(
+  dbOrTx: Db,
+  input: { companyId: string; issueId: string; serviceAgentId: string },
+): Promise<void> {
+  // Every host watcher service identity has one active key and one pinned issue.
+  // The issue lock serializes concurrent writes, while counting the agent's
+  // persisted comments keeps key rotation from resetting the quota.
+  const [locked] = await dbOrTx.select({ id: issues.id }).from(issues).where(and(
+    eq(issues.id, input.issueId),
+    eq(issues.companyId, input.companyId),
+  )).for("update");
+  if (!locked) throw conflict("Host watcher target changed before the comment");
+
+  const recent = await dbOrTx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorAgentId, input.serviceAgentId),
+    gte(issueComments.createdAt, sql<Date>`statement_timestamp() - interval '1 hour'`),
+  )).limit(HOST_WATCHER_COMMENT_LIMIT_PER_HOUR);
+  // Deleted comments still count: deleting and retrying must not reset the cap.
+  if (recent.length >= HOST_WATCHER_COMMENT_LIMIT_PER_HOUR) {
+    throw tooManyRequests("Host watcher comment quota exceeded", {
+      limit: HOST_WATCHER_COMMENT_LIMIT_PER_HOUR,
+      windowSeconds: 3600,
+    });
+  }
+}
 
 function hasOnlyKeys(value: unknown, required: string[], optional: string[] = []): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;

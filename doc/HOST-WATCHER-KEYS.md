@@ -18,6 +18,13 @@ fixtures live in `server/src/__tests__/host-watcher-key-routes.integration.test.
 | `be_1198`, `fe_1042` | Same read/comment routes; PATCH body has `status:"in_progress"` | Same row conditions as `pr_923`. |
 | `fleet_hourly` | `POST /api/issues/{issueId}/comments` with exactly `{body}`; `POST /api/companies/{companyId}/issues` with exactly `{title,description,status:"todo",priority:"high",assigneeAgentId,parentId}` | Comment goes only to the fixed parent in the fixed project. Create requires the fixed parent and assignee, a bounded `[watch][hourly] ` title and description, and no other open work order from that service identity. |
 
+All watcher comments, including comments supplied with `PATCH`, are limited to
+12 per service identity and pinned issue in a rolling hour. The check and insert
+share an issue-row lock and transaction, so concurrent requests cannot exceed
+the limit. Deleted comments still count; rotating the service's one active key
+does not reset the window. Excess writes return HTTP 429 without changing the
+issue status.
+
 The fleet order's `originKind` and `originId` are set by the server to
 `host_watcher` and the service agent UUID. A partial unique index prevents two
 visible open orders from the same service identity, including concurrent requests and

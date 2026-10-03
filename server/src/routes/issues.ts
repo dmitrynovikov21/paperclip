@@ -153,7 +153,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
-import { hostWatcherRequestAllowed } from "../middleware/cron-service-key.js";
+import { assertHostWatcherCommentQuota, hostWatcherRequestAllowed } from "../middleware/cron-service-key.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -13739,12 +13739,13 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || isHostWatcherKeyActor(req)
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
+        (isHostWatcherKeyActor(req) && Boolean(commentBody)) ||
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
@@ -13759,9 +13760,16 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || isHostWatcherKeyActor(req)) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
+              if (isHostWatcherKeyActor(req) && req.actor.type === "agent") {
+                await assertHostWatcherCommentQuota(tx as unknown as Db, {
+                  companyId: req.actor.companyId!,
+                  issueId: id,
+                  serviceAgentId: req.actor.agentId!,
+                });
+              }
               transactionalComment = await svc.addComment(
                 id,
                 commentBody,
@@ -17897,6 +17905,11 @@ export function issueRoutes(
               serviceAgentId: req.actor.agentId!,
             }, async () => locked, async () => false);
             if (!allowed) throw conflict("Host watcher target changed before the comment");
+            await assertHostWatcherCommentQuota(tx as unknown as Db, {
+              companyId: req.actor.companyId!,
+              issueId: id,
+              serviceAgentId: req.actor.agentId!,
+            });
             return add(tx as unknown as Db);
           });
         } else {

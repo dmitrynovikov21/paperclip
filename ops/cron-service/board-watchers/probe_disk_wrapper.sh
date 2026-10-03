@@ -17,7 +17,6 @@ chmod 755 /home/paperclip-user/bin/farm-artifact-gc.sh
 cat > /usr/bin/python3 <<'PY'
 #!/bin/sh
 printf '%s\n' "$*" >> /tmp/python-calls
-case "$*" in *disk_client.py*) cat > /tmp/last-disk-body ;; esac
 exit 0
 PY
 chmod 755 /usr/bin/python3
@@ -63,7 +62,6 @@ mkdir -p /home/paperclip-user/helloprint
 FIXTURE_SHIFT=1 LOG=/tmp/shifted.log ROOT_FREE_OVERRIDE=100 \
   SDB_FREE_OVERRIDE=100 DRY_RUN=0 bash /package/disk-pressure-gc-agent.sh
 [ "$(grep -c '^/opt/paperclip-cron/disk_client.py escalate$' /tmp/python-calls)" -eq 3 ]
-grep -q '/dev/shifted' /tmp/last-disk-body
-! grep -q '/dev/fixture' /tmp/last-disk-body
+grep -q 'tier=CRITICAL done: .* on /dev/shifted' /tmp/shifted.log
 echo 'PASS: strict sdb check; per-volume cooldown; post-sweep volume change alarms correctly'
 SH

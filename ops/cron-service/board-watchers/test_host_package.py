@@ -9,6 +9,7 @@ import socket
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import disk_reporter
@@ -70,30 +71,57 @@ class HostPackageTest(unittest.TestCase):
 
     def test_disk_socket_accepts_only_fixed_issue_and_uid(self):
         requests = []
-        with patch.object(disk_reporter, "service_request", side_effect=lambda *args: requests.append(args) or {}):
-            self.assertEqual(disk_reporter.report({"action": "note", "body":
-                             "🟡 **Срабатывание дискового сторожа** fixture"}, 1000), {"local": True})
-            self.assertEqual(requests, [])
-            message = {"action": "escalate", "body": "🚨 **Эскалация дискового сторожа** fixture"}
+
+        def send(message):
             left, right = socket.socketpair()
             try:
                 left.sendall(json.dumps(message).encode() + b"\n")
                 disk_reporter.serve_one(right)
-                self.assertEqual(json.loads(left.recv(256)), {"ok": True})
+                return json.loads(left.recv(256))
             finally:
                 left.close()
                 right.close()
+
+        def free_space(path):
+            free = 5 if path == "/" else 20
+            return SimpleNamespace(f_bavail=free, f_frsize=1_000_000_000)
+
+        with patch.object(disk_reporter, "last_reported", {}), \
+                patch.object(disk_reporter, "service_request", side_effect=lambda *args: requests.append(args) or {}), \
+                patch.object(disk_reporter.os.path, "ismount", return_value=True), \
+                patch.object(disk_reporter.os, "statvfs", side_effect=free_space):
+            self.assertEqual(send({"event": "critical"}), {"ok": True})
             self.assertEqual(requests[0][0:2],
                              ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}"))
-            disk_reporter.report({"action": "escalate", "body":
-                                 "🚨 **Disk CRITICAL** fixture"}, 1000)
-            self.assertEqual(requests[1][0:2],
-                             ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}"))
+            self.assertEqual(requests[0][2]["status"], "todo")
+            self.assertIn("root (`/`): свободно 5.0 ГБ", requests[0][2]["comment"])
+            self.assertNotIn("sdb:", requests[0][2]["comment"])
+            self.assertEqual(send({"event": "critical"}), {"ok": True})
+            self.assertEqual(len(requests), 1)
+
+            marker = "UNTRUSTED_UID1000_INSTRUCTION"
+            for message in ({"event": "critical", "body": f"🚨 **Disk CRITICAL** {marker}"},
+                            {"event": "critical", "issue": "other"},
+                            {"event": "note"}):
+                with self.subTest(message=message):
+                    self.assertEqual(send(message)["ok"], False)
+            self.assertEqual(len(requests), 1)
+            self.assertNotIn(marker, json.dumps(requests, ensure_ascii=False))
+
+            with patch.object(disk_reporter.os, "statvfs", return_value=SimpleNamespace(
+                    f_bavail=20, f_frsize=1_000_000_000)):
+                self.assertEqual(send({"event": "critical"})["ok"], False)
+            self.assertEqual(len(requests), 1)
+
+            with patch.object(disk_reporter.os, "statvfs", side_effect=lambda path: SimpleNamespace(
+                    f_bavail=20 if path == "/" else 3, f_frsize=1_000_000_000)):
+                self.assertEqual(send({"event": "critical"}), {"ok": True})
+            self.assertEqual(requests[1][2]["status"], "todo")
+            self.assertIn("sdb: свободно 3.0 ГБ", requests[1][2]["comment"])
+            self.assertEqual(send({"event": "critical"}), {"ok": True})
+            self.assertEqual(len(requests), 2)
             with self.assertRaises(ValueError):
-                disk_reporter.report(message, 1001)
-            with self.assertRaises(ValueError):
-                disk_reporter.report({"action": "escalate", "body": message["body"],
-                                      "issue": "other"}, 1000)
+                disk_reporter.report({"event": "critical"}, 1001)
         self.assertEqual(len(requests), 2)
 
     def test_pr_wake_rechecks_after_an_uncertain_patch_response(self):

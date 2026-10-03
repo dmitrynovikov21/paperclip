@@ -253,20 +253,20 @@ if args.dry_run:
     sys.exit(0)
 
 
-def report(action, text):
+def report():
     result = subprocess.run(
-        ["/usr/bin/python3", "/opt/paperclip-cron/disk_client.py", action],
-        input=text, capture_output=True, text=True, timeout=40,
+        ["/usr/bin/python3", "/opt/paperclip-cron/disk_client.py", "escalate"],
+        capture_output=True, text=True, timeout=40,
     )
     return result.returncode == 0
 
 
-def local_note(text):
-    return report("note", text), "local disk log only"
+def local_note(_text):
+    return True, "local disk log only"
 
 
-def api_escalate(text):
-    if not report("escalate", text):
+def api_escalate(_text):
+    if not report():
         raise RuntimeError("disk reporter rejected escalation")
     return True
 

@@ -9,29 +9,57 @@ import json
 import os
 import socket
 import struct
+import time
 
 from service_http import request as service_request
 
 
 SIGNAL_ISSUE = "f6775544-fb1c-4380-906c-66e4f5fb7028"
-MAX_REQUEST = 32_768
-MAX_BODY = 12_000
+MAX_REQUEST = 256
+CRITICAL_VOLUMES = (
+    ("/", "root (`/`)", 10),
+    ("/mnt/HC_Volume_106646767", "sdb", 8),
+)
+REPORT_GAP_S = 2 * 3600
+last_reported = {}
+
+
+def measured_pressure():
+    """Only the service's own filesystem measurements may authorize a wake."""
+    critical = []
+    for path, label, threshold_gb in CRITICAL_VOLUMES:
+        if path != "/" and not os.path.ismount(path):
+            continue
+        stats = os.statvfs(path)
+        free_gb = stats.f_bavail * stats.f_frsize / 1e9
+        if free_gb < threshold_gb:
+            critical.append((label, free_gb, threshold_gb))
+    return critical
 
 
 def report(message, peer_uid):
-    if peer_uid != 1000 or not isinstance(message, dict) or set(message) != {"action", "body"}:
+    if peer_uid != 1000 or not isinstance(message, dict) or message != {"event": "critical"}:
         raise ValueError("invalid reporter request")
-    action, body = message["action"], message["body"]
-    if action not in {"note", "escalate"} or not isinstance(body, str) or not 0 < len(body) <= MAX_BODY:
-        raise ValueError("invalid reporter action or body")
-    if not body.startswith(("🚨 **Эскалация дискового сторожа**", "🟡 **Срабатывание дискового сторожа**", "🚨 **Disk CRITICAL**")):
-        raise ValueError("invalid disk signal")
-    if action == "escalate":
-        return service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}", {"status": "todo", "comment": body})
-    # The board-issued disk_guard scope deliberately has no comment-only route.
-    # A routine note stays with the agent-side disk log; accepting it here must
-    # not wake the issue or attempt a broader credential fallback.
-    return {"local": True}
+    critical = measured_pressure()
+    if not critical:
+        raise ValueError("disk pressure not confirmed")
+    now = time.monotonic()
+    fresh = [(label, free_gb, threshold_gb) for label, free_gb, threshold_gb in critical
+             if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S]
+    if not fresh:
+        return {"local": True}
+    measurements = "\n".join(
+        f"- {label}: свободно {free_gb:.1f} ГБ, критический порог {threshold_gb} ГБ."
+        for label, free_gb, threshold_gb in fresh
+    )
+    comment = ("🚨 **Disk CRITICAL** — сервисный замер свободного места:\n"
+               f"{measurements}\n\n"
+               "Состояние уборки проверьте в локальном журнале дискового сторожа.")
+    result = service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}",
+                             {"status": "todo", "comment": comment})
+    for label, _free_gb, _threshold_gb in fresh:
+        last_reported[label] = now
+    return result
 
 
 def serve_one(connection):

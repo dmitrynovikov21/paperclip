@@ -32,10 +32,15 @@ The disk GC's former direct DB lookup of the owner's quota wall is removed:
 until a narrowly scoped status route exists, the reporter writes the fixed
 HELA-12595 escalation without an extra fallback mention. Routine notes are
 kept in the bounded agent-side `disk-guard.log` and never sent through a wider
-API credential. This prevents the agent
-UID from retaining a broad DB credential. The agent UID can call the fixed
-disk socket, so that one bounded HELA-12595 capability remains deliberately
-delegated; it cannot read the reporter key or choose another issue/API path.
+API credential. This prevents the agent UID from retaining a broad DB
+credential. The agent UID can call the fixed disk socket with only a `critical`
+event code. The separate service measures free space on `/` and the mounted
+sdb volume itself against fixed critical thresholds (10/8 GB), and creates the
+board comment from its own template. An arbitrary agent message or a critical
+event without measured pressure is rejected. The agent cannot read the reporter
+key, choose another issue/API path, or place its text in a service-authored wake.
+The reporter also suppresses repeat wakes for the same measured volume for two
+hours while its service process remains running.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are
 healthy. If a critical farm sweep leaves the volume below its threshold, its
 second alarm uses the reporter's fixed escalation action. A successful alarm

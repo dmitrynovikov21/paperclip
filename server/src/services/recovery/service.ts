@@ -2645,13 +2645,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       );
-    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
+    // Exclude any candidate that issue itself blocks — adding it would create a cycle.
+    const issueBlocksIds = await db
+      .select({ id: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, issue.companyId),
+          eq(issueRelations.issueId, issue.id),
+          eq(issueRelations.type, "blocks"),
+        ),
+      )
+      .then((rows) => new Set(rows.map((r) => r.id)));
+    const safeBlockers = existingBlockers.filter((r) => !issueBlocksIds.has(r.id));
+    const safeChildren = openChildren.filter((r) => !issueBlocksIds.has(r.id));
+    const blockedByIssueIds = [...new Set([...safeBlockers.map((row) => row.id), ...safeChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
     const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    const waitingOn = formatIssueLinksForComment([...safeChildren, ...safeBlockers]);
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -2884,10 +2898,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
       skipped: 0,
+      failed: 0,
       issueIds: [] as string[],
     };
 
     for (const issue of candidates) {
+      try {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -3298,6 +3314,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.issueIds.push(issue.id);
       } else {
         result.skipped += 1;
+      }
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ issueId: issue.id, identifier: issue.identifier, err }, "reconcileStrandedAssignedIssues: skipping candidate after error");
       }
     }
 

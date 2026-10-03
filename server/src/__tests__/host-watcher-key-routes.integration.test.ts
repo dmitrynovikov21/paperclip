@@ -5,7 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentApiKeys, agents, authUsers, companies, companyMemberships, createDb,
-  heartbeatRuns, issueComments, issues, projects,
+  heartbeatRuns, issueComments, issueExecutionDecisions, issues, projects,
 } from "@paperclipai/db";
 import type { HostWatcherAgentKeyScope } from "@paperclipai/shared";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
@@ -321,6 +321,56 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
     await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, persisted[0]!.id));
     expect((await request(app).post(url).set("Authorization", auth("pr923"))
       .send({ body: "Deleted comment cannot reset quota" })).status).toBe(429);
+  });
+
+  it("does not turn a fleet watcher comment into a review decision and still enforces its quota", async () => {
+    const issueId = targets.fleet.issueId;
+    const stageId = randomUUID();
+    const reviewState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: serviceAgents.fleet! },
+      returnAssignee: { type: "agent", agentId: targets.fleet.assigneeAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    } as const;
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: serviceAgents.fleet!,
+      executionPolicy: { stages: [{ id: stageId, type: "review", participants: [reviewState.currentParticipant] }] },
+      executionState: reviewState,
+    }).where(eq(issues.id, issueId));
+    try {
+      const url = `/api/issues/${issueId}/comments`;
+      const reviewLike = await request(app).post(url).set("Authorization", auth("fleet"))
+        .send({ body: "## Review: APPROVED" });
+      expect(reviewLike.status, JSON.stringify(reviewLike.body)).toBe(201);
+      const [afterComment] = await db.select({ status: issues.status, executionState: issues.executionState })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(afterComment?.status).toBe("in_review");
+      expect(afterComment?.executionState).toMatchObject({
+        status: "pending", currentStageId: stageId, lastDecisionId: null,
+      });
+      expect(await db.select({ id: issueExecutionDecisions.id }).from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+
+      await seedCommentsToOneBelowLimit("fleet", issueId);
+      expect((await request(app).post(url).set("Authorization", auth("fleet"))
+        .send({ body: "Twelfth fleet observation" })).status).toBe(201);
+      expect((await request(app).post(url).set("Authorization", auth("fleet"))
+        .send({ body: "Thirteenth fleet observation" })).status).toBe(429);
+      const [afterQuota] = await db.select({ status: issues.status, executionState: issues.executionState })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(afterQuota?.status).toBe("in_review");
+      expect(afterQuota?.executionState).toMatchObject({ lastDecisionId: null });
+    } finally {
+      await db.update(issues).set({
+        status: "backlog", assigneeAgentId: null, executionPolicy: null, executionState: null,
+      }).where(eq(issues.id, issueId));
+    }
   });
 
   it("caps PATCH comments and rolls back the signal status when quota is exhausted", async () => {

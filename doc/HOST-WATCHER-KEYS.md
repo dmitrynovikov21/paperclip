@@ -24,6 +24,9 @@ share an issue-row lock and transaction, so concurrent requests cannot exceed
 the limit. Deleted comments still count; rotating the service's one active key
 does not reset the window. Excess writes return HTTP 429 without changing the
 issue status.
+Watcher comments never act as execution review decisions, even if the service
+agent is selected as the reviewer and the comment resembles an approval. Such
+comments remain subject to the same quota.
 
 The fleet order's `originKind` and `originId` are set by the server to
 `host_watcher` and the service agent UUID. A partial unique index prevents two

@@ -17696,6 +17696,7 @@ export function issueRoutes(
         currentIssue.executionPolicy ?? null,
       );
       const shouldAutoApproveReviewComment =
+        !isHostWatcherKeyActor(req) &&
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
         actorMatchesExecutionParticipant(

@@ -18,7 +18,7 @@ SIGNAL_ISSUE = "f6775544-fb1c-4380-906c-66e4f5fb7028"
 MAX_REQUEST = 256
 CRITICAL_VOLUMES = (
     ("/", "root (`/`)", 10),
-    ("/mnt/HC_Volume_106646767", "sdb", 8),
+    ("/mnt/HC_Volume_106646767", "sdb", 10),
 )
 REPORT_GAP_S = 2 * 3600
 last_reported = {}

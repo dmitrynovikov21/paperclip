@@ -35,12 +35,14 @@ kept in the bounded agent-side `disk-guard.log` and never sent through a wider
 API credential. This prevents the agent UID from retaining a broad DB
 credential. The agent UID can call the fixed disk socket with only a `critical`
 event code. The separate service measures free space on `/` and the mounted
-sdb volume itself against fixed critical thresholds (10/8 GB), and creates the
+sdb volume itself against fixed alarm thresholds (10/10 GB), and creates the
 board comment from its own template. An arbitrary agent message or a critical
 event without measured pressure is rejected. The agent cannot read the reporter
 key, choose another issue/API path, or place its text in a service-authored wake.
 The reporter also suppresses repeat wakes for the same measured volume for two
 hours while its service process remains running.
+The sdb alarm threshold matches the farm GC's 10 GB post-sweep threshold;
+the separate strict sdb cleanup escalates only below 8 GB.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are
 healthy. If a critical farm sweep leaves the volume below its threshold, its
 second alarm uses the reporter's fixed escalation action. A successful alarm

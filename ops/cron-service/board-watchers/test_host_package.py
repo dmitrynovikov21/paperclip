@@ -114,10 +114,10 @@ class HostPackageTest(unittest.TestCase):
             self.assertEqual(len(requests), 1)
 
             with patch.object(disk_reporter.os, "statvfs", side_effect=lambda path: SimpleNamespace(
-                    f_bavail=20 if path == "/" else 3, f_frsize=1_000_000_000)):
+                    f_bavail=20 if path == "/" else 9, f_frsize=1_000_000_000)):
                 self.assertEqual(send({"event": "critical"}), {"ok": True})
             self.assertEqual(requests[1][2]["status"], "todo")
-            self.assertIn("sdb: свободно 3.0 ГБ", requests[1][2]["comment"])
+            self.assertIn("sdb: свободно 9.0 ГБ", requests[1][2]["comment"])
             self.assertEqual(send({"event": "critical"}), {"ok": True})
             self.assertEqual(len(requests), 2)
             with self.assertRaises(ValueError):

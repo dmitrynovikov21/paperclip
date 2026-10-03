@@ -3,7 +3,8 @@
 @@ -37,7 +37,6 @@
  
  BRIDGE_ENV = os.path.expanduser('~/.secrets/paperclip-bridge.env')   # PAPERCLIP_API_URL only
- CRON_TOKEN = os.path.expanduser('~/.secrets/paperclip-cron-agent-watchdog.token')  # API key of Alpha
+-CRON_TOKEN = os.path.expanduser('~/.secrets/paperclip-cron-agent-watchdog.token')  # API key of Alpha
++CRON_TOKEN = os.path.expanduser('~/.secrets/paperclip-cron-agent-watchdog.token')  # scoped watchdog service key
 -BOARD_KEY = os.path.expanduser('~/.paperclip-alpha-board-key.json')
  COMPANY = 'ac917a45-e6ea-4696-a85c-991147084939'
  STUCK = {'error', 'offline', 'crashed'}

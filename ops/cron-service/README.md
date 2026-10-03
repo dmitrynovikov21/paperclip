@@ -26,7 +26,8 @@ fixes the upstream host and refuses redirects so a caller cannot steer its key
 to another server.
 
 The watchdog and quota scripts still query the control-plane DB. The staged
-copies read `WATCHDOG_PG` and `QR_PG` from root-managed service environment files.
+copies use the `pc_watchdog` and `pc_quota` libpq service aliases. Their units
+point `PGSERVICEFILE` and `PGPASSFILE` at service-private files.
 The old DB password literal exists in agent-readable host copies and backups:
 **rotate that DB password and verify the old credential is rejected at cutover**.
 Use dedicated DB roles with only the needed tables/functions, subject to the
@@ -55,13 +56,14 @@ old DB path.
    only `PAPERCLIP_API_URL`. Under `/var/lib/pc-cron-quota/.secrets/`, install
    `paperclip-cron-quota-rewake.token`. Set owner to the respective service UID
    and mode 0400; service home and `.secrets` must deny `paperclip-user` traversal.
-4. Create `/etc/paperclip-cron/watchdog.env` with `WATCHDOG_PG`,
-   `/etc/paperclip-cron/quota.env` with `QR_PG`, `QR_AGENT_ID`, `QR_COMPANY`,
-   `QR_API`, and `/etc/paperclip-cron/deploy.env` with
-   `CRON_SERVICE_API_URL`. Each DB env file must be readable only by its service
-   UID/root. Copy quota `state.json` and watchdog poke state into the new
-   service homes with matching ownership. Do not install a board key or
-   `PAPERCLIP_OPS_TOKEN` for these services.
+4. Create service-private `pg_service.conf` and `pgpass` files for watchdog and
+   quota, with their respective aliases and dedicated DB roles. Create a
+   root-owned `/etc/paperclip-cron/watchdog.env` (it may be empty),
+   `/etc/paperclip-cron/quota.env` with `QR_AGENT_ID`, `QR_COMPANY`, `QR_API`,
+   and `/etc/paperclip-cron/deploy.env` with `CRON_SERVICE_API_URL`. Keep
+   `WATCHDOG_PG`, `QR_PG`, and broad API tokens out of these env files. Copy
+   quota `state.json` and watchdog poke state into the new service homes with
+   matching ownership. Do not install a board key or `PAPERCLIP_OPS_TOKEN`.
 5. Start the deploy broker, then run its scoped HTTP smoke. Verify one manual
    watchdog and quota service tick, without enabling timers. Stage the reviewed
    frontend patch from `/opt/paperclip-cron/deploy-frontend.sh.staged` into the
@@ -80,7 +82,7 @@ old DB path.
 ## Negative and positive smoke
 
 - As `paperclip-user`, `test -r` must fail for all three new token sources and
-  DB env files. Repeat in ordinary local shell, ACPX shell, sandbox/remote
+  service-private libpq files. Repeat in ordinary local shell, ACPX shell, sandbox/remote
   execution, and a copied worktree. Record UID, path, and boolean result only.
 - Via the frontend socket, `GET /api/agents/<id>/keys` must return 403 while
   the deploy incident create/read/comment/close flow succeeds. Direct agent

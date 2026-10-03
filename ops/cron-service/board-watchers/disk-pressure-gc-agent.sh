@@ -185,7 +185,20 @@ log "tier=$TIER done: ${FREE_GB}G -> ${AFTER:-?}G (tightest GC-root volume)"
 # that stretch was missing.
 if [ "$TIER" = CRITICAL ] && [ -n "$AFTER" ] && [ "$AFTER" -lt "$CRIT_GB" ]; then
   log "STILL CRITICAL after full sweep (${AFTER}G) — farm GC has no headroom left to reclaim"
-  printf '🚨 **Disk CRITICAL** — tightest GC-root volume (%s) at %sG free after a full farm sweep (STALE_DAYS=0). Review HELA-12595.\n' \
-    "$TIGHTEST" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py escalate \
-    || log "critical signal rejected by scoped reporter"
+  alarm_state=/home/paperclip-user/.disk-guard-state/last-critical-farm-alarm
+  alarm_gap_s=7200
+  last_alarm=$(cat "$alarm_state" 2>/dev/null || true)
+  now_epoch=$(date +%s)
+  if [[ $last_alarm =~ ^[0-9]+$ ]] && (( now_epoch >= last_alarm && now_epoch - last_alarm < alarm_gap_s )); then
+    log "critical signal suppressed: previous farm alarm less than two hours ago"
+  elif printf '🚨 **Disk CRITICAL** — tightest GC-root volume (%s) at %sG free after a full farm sweep (STALE_DAYS=0). Review HELA-12595.\n' \
+    "$TIGHTEST" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py escalate; then
+    if mkdir -p "$(dirname "$alarm_state")" && printf '%s\n' "$now_epoch" > "$alarm_state"; then
+      log "critical signal sent through scoped reporter; next alarm after two hours"
+    else
+      log "critical signal sent, but cooldown state could not be saved"
+    fi
+  else
+    log "critical signal rejected by scoped reporter"
+  fi
 fi

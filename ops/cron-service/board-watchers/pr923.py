@@ -100,12 +100,8 @@ def read_world():
     """Всё чтение GitHub одним местом."""
     pr = gh_json('repos/%s/pulls/%d' % (REPO, PR))
     head = pr['head']['sha']
-    commits = [{'sha': c['sha'], 'author': c['commit']['author']['name'],
-                'msg': (c['commit']['message'] or '').splitlines()[0][:120]}
+    commits = [{'sha': c['sha']}
                for c in gh_json('repos/%s/pulls/%d/commits?per_page=100' % (REPO, PR))]
-    author = next((c['author'] for c in commits if c['sha'] == head), None)
-    if author is None:
-        author = gh_json('repos/%s/commits/%s' % (REPO, head))['commit']['author']['name']
     checks = gh_json('repos/%s/commits/%s/check-runs?per_page=100' % (REPO, head))['check_runs']
     feedback = []
     for kind, path, when in (
@@ -116,9 +112,9 @@ def read_world():
             feedback.append({'key': '%s:%s' % (kind, x['id']), 'kind': kind, 'login': (x.get('user') or {}).get('login'),
                              'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url')})
     return {'state': pr['state'], 'draft': bool(pr.get('draft')), 'merged': bool(pr.get('merged')),
-            'merged_at': pr.get('merged_at'), 'merged_by': (pr.get('merged_by') or {}).get('login'),
+            'merged_at': pr.get('merged_at'),
             'merge_sha': pr.get('merge_commit_sha'), 'mergeable_state': pr.get('mergeable_state'),
-            'head': head, 'head_author': author, 'commits': commits,
+            'head': head, 'commits': commits,
             'checks': [{'name': c['name'], 'status': c['status'], 'conclusion': c.get('conclusion'),
                         'id': c['id'], 'url': c.get('html_url')} for c in checks],
             'feedback': feedback}
@@ -137,7 +133,7 @@ def merge_report(w):
             lines.append('- `%s`: одобренная `%s` → блоб `%s`; merge `%s` → `%s` — %s'
                          % (f, APPROVED[:9], a[:12], w['merge_sha'][:9], b[:12], 'РАВНЫ' if a == b else '**РАЗНЫЕ**'))
         except Exception as e:
-            lines.append('- `%s`: блоб не прочитан (%s) — сверить руками' % (f, str(e)[:100]))
+            lines.append('- `%s`: блоб не прочитан (%s) — сверить руками' % (f, type(e).__name__))
     lines.append('- «РАЗНЫЕ» ещё не дефект: до мержа в `main` могли влить соседей, правящих те же файлы (`handlers.ts`, '
                  '`fixtures.ts`, `types.ts` — общие). Решает `merge-tree` из пост-мерж сверки.')
     shas = [c['sha'] for c in w['commits']]
@@ -147,7 +143,7 @@ def merge_report(w):
                      % APPROVED[:9])
     if after:
         lines.append('- **Коммиты после одобренной головы (ревьюить полным diff):** ' + '; '.join(
-            '`%s` %s «%s»' % (c['sha'][:9], c['author'], c['msg']) for c in after))
+            '[`%s`](https://github.com/%s/commit/%s)' % (c['sha'][:9], REPO, c['sha']) for c in after))
     else:
         lines.append('- Коммитов после одобренной головы нет (голова PR `%s`).' % w['head'][:9])
     return '\n'.join(lines)
@@ -214,8 +210,8 @@ def wake(text, note):
 
 
 def pr_line(w):
-    return 'PR на этом тике: `%s`%s, голова `%s` (автор %s), mergeable_state `%s`' % (
-        w['state'], ' draft' if w['draft'] else '', w['head'][:9], w['head_author'], w.get('mergeable_state'))
+    return 'PR на этом тике: `%s`%s, голова `%s`, mergeable_state `%s`' % (
+        w['state'], ' draft' if w['draft'] else '', w['head'][:9], w.get('mergeable_state'))
 
 
 def tick(state):
@@ -240,14 +236,14 @@ def tick(state):
     if 'seen' not in state:                       # первый тик — baseline
         state['seen'] = [f['key'] for f in w['feedback']]
         state['head'] = w['head']
-        log('baseline: head=%s author=%s draft=%s mergeable=%s feedback=%d' % (
-            w['head'][:9], w['head_author'], w['draft'], w.get('mergeable_state'), len(state['seen'])))
+        log('baseline: head=%s draft=%s mergeable=%s feedback=%d' % (
+            w['head'][:9], w['draft'], w.get('mergeable_state'), len(state['seen'])))
 
     if w['merged']:
-        return wake('✅ **HELA-12380: frontend#923 влит** (%s, `%s`, merge-коммит `%s`, финальная голова `%s`, '
-                    'одобренная `%s`).\n\n**Сверка сторожа:**\n%s%s%s'
-                    % (w['merged_at'], w['merged_by'] or '?', (w['merge_sha'] or '?')[:10], w['head'][:9],
-                       APPROVED[:9], merge_report(w), POSTMERGE, TAIL), 'merged')
+        return wake('✅ **HELA-12380: frontend#923 влит** (%s, merge-коммит `%s`, финальная голова `%s`, '
+                    'одобренная `%s`). [Голова](https://github.com/%s/commit/%s).\n\n**Сверка сторожа:**\n%s%s%s'
+                    % (w['merged_at'], (w['merge_sha'] or '?')[:10], w['head'][:9],
+                       APPROVED[:9], REPO, w['head'], merge_report(w), POSTMERGE, TAIL), 'merged')
     if w['state'] == 'closed':
         return wake('⛔ **HELA-12380: frontend#923 закрыт БЕЗ мержа** (голова `%s`). Прочитать последний коммент '
                     'закрывшего: дубль — сверить названный PR в `main`; иначе выяснить причину — контракт типов на `main` '
@@ -269,10 +265,11 @@ def tick(state):
         state['seen'].extend(f['key'] for f in fresh)   # агентские/ботовые — просто в baseline
 
     if w['head'] != state.get('head') and ('head:' + w['head']) not in woken:
-        if wake('🔀 **HELA-12380: голова frontend#923 сменилась на `%s`, автор `%s`** (была `%s`, одобрена `%s`). '
+        if wake('🔀 **HELA-12380: голова frontend#923 сменилась на `%s`** (была `%s`, одобрена `%s`). '
+                '[Коммит](https://github.com/%s/commit/%s). '
                 'Прочитать дельту `git diff %s..%s`: кодовые файлы равны одобренным (`git rev-parse <sha>:<f>`) — '
                 'принять замером; иначе ревью дельты (п.3 описания карты).%s'
-                % (w['head'][:9], w['head_author'], (state.get('head') or '?')[:9], APPROVED[:9],
+                % (w['head'][:9], (state.get('head') or '?')[:9], APPROVED[:9], REPO, w['head'],
                    APPROVED[:9], w['head'][:9], KEEP), 'head'):
             woken.append('head:' + w['head'])
             state['head'] = w['head']

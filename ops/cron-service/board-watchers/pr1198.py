@@ -13,7 +13,7 @@ board-has-no-parking-status-for-external-waits). Карта HELA-12343 запа�
   * PR влит                                   -> вейк (пост-мерж шаги из описания карты).
   * PR закрыт БЕЗ мержа                       -> вейк (выяснить причину).
   * новый отзыв ЧЕЛОВЕКА (коммент/ревью/строчный; не агентская учётка и не бот) -> вейк. Сюда же ответ по REQ-4.
-  * новая голова открытого PR, автор коммита не Database Engineer -> вейк один раз на голову.
+  * новая голова открытого PR -> вейк один раз на голову.
   * required-чек головы открытого PR завершился не success -> вейк один раз на (голова, чек, id).
   * READ_FAIL_LIMIT тиков подряд падает чтение GitHub -> вейк один раз на серию («сторож ослеп»).
   * DEADLINE                                  -> ФИНАЛЬНЫЙ вейк, разоружиться.
@@ -42,7 +42,6 @@ PR = 1198
 APPROVED_HEAD = 'b2ac096d4'                          # голова, одобренная Security Auditor (b20fde14)
 REQUIRED = ('quality', 'test')
 AGENT_LOGINS = ('dmitrynovikov21',)                  # общая агентская учётка
-OWN_AUTHOR_NAMES = ('Database Engineer',)            # автор моих коммитов (identity на команде)
 DEADLINE = datetime.datetime(2026, 10, 3, 9, 0, tzinfo=datetime.timezone.utc)
 READ_FAIL_LIMIT = 6
 HOME_DIR = os.path.expanduser('~/.hela-12340-watch')
@@ -81,7 +80,6 @@ def read_world():
     """Всё чтение GitHub по PR (подменяется в самотесте)."""
     p = gh_json('repos/%s/pulls/%d' % (REPO, PR))
     head = p['head']['sha']
-    commit = gh_json('repos/%s/commits/%s' % (REPO, head))
     checks = gh_json('repos/%s/commits/%s/check-runs?per_page=100' % (REPO, head))['check_runs']
     feedback = []
     for kind, path, when in (
@@ -92,10 +90,8 @@ def read_world():
             feedback.append({'key': '%s:%s' % (kind, x['id']), 'kind': kind, 'login': (x.get('user') or {}).get('login'),
                              'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url')})
     return {'state': p['state'], 'merged': bool(p.get('merged')), 'merged_at': p.get('merged_at'),
-            'merged_by': (p.get('merged_by') or {}).get('login'), 'merge_sha': p.get('merge_commit_sha'),
+            'merge_sha': p.get('merge_commit_sha'),
             'head': head,
-            'head_author': ((commit.get('commit') or {}).get('author') or {}).get('name'),
-            'head_login': (commit.get('author') or {}).get('login'),
             'checks': [{'name': c['name'], 'status': c['status'], 'conclusion': c.get('conclusion'),
                         'id': c['id'], 'url': c.get('html_url')} for c in checks],
             'feedback': feedback}
@@ -150,8 +146,8 @@ def pr_line(w):
     if w is None:
         return 'состояние backend#%d прочитать не удалось' % PR
     if w['merged']:
-        return 'backend#%d влит %s (%s), merge-коммит `%s`, голова `%s`' % (
-            PR, w['merged_at'], w['merged_by'] or '?', (w['merge_sha'] or '?')[:10], w['head'][:9])
+        return 'backend#%d влит %s, merge-коммит `%s`, голова `%s` ([коммит](https://github.com/%s/commit/%s))' % (
+            PR, w['merged_at'], (w['merge_sha'] or '?')[:10], w['head'][:9], REPO, w['head'])
     return 'backend#%d `%s`, голова `%s`' % (PR, w['state'], w['head'][:9])
 
 
@@ -230,22 +226,19 @@ def tick(state):
         seen.extend(f['key'] for f in fresh)   # агентские/ботовые — просто в baseline
 
     if w['state'] == 'open' and w['head'] != state.get('head'):
-        if w['head_author'] in OWN_AUTHOR_NAMES:
-            state['head'] = w['head']          # мой собственный пуш — новый baseline, без вейка
-        else:
-            htag = 'head:%s' % w['head'][:12]
-            r = 'woke' if htag in state.setdefault('woken', []) else wake(
-                '🔀 **HELA-12343: в backend#%d новая голова `%s` не от Database Engineer** (автор коммита `%s`, логин '
-                '`%s`). Прочитать дельту от `%s` (одобрена `%s`), перемерить зону и мутации '
-                '(`/dev/shm/hela12340/run-final.sh`) и ответить в PR. Если дельта трогает прод-код, сообщить Security '
-                'Auditor.%s' % (PR, w['head'][:9], w['head_author'] or '?', w['head_login'] or '-',
-                                (state.get('head') or '?')[:9], APPROVED_HEAD, KEEP), 'head')
-            if r == 'disarm':
-                return True
-            if r == 'woke':
-                if htag not in state['woken']:
-                    state['woken'].append(htag)
-                state['head'] = w['head']
+        htag = 'head:%s' % w['head'][:12]
+        r = 'woke' if htag in state.setdefault('woken', []) else wake(
+            '🔀 **HELA-12343: в backend#%d новая голова `%s`**. '
+            '[Коммит](https://github.com/%s/commit/%s). Прочитать дельту от `%s` (одобрена `%s`), перемерить зону и мутации '
+            '(`/dev/shm/hela12340/run-final.sh`) и ответить в PR. Если дельта трогает прод-код, сообщить Security '
+            'Auditor.%s' % (PR, w['head'][:9], REPO, w['head'],
+                            (state.get('head') or '?')[:9], APPROVED_HEAD, KEEP), 'head')
+        if r == 'disarm':
+            return True
+        if r == 'woke':
+            if htag not in state['woken']:
+                state['woken'].append(htag)
+            state['head'] = w['head']
 
     if w['state'] == 'open':
         latest = {}

@@ -13,7 +13,7 @@ board-has-no-parking-status-for-external-waits). Каркас — ~/hela-12359-p
   * PR влит, но за DEPLOY_GRACE не выкачен -> вейк один раз (сторож ждёт выката дальше).
   * PR закрыт БЕЗ мержа          -> ФИНАЛЬНЫЙ вейк (выяснить причину), разоружиться.
   * новый отзыв ЧЕЛОВЕКА (коммент/ревью/строчный; не агентская учётка и не бот) -> вейк.
-  * новая голова открытого PR, автор коммита не Juliet -> вейк один раз на голову.
+  * новая голова открытого PR -> вейк один раз на голову.
   * required-чек головы открытого PR завершился не success -> вейк один раз на (голова, чек, id).
   * READ_FAIL_LIMIT тиков подряд падает чтение GitHub -> вейк один раз на серию («сторож ослеп»).
   * DEADLINE                     -> ФИНАЛЬНЫЙ вейк, разоружиться.
@@ -44,7 +44,6 @@ PR = 1042                                            # frontend#1042 — PR кр
 ROUND2_BRANCH = 'feat/HELA-12359-r2-n2-strategy'
 REQUIRED = ('unit-and-static', 'contract-snapshots')  # required-чеки ruleset FE main
 AGENT_LOGINS = ('dmitrynovikov21',)                  # общая агентская учётка
-OWN_AUTHOR_NAMES = ('Juliet (Builder)',)             # мой пуш — новый baseline без вейка
 FE_RELEASE_SHA_FILE = '/etc/paperclip-cron/fe-release-sha'
 DEPLOY_GRACE = datetime.timedelta(hours=3)
 DEADLINE = datetime.datetime(2026, 10, 6, 9, 0, tzinfo=datetime.timezone.utc)
@@ -102,7 +101,6 @@ def read_world():
     """Всё чтение GitHub по PR (подменяется в самотесте)."""
     p = gh_json('repos/%s/pulls/%d' % (REPO, PR))
     head = p['head']['sha']
-    commit = gh_json('repos/%s/commits/%s' % (REPO, head))
     checks = gh_json('repos/%s/commits/%s/check-runs?per_page=100' % (REPO, head))['check_runs']
     feedback = []
     for kind, path, when in (
@@ -113,10 +111,8 @@ def read_world():
             feedback.append({'key': '%s:%s' % (kind, x['id']), 'kind': kind, 'login': (x.get('user') or {}).get('login'),
                              'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url')})
     w = {'state': p['state'], 'merged': bool(p.get('merged')), 'merged_at': p.get('merged_at'),
-         'merged_by': (p.get('merged_by') or {}).get('login'), 'merge_sha': p.get('merge_commit_sha'),
+         'merge_sha': p.get('merge_commit_sha'),
          'head': head,
-         'head_author': ((commit.get('commit') or {}).get('author') or {}).get('name'),
-         'head_login': (commit.get('author') or {}).get('login'),
          'checks': [{'name': c['name'], 'status': c['status'], 'conclusion': c.get('conclusion'),
                      'id': c['id'], 'url': c.get('html_url')} for c in checks],
          'feedback': feedback, 'deployed': False, 'release': None}
@@ -177,8 +173,8 @@ def pr_line(w):
     if w is None:
         return 'состояние frontend#%d прочитать не удалось' % PR
     if w['merged']:
-        return 'frontend#%d влит %s (%s), merge-коммит `%s`, голова `%s`; dev раздаёт `%s`' % (
-            PR, w['merged_at'], w['merged_by'] or '?', (w['merge_sha'] or '?')[:10], w['head'][:9],
+        return 'frontend#%d влит %s, merge-коммит `%s`, голова `%s` ([коммит](https://github.com/%s/commit/%s)); dev раздаёт `%s`' % (
+            PR, w['merged_at'], (w['merge_sha'] or '?')[:10], w['head'][:9], REPO, w['head'],
             w.get('release') or '?')
     return 'frontend#%d `%s`, голова `%s`' % (PR, w['state'], w['head'][:9])
 
@@ -287,22 +283,19 @@ def tick(state):
         seen.extend(f['key'] for f in fresh)   # агентские/ботовые — просто в baseline
 
     if w['state'] == 'open' and w['head'] != state.get('head'):
-        if w['head_author'] in OWN_AUTHOR_NAMES:
-            state['head'] = w['head']          # мой собственный пуш — новый baseline, без вейка
-        else:
-            htag = 'head:%s' % w['head'][:12]
-            r = 'woke' if htag in state.setdefault('woken', []) else wake(
-                '🔀 **HELA-12359: в frontend#%d (круг 2) новая голова `%s` не от Juliet** (автор коммита `%s`, '
-                'логин `%s`). Прочитать дельту от `%s`: «Update branch» от человека — норма (сверить '
-                '`git merge-tree`), чужая правка гарда — разобрать.%s'
-                % (PR, w['head'][:9], w['head_author'] or '?', w['head_login'] or '-',
-                   (state.get('head') or '?')[:9], KEEP), 'head')
-            if r == 'disarm':
-                return True
-            if r == 'woke':
-                if htag not in state['woken']:
-                    state['woken'].append(htag)
-                state['head'] = w['head']
+        htag = 'head:%s' % w['head'][:12]
+        r = 'woke' if htag in state.setdefault('woken', []) else wake(
+            '🔀 **HELA-12359: в frontend#%d (круг 2) новая голова `%s`**. '
+            '[Коммит](https://github.com/%s/commit/%s). Прочитать дельту от `%s`: «Update branch» от человека — норма (сверить '
+            '`git merge-tree`), чужая правка гарда — разобрать.%s'
+            % (PR, w['head'][:9], REPO, w['head'],
+               (state.get('head') or '?')[:9], KEEP), 'head')
+        if r == 'disarm':
+            return True
+        if r == 'woke':
+            if htag not in state['woken']:
+                state['woken'].append(htag)
+            state['head'] = w['head']
 
     if w['state'] == 'open':
         latest = {}

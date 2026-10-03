@@ -169,6 +169,67 @@ class HostPackageTest(unittest.TestCase):
                     self.assertIn(url, message)
                 self.assertEqual(len(state["seen"]), 3)
 
+    def test_pr_head_and_merge_wakes_do_not_forward_commit_text(self):
+        head = "a" * 40
+        previous = "b" * 40
+        merge_sha = "c" * 40
+        forbidden = ("UNTRUSTED_AUTHOR_INSTRUCTION", "UNTRUSTED_SUBJECT_INSTRUCTION",
+                     "UNTRUSTED_LOGIN_INSTRUCTION")
+        for watcher in (pr923, pr1198, pr1042):
+            events = ("head", "merged") if watcher is pr923 else ("head", "merged", "spoofed_head")
+            for event in events:
+                with self.subTest(watcher=watcher.__name__, event=event):
+                    author = ("Database Engineer" if watcher is pr1198 else "Juliet (Builder)") \
+                        if event == "spoofed_head" else forbidden[0]
+                    base = f"repos/{watcher.REPO}"
+                    pr_path = f"{base}/pulls/{watcher.PR}"
+                    responses = {
+                        pr_path: {"head": {"sha": head}, "state": "open", "draft": False,
+                                  "merged": event == "merged", "merged_at": "2026-10-02T10:00:00Z",
+                                  "merged_by": {"login": forbidden[2]}, "merge_commit_sha": merge_sha,
+                                  "mergeable_state": "clean"},
+                        f"{base}/commits/{head}": {
+                            "commit": {"author": {"name": author}, "message": forbidden[1]},
+                            "author": {"login": forbidden[2]}},
+                        f"{base}/commits/{head}/check-runs?per_page=100": {"check_runs": []},
+                        f"{pr_path}/commits?per_page=100": [
+                            {"sha": watcher.APPROVED if watcher is pr923 else previous,
+                             "commit": {"author": {"name": "Fixture"}, "message": "Fixture"}},
+                            {"sha": head, "commit": {"author": {"name": author},
+                                                     "message": forbidden[1]}}],
+                        f"{base}/issues/{watcher.PR}/comments?per_page=100": [],
+                        f"{pr_path}/reviews?per_page=100": [],
+                        f"{pr_path}/comments?per_page=100": [],
+                    }
+                    with patch.object(watcher, "gh_json", side_effect=responses.__getitem__), \
+                            patch.object(pr1042, "deployed", return_value=(True, merge_sha)):
+                        world = watcher.read_world()
+
+                    requests = []
+                    assignee = watcher.ME if watcher is pr923 else watcher.ASSIGNEE
+
+                    def board_req(method, path, payload=None):
+                        requests.append((method, path, payload))
+                        if method == "GET":
+                            return {"status": "in_progress", "assigneeAgentId": assignee}
+                        return {}
+
+                    state = {"seen": [], "head": head if event == "merged" else previous}
+                    with patch.object(watcher, "read_world", return_value=world), \
+                            patch.object(watcher, "board_req", side_effect=board_req), \
+                            patch.object(watcher, "now", return_value=datetime.datetime(
+                                2026, 10, 2, 12, tzinfo=datetime.timezone.utc)), \
+                            patch.object(watcher, "log"), patch.object(pr923, "blob", return_value="d" * 40):
+                        watcher.tick(state)
+
+                    writes = [payload for method, _path, payload in requests if method in ("POST", "PATCH")]
+                    self.assertEqual(len(writes), 1)
+                    message = json.dumps(writes[0], ensure_ascii=False)
+                    for marker in forbidden:
+                        self.assertNotIn(marker, json.dumps(requests, ensure_ascii=False))
+                    self.assertIn(head[:9], message)
+                    self.assertIn(f"https://github.com/{watcher.REPO}/commit/{head}", message)
+
     def test_malformed_disk_client_is_denied_without_stopping_reporter(self):
         left, right = socket.socketpair()
         try:

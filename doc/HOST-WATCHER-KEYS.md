@@ -35,7 +35,10 @@ key rotation. The key can create another order after the prior order is closed o
 
 Any other method, path, query string, body field, target, assignee or company
 is denied. The service cannot call an HTTP proxy or arbitrary control-plane
-route. The separate `cron_service` scope used by the agent watchdog, quota
+route. `GET /api/companies/{companyId}/events/ws` is denied at WebSocket
+Upgrade for `host_watcher` and other nonstandard API key scopes because its
+stream contains events from the whole company and bypasses HTTP middleware.
+The separate `cron_service` scope used by the agent watchdog, quota
 rewake and frontend deploy services remains a distinct contract.
 
 Run the focused verification with:

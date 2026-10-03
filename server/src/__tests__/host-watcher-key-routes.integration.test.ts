@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import express from "express";
 import request from "supertest";
+import WebSocket from "ws";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -13,8 +15,10 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { HOST_WATCHER_COMMENT_LIMIT_PER_HOUR, hostWatcherKeyGuard } from "../middleware/cron-service-key.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { issueRoutes } from "../routes/issues.js";
+import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { agentService } from "../services/agents.js";
 import { issueService } from "../services/issues.js";
+import { publishLiveEvent } from "../services/live-events.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Mutations exercise real issue routes and DB writes; the test never starts a
@@ -118,6 +122,81 @@ describeDb("host watcher scoped keys on real issue routes and test DB", () => {
   function auth(name: string) {
     return `Bearer ${tokens[name]}`;
   }
+
+  it("keeps host watcher keys out of company-wide WebSocket events", async () => {
+    const standardAgentId = randomUUID();
+    const standardToken = "pc_standard_websocket_fixture";
+    const unsupportedToken = "pc_unsupported_websocket_fixture";
+    await db.insert(agents).values({
+      id: standardAgentId, companyId, name: "Standard WebSocket fixture",
+      adapterType: "process", adapterConfig: {}, runtimeConfig: {}, status: "idle",
+    });
+    await db.insert(agentApiKeys).values({
+      agentId: standardAgentId, companyId, name: "standard websocket",
+      keyHash: createHash("sha256").update(standardToken).digest("hex"),
+      responsibleUserId, scopeConfig: null,
+    });
+    await db.insert(agentApiKeys).values({
+      agentId: standardAgentId, companyId, name: "unsupported websocket scope",
+      keyHash: createHash("sha256").update(unsupportedToken).digest("hex"),
+      responsibleUserId, scopeConfig: { kind: "future_scope" } as never,
+    });
+
+    const server = createServer(app);
+    const wss = setupLiveEventsWebSocketServer(server, db, { deploymentMode: "authenticated" });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("WebSocket fixture has no port");
+    const url = `ws://127.0.0.1:${address.port}/api/companies/${companyId}/events/ws`;
+    let standardSocket: WebSocket | null = null;
+
+    const rejectedStatus = (socketUrl: string, headers?: Record<string, string>) =>
+      new Promise<number>((resolve, reject) => {
+        const socket = new WebSocket(socketUrl, { headers });
+        socket.once("unexpected-response", (_request, response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        });
+        socket.once("open", () => {
+          socket.close();
+          reject(new Error("A scoped key opened the company-wide WebSocket"));
+        });
+        socket.once("error", reject);
+      });
+
+    try {
+      expect(await rejectedStatus(url, { Authorization: auth("disk") })).toBe(403);
+      expect(await rejectedStatus(`${url}?token=${encodeURIComponent(tokens.fleet!)}`)).toBe(403);
+      expect(await rejectedStatus(url, { Authorization: `Bearer ${unsupportedToken}` })).toBe(403);
+
+      standardSocket = new WebSocket(url, { headers: { Authorization: `Bearer ${standardToken}` } });
+      await new Promise<void>((resolve, reject) => {
+        standardSocket!.once("open", resolve);
+        standardSocket!.once("error", reject);
+      });
+      const received = new Promise<Record<string, unknown>>((resolve, reject) => {
+        standardSocket!.once("message", (data) => {
+          try {
+            resolve(JSON.parse(data.toString()) as Record<string, unknown>);
+          } catch (error) {
+            reject(error);
+          }
+        });
+        standardSocket!.once("error", reject);
+      });
+      publishLiveEvent({
+        companyId, type: "activity.logged",
+        payload: { issueId: targets.pr923.issueId, bodySnippet: "private issue comment" },
+      });
+      expect(await received).toMatchObject({
+        companyId, payload: { issueId: targets.pr923.issueId, bodySnippet: "private issue comment" },
+      });
+    } finally {
+      standardSocket?.terminate();
+      await new Promise<void>((resolve) => wss.close(resolve));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 
   it("disk guard can signal its issue and cannot change another field, method or target", async () => {
     const url = `/api/issues/${targets.disk.issueId}`;

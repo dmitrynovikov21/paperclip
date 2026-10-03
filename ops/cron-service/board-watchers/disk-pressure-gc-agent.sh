@@ -112,19 +112,20 @@ else
     fi
   done
 fi
-[ -n "$FREE_GB" ] || { log "could not read df for any GC root, aborting"; exit 0; }
-
-if   [ "$FREE_GB" -lt "$CRIT_GB" ];     then TIER=CRITICAL; STALE=0
+if [ -z "$FREE_GB" ]; then
+  log "could not read df for any GC root; farm sweep skipped, checking strict volumes"
+  TIER=HEALTHY
+elif [ "$FREE_GB" -lt "$CRIT_GB" ];     then TIER=CRITICAL; STALE=0
 elif [ "$FREE_GB" -lt "$HIGH_GB" ];     then TIER=HIGH;     STALE=1
 elif [ "$FREE_GB" -lt "$ELEVATED_GB" ]; then TIER=ELEVATED; STALE=3
 elif [ "$FREE_GB" -lt "$HEALTHY_GB" ];  then TIER=ROUTINE;  STALE=7
 else
-  # Healthy: exit without walking the tree. This is the common case and is what
-  # keeps a 30-minute cadence affordable.
-  exit 0
+  TIER=HEALTHY
 fi
 
-log "tier=$TIER free=${FREE_GB}G on ${TIGHTEST} (tightest GC-root volume) -> sweeping STALE_DAYS=$STALE"
+if [ "$TIER" != HEALTHY ]; then
+  log "tier=$TIER free=${FREE_GB}G on ${TIGHTEST} (tightest GC-root volume) -> sweeping STALE_DAYS=$STALE"
+fi
 
 # HELA-11412: strict tier for / (see header). Runs under this script's flock
 # (DISK_GUARD_LOCKED=1); tiers on / alone because every lever works on / only.
@@ -155,6 +156,10 @@ if [ -n "$SDB_FREE" ] && [ "$SDB_FREE" -lt "$SDB_STRICT_GB" ]; then
     "${sdb_args[@]}" >> "$LOG" 2>&1 || log "strict tier sdb: disk_guard.py exit $?"
 fi
 
+# Strict root/sdb cleanup is independent of the farm GC roots. A healthy farm
+# tier must not skip pressure on a volume those roots do not cover.
+[ "$TIER" != HEALTHY ] || exit 0
+
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY_RUN=1, would run: STALE_DAYS=$STALE $GC --apply"
   exit 0
@@ -181,6 +186,6 @@ log "tier=$TIER done: ${FREE_GB}G -> ${AFTER:-?}G (tightest GC-root volume)"
 if [ "$TIER" = CRITICAL ] && [ -n "$AFTER" ] && [ "$AFTER" -lt "$CRIT_GB" ]; then
   log "STILL CRITICAL after full sweep (${AFTER}G) — farm GC has no headroom left to reclaim"
   printf '🚨 **Disk CRITICAL** — tightest GC-root volume (%s) at %sG free after a full farm sweep (STALE_DAYS=0). Review HELA-12595.\n' \
-    "$TIGHTEST" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py note \
+    "$TIGHTEST" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py escalate \
     || log "critical signal rejected by scoped reporter"
 fi

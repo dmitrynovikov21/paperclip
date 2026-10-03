@@ -75,7 +75,7 @@ class Server(socketserver.ThreadingUnixStreamServer):
     def __init__(self, socket_path, api_url, api_key):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
-        self.opener = urllib.request.build_opener(NoRedirect())
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         super().__init__(socket_path, Handler)
 
 

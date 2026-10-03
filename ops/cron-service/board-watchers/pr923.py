@@ -193,7 +193,18 @@ def wake(text, note):
             log('WOKE via PATCH todo+comment (%s)' % note)
             return True
         except (urllib.error.URLError, OSError, ValueError) as e:
-            log('PATCH todo failed (%s): %s — fallback comment' % (note, str(e)[:160]))
+            # A lost response can follow a committed PATCH. Re-read the card
+            # before falling back, or the same wake is posted twice.
+            log('PATCH response uncertain (%s): %s — checking card' % (note, str(e)[:160]))
+            after = guard(note + ': after PATCH')
+            if after is None:
+                return True
+            if after is False:
+                return False
+            if after.get('status') != 'blocked':
+                log('PATCH changed card status (%s); no duplicate comment' % note)
+                return True
+            log('card remains blocked (%s); fallback comment' % note)
     try:
         board_req('POST', '/issues/%s/comments' % ISSUE, {'body': body})
     except (urllib.error.URLError, OSError, ValueError) as e:

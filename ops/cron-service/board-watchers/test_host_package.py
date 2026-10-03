@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import disk_reporter
 import github_api
+import pr923
 import service_http
 import verify_boundary
 
@@ -81,12 +82,36 @@ class HostPackageTest(unittest.TestCase):
                 right.close()
             self.assertEqual(requests[0][0:2],
                              ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}"))
+            disk_reporter.report({"action": "escalate", "body":
+                                 "🚨 **Disk CRITICAL** fixture"}, 1000)
+            self.assertEqual(requests[1][0:2],
+                             ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}"))
             with self.assertRaises(ValueError):
                 disk_reporter.report(message, 1001)
             with self.assertRaises(ValueError):
                 disk_reporter.report({"action": "escalate", "body": message["body"],
                                       "issue": "other"}, 1000)
-        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(requests), 2)
+
+    def test_pr_wake_rechecks_after_an_uncertain_patch_response(self):
+        with patch.object(pr923, "guard", side_effect=[{"status": "blocked"}, {"status": "todo"}]) as guard, \
+                patch.object(pr923, "board_req", side_effect=OSError("response lost")) as board, \
+                patch.object(pr923, "log"):
+            self.assertTrue(pr923.wake("fixture", "head"))
+            self.assertEqual(guard.call_count, 2)
+            self.assertEqual(board.call_count, 1)
+            self.assertEqual(board.call_args.args[0], "PATCH")
+
+        def failed_patch(method, *_args):
+            if method == "PATCH":
+                raise OSError("response lost")
+            return {}
+
+        with patch.object(pr923, "guard", side_effect=[{"status": "blocked"}, {"status": "blocked"}]), \
+                patch.object(pr923, "board_req", side_effect=failed_patch) as board, \
+                patch.object(pr923, "log"):
+            self.assertTrue(pr923.wake("fixture", "head"))
+            self.assertEqual([call.args[0] for call in board.call_args_list], ["PATCH", "POST"])
 
     def test_malformed_disk_client_is_denied_without_stopping_reporter(self):
         left, right = socket.socketpair()

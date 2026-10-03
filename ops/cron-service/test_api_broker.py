@@ -30,6 +30,18 @@ class Upstream(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b'{"ok":true}')
 
 
+class Proxy(http.server.BaseHTTPRequestHandler):
+    seen = []
+
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        self.seen.append(self.path)
+        self.send_response(502)
+        self.end_headers()
+
+
 class BrokerTest(unittest.TestCase):
     def test_credential_remains_in_broker_and_redirect_is_not_followed(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
@@ -41,11 +53,18 @@ class BrokerTest(unittest.TestCase):
             upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
             thread = threading.Thread(target=upstream.serve_forever, daemon=True)
             thread.start()
+            proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+            proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            proxy_thread.start()
             environment = {
                 **os.environ,
                 "CRON_SERVICE_API_URL": f"http://127.0.0.1:{upstream.server_port}",
                 "CRON_SERVICE_SOCKET": socket_path,
                 "CRON_SERVICE_TOKEN_FILE": str(token_file),
+                "http_proxy": f"http://127.0.0.1:{proxy.server_port}",
+                "HTTP_PROXY": f"http://127.0.0.1:{proxy.server_port}",
+                "no_proxy": "",
+                "NO_PROXY": "",
             }
             broker = subprocess.Popen(["python3", str(HERE / "api_broker.py")], env=environment)
             try:
@@ -70,12 +89,16 @@ class BrokerTest(unittest.TestCase):
                     ("/api/allowed", "Bearer " + secret),
                     ("/api/redirect", "Bearer " + secret),
                 ])
+                self.assertEqual(Proxy.seen, [])
             finally:
                 broker.terminate()
                 broker.wait(timeout=5)
                 upstream.shutdown()
                 upstream.server_close()
+                proxy.shutdown()
+                proxy.server_close()
                 Upstream.seen.clear()
+                Proxy.seen.clear()
 
 
 if __name__ == "__main__":

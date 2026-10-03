@@ -2,6 +2,7 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import datetime
 import json
 import os
 import socket
@@ -12,6 +13,8 @@ from unittest.mock import patch
 
 import disk_reporter
 import github_api
+import pr1042
+import pr1198
 import pr923
 import service_http
 import verify_boundary
@@ -112,6 +115,59 @@ class HostPackageTest(unittest.TestCase):
                 patch.object(pr923, "log"):
             self.assertTrue(pr923.wake("fixture", "head"))
             self.assertEqual([call.args[0] for call in board.call_args_list], ["PATCH", "POST"])
+
+    def test_pr_feedback_wakes_with_links_but_without_external_bodies(self):
+        head = "a" * 40
+        forbidden = "UNTRUSTED_FEEDBACK_BODY_DO_NOT_FORWARD"
+        for watcher in (pr923, pr1198, pr1042):
+            with self.subTest(watcher=watcher.__name__):
+                base = f"repos/{watcher.REPO}"
+                pr_path = f"{base}/pulls/{watcher.PR}"
+                urls = [f"https://github.com/{watcher.REPO}/pull/{watcher.PR}#feedback-{i}"
+                        for i in range(3)]
+                feedback = [
+                    {"id": i + 1, "user": {"login": "human-reviewer"},
+                     "created_at": "2026-10-02T10:00:00Z", "submitted_at": "2026-10-02T10:00:00Z",
+                     "state": "COMMENTED", "html_url": urls[i], "body": f"{forbidden}-{i}"}
+                    for i in range(3)
+                ]
+                responses = {
+                    pr_path: {"head": {"sha": head}, "state": "open", "draft": False,
+                              "merged": False, "mergeable_state": "clean"},
+                    f"{base}/commits/{head}": {"commit": {"author": {"name": "Fixture"}},
+                                               "author": {"login": "fixture"}},
+                    f"{base}/commits/{head}/check-runs?per_page=100": {"check_runs": []},
+                    f"{pr_path}/commits?per_page=100": [
+                        {"sha": head, "commit": {"author": {"name": "Fixture"},
+                                                  "message": "Fixture commit"}}],
+                    f"{base}/issues/{watcher.PR}/comments?per_page=100": [feedback[0]],
+                    f"{pr_path}/reviews?per_page=100": [feedback[1]],
+                    f"{pr_path}/comments?per_page=100": [feedback[2]],
+                }
+                with patch.object(watcher, "gh_json", side_effect=responses.__getitem__):
+                    world = watcher.read_world()
+                self.assertNotIn(forbidden, repr(world))
+
+                state = {"seen": [], "head": head}
+                wake_result = True if watcher is pr923 else "woke"
+                with patch.object(watcher, "read_world", return_value=world), \
+                        patch.object(watcher, "wake", return_value=wake_result) as wake, \
+                        patch.object(watcher, "now", return_value=datetime.datetime(
+                            2026, 10, 2, 12, tzinfo=datetime.timezone.utc)), \
+                        patch.object(watcher, "log"):
+                    watcher.tick(state)
+                calls = [call for call in wake.call_args_list if call.args[1] == "feedback"]
+                self.assertEqual(len(calls), 1)
+                message = calls[0].args[0]
+                self.assertNotIn(forbidden, message)
+                for kind in ("коммент", "ревью", "строчный коммент"):
+                    self.assertIn(f"- {kind}", message)
+                self.assertIn("human-reviewer", message)
+                self.assertIn("2026-10-02T10:00:00Z", message)
+                self.assertIn("COMMENTED", message)
+                for url in urls:
+                    self.assertIn(url, message)
+                self.assertEqual(len(state["seen"]), 3)
 
     def test_malformed_disk_client_is_denied_without_stopping_reporter(self):
         left, right = socket.socketpair()

@@ -90,8 +90,7 @@ def read_world():
             ('строчный коммент', 'repos/%s/pulls/%d/comments?per_page=100' % (REPO, PR), 'created_at')):
         for x in gh_json(path):
             feedback.append({'key': '%s:%s' % (kind, x['id']), 'kind': kind, 'login': (x.get('user') or {}).get('login'),
-                             'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url'),
-                             'text': (x.get('body') or '').strip().replace('\n', ' ')[:300]})
+                             'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url')})
     return {'state': p['state'], 'merged': bool(p.get('merged')), 'merged_at': p.get('merged_at'),
             'merged_by': (p.get('merged_by') or {}).get('login'), 'merge_sha': p.get('merge_commit_sha'),
             'head': head,
@@ -217,10 +216,10 @@ def tick(state):
     fresh = [f for f in w['feedback'] if f['key'] not in seen]
     human = [f for f in fresh if is_human(f['login'])]
     if human:
-        text = '\n'.join('- %s `%s` %s%s: «%s» — %s' % (f['kind'], f['login'], f['at'] or '',
-                                                       (' (%s)' % f['state']) if f['state'] else '',
-                                                       f['text'], f['url'] or '') for f in human)
-        r = wake('💬 **HELA-12343: в backend#%d новый отзыв человека** (%s):\n%s\n\nРевизия Саши (MERGE / FIX / '
+        text = '\n'.join('- %s `%s` %s%s — %s' % (f['kind'], f['login'], f['at'] or '',
+                                                   (' (%s)' % f['state']) if f['state'] else '',
+                                                   f['url'] or '') for f in human)
+        r = wake('💬 **HELA-12343: в backend#%d новый отзыв человека** (%s):\n%s\n\nОткрыть отзыв по ссылке в GitHub. Ревизия Саши (MERGE / FIX / '
                  'OWNER) — действовать по ней. Ответ по REQ-4 (строки `SCHEMAS` / `CONFIGS` / `SCHEMES`) — разобрать '
                  'по разделу «REQ-4 + N1» описания карты.%s' % (PR, line, text, KEEP), 'feedback')
         if r == 'disarm':

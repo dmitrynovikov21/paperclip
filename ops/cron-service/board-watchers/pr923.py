@@ -114,8 +114,7 @@ def read_world():
             ('строчный коммент', 'repos/%s/pulls/%d/comments?per_page=100' % (REPO, PR), 'created_at')):
         for x in gh_json(path):
             feedback.append({'key': '%s:%s' % (kind, x['id']), 'kind': kind, 'login': (x.get('user') or {}).get('login'),
-                             'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url'),
-                             'text': (x.get('body') or '').strip().replace('\n', ' ')[:200]})
+                             'at': x.get(when), 'state': x.get('state'), 'url': x.get('html_url')})
     return {'state': pr['state'], 'draft': bool(pr.get('draft')), 'merged': bool(pr.get('merged')),
             'merged_at': pr.get('merged_at'), 'merged_by': (pr.get('merged_by') or {}).get('login'),
             'merge_sha': pr.get('merge_commit_sha'), 'mergeable_state': pr.get('mergeable_state'),
@@ -258,10 +257,10 @@ def tick(state):
     fresh = [f for f in w['feedback'] if f['key'] not in state['seen']]
     human = [f for f in fresh if is_human(f['login'])]
     if human:
-        lines = '\n'.join('- %s `%s` %s%s: «%s» — %s' % (f['kind'], f['login'], f['at'] or '',
-                                                        (' (%s)' % f['state']) if f['state'] else '',
-                                                        f['text'], f['url'] or '') for f in human)
-        if wake('💬 **HELA-12380: в frontend#923 новый отзыв человека** (%s):\n%s\n\nРазобрать: вердикт '
+        lines = '\n'.join('- %s `%s` %s%s — %s' % (f['kind'], f['login'], f['at'] or '',
+                                                    (' (%s)' % f['state']) if f['state'] else '',
+                                                    f['url'] or '') for f in human)
+        if wake('💬 **HELA-12380: в frontend#923 новый отзыв человека** (%s):\n%s\n\nОткрыть отзыв по ссылке в GitHub. Разобрать: вердикт '
                 'мержера (`MERGE` — мерж за минуты, сначала `gh pr view 923 --json state,mergedAt`; `FIX` — он '
                 'сам пушит правку, дельту читать ревью; п.4 описания карты) или '
                 'вопрос — ответить в PR.%s' % (pr_line(w), lines, KEEP), 'feedback'):

@@ -170,13 +170,17 @@ STALE_DAYS=$STALE "$GC" --apply >> "$LOG" 2>&1
 # Re-measure the same way we measured going in (min across GC roots). Reading `/`
 # here while having tiered on sdb would report a recovery that did not happen on
 # the volume that triggered the sweep.
-AFTER=""
+AFTER=""; AFTER_SOURCE=""
 for r in $GC_ROOTS; do
   [ -d "$r" ] || continue
   f=$(free_of "$r"); [ -n "$f" ] || continue
-  { [ -z "$AFTER" ] || [ "$f" -lt "$AFTER" ]; } && AFTER=$f
+  if [ -z "$AFTER" ] || [ "$f" -lt "$AFTER" ]; then
+    AFTER=$f
+    AFTER_SOURCE=$(df --output=source "$r" 2>/dev/null | tail -1)
+    [ -n "$AFTER_SOURCE" ] || AFTER_SOURCE=$r
+  fi
 done
-log "tier=$TIER done: ${FREE_GB}G -> ${AFTER:-?}G (tightest GC-root volume)"
+log "tier=$TIER done: ${FREE_GB}G -> ${AFTER:-?}G on ${AFTER_SOURCE:-?} (tightest GC-root volume)"
 
 # CRITICAL that a sweep could not fix is the ENOSPC precursor from 01.09 and the
 # one state a human must see. disk-alert.sh cannot report this: it is
@@ -187,7 +191,7 @@ if [ "$TIER" = CRITICAL ] && [ -n "$AFTER" ] && [ "$AFTER" -lt "$CRIT_GB" ]; the
   log "STILL CRITICAL after full sweep (${AFTER}G) — farm GC has no headroom left to reclaim"
   # Keep separate cooldowns for distinct farm volumes: pressure on sdb must
   # not be hidden by a recent root-volume alarm (or the reverse).
-  volume_key=$(printf '%s' "$TIGHTEST" | sha256sum | cut -c1-64)
+  volume_key=$(printf '%s' "$AFTER_SOURCE" | sha256sum | cut -c1-64)
   alarm_state=/home/paperclip-user/.disk-guard-state/last-critical-farm-alarm-$volume_key
   alarm_gap_s=7200
   last_alarm=$(cat "$alarm_state" 2>/dev/null || true)
@@ -195,7 +199,7 @@ if [ "$TIER" = CRITICAL ] && [ -n "$AFTER" ] && [ "$AFTER" -lt "$CRIT_GB" ]; the
   if [[ $last_alarm =~ ^[0-9]+$ ]] && (( now_epoch >= last_alarm && now_epoch - last_alarm < alarm_gap_s )); then
     log "critical signal suppressed: previous farm alarm less than two hours ago"
   elif printf '🚨 **Disk CRITICAL** — tightest GC-root volume (%s) at %sG free after a full farm sweep (STALE_DAYS=0). Review HELA-12595.\n' \
-    "$TIGHTEST" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py escalate; then
+    "$AFTER_SOURCE" "$AFTER" | /usr/bin/python3 /opt/paperclip-cron/disk_client.py escalate; then
     if mkdir -p "$(dirname "$alarm_state")" && printf '%s\n' "$now_epoch" > "$alarm_state"; then
       log "critical signal sent through scoped reporter; next alarm after two hours"
     else

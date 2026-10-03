@@ -39,7 +39,8 @@ delegated; it cannot read the reporter key or choose another issue/API path.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are
 healthy. If a critical farm sweep leaves the volume below its threshold, its
 second alarm uses the reporter's fixed escalation action. A successful alarm
-sets a two-hour cooldown for that volume in the agent-side disk state directory.
+sets a two-hour cooldown for the volume measured after the sweep in the
+agent-side disk state directory.
 
 On 03.10.2026 the uid-1000 crontab has no active row for any of the three PR
 watchers. PR #1198's old source path is absent; PR #1042's source is in

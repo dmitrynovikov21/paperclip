@@ -420,7 +420,7 @@ export interface StageCodexHomeForSyncOptions {
 
 /** Copy bytes from an already-open inode. An agent replacing its path cannot
  * redirect the service read after this point. */
-async function stagePinnedEntry(source: SafeHandle, target: string): Promise<void> {
+async function stagePinnedEntry(source: SafeHandle, target: string, preserveExecutable = false): Promise<void> {
   const stat = await source.stat();
   if (stat.isDirectory()) {
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
@@ -428,14 +428,15 @@ async function stagePinnedEntry(source: SafeHandle, target: string): Promise<voi
       const child = await openChildNoFollow(source, name);
       if (!child) continue; // Never follow nested links, including directory aliases.
       try {
-        await stagePinnedEntry(child, path.join(target, name));
+        await stagePinnedEntry(child, path.join(target, name), preserveExecutable);
       } finally {
         await child.close();
       }
     }
   } else if (stat.isFile()) {
-    await fs.writeFile(target, await source.readFile(), { mode: 0o600 });
-    await fs.chmod(target, 0o600);
+    const mode = preserveExecutable && (stat.mode & 0o111) !== 0 ? 0o700 : 0o600;
+    await fs.writeFile(target, await source.readFile(), { mode });
+    await fs.chmod(target, mode);
   }
   // Sockets, devices and nonblocking FIFOs are not staging inputs.
 }
@@ -502,7 +503,7 @@ async function stageCodexHomeEntry(
           const source = await openPathNoFollow(skill.source);
           if (!source) throw new Error("Selected Codex skill source is missing or linked");
           try {
-            await stagePinnedEntry(source, path.join(target, skill.name));
+            await stagePinnedEntry(source, path.join(target, skill.name), true);
           } finally {
             await source.close();
           }
@@ -514,7 +515,7 @@ async function stageCodexHomeEntry(
           const source = await openChildNoFollow(skills, name);
           if (!source) continue;
           try {
-            await stagePinnedEntry(source, path.join(target, name));
+            await stagePinnedEntry(source, path.join(target, name), true);
           } finally {
             await source.close();
           }
@@ -562,10 +563,9 @@ async function stageCodexHomeEntry(
  *   Agent-controlled links and directory aliases are never followed.
  * - **Missing-but-optional entries are skipped** — no `auth.json` in
  *   keyring-credential mode, or no `config.json`, is not an error.
- * - **`mkdtemp` guarantees the staged dir is `0700`** on POSIX, and every staged
- *   regular file is written `0600` (least privilege), so staged credentials —
- *   `auth.json` (OAuth token) and `config.toml` (managed MCP bearer header) —
- *   are never group/other-readable.
+ * - **`mkdtemp` guarantees the staged dir is `0700`** on POSIX. Credential and
+ *   config files are `0600`; selected skill executables retain only owner
+ *   execute permission (`0700`). Nothing staged is group/other-readable.
  * - **Fail-closed** — any *unexpected* I/O error removes the partial temp dir
  *   and re-throws, so a run never proceeds with a partial or empty home.
  *

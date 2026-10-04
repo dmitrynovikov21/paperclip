@@ -119,6 +119,11 @@ vi.mock("../routes/ai-connections.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../routes/ai-connections.js")>()),
   validateAiApiKey: mockValidateAiApiKey,
 }));
+const mockMarkAuthenticationFailed = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../services/ai-connections.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/ai-connections.js")>()),
+  aiConnectionService: () => ({ markAuthenticationFailed: mockMarkAuthenticationFailed }),
+}));
 
 function mockManagedRuntime(method: "api_key" | "subscription") {
   mockPrepareManagedAiRuntime.mockImplementation(
@@ -536,7 +541,10 @@ esac
 
   it("fails adoption of an api_key connection the provider no longer accepts", async () => {
     mockManagedRuntime("api_key");
-    mockValidateAiApiKey.mockRejectedValueOnce(Object.assign(new Error("The provider rejected this API key."), { status: 422 }));
+    const { unprocessable } = await import("../errors.js");
+    mockValidateAiApiKey.mockRejectedValueOnce(unprocessable("The provider rejected this API key.", {
+      code: "ai_connection_api_key_rejected",
+    }));
     const app = await createApp();
     const res = await request(app)
       .post("/api/companies/company-1/adapters/external_test/test-environment")
@@ -547,6 +555,10 @@ esac
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("fail");
     expect(res.body.checks.map((check: { code: string }) => check.code)).toContain("ai_connection_api_key_rejected");
+    expect(mockMarkAuthenticationFailed).toHaveBeenCalledWith(expect.objectContaining({
+      companyId: "company-1",
+      attribution: expect.objectContaining({ connectionId: "conn-1", grantId: "grant-1" }),
+    }));
   });
 
   it("still fails subscription adoption when no hello probe can run", async () => {

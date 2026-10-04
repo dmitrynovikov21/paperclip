@@ -24,6 +24,23 @@ This directory contains templates. **Do not install or run them on the live host
 
 The table is a rewrite contract, not a copy of the live scripts. The six site-by-site patch instructions are in `job-rewrite-templates.md`. `pg-client` keeps a URL out of libpq client argv; it must be installed beside `run-host-job`. DevOps must inspect each SQL statement and apply the source rewrite, then review the resulting redacted diff before installation. A role starts with `CONNECT` only; grant table/function rights individually after the audit. `testdb-gc` must not inherit the Paperclip service role or superuser rights. If a job cannot be made least-privilege, keep it disabled and escalate the exact SQL/permission conflict.
 
+## Build artifact and handoff before the live window
+
+Build from a clean, CI-green PR head. Record the full Git SHA, the `master` base SHA, the image ID, and the SHA-256 of the saved image in the release issue. Pass the full commit to the Docker build so the server stamp and remote provider pack describe the same source. Save the resulting image, not just its tag: tags and upstream image/package names can move. Do not include a config, `.env`, database dump, credential file, or host cron script in the build context or artifact.
+
+```sh
+sha=$(git rev-parse HEAD)
+test -z "$(git status --porcelain)"
+docker build --target production --build-arg "PAPERCLIP_BUILD_COMMIT=$sha" -t "paperclip-db-credential:$sha" .
+docker image inspect --format '{{.Id}}' "paperclip-db-credential:$sha"
+docker image save -o "paperclip-db-credential-$sha.tar" "paperclip-db-credential:$sha"
+sha256sum "paperclip-db-credential-$sha.tar"
+```
+
+Keep the image tar and its checksum together as the immutable candidate. On the deployment host, verify `sha256sum -c` before `docker load`; stage its `/app` and `/opt/paperclip-runner/provider-pack` trees at the reviewed paths with root ownership, and verify the server build stamp equals the recorded SHA. The service needs Node 24.11 or newer. The service credential is mounted at runtime; it is never baked into either tree. If the operator uses a native systemd process rather than a container, confirm its executable, provider-pack path, and service UID against the extracted image before the cutover.
+
+Save the exact known-good pre-cutover image or app tree as a separate checksum-verified rollback artifact before changing any live carrier. A pre-isolation image is usable only while dispatch remains frozen and the original credential state is still valid; after old-role revocation it is **not** an agent-enabled rollback. Preserve the new isolated build and repair its roles/grants instead, or obtain a fresh security-approved cutover plan. The release issue carries the candidate and rollback artifact digests and the synthetic test result; live staging, schedule changes, credential rotation, and activation belong exclusively to the approved root window.
+
 ## Ordered live runbook — founder go required
 
 1. Record SHA, approved PR, the exact six cron definitions and next occurrences, all agent dispatch/runners/host bridges and restart monitors, service status, old DB role and backup location. Confirm each rewritten job can run while the Paperclip service is stopped; if any cannot, resolve that dependency before cutover. Take an encrypted database backup and private copies of the seven original files; verify restore in a disposable environment. Keep the old URL for the negative check in a root-only file outside agent-readable homes and worktrees. Do not print it.

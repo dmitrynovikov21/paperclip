@@ -28,8 +28,9 @@ CRITICAL_VOLUMES = (
     ("/mnt/HC_Volume_106646767", "sdb", 10),
 )
 REPORT_GAP_S = 2 * 3600
-last_reported = {}  # agent-triggered post-sweep signals
-last_monitored = {}  # autonomous pre-sweep observations
+PERSISTENCE_GAP_S = 10 * 60
+last_reported = {}
+last_persistent = {}
 report_lock = threading.Lock()
 
 
@@ -66,24 +67,30 @@ def emit_measured_alarm(source):
         if not critical:
             return None
         now = time.monotonic()
-        fresh = [(label, free_gb, threshold_gb) for label, free_gb, threshold_gb in critical
-                 if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S
-                 and (source == "socket"
-                      or now - last_monitored.get(label, float("-inf")) >= REPORT_GAP_S)]
+        fresh = []
+        for label, free_gb, threshold_gb in critical:
+            if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S:
+                fresh.append((label, free_gb, threshold_gb, False))
+            elif (source == "monitor"
+                  and now - last_reported[label] >= PERSISTENCE_GAP_S
+                  and now - last_persistent.get(label, float("-inf")) >= REPORT_GAP_S):
+                # Only the service's timer may issue the follow-up. UID 1000
+                # cannot prove a sweep occurred by sending a socket message.
+                fresh.append((label, free_gb, threshold_gb, True))
         if not fresh:
             return {"local": True}
         measurements = "\n".join(
-            f"- {label}: свободно {free_gb:.1f} ГБ, критический порог {threshold_gb} ГБ."
-            for label, free_gb, threshold_gb in fresh
+            f"- {label}: свободно {free_gb:.1f} ГБ, критический порог {threshold_gb} ГБ"
+            f"{' (сохраняется после 10 минут)' if persistent else ''}."
+            for label, free_gb, threshold_gb, persistent in fresh
         )
         comment = ("🚨 **Disk CRITICAL** — сервисный замер свободного места:\n"
                    f"{measurements}\n\n"
                    "Состояние уборки проверьте в локальном журнале дискового сторожа.")
         result = service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}",
                                  {"status": "todo", "comment": comment})
-        destination = last_reported if source == "socket" else last_monitored
-        for label, _free_gb, _threshold_gb in fresh:
-            destination[label] = now
+        for label, _free_gb, _threshold_gb, persistent in fresh:
+            (last_persistent if persistent else last_reported)[label] = now
         return result
 
 

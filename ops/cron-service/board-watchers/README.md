@@ -39,12 +39,16 @@ sdb volume itself against fixed alarm thresholds (10/10 GB), and creates the
 board comment from its own template. An arbitrary agent message or a critical
 event without measured pressure is rejected. The agent cannot read the reporter
 key, choose another issue/API path, or place its text in a service-authored wake.
-The reporter suppresses repeat wakes from each source for the same measured
-volume for two hours while its service process remains running. The autonomous
-check never consumes the post-sweep signal's cooldown: persistent pressure
-can therefore produce one alarm before a sweep and one after it. A post-sweep
-signal suppresses further autonomous alarms for the same volume. Socket reads
-have a two-second absolute deadline; four workers handle at most eight active or queued clients,
+The reporter allows one immediate measured alarm per volume per two hours,
+whether the service timer or the GC socket triggers it. A socket request cannot
+create another immediate wake after the service timer. If pressure remains
+critical for ten minutes after that first alarm, only the service timer can
+send one persistent-pressure follow-up, with its own two-hour limit. This
+recheck remains available after a failed GC even when the socket is saturated
+or a socket request was already suppressed. It reports measured persistence;
+it does not claim to prove that a GC sweep completed. Socket reads have a
+two-second absolute deadline; four workers handle at most eight active or
+queued clients,
 and concurrent valid signals share one cooldown decision. An independent service
 check starts when the service is enabled at boot and repeats every 30 seconds,
 measuring the same fixed volumes and sending the same scoped alarm when pressure

@@ -19,6 +19,16 @@ SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
+PGPASSWORD_ASSIGNMENT = re.compile(rb"^[ \t]*(?:export[ \t]+)?PGPASSWORD[ \t]*=[ \t]*(.*)")
+LIBPQ_CONNINFO_START = re.compile(
+    rb"^[ \t]*(?:host|hostaddr|port|dbname|user|service|sslmode|connect_timeout|application_name|password)[ \t]*=",
+    re.I,
+)
+LIBPQ_CONNINFO_KEY = re.compile(
+    rb"(?:^|[ \t])(?:host|hostaddr|port|dbname|user|service|sslmode|connect_timeout|application_name)[ \t]*=",
+    re.I,
+)
+LIBPQ_PASSWORD_KEY = re.compile(rb"(?:^|[ \t])password[ \t]*=[ \t]*\S", re.I)
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -208,9 +218,9 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
 def scan_libpq_carrier(path: Path) -> list[str]:
     """Reject libpq password sources that contain no PostgreSQL URL.
 
-    A service file may have any name via PGSERVICEFILE. Read bounded lines in
-    every file to recognize its INI section and credential assignments. Named
-    carriers and oversized service sections fail closed; values are not logged.
+    A service file may have any name via PGSERVICEFILE. Shell assignments and
+    keyword/value conninfo may also have arbitrary names. Read bounded lines
+    in every file; suspicious oversized lines fail closed. Values are not logged.
     """
     is_env = path.name.startswith(".env")
     is_service = path.name in SERVICE_FILE_NAMES
@@ -219,6 +229,10 @@ def scan_libpq_carrier(path: Path) -> list[str]:
     reasons = set()
     in_service_section = False
     skipping_oversized_line = False
+    conninfo_has_key = False
+    conninfo_has_password = False
+    meaningful_lines = 0
+    password_only_line = False
     with path.open("rb") as source:
         while line := source.readline(MAX_CARRIER_LINE_BYTES + 1):
             if skipping_oversized_line:
@@ -227,7 +241,12 @@ def scan_libpq_carrier(path: Path) -> list[str]:
             if len(line) > MAX_CARRIER_LINE_BYTES:
                 if is_named_carrier or (
                     not line.lstrip().startswith(b"#")
-                    and (in_service_section or line.lstrip().startswith(b"["))
+                    and (
+                        in_service_section
+                        or line.lstrip().startswith(b"[")
+                        or PGPASSWORD_ASSIGNMENT.match(line)
+                        or LIBPQ_CONNINFO_START.match(line)
+                    )
                 ):
                     reasons.add("oversized-db-carrier-line")
                 if is_named_carrier:
@@ -255,8 +274,32 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                 rb"^[ \t]*(?:password|passfile)[ \t]*=", line, re.I
             ):
                 reasons.add("libpq-service-credential")
+            # Ignore computed source-code expressions such as
+            # PGPASSWORD=unquote(url.password); they do not copy a credential.
+            shell_assignment = PGPASSWORD_ASSIGNMENT.match(line)
+            if shell_assignment:
+                value = shell_assignment.group(1).strip()
+                if value and not value.startswith((b"$", b"`")) and not re.match(
+                    rb"[A-Za-z_][A-Za-z_0-9]*\(", value
+                ):
+                    reasons.add("env-libpq-password")
+            if not is_service and not in_service_section:
+                meaningful_lines += 1
+                if LIBPQ_CONNINFO_START.match(line):
+                    has_key = bool(LIBPQ_CONNINFO_KEY.search(line))
+                    has_password = bool(LIBPQ_PASSWORD_KEY.search(line))
+                    conninfo_has_key |= has_key
+                    conninfo_has_password |= has_password
+                    password_only_line = has_password and not has_key
+                    if conninfo_has_key and conninfo_has_password:
+                        reasons.add("libpq-conninfo-password")
+                else:
+                    conninfo_has_key = False
+                    conninfo_has_password = False
             if is_passfile:
                 reasons.add("libpq-passfile-entry")
+    if meaningful_lines == 1 and password_only_line:
+        reasons.add("libpq-conninfo-password")
     return sorted(reasons)
 
 

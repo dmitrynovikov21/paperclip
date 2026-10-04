@@ -105,6 +105,66 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
 fi
 grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
+for fixture in conninfo conninfo_multiline conninfo_password_only shell; do
+  case "$fixture" in
+    conninfo)
+      name=conninfo.txt
+      content='host=127.0.0.1 dbname=synthetic user=new_agent password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_multiline)
+      name=multiline-conninfo.txt
+      content='host=127.0.0.1 dbname=synthetic user=new_agent
+password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_password_only)
+      name=password-only-conninfo.txt
+      content='password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
+    shell)
+      name=run.sh
+      content='export PGPASSWORD=different_synthetic'
+      reason=env-libpq-password
+      ;;
+  esac
+  printf '%s\n' "$content" > "$scratch/worktree/nested/$name"
+  chmod 0600 "$scratch/worktree/nested/$name"
+  if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+    > "$scratch/scan-result" 2>&1; then
+    echo "Copy scan did not reject worktree $fixture credential" >&2
+    exit 1
+  fi
+  grep -q "reasons=$reason" "$scratch/scan-result"
+  if grep -q 'different_synthetic' "$scratch/scan-result"; then
+    echo 'Copy scan printed synthetic credential material' >&2
+    exit 1
+  fi
+  mv "$scratch/worktree/nested/$name" "$scratch/$name"
+  if python3 "$scan" --old-url-file "$scratch/old-url" --carrier "$scratch/$name" \
+    > "$scratch/scan-result" 2>&1; then
+    echo "Copy scan did not reject explicit $fixture carrier" >&2
+    exit 1
+  fi
+  grep -q "reasons=$reason" "$scratch/scan-result"
+  if grep -q 'different_synthetic' "$scratch/scan-result"; then
+    echo 'Copy scan printed synthetic credential material' >&2
+    exit 1
+  fi
+  rm "$scratch/$name"
+done
+printf '%s\n' 'host=127.0.0.1 dbname=synthetic user=new_agent' \
+  > "$scratch/worktree/nested/clean-conninfo.txt"
+printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' \
+  > "$scratch/worktree/nested/clean-run.sh"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+for name in clean-conninfo.txt clean-run.sh; do
+  python3 "$scan" --old-url-file "$scratch/old-url" \
+    --carrier "$scratch/worktree/nested/$name" > "$scratch/scan-result"
+done
+rm "$scratch/worktree/nested/clean-conninfo.txt" "$scratch/worktree/nested/clean-run.sh"
 printf '%s\n' 'region:2024:metric:dimension:value' > "$scratch/worktree/nested/metrics.txt"
 chmod 0644 "$scratch/worktree/nested/metrics.txt"
 if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
@@ -264,4 +324,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo and shell password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

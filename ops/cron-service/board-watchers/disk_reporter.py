@@ -31,6 +31,7 @@ REPORT_GAP_S = 2 * 3600
 PERSISTENCE_GAP_S = 10 * 60
 last_reported = {}
 last_persistent = {}
+pressure_since = {}
 report_lock = threading.Lock()
 
 
@@ -64,15 +65,23 @@ def emit_measured_alarm(source):
     # is recorded. The HTTP request is bounded by the service transport timeout.
     with report_lock:
         critical = measured_pressure()
+        now = time.monotonic()
+        if source == "monitor":
+            critical_labels = {label for label, _free_gb, _threshold_gb in critical}
+            for label in tuple(pressure_since):
+                if label not in critical_labels:
+                    del pressure_since[label]
+            for label in critical_labels:
+                pressure_since.setdefault(label, now)
         if not critical:
             return None
-        now = time.monotonic()
         fresh = []
         for label, free_gb, threshold_gb in critical:
             if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S:
                 fresh.append((label, free_gb, threshold_gb, False))
             elif (source == "monitor"
                   and now - last_reported[label] >= PERSISTENCE_GAP_S
+                  and now - pressure_since[label] >= PERSISTENCE_GAP_S
                   and now - last_persistent.get(label, float("-inf")) >= REPORT_GAP_S):
                 # Only the service's timer may issue the follow-up. UID 1000
                 # cannot prove a sweep occurred by sending a socket message.
@@ -81,7 +90,7 @@ def emit_measured_alarm(source):
             return {"local": True}
         measurements = "\n".join(
             f"- {label}: свободно {free_gb:.1f} ГБ, критический порог {threshold_gb} ГБ"
-            f"{' (сохраняется после 10 минут)' if persistent else ''}."
+            f"{' (критично на каждом сервисном замере за 10 минут)' if persistent else ''}."
             for label, free_gb, threshold_gb, persistent in fresh
         )
         comment = ("🚨 **Disk CRITICAL** — сервисный замер свободного места:\n"

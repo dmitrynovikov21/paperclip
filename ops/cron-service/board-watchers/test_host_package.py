@@ -307,6 +307,7 @@ class HostPackageTest(unittest.TestCase):
         now = [1000.0]
         with patch.object(disk_reporter, "last_reported", {}), \
                 patch.object(disk_reporter, "last_persistent", {}), \
+                patch.object(disk_reporter, "pressure_since", {}), \
                 patch.object(disk_reporter, "measured_pressure", return_value=[("root", 5, 10)]), \
                 patch.object(disk_reporter.time, "monotonic", side_effect=lambda: now[0]), \
                 patch.object(disk_reporter, "service_request",
@@ -321,7 +322,31 @@ class HostPackageTest(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         self.assertTrue(all(call[0:2] == ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}")
                             for call in requests))
-        self.assertIn("сохраняется после 10 минут", requests[-1][2]["comment"])
+        self.assertIn("критично на каждом сервисном замере за 10 минут", requests[-1][2]["comment"])
+
+    def test_pressure_recovery_resets_persistence_observation(self):
+        requests = []
+        now = [1000.0]
+        pressure = [[("root", 5, 10)]]
+        with patch.object(disk_reporter, "last_reported", {}), \
+                patch.object(disk_reporter, "last_persistent", {}), \
+                patch.object(disk_reporter, "pressure_since", {}), \
+                patch.object(disk_reporter, "measured_pressure", side_effect=lambda: pressure[0]), \
+                patch.object(disk_reporter.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(disk_reporter, "service_request",
+                             side_effect=lambda *args: requests.append(args) or {}):
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {})
+            now[0] += disk_reporter.PERSISTENCE_GAP_S / 2
+            pressure[0] = []
+            self.assertIsNone(disk_reporter.emit_measured_alarm("monitor"))
+            now[0] += disk_reporter.PERSISTENCE_GAP_S / 2
+            pressure[0] = [("root", 5, 10)]
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {"local": True})
+            now[0] += disk_reporter.PERSISTENCE_GAP_S / 2
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {"local": True})
+            now[0] += disk_reporter.PERSISTENCE_GAP_S / 2
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {})
+        self.assertEqual(len(requests), 2)
 
     def test_saturated_disk_socket_cannot_suppress_service_measured_alarm(self):
         gate = threading.Event()
@@ -352,6 +377,7 @@ class HostPackageTest(unittest.TestCase):
                 pairs.append((stack.enter_context(client), stack.enter_context(server)))
             with patch.object(disk_reporter, "last_reported", {}), \
                     patch.object(disk_reporter, "last_persistent", {}), \
+                    patch.object(disk_reporter, "pressure_since", {}), \
                     patch.object(disk_reporter, "read_request", side_effect=slow_read), \
                     patch.object(disk_reporter, "measured_pressure", side_effect=measured_pressure), \
                     patch.object(disk_reporter, "service_request", side_effect=service_request), \

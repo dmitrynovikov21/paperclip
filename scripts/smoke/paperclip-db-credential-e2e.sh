@@ -114,7 +114,7 @@ for fixture in conninfo conninfo_multiline conninfo_password_only \
   shell_prefix_command_env shell_default shell_exec_default \
   shell_if shell_if_prefixed shell_elif shell_while shell_until \
   shell_then shell_do shell_not shell_time shell_command_substitution shell_multiple \
-  shell_env_multiple; do
+  shell_env_multiple shell_group shell_local_source shell_quoted_command; do
   case "$fixture" in
     conninfo)
       name=conninfo.txt
@@ -298,8 +298,25 @@ password=different_synthetic'
       content='env PGPASSWORD=$FROM_PRIVATE_SOURCE PGPASSWORD=different_synthetic psql'
       reason=env-libpq-password
       ;;
+    shell_group)
+      name=run-group.sh
+      content="{ PGPASSWORD=different_synthetic sh -c 'test \"\$PGPASSWORD\" = different_synthetic'; }"
+      reason=env-libpq-password
+      ;;
+    shell_local_source)
+      name=run-local-source.sh
+      content="DB_PASS=different_synthetic
+PGPASSWORD=\$DB_PASS sh -c 'test \"\$PGPASSWORD\" = different_synthetic'"
+      reason=env-libpq-password
+      ;;
+    shell_quoted_command)
+      name=run-quoted-command.sh
+      content="sh -c 'if PGPASSWORD=different_synthetic sh -c \"test \\\$PGPASSWORD = different_synthetic\"; then :; else exit 1; fi'"
+      reason=env-libpq-password
+      ;;
   esac
-  if [ "$fixture" = shell_if ]; then
+  if [ "$fixture" = shell_if ] || [ "$fixture" = shell_group ] || \
+      [ "$fixture" = shell_local_source ] || [ "$fixture" = shell_quoted_command ]; then
     sh -c "$content" # The synthetic assignment really reaches the child process.
   fi
   printf '%s\n' "$content" > "$scratch/worktree/nested/$name"
@@ -331,6 +348,42 @@ password=different_synthetic'
   fi
   rm "$scratch/$name"
 done
+printf '%s\n' 'DB_PASS=different_synthetic' > "$scratch/worktree/nested/source.env"
+printf '%s\n' 'PGPASSWORD=$DB_PASS sh -c '\''test "$PGPASSWORD" = different_synthetic'\''' \
+  > "$scratch/worktree/nested/run-from-source.sh"
+chmod 0600 "$scratch/worktree/nested/source.env" "$scratch/worktree/nested/run-from-source.sh"
+sh -c '. "$1"; . "$2"' sh "$scratch/worktree/nested/source.env" \
+  "$scratch/worktree/nested/run-from-source.sh"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject a worktree variable defined in another file' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/run-from-source.sh reasons=env-libpq-password" \
+  "$scratch/scan-result"
+grep -Eq '^Copy scan: checked=[0-9]+ failures=1$' "$scratch/scan-result"
+test "$(wc -l < "$scratch/scan-result")" -eq 2
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+if python3 "$scan" --old-url-file "$scratch/old-url" \
+  --carrier "$scratch/worktree/nested/source.env" \
+  --carrier "$scratch/worktree/nested/run-from-source.sh" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject an explicit carrier variable defined in another file' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/run-from-source.sh reasons=env-libpq-password" \
+  "$scratch/scan-result"
+grep -Fxq 'Copy scan: checked=2 failures=1' "$scratch/scan-result"
+test "$(wc -l < "$scratch/scan-result")" -eq 2
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+rm "$scratch/worktree/nested/source.env" "$scratch/worktree/nested/run-from-source.sh"
+echo 'Shell group and local/cross-file password reference rejection passed in worktree and explicit carriers'
 printf '%s\n' 'client_encoding=UTF8 host=127.0.0.1 dbname=synthetic user=new_agent' \
   > "$scratch/worktree/nested/clean-conninfo.txt"
 printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' 'export PGPASSWORD=$FROM_PRIVATE_SOURCE' \
@@ -356,6 +409,7 @@ printf '%s\n' '#!/bin/sh' 'PGAPPNAME=probe PGPASSWORD=$FROM_PRIVATE_SOURCE psql'
   'while PGPASSWORD=$FROM_PRIVATE_SOURCE psql; do :; done' \
   > "$scratch/worktree/nested/clean-prefixed-run.sh"
 printf '%s\n' '#!/bin/sh' 'export PGPASSWORD="${FROM_PRIVATE_SOURCE}"' \
+  'export PGPASSWORD=${FROM_PRIVATE_SOURCE}' \
   > "$scratch/worktree/nested/clean-braced-run.sh"
 printf '%s\n' "content='PGAPPNAME=probe PGPASSWORD=different_synthetic psql'" \
   "content='if PGPASSWORD=different_synthetic psql; then :; fi'" \

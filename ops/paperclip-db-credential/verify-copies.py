@@ -19,52 +19,13 @@ SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
-# Recognize shell assignments, including control-flow commands, leading
-# assignments, `env` options, `command`, `exec`, and `builtin` wrappers, and
-# commands after a shell separator.
-# A preceding assignment must be a complete shell token so quoted fixture
-# strings in source code do not make the scanner reject the defining file.
 SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
-SHELL_ASSIGNMENT_VALUE = rb"(?:[^ \t;|&'\"\\]+|'[^']*'|\"[^\"\\]*\")?"
-SHELL_PREFIX_ASSIGNMENT = SHELL_IDENTIFIER + rb"=" + SHELL_ASSIGNMENT_VALUE
-SHELL_ENV_OPTION = (
-    rb"(?:-u[ \t]+"
-    + SHELL_IDENTIFIER
-    + rb"|--unset(?:=|[ \t]+)"
-    + SHELL_IDENTIFIER
-    + rb"|-[^ \t;|&]+)"
-)
-SHELL_EXEC_ARG = rb"(?:[^ \t;|&'\"\\]+|'[^']*'|\"[^\"\\]*\")"
-SHELL_EXEC_OPTION = rb"(?:--|-c|-l|-a[ \t]+" + SHELL_EXEC_ARG + rb")"
-SHELL_COMMAND_PREFIX = (
-    rb"(?:command(?:[ \t]+-p)?[ \t]+|builtin[ \t]+|exec(?:[ \t]+"
-    + SHELL_EXEC_OPTION
-    + rb")*[ \t]+)*"
-)
-SHELL_CONTROL_PREFIX = (
-    rb"(?:(?:if|elif|while|until|then|do|!|time(?:[ \t]+-p)?)[ \t]+)*"
-)
-PGPASSWORD_ASSIGNMENT = re.compile(
-    rb"(?:^|[;|&])[ \t]*"
-    + SHELL_CONTROL_PREFIX
-    + rb"(?:"
-    + SHELL_PREFIX_ASSIGNMENT
-    + rb"[ \t]+)*"
-    + SHELL_COMMAND_PREFIX
-    + rb"(?:export[ \t]+|env[ \t]+)?"
-    + rb"(?:(?:"
-    + SHELL_ENV_OPTION
-    + rb"|"
-    + SHELL_PREFIX_ASSIGNMENT
-    + rb")[ \t]+)*"
-    + rb"PGPASSWORD[ \t]*=[ \t]*"
-)
-PGPASSWORD_TOKEN = re.compile(rb"(?:^|[ \t;|&])PGPASSWORD[ \t]*=")
+SHELL_ASSIGNMENT = re.compile(rb"^(" + SHELL_IDENTIFIER + rb")=(.*)$")
 SAFE_PASSWORD_REFERENCE = re.compile(
-    rb"^(?:\$(?:" + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb"\})"
+    rb"(?:\$(?:" + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb"\})"
     rb'|"\$(?:' + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb'\})")'
-    rb"(?=$|[ \t;|&])"
 )
+PRIVATE_REFERENCE_NAME = re.compile(rb"^\$\{?(" + SHELL_IDENTIFIER + rb")\}?$")
 # A connection string may begin with any libpq parameter, not just host/user.
 # Keep this set aligned with libpq's documented keyword/value parameters.
 LIBPQ_CONNINFO_KEYS = frozenset(
@@ -90,6 +51,48 @@ LIBPQ_CONNINFO_KEY = re.compile(
     re.I,
 )
 LIBPQ_PASSWORD_KEY = re.compile(rb"(?:^|[ \t])password[ \t]*=[ \t]*\S", re.I)
+
+
+def shell_words(line: bytes):
+    """Yield shell words without treating a quoted fixture as executable code.
+
+    The scanner rejects a password assignment wherever it is a whole word,
+    including in groups, subshells, env arguments and quoted command strings.
+    It does not need to enumerate the command words that can precede it.
+    """
+    start = None
+    quote = None
+    escaped = False
+    for index, byte in enumerate(line):
+        if start is None:
+            if byte in b" \t\r\n;|&()<>":
+                continue
+            if byte == ord("#"):
+                break
+            start = index
+        if escaped:
+            escaped = False
+        elif byte == ord("\\") and quote != ord("'"):
+            escaped = True
+        elif quote is not None:
+            if byte == quote:
+                quote = None
+        elif byte in (ord("'"), ord('"')):
+            quote = byte
+        elif byte in b" \t\r\n;|&()<>":
+            yield line[start:index]
+            start = None
+    if start is not None:
+        yield line[start:]
+
+
+def shell_assignment(word: bytes) -> tuple[bytes, bytes] | None:
+    # `env "PGPASSWORD=literal"` is executable; `content='PGPASSWORD=literal'`
+    # assigns a different variable and is a harmless fixture definition.
+    if len(word) >= 2 and word[0] in (ord("'"), ord('"')) and word[-1] == word[0]:
+        word = word[1:-1]
+    match = SHELL_ASSIGNMENT.match(word)
+    return (match.group(1), match.group(2)) if match else None
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -276,7 +279,7 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
     return has_old_url, has_inline_url, has_passfile_entry
 
 
-def scan_libpq_carrier(path: Path) -> list[str]:
+def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
     """Reject libpq password sources that contain no PostgreSQL URL.
 
     A service file may have any name via PGSERVICEFILE. Shell assignments and
@@ -294,6 +297,8 @@ def scan_libpq_carrier(path: Path) -> list[str]:
     conninfo_has_password = False
     meaningful_lines = 0
     password_only_line = False
+    assigned_variables = set()
+    password_references = set()
     with path.open("rb") as source:
         while line := source.readline(MAX_CARRIER_LINE_BYTES + 1):
             if skipping_oversized_line:
@@ -305,7 +310,7 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                     and (
                         in_service_section
                         or line.lstrip().startswith(b"[")
-                        or PGPASSWORD_ASSIGNMENT.search(line)
+                        or b"PGPASSWORD=" in line
                         or LIBPQ_CONNINFO_START.match(line)
                     )
                 ):
@@ -335,19 +340,38 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                 rb"^[ \t]*(?:password|passfile)[ \t]*=", line, re.I
             ):
                 reasons.add("libpq-service-credential")
-            # A direct reference to a private variable is safe here. Reject
-            # defaults, command substitutions and other computed shell values:
-            # they can contain a literal credential in this readable file.
-            for shell_assignment in PGPASSWORD_ASSIGNMENT.finditer(line):
-                value = line[shell_assignment.end() :].strip()
-                if value and (
-                    PGPASSWORD_TOKEN.search(value)
-                    or (
-                        not SAFE_PASSWORD_REFERENCE.match(value)
-                        and not re.match(rb"[A-Za-z_][A-Za-z_0-9]*\(", value)
-                    )
-                ):
-                    reasons.add("env-libpq-password")
+            # A whole assignment word can follow any shell construct, including
+            # a group. The caller checks direct references against definitions
+            # in every scanned file, not only the file holding PGPASSWORD.
+            if b"=" in line:
+                for word in shell_words(line):
+                    assignments = [shell_assignment(word)]
+                    if (
+                        assignments[0] is None
+                        and len(word) >= 2
+                        and word[0] in (ord("'"), ord('"'))
+                        and word[-1] == word[0]
+                    ):
+                        # A standalone quoted argument can itself be a `sh -c`
+                        # command. Inspect its words while leaving `content='…'`
+                        # fixture definitions alone.
+                        assignments.extend(
+                            shell_assignment(inner) for inner in shell_words(word[1:-1])
+                        )
+                    for assignment in assignments:
+                        if assignment is None:
+                            continue
+                        name, value = assignment
+                        if name != b"PGPASSWORD":
+                            assigned_variables.add(name)
+                        elif value:
+                            if SAFE_PASSWORD_REFERENCE.fullmatch(value):
+                                reference = value.strip(b'"')
+                                match = PRIVATE_REFERENCE_NAME.fullmatch(reference)
+                                if match:
+                                    password_references.add(match.group(1))
+                            else:
+                                reasons.add("env-libpq-password")
             if not is_service and not in_service_section:
                 meaningful_lines += 1
                 if LIBPQ_CONNINFO_START.match(line):
@@ -365,7 +389,7 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                 reasons.add("libpq-passfile-entry")
     if meaningful_lines == 1 and password_only_line:
         reasons.add("libpq-conninfo-password")
-    return sorted(reasons)
+    return sorted(reasons), assigned_variables, password_references
 
 
 def main() -> int:
@@ -383,6 +407,8 @@ def main() -> int:
 
     failures = 0
     checked = 0
+    assigned_variables = set()
+    scanned_files = []
     for root in args.worktree_root:
         if root.is_symlink() or not root.is_dir():
             print(f"INVALID_WORKTREE_ROOT {root}")
@@ -412,12 +438,13 @@ def main() -> int:
                 path.name == "config.json" and path.parent.name == ".paperclip"
             )
             data = path.read_bytes() if is_instance_config else b""
-            carrier_reasons = scan_libpq_carrier(path)
+            carrier_reasons, definitions, references = scan_libpq_carrier(path)
         except OSError:
             print(f"UNREADABLE {path}")
             failures += 1
             continue
         checked += 1
+        assigned_variables.update(definitions)
         reasons = []
         if has_old_url:
             reasons.append("old-url-copy")
@@ -433,6 +460,10 @@ def main() -> int:
                     reasons.append("config-connection-string")
             except (ValueError, TypeError, AttributeError):
                 reasons.append("invalid-config-json")
+        scanned_files.append((path, reasons, references))
+    for path, reasons, references in scanned_files:
+        if references & assigned_variables and "env-libpq-password" not in reasons:
+            reasons.append("env-libpq-password")
         if reasons:
             print(f"FAIL {path} reasons={','.join(reasons)}")
             failures += 1

@@ -106,6 +106,7 @@ fi
 grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
 for fixture in conninfo conninfo_multiline conninfo_password_only \
+  conninfo_psql_d conninfo_psql_d_prefixed conninfo_psql_d_password_only \
   conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c \
   shell_env shell_leading_assignment shell_quoted_assignment shell_env_unset \
   shell_command_env shell_command_p_env shell_exec_env shell_exec_env_unset \
@@ -130,6 +131,21 @@ password=different_synthetic'
     conninfo_password_only)
       name=password-only-conninfo.txt
       content='password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d)
+      name=psql-conninfo.sh
+      content='psql -d "host=127.0.0.1 dbname=synthetic user=new_agent password=different_synthetic"'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_prefixed)
+      name=psql-prefixed-conninfo.sh
+      content='PGAPPNAME=probe psql --dbname="host=127.0.0.1 dbname=synthetic user=new_agent password=different_synthetic"'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_password_only)
+      name=psql-password-only-conninfo.sh
+      content="psql -d 'password=different_synthetic'"
       reason=libpq-conninfo-password
       ;;
     conninfo_client_encoding)
@@ -348,6 +364,16 @@ PGPASSWORD=\$DB_PASS sh -c 'test \"\$PGPASSWORD\" = different_synthetic'"
   fi
   rm "$scratch/$name"
 done
+printf '%s\n' 'psql -d "host=127.0.0.1 dbname=synthetic user=new_agent"' \
+  > "$scratch/worktree/nested/psql-passwordless.sh"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+grep -Eq '^Copy scan: checked=[0-9]+ failures=0$' "$scratch/scan-result"
+python3 "$scan" --old-url-file "$scratch/old-url" \
+  --carrier "$scratch/worktree/nested/psql-passwordless.sh" > "$scratch/scan-result"
+grep -Fxq 'Copy scan: checked=1 failures=0' "$scratch/scan-result"
+rm "$scratch/worktree/nested/psql-passwordless.sh"
+echo 'psql -d conninfo rejection and passwordless control passed in worktree and explicit carrier'
 printf '%s\n' 'DB_PASS=different_synthetic' > "$scratch/worktree/nested/source.env"
 printf '%s\n' 'PGPASSWORD=$DB_PASS sh -c '\''test "$PGPASSWORD" = different_synthetic'\''' \
   > "$scratch/worktree/nested/run-from-source.sh"

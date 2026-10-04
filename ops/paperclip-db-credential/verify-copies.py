@@ -95,6 +95,30 @@ def shell_assignment(word: bytes) -> tuple[bytes, bytes] | None:
     return (match.group(1), match.group(2)) if match else None
 
 
+def libpq_conninfo_arguments(line: bytes):
+    """Yield psql database arguments, including quoted keyword/value strings.
+
+    Keep shell assignment values opaque: a fixture such as
+    `content='psql -d "host=..."'` is not itself an executable psql command.
+    """
+    words = list(shell_words(line))
+    for index, word in enumerate(words):
+        if word in (b"-d", b"--dbname") and index + 1 < len(words):
+            argument = words[index + 1]
+        elif word.startswith(b"--dbname="):
+            argument = word[len(b"--dbname=") :]
+        elif word.startswith(b"-d") and len(word) > 2:
+            argument = word[2:]
+        else:
+            continue
+        if len(argument) >= 2 and argument[0] in (ord("'"), ord('"')):
+            if argument[-1] == argument[0]:
+                argument = argument[1:-1]
+            else:
+                argument = argument[1:]
+        yield argument
+
+
 def shell_logical_lines(source):
     """Join shell backslash-newline continuations without retaining long lines.
 
@@ -421,13 +445,27 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
                                 reasons.add("env-libpq-password")
             if not is_service and not in_service_section:
                 meaningful_lines += 1
-                if LIBPQ_CONNINFO_START.match(line):
-                    has_key = bool(LIBPQ_CONNINFO_KEY.search(line))
-                    has_password = bool(LIBPQ_PASSWORD_KEY.search(line))
+                conninfo_lines = [line]
+                conninfo_lines.extend(libpq_conninfo_arguments(line))
+                matches = [
+                    (
+                        bool(LIBPQ_CONNINFO_KEY.search(candidate)),
+                        bool(LIBPQ_PASSWORD_KEY.search(candidate)),
+                        index > 0,
+                    )
+                    for index, candidate in enumerate(conninfo_lines)
+                    if LIBPQ_CONNINFO_START.match(candidate)
+                ]
+                if matches:
+                    has_key = any(match[0] for match in matches)
+                    has_password = any(match[1] for match in matches)
                     conninfo_has_key |= has_key
                     conninfo_has_password |= has_password
                     password_only_line = has_password and not has_key
                     if conninfo_has_key and conninfo_has_password:
+                        reasons.add("libpq-conninfo-password")
+                    if any(match[1] and match[2] for match in matches):
+                        # `psql -d 'password=...'` is a complete conninfo too.
                         reasons.add("libpq-conninfo-password")
                 else:
                     conninfo_has_key = False

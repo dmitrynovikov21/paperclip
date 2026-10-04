@@ -20,9 +20,9 @@ PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
 # Recognize shell assignments, including leading assignments, `env` options,
-# `command env`, and commands after a shell separator. A preceding assignment
-# must be a complete shell token so quoted fixture strings in source code do
-# not make the scanner reject the file that defines the fixture.
+# `command`, `exec`, and `builtin` wrappers, and commands after a shell separator.
+# A preceding assignment must be a complete shell token so quoted fixture
+# strings in source code do not make the scanner reject the defining file.
 SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
 SHELL_ASSIGNMENT_VALUE = rb"(?:[^ \t;|&'\"\\]+|'[^']*'|\"[^\"\\]*\")?"
 SHELL_PREFIX_ASSIGNMENT = SHELL_IDENTIFIER + rb"=" + SHELL_ASSIGNMENT_VALUE
@@ -33,11 +33,25 @@ SHELL_ENV_OPTION = (
     + SHELL_IDENTIFIER
     + rb"|-[^ \t;|&]+)"
 )
+SHELL_EXEC_ARG = rb"(?:[^ \t;|&'\"\\]+|'[^']*'|\"[^\"\\]*\")"
+SHELL_EXEC_OPTION = rb"(?:--|-c|-l|-a[ \t]+" + SHELL_EXEC_ARG + rb")"
+SHELL_COMMAND_PREFIX = (
+    rb"(?:command(?:[ \t]+-p)?[ \t]+|builtin[ \t]+|exec(?:[ \t]+"
+    + SHELL_EXEC_OPTION
+    + rb")*[ \t]+)*"
+)
 PGPASSWORD_ASSIGNMENT = re.compile(
-    rb"(?:^|[;|&])[ \t]*(?:" + SHELL_PREFIX_ASSIGNMENT + rb"[ \t]+)*"
-    rb"(?:command[ \t]+)?(?:export[ \t]+|env[ \t]+)?"
-    rb"(?:(?:" + SHELL_ENV_OPTION + rb"|" + SHELL_PREFIX_ASSIGNMENT + rb")[ \t]+)*"
-    rb"PGPASSWORD[ \t]*=[ \t]*"
+    rb"(?:^|[;|&])[ \t]*(?:"
+    + SHELL_PREFIX_ASSIGNMENT
+    + rb"[ \t]+)*"
+    + SHELL_COMMAND_PREFIX
+    + rb"(?:export[ \t]+|env[ \t]+)?"
+    + rb"(?:(?:"
+    + SHELL_ENV_OPTION
+    + rb"|"
+    + SHELL_PREFIX_ASSIGNMENT
+    + rb")[ \t]+)*"
+    + rb"PGPASSWORD[ \t]*=[ \t]*"
 )
 PGPASSWORD_TOKEN = re.compile(rb"(?:^|[ \t;|&])PGPASSWORD[ \t]*=")
 SAFE_PASSWORD_REFERENCE = re.compile(
@@ -414,9 +428,7 @@ def main() -> int:
             except (ValueError, TypeError, AttributeError):
                 reasons.append("invalid-config-json")
         if reasons:
-            print(
-                f"FAIL {path} mode={stat.S_IMODE(info.st_mode):04o} uid={info.st_uid} reasons={','.join(reasons)}"
-            )
+            print(f"FAIL {path} reasons={','.join(reasons)}")
             failures += 1
     print(f"Copy scan: checked={checked} failures={failures}")
     return 1 if failures else 0

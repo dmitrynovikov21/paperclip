@@ -242,12 +242,6 @@ export const cronServiceAgentKeyScopeSchema = z.discriminatedUnion("service", [
   }).strict(),
   z.object({
     kind: z.literal("cron_service"),
-    service: z.literal("deploy_frontend"),
-    projectId: z.string().uuid(),
-    assigneeAgentId: z.string().uuid(),
-  }).strict(),
-  z.object({
-    kind: z.literal("cron_service"),
     service: z.literal("quota_rewake"),
   }).strict(),
 ]);

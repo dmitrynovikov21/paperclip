@@ -65,8 +65,9 @@ keeping helper output restricted to numeric counters. Quota source changed on
 hash and its sanitizing patch is verified against those bytes. Any later drift
 halts the relevant installer before staging.
 
-The frontend deploy broker in HELA-12871 is an eighth, separate contour. Its
-own architecture/security fixes and cutover are not inferred from this map.
+Frontend deploy in HELA-12871 is an eighth, separate contour excluded from this
+package. Its broker and API capability require their own security fix and review;
+no frontend-deploy scope, socket, or unit is included here.
 
 ## Review and dry run (no root, no live mutation)
 

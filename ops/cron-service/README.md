@@ -3,7 +3,7 @@
 The separate seven-flow board-key isolation package and cutover checklist for
 HELA-13399 live in [board-watchers/README.md](board-watchers/README.md).
 
-This directory stages the three cron changes. `prepare-host.sh --check` checks
+This directory stages the watchdog and quota cron changes. `prepare-host.sh --check` checks
 the reviewed host source hashes, strips the old DB password literals from the
 staged copies, applies the patches, and checks Python and shell syntax. It does
 not change the live host. Running without `--check` requires root and an explicit
@@ -16,14 +16,11 @@ touch live credentials.
 | --- | --- | --- | --- |
 | Agent watchdog | `pc-cron-watchdog`, root-owned script | `cron_service/agent_watchdog`, fixed alarm issue IDs | service home `.secrets`, mode 0400 |
 | Quota re-wake | `pc-cron-quota`, root-owned script | `cron_service/quota_rewake`, nudge orders only | service home `.secrets`, mode 0400 |
-| Frontend deploy | build remains `paperclip-user`; API broker runs as `pc-cron-deploy` | `cron_service/deploy_frontend`, fixed project/assignee and own incidents | `/etc/paperclip-cron/deploy-frontend.token`, mode 0400 |
 
-The frontend build must never run under `pc-cron-deploy`: the source checkout is
-agent-writable. Its API calls use `api_client.py` over a Unix socket. An agent can
-ask the broker to perform an operation, but cannot read its key; the Paperclip
-API enforces the service key's method, path, body, and issue boundary. The broker
-fixes the upstream host and refuses redirects so a caller cannot steer its key
-to another server.
+Frontend deploy is a separate eighth contour under HELA-12871. Its agent-accessible
+socket can authorize caller-chosen incidents, so this seven-UID package does not
+install a broker or grant `cron_service/deploy_frontend`. Its cutover requires a
+separate security fix and review; leave its existing cron entry untouched here.
 
 The watchdog and quota scripts still query the control-plane DB. The staged
 copies use the `pc_watchdog` and `pc_quota` libpq service aliases. Their units
@@ -36,10 +33,9 @@ old DB path.
 
 ## Cutover after founder go and architecture/security review
 
-1. Create three non-executing Paperclip service agents in the target company.
+1. Create two non-executing Paperclip service agents in the target company.
    Create one API key for each with the matching `cron_service` scope. The
-   watchdog scope lists the four current alarm issue UUIDs; the frontend scope
-   fixes the HelloPrint project UUID and Pixel UI assignee UUID. Record key IDs,
+   watchdog scope lists the four current alarm issue UUIDs. Record key IDs,
    not token values. Creation and revocation must be done through the board
    authority; no agent impersonation. The watchdog key's responsible user needs
    `agents:configure` for agent recovery; normal responsible-user authorization
@@ -59,21 +55,15 @@ old DB path.
 4. Create service-private `pg_service.conf` and `pgpass` files for watchdog and
    quota, with their respective aliases and dedicated DB roles. Create a
    root-owned `/etc/paperclip-cron/watchdog.env` (it may be empty),
-   `/etc/paperclip-cron/quota.env` with `QR_AGENT_ID`, `QR_COMPANY`, `QR_API`,
-   and `/etc/paperclip-cron/deploy.env` with `CRON_SERVICE_API_URL`. Keep
+   and `/etc/paperclip-cron/quota.env` with `QR_AGENT_ID`, `QR_COMPANY`, `QR_API`. Keep
    `WATCHDOG_PG`, `QR_PG`, and broad API tokens out of these env files. Copy
    quota `state.json` and watchdog poke state into the new service homes with
    matching ownership. Do not install a board key or `PAPERCLIP_OPS_TOKEN`.
-5. Start the deploy broker, then run its scoped HTTP smoke. Verify one manual
-   watchdog and quota service tick, without enabling timers. Stage the reviewed
-   frontend patch from `/opt/paperclip-cron/deploy-frontend.sh.staged` into the
-   existing agent-owned deploy script; the cron entry still runs under the agent
-   UID, but no longer opens a token file.
-6. Remove only the three old cron entries (watchdog, quota, frontend deploy),
-   then add the frontend entry back with the patched script and enable the two
+5. Verify one manual watchdog and quota service tick, without enabling timers.
+6. Remove only the two old cron entries (watchdog and quota), then enable the two
    new timers. Keep an exact crontab backup. Do not touch CI workflows or runs.
 7. Confirm two normal ticks per job. The new keys' `last_used_at` must increase;
-   ordinary logs must have no 401/403. Revoke the three old `standard` keys and
+   ordinary logs must have no 401/403. Revoke the two old `standard` keys and
    remove the old token files from agent-readable locations. Rotate the old DB
    password, scan agent worktrees/backups for readable copies, and verify the old
    credential no longer authenticates. Do not log credentials or API responses
@@ -81,15 +71,13 @@ old DB path.
 
 ## Negative and positive smoke
 
-- As `paperclip-user`, `test -r` must fail for all three new token sources and
+- As `paperclip-user`, `test -r` must fail for both new token sources and
   service-private libpq files. Repeat in ordinary local shell, ACPX shell, sandbox/remote
   execution, and a copied worktree. Record UID, path, and boolean result only.
-- Via the frontend socket, `GET /api/agents/<id>/keys` must return 403 while
-  the deploy incident create/read/comment/close flow succeeds. Direct agent
-  shell API calls with the agent's own run JWT must not gain cron-only rights.
 - Start the watchdog once and verify agent recovery plus alarm re-arm/comment;
   start quota once and verify a scoped nudge order. Confirm their keys cannot
-  call a forbidden endpoint or mutate an unrelated issue. Capture only status
+  call a forbidden endpoint or mutate an unrelated issue. Direct agent shell
+  calls with its own run JWT must not gain cron-only rights. Capture only status
   codes, issue IDs, and `last_used_at` timestamps.
 - Run the existing run-scoped JWT regression suite before and after API rollout.
 

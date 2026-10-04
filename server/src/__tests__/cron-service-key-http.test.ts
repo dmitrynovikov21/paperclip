@@ -13,7 +13,6 @@ import { errorHandler } from "../middleware/error-handler.js";
 const companyId = "ac917a45-e6ea-4696-a85c-991147084939";
 const agentId = "94906724-4190-4b53-9393-66148d453477";
 const issueId = "7f82bd2d-f408-4e8f-98aa-d54b5a58903b";
-const projectId = "889a9edc-6a07-406d-a7ca-dcb1b4de1de3";
 const pixelAgentId = "f0ddf9c0-d0cf-4a44-8b0b-c2167232852e";
 const key = "pc_cron_synthetic_value_never_logged";
 
@@ -57,11 +56,6 @@ describe("synthetic HTTP boundary for cron identities", () => {
         method: "post", path: `/api/companies/${companyId}/issues`,
         body: { title: "[quota-rewake] operator: return", description: "quota restored", status: "todo", assigneeAgentId: pixelAgentId },
       },
-      {
-        scope: { kind: "cron_service", service: "deploy_frontend", projectId, assigneeAgentId: pixelAgentId },
-        method: "post", path: `/api/companies/${companyId}/issues`,
-        body: { title: "🔴 Фронт-деплой: build failed", description: "build error", priority: "high", assigneeAgentId: pixelAgentId, projectId, status: "todo" },
-      },
     ];
     for (const candidate of cases) {
       const app = appFor(candidate.scope);
@@ -79,6 +73,15 @@ describe("synthetic HTTP boundary for cron identities", () => {
     const response = await request(appFor({ kind: "future_scope" }))
       .get(`/api/companies/${companyId}/agents`)
       .set("Authorization", `Bearer ${key}`);
+    expect(response.status).toBe(403);
+  });
+
+  it("rejects the removed deploy service scope on the HTTP boundary", async () => {
+    const response = await request(appFor({
+      kind: "cron_service", service: "deploy_frontend", projectId: companyId, assigneeAgentId: pixelAgentId,
+    })).post(`/api/companies/${companyId}/issues`)
+      .set("Authorization", `Bearer ${key}`)
+      .send({ title: "🔴 Фронт-деплой: injected", description: "agent-controlled" });
     expect(response.status).toBe(403);
   });
 });

@@ -43,19 +43,16 @@ trap 'rm -rf -- "$stage"' EXIT
 printf '%s  %s\n' \
   '7d4f2ae5f79705e739c96d77ffd19f5b285e46bced6135ae7a86e94f91c03853' "$host_home/agent-watchdog.py" \
   'd68ea4697690608114844f1748738c8fdf700a6bd8387aec8c2c4562f58f93eb' "$host_home/quota-rewake/quota_rewake.py" \
-  'e3cea73f6db6f206b7f91c725991aa5aa8fa4b56255c23c74ace8087da6b5667' "$host_home/helloprint/deploy-frontend.sh" \
   | sha256sum --check --status || { echo 'host sources changed; refresh review' >&2; exit 1; }
 
 cp -- "$host_home/agent-watchdog.py" "$stage/agent-watchdog.py"
 cp -- "$host_home/quota-rewake/quota_rewake.py" "$stage/quota_rewake.py"
-cp -- "$host_home/helloprint/deploy-frontend.sh" "$stage/deploy-frontend.sh"
 
 # Check the exact bytes copied for patching as well as the live paths above:
 # an agent-writable source can otherwise change between verification and cp.
 printf '%s  %s\n' \
   '7d4f2ae5f79705e739c96d77ffd19f5b285e46bced6135ae7a86e94f91c03853' "$stage/agent-watchdog.py" \
   'd68ea4697690608114844f1748738c8fdf700a6bd8387aec8c2c4562f58f93eb' "$stage/quota_rewake.py" \
-  'e3cea73f6db6f206b7f91c725991aa5aa8fa4b56255c23c74ace8087da6b5667' "$stage/deploy-frontend.sh" \
   | sha256sum --check --status || { echo 'copied host sources changed; refresh review' >&2; exit 1; }
 
 # The old scripts contain a DB password literal. Remove it before applying the
@@ -78,25 +75,22 @@ PY
 
 patch --batch --fuzz=0 -d "$stage" -p0 < "$source_dir/agent-watchdog.patch"
 patch --batch --fuzz=0 -d "$stage" -p0 < "$source_dir/quota_rewake.patch"
-patch --batch --fuzz=0 -d "$stage" -p0 < "$source_dir/deploy-frontend.patch"
 python3 "$source_dir/sanitize-staged.py" "$stage"
-python3 - "$stage" "$source_dir" <<'PY'
+python3 - "$stage" <<'PY'
 import ast
 from pathlib import Path
 import sys
-stage, source = map(Path, sys.argv[1:])
-for path in (stage / 'agent-watchdog.py', stage / 'quota_rewake.py',
-             source / 'api_broker.py', source / 'api_client.py'):
+stage = Path(sys.argv[1])
+for path in (stage / 'agent-watchdog.py', stage / 'quota_rewake.py'):
     ast.parse(path.read_text(), filename=str(path))
 PY
-bash -n "$stage/deploy-frontend.sh"
 
 if [[ $check_only == true ]]; then
   echo 'Host sources match reviewed hashes; sanitized patches and syntax checks pass.'
   exit 0
 fi
 
-for account in pc-cron-watchdog pc-cron-quota pc-cron-deploy; do
+for account in pc-cron-watchdog pc-cron-quota; do
   getent group "$account" >/dev/null || groupadd --system "$account"
   if ! id "$account" >/dev/null 2>&1; then
     useradd --system --gid "$account" --home-dir "/var/lib/$account" \
@@ -111,9 +105,6 @@ install -d -o root -g root -m 0755 /opt/paperclip-cron
 install -d -o root -g root -m 0755 /etc/paperclip-cron
 install -o root -g root -m 0755 "$stage/agent-watchdog.py" /opt/paperclip-cron/agent-watchdog.py
 install -o root -g root -m 0755 "$stage/quota_rewake.py" /opt/paperclip-cron/quota_rewake.py
-install -o root -g root -m 0755 "$source_dir/api_broker.py" /opt/paperclip-cron/api_broker.py
-install -o root -g root -m 0755 "$source_dir/api_client.py" /opt/paperclip-cron/api_client.py
-install -o root -g root -m 0755 "$stage/deploy-frontend.sh" /opt/paperclip-cron/deploy-frontend.sh.staged
 install -o root -g root -m 0644 "$source_dir"/*.service "$source_dir"/*.timer /etc/systemd/system/
 systemctl daemon-reload
 python3 "$source_dir/board-watchers/verify_boundary.py" /opt/paperclip-cron \

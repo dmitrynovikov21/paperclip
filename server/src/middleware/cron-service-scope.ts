@@ -91,37 +91,24 @@ export async function cronServiceRequestAllowed(
     return Boolean(issue && watchdogMonitorUpdate(body, issue.executionPolicy));
   }
 
+  if (scope.service !== "quota_rewake") return false;
   if (createMatch?.[1] === companyId && method === "POST") {
-    if (scope.service === "quota_rewake") {
-      return keysAre(body, ["title", "description", "status", "assigneeAgentId"], ["priority"])
-        && typeof body.title === "string" && body.title.startsWith("[quota-rewake] ")
-        && body.status === "todo" && typeof body.description === "string"
-        && typeof body.assigneeAgentId === "string"
-        && (body.priority === undefined || body.priority === "high");
-    }
-    return keysAre(body, ["title", "description", "priority", "assigneeAgentId", "projectId", "status"])
-      && typeof body.title === "string" && body.title.startsWith("🔴 Фронт-деплой:")
-      && typeof body.description === "string" && body.priority === "high" && body.status === "todo"
-      && body.assigneeAgentId === scope.assigneeAgentId && body.projectId === scope.projectId;
+    return keysAre(body, ["title", "description", "status", "assigneeAgentId"], ["priority"])
+      && typeof body.title === "string" && body.title.startsWith("[quota-rewake] ")
+      && body.status === "todo" && typeof body.description === "string"
+      && typeof body.assigneeAgentId === "string"
+      && (body.priority === undefined || body.priority === "high");
   }
 
   if (!issueMatch) return false;
   const issue = await getIssue(issueMatch[1]!);
   if (!issue) return false;
-  const ownPrefix = scope.service === "quota_rewake" ? "[quota-rewake] " : "🔴 Фронт-деплой:";
-  const owned = issue.createdByAgentId === agentId && issue.title.startsWith(ownPrefix);
+  const owned = issue.createdByAgentId === agentId && issue.title.startsWith("[quota-rewake] ");
   if (!owned) return false;
   if (method === "GET" && !issueMatch[2]) return true;
-  if (scope.service === "deploy_frontend" && method === "POST" && issueMatch[2] === "/comments") {
-    return keysAre(body, ["body"]) && typeof body.body === "string" && body.body.length <= 16000;
-  }
   if (method !== "PATCH" || issueMatch[2]) return false;
-  if (scope.service === "quota_rewake") {
-    return keysAre(body, ["status", "comment"]) && body.status === "cancelled"
-      && typeof body.comment === "string";
-  }
-  return keysAre(body, ["status"], ["comment"]) && (body.status === "done" || body.status === "cancelled")
-    && (body.comment === undefined || typeof body.comment === "string");
+  return keysAre(body, ["status", "comment"]) && body.status === "cancelled"
+    && typeof body.comment === "string";
 }
 
 export function cronServiceKeyGuard(db: Db): RequestHandler {

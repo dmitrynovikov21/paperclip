@@ -112,7 +112,8 @@ for fixture in conninfo conninfo_multiline conninfo_password_only \
   shell_exec_dashdash_env shell_exec_c_env shell_exec_a_env \
   shell_builtin_exec_env shell_command_exec_env shell_prefix_exec_env \
   shell_prefix_command_env shell_default shell_exec_default \
-  shell_command_substitution shell_multiple \
+  shell_if shell_if_prefixed shell_elif shell_while shell_until \
+  shell_then shell_do shell_not shell_time shell_command_substitution shell_multiple \
   shell_env_multiple; do
   case "$fixture" in
     conninfo)
@@ -232,6 +233,51 @@ password=different_synthetic'
       content='export PGPASSWORD=${DB_PASS:-different_synthetic}'
       reason=env-libpq-password
       ;;
+    shell_if)
+      name=run-if.sh
+      content="if PGPASSWORD=different_synthetic sh -c 'test \"\$PGPASSWORD\" = different_synthetic'; then :; else exit 1; fi"
+      reason=env-libpq-password
+      ;;
+    shell_if_prefixed)
+      name=run-if-prefixed.sh
+      content='if PGAPPNAME=probe command env PGPASSWORD=different_synthetic psql; then :; fi'
+      reason=env-libpq-password
+      ;;
+    shell_elif)
+      name=run-elif.sh
+      content='if false; then :; elif PGPASSWORD=different_synthetic psql; then :; fi'
+      reason=env-libpq-password
+      ;;
+    shell_while)
+      name=run-while.sh
+      content='while PGPASSWORD=different_synthetic psql; do :; done'
+      reason=env-libpq-password
+      ;;
+    shell_until)
+      name=run-until.sh
+      content='until PGPASSWORD=different_synthetic psql; do :; done'
+      reason=env-libpq-password
+      ;;
+    shell_then)
+      name=run-then.sh
+      content='if true; then PGPASSWORD=different_synthetic psql; fi'
+      reason=env-libpq-password
+      ;;
+    shell_do)
+      name=run-do.sh
+      content='while true; do PGPASSWORD=different_synthetic psql; done'
+      reason=env-libpq-password
+      ;;
+    shell_not)
+      name=run-not.sh
+      content='if ! PGPASSWORD=different_synthetic psql; then :; fi'
+      reason=env-libpq-password
+      ;;
+    shell_time)
+      name=run-time.sh
+      content='time -p PGPASSWORD=different_synthetic psql'
+      reason=env-libpq-password
+      ;;
     shell_exec_default)
       name=run-exec-default.sh
       content='exec env PGPASSWORD=${DB_PASS:-different_synthetic} psql'
@@ -253,6 +299,9 @@ password=different_synthetic'
       reason=env-libpq-password
       ;;
   esac
+  if [ "$fixture" = shell_if ]; then
+    sh -c "$content" # The synthetic assignment really reaches the child process.
+  fi
   printf '%s\n' "$content" > "$scratch/worktree/nested/$name"
   chmod 0600 "$scratch/worktree/nested/$name"
   if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
@@ -301,10 +350,15 @@ printf '%s\n' '#!/bin/sh' 'PGAPPNAME=probe PGPASSWORD=$FROM_PRIVATE_SOURCE psql'
   'command exec env PGPASSWORD=$FROM_PRIVATE_SOURCE psql' \
   'PGAPPNAME=probe exec env PGPASSWORD=$FROM_PRIVATE_SOURCE psql' \
   'PGAPPNAME=probe command env PGPASSWORD=$FROM_PRIVATE_SOURCE psql' \
+  'if PGPASSWORD=$FROM_PRIVATE_SOURCE psql; then :; fi' \
+  'if PGAPPNAME=probe command env PGPASSWORD=$FROM_PRIVATE_SOURCE psql; then :; fi' \
+  'if ! PGPASSWORD=$FROM_PRIVATE_SOURCE psql; then :; fi' \
+  'while PGPASSWORD=$FROM_PRIVATE_SOURCE psql; do :; done' \
   > "$scratch/worktree/nested/clean-prefixed-run.sh"
 printf '%s\n' '#!/bin/sh' 'export PGPASSWORD="${FROM_PRIVATE_SOURCE}"' \
   > "$scratch/worktree/nested/clean-braced-run.sh"
 printf '%s\n' "content='PGAPPNAME=probe PGPASSWORD=different_synthetic psql'" \
+  "content='if PGPASSWORD=different_synthetic psql; then :; fi'" \
   > "$scratch/worktree/nested/quoted-fixture.sh"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"
@@ -477,4 +531,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo (including client_encoding) and shell (including leading assignments, env options, command/exec env, defaults and command substitution) password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo (including client_encoding) and shell (including control words, leading assignments, env options, command/exec env, defaults and command substitution) password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

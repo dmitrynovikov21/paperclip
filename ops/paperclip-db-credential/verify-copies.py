@@ -19,8 +19,9 @@ SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
-# Recognize shell assignments, including leading assignments, `env` options,
-# `command`, `exec`, and `builtin` wrappers, and commands after a shell separator.
+# Recognize shell assignments, including control-flow commands, leading
+# assignments, `env` options, `command`, `exec`, and `builtin` wrappers, and
+# commands after a shell separator.
 # A preceding assignment must be a complete shell token so quoted fixture
 # strings in source code do not make the scanner reject the defining file.
 SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
@@ -40,8 +41,13 @@ SHELL_COMMAND_PREFIX = (
     + SHELL_EXEC_OPTION
     + rb")*[ \t]+)*"
 )
+SHELL_CONTROL_PREFIX = (
+    rb"(?:(?:if|elif|while|until|then|do|!|time(?:[ \t]+-p)?)[ \t]+)*"
+)
 PGPASSWORD_ASSIGNMENT = re.compile(
-    rb"(?:^|[;|&])[ \t]*(?:"
+    rb"(?:^|[;|&])[ \t]*"
+    + SHELL_CONTROL_PREFIX
+    + rb"(?:"
     + SHELL_PREFIX_ASSIGNMENT
     + rb"[ \t]+)*"
     + SHELL_COMMAND_PREFIX

@@ -28,7 +28,8 @@ CRITICAL_VOLUMES = (
     ("/mnt/HC_Volume_106646767", "sdb", 10),
 )
 REPORT_GAP_S = 2 * 3600
-last_reported = {}
+last_reported = {}  # agent-triggered post-sweep signals
+last_monitored = {}  # autonomous pre-sweep observations
 report_lock = threading.Lock()
 
 
@@ -48,14 +49,16 @@ def measured_pressure():
 def report(message, peer_uid):
     if peer_uid != 1000 or not isinstance(message, dict) or message != {"event": "critical"}:
         raise ValueError("invalid reporter request")
-    result = emit_measured_alarm()
+    result = emit_measured_alarm("socket")
     if result is None:
         raise ValueError("disk pressure not confirmed")
     return result
 
 
-def emit_measured_alarm():
+def emit_measured_alarm(source):
     """Check fixed volumes without trusting or needing a socket client."""
+    if source not in ("socket", "monitor"):
+        raise ValueError("invalid alarm source")
     # Multiple socket workers must not issue the same alarm before the cooldown
     # is recorded. The HTTP request is bounded by the service transport timeout.
     with report_lock:
@@ -64,7 +67,9 @@ def emit_measured_alarm():
             return None
         now = time.monotonic()
         fresh = [(label, free_gb, threshold_gb) for label, free_gb, threshold_gb in critical
-                 if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S]
+                 if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S
+                 and (source == "socket"
+                      or now - last_monitored.get(label, float("-inf")) >= REPORT_GAP_S)]
         if not fresh:
             return {"local": True}
         measurements = "\n".join(
@@ -76,8 +81,9 @@ def emit_measured_alarm():
                    "Состояние уборки проверьте в локальном журнале дискового сторожа.")
         result = service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}",
                                  {"status": "todo", "comment": comment})
+        destination = last_reported if source == "socket" else last_monitored
         for label, _free_gb, _threshold_gb in fresh:
-            last_reported[label] = now
+            destination[label] = now
         return result
 
 
@@ -85,7 +91,7 @@ def monitor_pressure(stop):
     # A saturated agent-accessible socket cannot suppress a critical alarm.
     while not stop.is_set():
         try:
-            emit_measured_alarm()
+            emit_measured_alarm("monitor")
         except Exception as error:
             # Only the exception class reaches journald, never API responses or keys.
             print(f"disk pressure monitor: {type(error).__name__}", file=sys.stderr, flush=True)

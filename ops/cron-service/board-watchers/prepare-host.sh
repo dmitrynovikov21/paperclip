@@ -13,7 +13,8 @@ host_home=/home/paperclip-user
 # immutable release checkout. A removed watcher cannot be silently revived.
 printf '%s  %s\n' \
   'c81f3a35d0c1f77c984aa153b351ec6c2dcd26278872613153505ad63691e210' "$host_home/bin/disk-pressure-gc.sh" \
-  'eaae1aad065975b65692e120ea1fa33cac45885fae23dcf3dcb9e73429f547ae' "$host_home/bin/closed-card-gc/disk_guard.py" \
+  '89ed0e612784703acefc66fa6cf23ccd435db091c6c25148dc5769cc14b53dc2' "$host_home/bin/closed-card-gc/disk_guard.py" \
+  '843d9f8f05ab017ef0674b68566fa4dfda6aefd4782d581c1a0ca8f7d49ed3e7' "$host_home/bin/disk-guard-urgent.sh" \
   '17119fdc958a06c4d8b6c7b1ad616f2faff6ef3f106d9afbfa9108e83c45bc05' "$host_home/hela-12320-pr923-watch.py" \
   '0127f3bc082806bf65778d85423bdf121e8e157b621f1812c3854aec5a233d32' "$host_home/helloprint/qa-12359/watch-archive/hela-12359-r2-pr-watch.py" \
   'fd98b853a4d040522c9ce6e6e32e8aa25e09be293949c3d727f24422fe75bfc9' "$host_home/fleet-hourly-watch.py" \
@@ -31,11 +32,11 @@ source = Path(sys.argv[1])
 for path in source.glob('*.py'):
     ast.parse(path.read_text(), filename=str(path))
 PY
-bash -n "$source_dir/disk-pressure-gc-agent.sh"
+bash -n "$source_dir/disk-pressure-gc-agent.sh" "$host_home/bin/disk-guard-urgent.sh"
 python3 "$source_dir/verify_boundary.py" /usr/bin/bash /usr/bin/python3 /usr/bin/psql
 
 if [[ $mode == --check ]]; then
-  echo 'Five reviewed source hashes match; retired PR #1198/#1042 paths remain absent; Python/shell/path checks pass.'
+  echo 'Six reviewed source hashes match; retired PR #1198/#1042 paths remain absent; Python/shell/path checks pass.'
   exit 0
 fi
 

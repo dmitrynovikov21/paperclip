@@ -3,7 +3,8 @@
 #
 # Called by ~/bin/disk-pressure-gc.sh (cron 5,35) under its flock; can also run standalone.
 # --volume root (/, /dev/sda1; threshold 15, crit 10). Levers in order, stop at threshold + HYST_GB:
-#     run-scratch -> hardlink .venv -> hardlink node_modules -> docker build cache unused 12 h (HELA-12595 30.09)
+#     own crash reports (HELA-14308) -> run-scratch -> hardlink .venv -> hardlink node_modules
+#     -> docker build cache unused 3 h (HELA-14308)
 #     -> closed-card Docker images, with the reviewed rollout gates in gc_closed_card_images.py
 #     -> closed-trees (idle 6 h) -> idle open-card trees (blocked/todo/backlog, idle 48 h, clean + pushed, Codex farm; HELA-11412 29.09).
 #   HELA-11412 30.09 (Alpha's decision on d9e1910b), all idle 48 h:
@@ -16,6 +17,7 @@
 #     docker build cache unused 2 h -> closed-trees (idle 1 h) -> idle open-card trees (idle 24 h)
 #     -> idle test DBs (gc_test_dbs.py, >= 2 h, card without live run, plain DROP)
 #     -> deps (.venv, then node_modules) of cards not in_progress, idle >= 2 h (gc_deps_strict.py).
+#   Off-schedule start (HELA-14308): the urgent helper starts the same scoped wrapper below 5 GB.
 # --volume sdb (/mnt/HC_Volume_106646767; threshold 12, crit 8; HELA-12993). Levers in order:
 #     archive Codex rollouts idle 14 d -> idle 7 d (zstd + sha256, archive_codex_sessions.py)
 #     -> clean checkouts of closed cards in the sdb project farm, idle 24 h (gc_closed_trees_strict.py --farm sdb).
@@ -63,6 +65,7 @@ ap.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RU
 ap.add_argument("--free-override", "--root-free-override", dest="free_override", type=float, default=None)
 ap.add_argument("--force", action="store_true")
 args = ap.parse_args()
+URGENT = os.environ.get("DISK_GUARD_TRIGGER") == "urgent"
 VOL = VOLUMES[args.volume]
 if args.threshold_gb is None:
     args.threshold_gb = float(os.environ.get(VOL["threshold"][0], VOL["threshold"][1]))
@@ -115,7 +118,8 @@ if start >= args.threshold_gb and not args.force:
     sys.exit(0)
 
 mode = "DRY-RUN" if args.dry_run else "apply"
-log(f"strict tier: {VOL['path']} free {start}G < {args.threshold_gb}G (force={args.force}, {mode})")
+log(f"strict tier: {VOL['path']} free {start}G < {args.threshold_gb}G (force={args.force}, {mode}"
+    f"{', off-schedule: / below 5G' if URGENT else ''})")
 apply = [] if args.dry_run else ["--apply"]
 py = sys.executable
 # Idle OPEN cards' trees (HELA-11412, 29.09; founder 27.09 "... закрытых карт и простаивающих"): Codex farm only (Claude
@@ -138,10 +142,11 @@ if args.volume == "sdb":
     ]
 else:
     LEVERS = [
+        ("var-crash-own-uid", [py, BIN + "/gc_var_crash.py", "--min-idle-min", "30"] + apply, 120),
         ("run-scratch", [py, BIN + "/gc_run_scratch.py"] + apply, 300),
         ("hardlink-venv", [py, BIN + "/hardlink_deps.py", "--target", ".venv"] + apply, 900),
         ("hardlink-node_modules", [py, BIN + "/hardlink_deps.py", "--target", "node_modules"] + apply, 900),
-        ("build-cache-12h", [py, BIN + "/gc_build_cache.py", "--unused-h", "12"] + apply, 300),
+        ("build-cache-3h", [py, BIN + "/gc_build_cache.py", "--unused-h", "3"] + apply, 300),
         (IMAGES[0], [py, BIN + "/gc_closed_card_images.py", "--idle-h", "6"] + IMAGES[1], 600),
         ("closed-trees", [py, BIN + "/gc_closed_trees_strict.py", "--idle-h", "6", "--budget", "600"] + apply, 900),
         ("closed-trees-archive-48h", [py, BIN + "/gc_closed_trees_archive.py"] + ARCHIVE + ["--idle-h", "48"] + apply, 900),
@@ -208,7 +213,7 @@ end = real_free_gb()
 end_eff = free_gb() if args.free_override is not None else end
 table = "\n".join(f"| {n} | {rc} | {d:+.1f} | {b.replace('|', '/')} |" for n, rc, d, b in rows)
 host = (f"[{ts()}] disk-guard{'-' + args.volume if args.volume != 'root' else ''}: {VOL['path']} {start}G -> {end}G "
-        f"({mode}); " + ", ".join(f"{n}={rc}:{d:+.1f}G" for n, rc, d, _ in rows))
+        f"({mode}{', off-schedule' if URGENT else ''}); " + ", ".join(f"{n}={rc}:{d:+.1f}G" for n, rc, d, _ in rows))
 if not args.dry_run:
     try:
         with open(HOST_LOG, "a") as f:
@@ -229,6 +234,8 @@ if escalate and time.time() - last < ESCALATE_GAP_S and not args.dry_run:
     escalate = False
 
 head = ("🚨 **Эскалация дискового сторожа**" if escalate else "🟡 **Срабатывание дискового сторожа**")
+if URGENT:
+    head += " (внеплановый запуск: на `/` было меньше 5 ГБ, [HELA-14308](/HELA/issues/HELA-14308))"
 body = (f"{head} — {VOL['label']} свободно было **{start} ГБ** (порог {args.threshold_gb:g}), после строгих рычагов"
         f"{' и аварийной ступени' if emergency_ran else ''} **{end} ГБ**"
         f"{' (замер подменён тест-хуком: ' + str(end_eff) + ' ГБ)' if args.free_override is not None else ''}.\n\n"

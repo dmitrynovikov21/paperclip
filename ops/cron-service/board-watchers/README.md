@@ -21,7 +21,7 @@ the three PR watchers have the same private parent but use `github.token`.
 | Old trigger / flow | Service UID and new trigger | Fixed Paperclip grant | Other private source |
 | --- | --- | --- | --- |
 | crontab 18, watchdog every 2m | `pc-cron-watchdog`, staged timer | recover stuck agents; monitor/comment only four fixed alarm IDs from HELA-12871 | `pc_watchdog` libpq service, `PGSERVICEFILE`/`PGPASSFILE` |
-| crontab 48, disk-pressure GC strict branch | GC remains agent UID using root-owned `/opt/paperclip-cron/disk-pressure-gc-agent.sh`; `pc-disk-guard` socket reporter | `host_watcher/disk_guard`: `PATCH todo+comment` only HELA-12595 on escalation; routine note stays in local disk log | no DB credential in agent GC; reporter socket grants a bounded fixed-issue escalation capability |
+| crontab 48, disk-pressure GC strict branch, and HELA-14308 urgent trigger | GC remains agent UID using root-owned `/opt/paperclip-cron/disk-pressure-gc-agent.sh`; `pc-disk-guard` socket reporter | `host_watcher/disk_guard`: `PATCH todo+comment` only HELA-12595 on escalation; routine note stays in local disk log | no DB credential in agent GC; reporter socket grants a bounded fixed-issue escalation capability |
 | former crontab 77, frontend PR #923 | `pc-watch-12320`, **timer remains disabled** | `host_watcher/pr_923`: `GET`, `PATCH blocked→todo`, `POST` bounded comment only HELA-12380 | GitHub repo read token only if explicitly reactivated |
 | former crontab 76, backend PR #1198 | `pc-watch-12340`, **timer remains disabled** | `host_watcher/be_1198`: `GET`, `PATCH blocked→in_progress`, `POST` bounded comment only HELA-12343 | GitHub repo read token only if explicitly reactivated |
 | former crontab 78, frontend PR #1042 | `pc-watch-12359`, **timer remains disabled** | `host_watcher/fe_1042`: `GET`, `PATCH blocked→in_progress`, `POST` bounded comment only HELA-12359 | GitHub repo read token and root-owned `/etc/paperclip-cron/fe-release-sha` only if explicitly reactivated |
@@ -39,13 +39,16 @@ sdb volume itself against fixed alarm thresholds (10/10 GB), and creates the
 board comment from its own template. An arbitrary agent message or a critical
 event without measured pressure is rejected. The agent cannot read the reporter
 key, choose another issue/API path, or place its text in a service-authored wake.
-The reporter also suppresses repeat wakes for the same measured volume for two
-hours while its service process remains running. Socket reads have a two-second
-absolute deadline; four workers handle at most eight active or queued clients,
+The reporter suppresses repeat wakes from each source for the same measured
+volume for two hours while its service process remains running. The autonomous
+check never consumes the post-sweep signal's cooldown: persistent pressure
+can therefore produce one alarm before a sweep and one after it. A post-sweep
+signal suppresses further autonomous alarms for the same volume. Socket reads
+have a two-second absolute deadline; four workers handle at most eight active or queued clients,
 and concurrent valid signals share one cooldown decision. An independent service
-check at startup and every 30 seconds measures the same fixed volumes and sends
-the same scoped alarm when pressure is real. Saturating the agent-accessible
-socket cannot suppress that service-side alarm.
+check starts when the service is enabled at boot and repeats every 30 seconds,
+measuring the same fixed volumes and sending the same scoped alarm when pressure
+is real. Saturating the agent-accessible socket cannot suppress that service-side alarm.
 The sdb alarm threshold matches the farm GC's 10 GB post-sweep threshold;
 the separate strict sdb cleanup escalates only below 8 GB.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are
@@ -69,6 +72,11 @@ keeping helper output restricted to numeric counters. Quota source changed on
 01.10 to cover additional failed-run classes; the base installer pins the new
 hash and its sanitizing patch is verified against those bytes. Any later drift
 halts the relevant installer before staging.
+On 04.10 HELA-14308 added own crash-report cleanup, a three-hour build-cache
+lever and an urgent five-minute trigger. The sanitized strict-tier copy retains
+those levers and the off-schedule marker. The child installer pins both the
+current strict-tier source and the urgent helper, so further host changes halt
+the staged cutover until reviewed.
 
 Frontend deploy in HELA-12871 is an eighth, separate contour excluded from this
 package. Its broker and API capability require their own security fix and review;
@@ -140,9 +148,15 @@ reviewed source base: `git diff 8235674d4c47..HEAD -- ops/cron-service`.
    DB grants must follow HELA-13316: watchdog narrow read/reap function, quota
    read-only projections, fleet read-only company projections; no shared broad
    DSN, password in argv, SUPERUSER, BYPASSRLS or arbitrary table write.
-4. Save an exact uid-1000 crontab backup and diff each old row. Start the disk
-   reporter socket, prove its fixed issue operation, then switch only the disk
-   row to the root-owned wrapper under uid 1000. For each other active flow,
+4. Save an exact uid-1000 crontab backup and diff each old row, including the
+   five-minute HELA-14308 urgent trigger. Enable and start both
+   `pc-disk-guard.socket` and `pc-disk-guard.service`; verify the service
+   remains active without a socket client and its autonomous pressure check runs
+   before the agent-side GC. Prove the socket's fixed issue operation, then switch
+   the disk row to the root-owned wrapper under uid 1000. Set the urgent row's
+   `DPGC=/opt/paperclip-cron/disk-pressure-gc-agent.sh`; verify its dry-run
+   target and one off-schedule scoped tick. The urgent helper must never call the
+   old broad-key script after cutover. For each other active flow,
    run one manual scoped tick, compare output/status and `last_used_at`, then
    replace exactly its old cron row with the reviewed timer. Keep all three PR
    watchers retired. Do not alter CI or unrelated cron rows. Verify two normal
@@ -185,7 +199,7 @@ board key has not been established.
 ## Rollback
 
 Before old-key revocation, a failed scoped tick: stop **only that** new
-timer/socket, restore its exact saved cron row, and inspect its scoped key,
+timer/socket/service, restore its exact saved cron row, and inspect its scoped key,
 DB/GitHub role, and root-owned path. Do not edit CI. After revocation, never
 reintroduce an agent-readable broad key or old DB password: repair/reissue the
 narrow identity or keep that watcher disabled with an explicit owner/incident.

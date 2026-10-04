@@ -302,6 +302,21 @@ class HostPackageTest(unittest.TestCase):
             slow_client.settimeout(disk_reporter.REQUEST_DEADLINE_S + 1)
             self.assertEqual(json.loads(slow_client.recv(256))["ok"], False)
 
+    def test_monitor_alarm_does_not_hide_post_sweep_signal(self):
+        requests = []
+        with patch.object(disk_reporter, "last_reported", {}), \
+                patch.object(disk_reporter, "last_monitored", {}), \
+                patch.object(disk_reporter, "measured_pressure", return_value=[("root", 5, 10)]), \
+                patch.object(disk_reporter, "service_request",
+                             side_effect=lambda *args: requests.append(args) or {}):
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {})
+            self.assertEqual(disk_reporter.report({"event": "critical"}, 1000), {})
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {"local": True})
+            self.assertEqual(disk_reporter.report({"event": "critical"}, 1000), {"local": True})
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(call[0:2] == ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}")
+                            for call in requests))
+
     def test_saturated_disk_socket_cannot_suppress_service_measured_alarm(self):
         gate = threading.Event()
         alarm = threading.Event()
@@ -330,6 +345,7 @@ class HostPackageTest(unittest.TestCase):
                 client, server = socket.socketpair()
                 pairs.append((stack.enter_context(client), stack.enter_context(server)))
             with patch.object(disk_reporter, "last_reported", {}), \
+                    patch.object(disk_reporter, "last_monitored", {}), \
                     patch.object(disk_reporter, "read_request", side_effect=slow_read), \
                     patch.object(disk_reporter, "measured_pressure", side_effect=measured_pressure), \
                     patch.object(disk_reporter, "service_request", side_effect=service_request), \
@@ -393,6 +409,11 @@ class HostPackageTest(unittest.TestCase):
             self.assertIn(f"User={identity}\n", text)
             self.assertIn("WorkingDirectory=/opt/paperclip-cron\n", text)
             self.assertIn("UMask=0077\n", text)
+        disk_unit = (base / "pc-disk-guard.service").read_text()
+        self.assertIn("Requires=pc-disk-guard.socket\n", disk_unit)
+        self.assertIn("After=pc-disk-guard.socket network-online.target\n", disk_unit)
+        self.assertIn("Sockets=pc-disk-guard.socket\n", disk_unit)
+        self.assertIn("[Install]\nWantedBy=multi-user.target\n", disk_unit)
 
 
 if __name__ == "__main__":

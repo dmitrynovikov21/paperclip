@@ -78,11 +78,12 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                 elif byte in URL_WHITESPACE or byte in b"'\"<>`#":
                     query_part = 0
                     query_key.clear()
-                elif query_part == 1:
-                    if byte == ord("?"):
-                        query_part = 2
-                        query_key.clear()
-                        query_key_overlong = False
+                # A second URL can immediately follow a query value in the same
+                # file, so each ? starts a new parameter name candidate.
+                elif query_part and byte == ord("?"):
+                    query_part = 2
+                    query_key.clear()
+                    query_key_overlong = False
                 elif query_part == 2:
                     if byte == ord("&"):
                         query_key.clear()
@@ -112,6 +113,8 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                     if byte == ord(":"):
                         credential_part = 2 if part_has_bytes else 0
                         part_has_bytes = False
+                    elif byte in b"/@?#":
+                        credential_part = 0
                     elif byte in URL_WHITESPACE or byte in b"'\"":
                         credential_part = 0
                     else:

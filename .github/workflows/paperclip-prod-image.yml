@@ -1,0 +1,157 @@
+name: Paperclip production image (manual)
+
+# Builds the self-hosted `production` stage for one commit and publishes it as
+# ghcr.io/<owner>/paperclip:<first 9 chars of the commit SHA>.
+#
+# Why this exists: building this stage on the fleet host took ~7 GB of the
+# root disk in four minutes (BuildKit state for the Rust runner and the CLI
+# tool layer, HELA-14457), on the same disk as the board database. Release
+# builders dispatch this workflow instead, and the host only runs
+# `docker pull`. Pin the pulled image by the digest printed in the run
+# summary: a re-dispatch of the same commit re-tags a fresh build.
+#
+# Manual only, on purpose: no push or pull_request trigger, so nothing here
+# runs unless someone dispatches it (HELA-14570).
+#
+# The build mirrors the host recipe in ops/paperclip-db-credential/README.md:
+# a fresh `git archive` of the exact commit is the build context (no ignored
+# local files can reach `COPY . .`), PAPERCLIP_BUILD_COMMIT carries the full
+# SHA into the server build stamp, and the archive SHA-256 is recorded.
+# It differs from docker.yml: amd64 only, no lockfile refresh (the commit is
+# built exactly as it is), and its own BuildKit cache in the Actions cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or full commit SHA of this repository to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: paperclip-prod-image-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      # The input reaches shell steps only through env, never through
+      # expression interpolation inside `run:`.
+      - name: Validate ref input
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$INPUT_REF" | grep -Eqx '[A-Za-z0-9._/-]{1,200}'; then
+            echo "::error::ref may contain only letters, digits, '.', '_', '/' and '-' (at most 200 characters)"
+            exit 1
+          fi
+          case "$INPUT_REF" in
+            -*|*..*)
+              echo "::error::ref must not start with '-' or contain '..'"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Prepare source archive
+        id: src
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          context="$RUNNER_TEMP/build-context"
+          archive="$RUNNER_TEMP/source.tar"
+          git archive --format=tar -o "$archive" "$sha"
+          archive_sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
+          mkdir -p "$context"
+          tar -xf "$archive" -C "$context"
+          rm -f "$archive"
+          test ! -e "$context/.env"
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:9}"
+            echo "context=$context"
+            echo "archive_sha256=$archive_sha256"
+          } >> "$GITHUB_OUTPUT"
+          echo "Commit $sha, source archive sha256 $archive_sha256"
+
+      # Same ISO-week stamp as docker.yml: the @latest CLI tool layer is
+      # refreshed weekly instead of staying frozen in the cache.
+      - name: Compute tool cache epoch
+        id: tools-epoch
+        run: echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ steps.src.outputs.context }}
+          target: production
+          platforms: linux/amd64
+          build-args: |
+            PAPERCLIP_BUILD_COMMIT=${{ steps.src.outputs.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.src.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.src.outputs.sha }}
+          cache-from: type=gha,scope=paperclip-prod-amd64
+          cache-to: type=gha,scope=paperclip-prod-amd64,mode=max
+
+      - name: Summary
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          SHA: ${{ steps.src.outputs.sha }}
+          SHORT: ${{ steps.src.outputs.short }}
+          ARCHIVE_SHA256: ${{ steps.src.outputs.archive_sha256 }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Paperclip production image"
+            echo ""
+            echo "- ref: \`$INPUT_REF\`"
+            echo "- commit: \`$SHA\`"
+            echo "- source archive sha256: \`$ARCHIVE_SHA256\`"
+            echo "- image: \`$IMAGE:$SHORT\`"
+            echo "- digest: \`$DIGEST\`"
+            echo "- pull: \`docker pull $IMAGE@$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"

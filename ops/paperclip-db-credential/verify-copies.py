@@ -14,6 +14,11 @@ URL_PREFIXES = (b"postgres://", b"postgresql://")
 URL_WHITESPACE = b" \t\n\r\f\v"
 PASSWORD_QUERY_KEY = b"password"
 MAX_QUERY_KEY_BYTES = len(PASSWORD_QUERY_KEY) * 3  # Percent-encoded bytes.
+MAX_CARRIER_LINE_BYTES = 64 * 1024
+SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
+PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
+ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
+ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -139,6 +144,48 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
     return has_old_url, has_inline_url
 
 
+def scan_named_carrier(path: Path) -> list[str]:
+    """Reject libpq password sources that contain no PostgreSQL URL.
+
+    A named carrier is read a bounded line at a time. An oversized line fails
+    closed, and no credential value is ever included in a reason code.
+    """
+    is_env = path.name.startswith(".env")
+    is_service = path.name in SERVICE_FILE_NAMES
+    is_passfile = path.name in PASSFILE_NAMES
+    if not (is_env or is_service or is_passfile):
+        return []
+
+    reasons = set()
+    with path.open("rb") as source:
+        while line := source.readline(MAX_CARRIER_LINE_BYTES + 1):
+            if len(line) > MAX_CARRIER_LINE_BYTES:
+                reasons.add("oversized-db-carrier-line")
+                break
+            if not line.strip() or line.lstrip().startswith(b"#"):
+                continue
+            if is_env:
+                assignment = re.match(
+                    rb"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z_0-9]*)[ \t]*=",
+                    line,
+                )
+                if assignment:
+                    key = assignment.group(1)
+                    if key in ENV_DB_URL_KEYS:
+                        reasons.add("env-db-url")
+                    if key == b"PGPASSWORD":
+                        reasons.add("env-libpq-password")
+                    if key in ENV_LIBPQ_KEYS - {b"PGPASSWORD"}:
+                        reasons.add("env-libpq-credential-reference")
+            if is_service and re.search(
+                rb"(?<![A-Za-z0-9_])(?:password|passfile)[ \t]*=", line, re.I
+            ):
+                reasons.add("libpq-service-credential")
+            if is_passfile:
+                reasons.add("libpq-passfile-entry")
+    return sorted(reasons)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-url-file", required=True, type=Path)
@@ -180,9 +227,8 @@ def main() -> int:
             is_instance_config = (
                 path.name == "config.json" and path.parent.name == ".paperclip"
             )
-            data = (
-                path.read_bytes() if is_instance_config or path.name == ".env" else b""
-            )
+            data = path.read_bytes() if is_instance_config else b""
+            carrier_reasons = scan_named_carrier(path)
         except OSError:
             print(f"UNREADABLE {path}")
             failures += 1
@@ -193,6 +239,7 @@ def main() -> int:
             reasons.append("old-url-copy")
         if has_inline_url:
             reasons.append("inline-db-credential")
+        reasons.extend(carrier_reasons)
         if is_instance_config:
             try:
                 config = json.loads(data)
@@ -200,10 +247,6 @@ def main() -> int:
                     reasons.append("config-connection-string")
             except (ValueError, TypeError, AttributeError):
                 reasons.append("invalid-config-json")
-        if path.name == ".env" and re.search(
-            rb"^\s*DATABASE_(?:MIGRATION_)?URL\s*=", data, re.M
-        ):
-            reasons.append("env-db-url")
         if reasons:
             print(
                 f"FAIL {path} mode={stat.S_IMODE(info.st_mode):04o} uid={info.st_uid} reasons={','.join(reasons)}"

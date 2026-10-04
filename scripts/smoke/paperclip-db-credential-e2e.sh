@@ -82,6 +82,68 @@ fi
 grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
 grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
+printf '%s\n' 'PGPASSWORD=different_synthetic' \
+  > "$scratch/worktree/.env.local"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject PGPASSWORD in .env.local' >&2
+  exit 1
+fi
+grep -q 'reasons=env-libpq-password' "$scratch/scan-result"
+rm "$scratch/worktree/.env.local"
+printf '%s\n' 'PGPASSFILE=/synthetic/private/passfile' \
+  > "$scratch/worktree/.env.local"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a libpq passfile reference in .env.local' >&2
+  exit 1
+fi
+grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
+rm "$scratch/worktree/.env.local"
+for service_file in pg_service.conf .pg_service.conf; do
+  printf '[synthetic]\nhost=127.0.0.1\npassword=different_synthetic\n' \
+    > "$scratch/worktree/$service_file"
+  if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+    > "$scratch/scan-result"; then
+    echo "Copy scan did not reject $service_file password" >&2
+    exit 1
+  fi
+  grep -q 'reasons=libpq-service-credential' "$scratch/scan-result"
+  rm "$scratch/worktree/$service_file"
+done
+printf '[synthetic]\npassfile=/synthetic/private/passfile\n' \
+  > "$scratch/worktree/pg_service.conf"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a libpq passfile reference in a service file' >&2
+  exit 1
+fi
+grep -q 'reasons=libpq-service-credential' "$scratch/scan-result"
+rm "$scratch/worktree/pg_service.conf"
+for passfile in .pgpass pgpass.conf; do
+  printf '%s\n' '127.0.0.1:5432:synthetic:new_agent:different_synthetic' \
+    > "$scratch/worktree/$passfile"
+  chmod 0600 "$scratch/worktree/$passfile"
+  if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+    > "$scratch/scan-result"; then
+    echo "Copy scan did not reject $passfile credential" >&2
+    exit 1
+  fi
+  grep -q 'reasons=libpq-passfile-entry' "$scratch/scan-result"
+  if grep -q 'different_synthetic' "$scratch/scan-result"; then
+    echo 'Copy scan printed synthetic credential material' >&2
+    exit 1
+  fi
+  rm "$scratch/worktree/$passfile"
+done
+printf '%s\n' 'PGAPPNAME=synthetic' > "$scratch/worktree/.env.local"
+printf '[synthetic]\nhost=127.0.0.1\nuser=new_agent\n' \
+  > "$scratch/worktree/pg_service.conf"
+printf '%s\n' '# no credential entry' > "$scratch/worktree/.pgpass"
+chmod 0600 "$scratch/worktree/.pgpass"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+rm "$scratch/worktree/.env.local" "$scratch/worktree/pg_service.conf" "$scratch/worktree/.pgpass"
 printf '%s\n' 'postgres://new_agent@127.0.0.1/synthetic?pass%77ord=different_synthetic' \
   > "$scratch/worktree/nested/notes.txt"
 if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
@@ -127,4 +189,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

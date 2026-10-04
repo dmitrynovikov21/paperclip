@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,7 @@ MAX_REQUEST = 256
 REQUEST_DEADLINE_S = 2
 MAX_WORKERS = 4
 MAX_IN_FLIGHT = 8
+MONITOR_INTERVAL_S = 30
 CRITICAL_VOLUMES = (
     ("/", "root (`/`)", 10),
     ("/mnt/HC_Volume_106646767", "sdb", 10),
@@ -46,12 +48,20 @@ def measured_pressure():
 def report(message, peer_uid):
     if peer_uid != 1000 or not isinstance(message, dict) or message != {"event": "critical"}:
         raise ValueError("invalid reporter request")
+    result = emit_measured_alarm()
+    if result is None:
+        raise ValueError("disk pressure not confirmed")
+    return result
+
+
+def emit_measured_alarm():
+    """Check fixed volumes without trusting or needing a socket client."""
     # Multiple socket workers must not issue the same alarm before the cooldown
     # is recorded. The HTTP request is bounded by the service transport timeout.
     with report_lock:
         critical = measured_pressure()
         if not critical:
-            raise ValueError("disk pressure not confirmed")
+            return None
         now = time.monotonic()
         fresh = [(label, free_gb, threshold_gb) for label, free_gb, threshold_gb in critical
                  if now - last_reported.get(label, float("-inf")) >= REPORT_GAP_S]
@@ -69,6 +79,17 @@ def report(message, peer_uid):
         for label, _free_gb, _threshold_gb in fresh:
             last_reported[label] = now
         return result
+
+
+def monitor_pressure(stop):
+    # A saturated agent-accessible socket cannot suppress a critical alarm.
+    while not stop.is_set():
+        try:
+            emit_measured_alarm()
+        except Exception as error:
+            # Only the exception class reaches journald, never API responses or keys.
+            print(f"disk pressure monitor: {type(error).__name__}", file=sys.stderr, flush=True)
+        stop.wait(MONITOR_INTERVAL_S)
 
 
 def read_request(connection):
@@ -129,10 +150,18 @@ def main():
     if int(os.environ.get("LISTEN_FDS", "0")) != 1:
         raise SystemExit("one systemd socket is required")
     slots = threading.BoundedSemaphore(MAX_IN_FLIGHT)
-    with socket.socket(fileno=3) as listener, ThreadPoolExecutor(max_workers=MAX_WORKERS) as workers:
-        while True:
-            connection, _address = listener.accept()
-            dispatch_connection(connection, workers, slots)
+    stop = threading.Event()
+    monitor = threading.Thread(target=monitor_pressure, args=(stop,), daemon=True,
+                               name="disk-pressure-monitor")
+    monitor.start()
+    try:
+        with socket.socket(fileno=3) as listener, ThreadPoolExecutor(max_workers=MAX_WORKERS) as workers:
+            while True:
+                connection, _address = listener.accept()
+                dispatch_connection(connection, workers, slots)
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
 
 
 if __name__ == "__main__":

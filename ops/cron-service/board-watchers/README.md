@@ -42,7 +42,10 @@ key, choose another issue/API path, or place its text in a service-authored wake
 The reporter also suppresses repeat wakes for the same measured volume for two
 hours while its service process remains running. Socket reads have a two-second
 absolute deadline; four workers handle at most eight active or queued clients,
-and concurrent valid signals share one cooldown decision.
+and concurrent valid signals share one cooldown decision. An independent service
+check at startup and every 30 seconds measures the same fixed volumes and sends
+the same scoped alarm when pressure is real. Saturating the agent-accessible
+socket cannot suppress that service-side alarm.
 The sdb alarm threshold matches the farm GC's 10 GB post-sweep threshold;
 the separate strict sdb cleanup escalates only below 8 GB.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are

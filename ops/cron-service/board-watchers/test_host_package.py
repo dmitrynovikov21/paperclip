@@ -3,6 +3,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import datetime
 import json
 import os
@@ -300,6 +301,64 @@ class HostPackageTest(unittest.TestCase):
             self.assertEqual(len(requests), 1)
             slow_client.settimeout(disk_reporter.REQUEST_DEADLINE_S + 1)
             self.assertEqual(json.loads(slow_client.recv(256))["ok"], False)
+
+    def test_saturated_disk_socket_cannot_suppress_service_measured_alarm(self):
+        gate = threading.Event()
+        alarm = threading.Event()
+        first_sample = threading.Event()
+        stop = threading.Event()
+        requests = []
+
+        def slow_read(_connection):
+            gate.wait(5)
+            raise TimeoutError("incomplete fixture request")
+
+        def service_request(*args):
+            requests.append(args)
+            alarm.set()
+            return {}
+
+        def measured_pressure():
+            if not first_sample.is_set():
+                first_sample.set()
+                return []
+            return [("root", 5, 10)]
+
+        with ExitStack() as stack:
+            pairs = []
+            for _ in range(disk_reporter.MAX_IN_FLIGHT + 1):
+                client, server = socket.socketpair()
+                pairs.append((stack.enter_context(client), stack.enter_context(server)))
+            with patch.object(disk_reporter, "last_reported", {}), \
+                    patch.object(disk_reporter, "read_request", side_effect=slow_read), \
+                    patch.object(disk_reporter, "measured_pressure", side_effect=measured_pressure), \
+                    patch.object(disk_reporter, "service_request", side_effect=service_request), \
+                    patch.object(disk_reporter, "MONITOR_INTERVAL_S", 0.05), \
+                    ThreadPoolExecutor(max_workers=disk_reporter.MAX_WORKERS) as workers:
+                slots = threading.BoundedSemaphore(disk_reporter.MAX_IN_FLIGHT)
+                monitor = None
+                try:
+                    for client, server in pairs[:-1]:
+                        client.sendall(b'{"event":')
+                        self.assertTrue(disk_reporter.dispatch_connection(server, workers, slots))
+                    overflow_client, overflow_server = pairs[-1]
+                    overflow_client.settimeout(1)
+                    overflow_client.sendall(b'{"event":"critical"}\n')
+                    self.assertFalse(disk_reporter.dispatch_connection(overflow_server, workers, slots))
+
+                    monitor = threading.Thread(target=disk_reporter.monitor_pressure,
+                                               args=(stop,), daemon=True)
+                    monitor.start()
+                    self.assertTrue(first_sample.wait(1), "initial healthy disk sample was missed")
+                    self.assertTrue(alarm.wait(2), "periodic service alarm was suppressed by the socket")
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(requests[0][0:2],
+                                     ("PATCH", f"/api/issues/{disk_reporter.SIGNAL_ISSUE}"))
+                finally:
+                    stop.set()
+                    gate.set()
+                    if monitor is not None:
+                        monitor.join(timeout=1)
 
     def test_github_reader_cannot_use_foreign_origin_or_path(self):
         for path in ("https://evil.example/", "repos/Other/repo/issues/1",

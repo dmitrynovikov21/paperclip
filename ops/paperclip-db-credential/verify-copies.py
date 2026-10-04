@@ -205,26 +205,39 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
     return has_old_url, has_inline_url, has_passfile_entry
 
 
-def scan_named_carrier(path: Path) -> list[str]:
+def scan_libpq_carrier(path: Path) -> list[str]:
     """Reject libpq password sources that contain no PostgreSQL URL.
 
-    A named carrier is read a bounded line at a time. An oversized line fails
-    closed, and no credential value is ever included in a reason code.
+    A service file may have any name via PGSERVICEFILE. Read bounded lines in
+    every file to recognize its INI section and credential assignments. Named
+    carriers and oversized service sections fail closed; values are not logged.
     """
     is_env = path.name.startswith(".env")
     is_service = path.name in SERVICE_FILE_NAMES
     is_passfile = path.name in PASSFILE_NAMES
-    if not (is_env or is_service or is_passfile):
-        return []
-
+    is_named_carrier = is_env or is_service or is_passfile
     reasons = set()
+    in_service_section = False
+    skipping_oversized_line = False
     with path.open("rb") as source:
         while line := source.readline(MAX_CARRIER_LINE_BYTES + 1):
+            if skipping_oversized_line:
+                skipping_oversized_line = not line.endswith(b"\n")
+                continue
             if len(line) > MAX_CARRIER_LINE_BYTES:
-                reasons.add("oversized-db-carrier-line")
-                break
+                if is_named_carrier or (
+                    not line.lstrip().startswith(b"#")
+                    and (in_service_section or line.lstrip().startswith(b"["))
+                ):
+                    reasons.add("oversized-db-carrier-line")
+                if is_named_carrier:
+                    break
+                skipping_oversized_line = not line.endswith(b"\n")
+                continue
             if not line.strip() or line.lstrip().startswith(b"#"):
                 continue
+            if re.fullmatch(rb"\[[^\]\r\n]+\]", line.strip()):
+                in_service_section = True
             if is_env:
                 assignment = re.match(
                     rb"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z_0-9]*)[ \t]*=",
@@ -238,8 +251,8 @@ def scan_named_carrier(path: Path) -> list[str]:
                         reasons.add("env-libpq-password")
                     if key in ENV_LIBPQ_KEYS - {b"PGPASSWORD"}:
                         reasons.add("env-libpq-credential-reference")
-            if is_service and re.search(
-                rb"(?<![A-Za-z0-9_])(?:password|passfile)[ \t]*=", line, re.I
+            if (is_service or in_service_section) and re.match(
+                rb"^[ \t]*(?:password|passfile)[ \t]*=", line, re.I
             ):
                 reasons.add("libpq-service-credential")
             if is_passfile:
@@ -291,7 +304,7 @@ def main() -> int:
                 path.name == "config.json" and path.parent.name == ".paperclip"
             )
             data = path.read_bytes() if is_instance_config else b""
-            carrier_reasons = scan_named_carrier(path)
+            carrier_reasons = scan_libpq_carrier(path)
         except OSError:
             print(f"UNREADABLE {path}")
             failures += 1

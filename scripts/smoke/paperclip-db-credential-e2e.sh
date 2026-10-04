@@ -125,6 +125,37 @@ for service_file in pg_service.conf .pg_service.conf; do
   grep -q 'reasons=libpq-service-credential' "$scratch/scan-result"
   rm "$scratch/worktree/$service_file"
 done
+printf '[synthetic]\nhost=127.0.0.1\npassword=different_synthetic\n' \
+  > "$scratch/worktree/custom-service.ini"
+chmod 0600 "$scratch/worktree/custom-service.ini"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject a custom-named worktree service file' >&2
+  exit 1
+fi
+grep -q 'reasons=libpq-service-credential' "$scratch/scan-result"
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+mv "$scratch/worktree/custom-service.ini" "$scratch/custom-service.ini"
+printf '[synthetic]\npassfile=/synthetic/private/passfile\n' \
+  > "$scratch/custom-service.ini"
+if python3 "$scan" --old-url-file "$scratch/old-url" --carrier "$scratch/custom-service.ini" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject an explicit custom-named service file' >&2
+  exit 1
+fi
+grep -q 'reasons=libpq-service-credential' "$scratch/scan-result"
+if grep -q '/synthetic/private/passfile' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+printf '[synthetic]\nhost=127.0.0.1\nuser=new_agent\n' \
+  > "$scratch/custom-service.ini"
+python3 "$scan" --old-url-file "$scratch/old-url" --carrier "$scratch/custom-service.ini" \
+  > "$scratch/scan-result"
+rm "$scratch/custom-service.ini"
 printf '%s\n' '127.0.0.1:5432:synthetic:new_agent:different_synthetic' \
   > "$scratch/worktree/credentials"
 chmod 0600 "$scratch/worktree/credentials"
@@ -233,4 +264,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, custom passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

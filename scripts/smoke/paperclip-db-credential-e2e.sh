@@ -44,6 +44,29 @@ fi
 grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
 grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
+printf '%s\n' 'postgresql://new_agent@127.0.0.1/synthetic?application_name=copy_scan' \
+  > "$scratch/worktree/nested/notes.txt"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+printf '%s\n' 'DATABASE_URL=postgresql://new_agent@127.0.0.1/synthetic?application_name=copy_scan&password=different_synthetic' \
+  > "$scratch/worktree/.env.local"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a query-parameter password in .env.local' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
+grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
+rm "$scratch/worktree/.env.local"
+printf '%s\n' 'postgres://new_agent@127.0.0.1/synthetic?pass%77ord=different_synthetic' \
+  > "$scratch/worktree/nested/notes.txt"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a percent-encoded query-parameter password' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
+printf '%s\n' 'no credential here' > "$scratch/worktree/nested/notes.txt"
 # Place the URL prefix across the 1 MiB read boundary and the @ after a
 # password longer than one chunk; neither split may bypass the scanner.
 head -c 1048570 /dev/zero > "$scratch/worktree/nested/large.bin"
@@ -80,4 +103,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, query password, encoded query key, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

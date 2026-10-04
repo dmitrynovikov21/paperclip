@@ -7,10 +7,13 @@ import os
 import re
 import stat
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 
 URL_PREFIXES = (b"postgres://", b"postgresql://")
 URL_WHITESPACE = b" \t\n\r\f\v"
+PASSWORD_QUERY_KEY = b"password"
+MAX_QUERY_KEY_BYTES = len(PASSWORD_QUERY_KEY) * 3  # Percent-encoded bytes.
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -47,6 +50,9 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
     prefix_lengths = [0, 0]
     credential_part = 0  # 0: none, 1: username, 2: password
     part_has_bytes = False
+    query_part = 0  # 0: no URL, 1: before ?, 2: parameter name, 3: value
+    query_key = bytearray()
+    query_key_overlong = False
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             data = overlap + chunk
@@ -67,6 +73,36 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                     else:
                         length = 1 if byte == ord("p") else 0
                     prefix_lengths[index] = length
+                if found_prefix and query_part == 0:
+                    query_part = 1
+                elif byte in URL_WHITESPACE or byte in b"'\"<>`#":
+                    query_part = 0
+                    query_key.clear()
+                elif query_part == 1:
+                    if byte == ord("?"):
+                        query_part = 2
+                        query_key.clear()
+                        query_key_overlong = False
+                elif query_part == 2:
+                    if byte == ord("&"):
+                        query_key.clear()
+                        query_key_overlong = False
+                    elif byte == ord("="):
+                        if (
+                            not query_key_overlong
+                            and unquote_to_bytes(bytes(query_key)) == PASSWORD_QUERY_KEY
+                        ):
+                            has_inline_url = True
+                            break
+                        query_part = 3
+                    elif len(query_key) < MAX_QUERY_KEY_BYTES:
+                        query_key.append(byte)
+                    else:
+                        query_key_overlong = True
+                elif query_part == 3 and byte == ord("&"):
+                    query_part = 2
+                    query_key.clear()
+                    query_key_overlong = False
                 # A second prefix may itself be part of a password.
                 if found_prefix and credential_part == 0:
                     credential_part = 1

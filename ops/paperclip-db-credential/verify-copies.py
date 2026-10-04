@@ -43,8 +43,8 @@ def candidates(carriers: list[Path], worktree_roots: list[Path]):
             yield Path(error.filename), False
 
 
-def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
-    """Find the old URL and any inline PostgreSQL URL with bounded memory.
+def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
+    """Find old URLs, inline URLs and libpq passfile entries with bounded memory.
 
     Prefix and credential state continue across read boundaries, including for
     URLs with a username or password longer than a read chunk.
@@ -52,6 +52,12 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
     overlap = b""
     has_old_url = False
     has_inline_url = False
+    has_passfile_entry = False
+    passfile_fields = 0
+    passfile_field_has_bytes = False
+    passfile_line_valid = True
+    passfile_escaped = False
+    passfile_port_star = False
     prefix_lengths = [0, 0]
     credential_part = 0  # 0: none, 1: username, 2: password
     part_has_bytes = False
@@ -67,6 +73,55 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
             if has_inline_url:
                 continue
             for raw_byte in chunk:
+                # A custom PGPASSFILE can have any name. Recognize its five
+                # colon-separated fields in every scanned file, including
+                # explicit --carrier paths, without retaining line contents.
+                if not has_passfile_entry:
+                    if raw_byte in (10, 13):
+                        has_passfile_entry = (
+                            passfile_line_valid
+                            and passfile_fields == 4
+                            and passfile_field_has_bytes
+                            and not passfile_escaped
+                        )
+                        passfile_fields = 0
+                        passfile_field_has_bytes = False
+                        passfile_line_valid = True
+                        passfile_escaped = False
+                        passfile_port_star = False
+                    elif passfile_line_valid:
+                        if raw_byte == 0 or (
+                            raw_byte == ord("#")
+                            and passfile_fields == 0
+                            and not passfile_field_has_bytes
+                        ):
+                            passfile_line_valid = False
+                        elif passfile_escaped:
+                            passfile_field_has_bytes = True
+                            passfile_escaped = False
+                        elif raw_byte == ord("\\"):
+                            if passfile_fields == 1:
+                                passfile_line_valid = False
+                            else:
+                                passfile_escaped = True
+                        elif raw_byte == ord(":"):
+                            if not passfile_field_has_bytes or passfile_fields == 4:
+                                passfile_line_valid = False
+                            else:
+                                passfile_fields += 1
+                                passfile_field_has_bytes = False
+                        else:
+                            if passfile_fields == 1:
+                                if (
+                                    raw_byte == ord("*")
+                                    and not passfile_field_has_bytes
+                                ):
+                                    passfile_port_star = True
+                                elif not (
+                                    48 <= raw_byte <= 57 and not passfile_port_star
+                                ):
+                                    passfile_line_valid = False
+                            passfile_field_has_bytes = True
                 byte = raw_byte + 32 if 65 <= raw_byte <= 90 else raw_byte
                 found_prefix = False
                 for index, prefix in enumerate(URL_PREFIXES):
@@ -141,7 +196,13 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                         credential_part = 0
                     else:
                         part_has_bytes = True
-    return has_old_url, has_inline_url
+    has_passfile_entry |= (
+        passfile_line_valid
+        and passfile_fields == 4
+        and passfile_field_has_bytes
+        and not passfile_escaped
+    )
+    return has_old_url, has_inline_url, has_passfile_entry
 
 
 def scan_named_carrier(path: Path) -> list[str]:
@@ -223,7 +284,9 @@ def main() -> int:
             failures += 1
             continue
         try:
-            has_old_url, has_inline_url = scan_credentials(path, old_url)
+            has_old_url, has_inline_url, has_passfile_entry = scan_credentials(
+                path, old_url
+            )
             is_instance_config = (
                 path.name == "config.json" and path.parent.name == ".paperclip"
             )
@@ -239,6 +302,8 @@ def main() -> int:
             reasons.append("old-url-copy")
         if has_inline_url:
             reasons.append("inline-db-credential")
+        if has_passfile_entry and "libpq-passfile-entry" not in carrier_reasons:
+            reasons.append("libpq-passfile-entry")
         reasons.extend(carrier_reasons)
         if is_instance_config:
             try:

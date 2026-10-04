@@ -105,7 +105,8 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
 fi
 grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
-for fixture in conninfo conninfo_multiline conninfo_password_only shell; do
+for fixture in conninfo conninfo_multiline conninfo_password_only \
+  conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c; do
   case "$fixture" in
     conninfo)
       name=conninfo.txt
@@ -123,9 +124,25 @@ password=different_synthetic'
       content='password=different_synthetic'
       reason=libpq-conninfo-password
       ;;
+    conninfo_client_encoding)
+      name=client-encoding-conninfo.txt
+      content='client_encoding=UTF8 host=127.0.0.1 password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_client_encoding_multiline)
+      name=client-encoding-multiline-conninfo.txt
+      content='client_encoding=UTF8
+password=different_synthetic'
+      reason=libpq-conninfo-password
+      ;;
     shell)
       name=run.sh
       content='export PGPASSWORD=different_synthetic'
+      reason=env-libpq-password
+      ;;
+    shell_ansi_c)
+      name=run-ansi-c.sh
+      content="export PGPASSWORD=\$'different_synthetic'"
       reason=env-libpq-password
       ;;
   esac
@@ -154,9 +171,9 @@ password=different_synthetic'
   fi
   rm "$scratch/$name"
 done
-printf '%s\n' 'host=127.0.0.1 dbname=synthetic user=new_agent' \
+printf '%s\n' 'client_encoding=UTF8 host=127.0.0.1 dbname=synthetic user=new_agent' \
   > "$scratch/worktree/nested/clean-conninfo.txt"
-printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' \
+printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' 'export PGPASSWORD=$FROM_PRIVATE_SOURCE' \
   > "$scratch/worktree/nested/clean-run.sh"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"
@@ -324,4 +341,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo and shell password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo (including client_encoding) and shell (including ANSI-C literal) password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

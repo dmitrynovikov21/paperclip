@@ -20,12 +20,28 @@ PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
 PGPASSWORD_ASSIGNMENT = re.compile(rb"^[ \t]*(?:export[ \t]+)?PGPASSWORD[ \t]*=[ \t]*(.*)")
+# A connection string may begin with any libpq parameter, not just host/user.
+# Keep this set aligned with libpq's documented keyword/value parameters.
+LIBPQ_CONNINFO_KEYS = frozenset(
+    b"""host hostaddr port dbname user password passfile require_auth
+    channel_binding connect_timeout client_encoding options application_name
+    fallback_application_name keepalives keepalives_idle keepalives_interval
+    keepalives_count tcp_user_timeout replication gssencmode sslmode requiressl
+    sslnegotiation sslcompression sslcert sslkey sslkeylogfile sslpassword
+    sslcertmode sslrootcert sslcrl sslcrldir sslsni requirepeer
+    ssl_min_protocol_version ssl_max_protocol_version min_protocol_version
+    max_protocol_version krbsrvname gsslib gssdelegation scram_client_key
+    scram_server_key service target_session_attrs load_balance_hosts
+    oauth_issuer oauth_client_id oauth_client_secret oauth_scope""".split()
+)
 LIBPQ_CONNINFO_START = re.compile(
-    rb"^[ \t]*(?:host|hostaddr|port|dbname|user|service|sslmode|connect_timeout|application_name|password)[ \t]*=",
+    rb"^[ \t]*(?:" + b"|".join(sorted(LIBPQ_CONNINFO_KEYS)) + rb")[ \t]*=",
     re.I,
 )
 LIBPQ_CONNINFO_KEY = re.compile(
-    rb"(?:^|[ \t])(?:host|hostaddr|port|dbname|user|service|sslmode|connect_timeout|application_name)[ \t]*=",
+    rb"(?:^|[ \t])(?:"
+    + b"|".join(sorted(LIBPQ_CONNINFO_KEYS - {b"password"}))
+    + rb")[ \t]*=",
     re.I,
 )
 LIBPQ_PASSWORD_KEY = re.compile(rb"(?:^|[ \t])password[ \t]*=[ \t]*\S", re.I)
@@ -275,12 +291,18 @@ def scan_libpq_carrier(path: Path) -> list[str]:
             ):
                 reasons.add("libpq-service-credential")
             # Ignore computed source-code expressions such as
-            # PGPASSWORD=unquote(url.password); they do not copy a credential.
+            # PGPASSWORD=unquote(url.password); Bash $'...' and $"..." are
+            # literal strings even though they begin with a dollar sign.
             shell_assignment = PGPASSWORD_ASSIGNMENT.match(line)
             if shell_assignment:
                 value = shell_assignment.group(1).strip()
-                if value and not value.startswith((b"$", b"`")) and not re.match(
-                    rb"[A-Za-z_][A-Za-z_0-9]*\(", value
+                is_shell_literal = value.startswith((b"$'", b'$"'))
+                if value and (
+                    is_shell_literal
+                    or (
+                        not value.startswith((b"$", b"`"))
+                        and not re.match(rb"[A-Za-z_][A-Za-z_0-9]*\(", value)
+                    )
                 ):
                     reasons.add("env-libpq-password")
             if not is_service and not in_service_section:

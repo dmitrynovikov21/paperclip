@@ -53,7 +53,7 @@ LIBPQ_CONNINFO_KEY = re.compile(
 LIBPQ_PASSWORD_KEY = re.compile(rb"(?:^|[ \t])password[ \t]*=[ \t]*\S", re.I)
 
 
-def shell_words(line: bytes):
+def shell_words(line: bytes, *, include_separators: bool = False):
     """Yield shell words without treating a quoted fixture as executable code.
 
     The scanner rejects a password assignment wherever it is a whole word,
@@ -66,6 +66,8 @@ def shell_words(line: bytes):
     for index, byte in enumerate(line):
         if start is None:
             if byte in b" \t\r\n;|&()<>":
+                if include_separators and byte in b";|&()<>":
+                    yield line[index : index + 1]
                 continue
             if byte == ord("#"):
                 break
@@ -82,6 +84,8 @@ def shell_words(line: bytes):
         elif byte in b" \t\r\n;|&()<>":
             yield line[start:index]
             start = None
+            if include_separators and byte in b";|&()<>":
+                yield line[index : index + 1]
     if start is not None:
         yield line[start:]
 
@@ -95,28 +99,97 @@ def shell_assignment(word: bytes) -> tuple[bytes, bytes] | None:
     return (match.group(1), match.group(2)) if match else None
 
 
-def libpq_conninfo_arguments(line: bytes):
-    """Yield psql database arguments, including quoted keyword/value strings.
-
-    Keep shell assignment values opaque: a fixture such as
-    `content='psql -d "host=..."'` is not itself an executable psql command.
-    """
-    words = list(shell_words(line))
-    for index, word in enumerate(words):
-        if word in (b"-d", b"--dbname") and index + 1 < len(words):
-            argument = words[index + 1]
-        elif word.startswith(b"--dbname="):
-            argument = word[len(b"--dbname=") :]
-        elif word.startswith(b"-d") and len(word) > 2:
-            argument = word[2:]
+def shell_commands(line: bytes):
+    """Split shell commands without interpreting separators inside quotes."""
+    words = []
+    for word in shell_words(line, include_separators=True):
+        if word in (b";", b"|", b"&", b"(", b")", b"<", b">"):
+            if words:
+                yield words
+                words = []
         else:
-            continue
-        if len(argument) >= 2 and argument[0] in (ord("'"), ord('"')):
-            if argument[-1] == argument[0]:
-                argument = argument[1:-1]
-            else:
-                argument = argument[1:]
-        yield argument
+            words.append(word)
+    if words:
+        yield words
+
+
+def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
+    """Find the executable after shell control words, assignments and wrappers."""
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in (
+            b"if",
+            b"then",
+            b"elif",
+            b"else",
+            b"while",
+            b"until",
+            b"do",
+            b"!",
+            b"--",
+        ):
+            index += 1
+        elif word == b"time":
+            index += 1
+            if index < len(words) and words[index] == b"-p":
+                index += 1
+        elif shell_assignment(word):
+            index += 1
+        elif word.rsplit(b"/", 1)[-1] == b"env":
+            index += 1
+            while index < len(words) and words[index].startswith(b"-"):
+                option = words[index]
+                index += 1
+                if option in (b"-u", b"--unset", b"-C", b"--chdir"):
+                    index += 1
+        elif word in (b"command", b"exec", b"builtin"):
+            index += 1
+            while index < len(words) and words[index].startswith(b"-"):
+                option = words[index]
+                index += 1
+                if word == b"exec" and option == b"-a":
+                    index += 1
+        else:
+            return word.rsplit(b"/", 1)[-1], words[index + 1 :]
+    return b"", []
+
+
+def unquote_shell_word(word: bytes) -> bytes:
+    if len(word) >= 2 and word[0] == word[-1] == ord("'"):
+        return word[1:-1]
+    if len(word) >= 2 and word[0] == word[-1] == ord('"'):
+        return re.sub(rb"\\([\\$`\"])", rb"\1", word[1:-1])
+    return word
+
+
+def libpq_conninfo_arguments(line: bytes):
+    """Yield executable psql database arguments, including shell -c commands.
+
+    Assignment values and arguments of other programs stay opaque, so fixture
+    definitions and `curl -d` do not become psql commands.
+    """
+    pending = [line]
+    while pending:
+        for command in shell_commands(pending.pop()):
+            executable, arguments = executable_words(command)
+            if executable in (b"sh", b"bash", b"dash", b"zsh", b"ksh"):
+                for index, word in enumerate(arguments[:-1]):
+                    if re.fullmatch(rb"-[A-Za-z]*c[A-Za-z]*", word):
+                        pending.append(unquote_shell_word(arguments[index + 1]))
+                        break
+            if executable != b"psql":
+                continue
+            for index, word in enumerate(arguments):
+                if word in (b"-d", b"--dbname") and index + 1 < len(arguments):
+                    argument = arguments[index + 1]
+                elif word.startswith(b"--dbname="):
+                    argument = word[len(b"--dbname=") :]
+                elif word.startswith(b"-d") and len(word) > 2:
+                    argument = word[2:]
+                else:
+                    continue
+                yield unquote_shell_word(argument)
 
 
 def shell_logical_lines(source):
@@ -376,14 +449,18 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
     with path.open("rb") as source:
         for line, oversized, joined in shell_logical_lines(source):
             if oversized:
-                if is_named_carrier or joined or (
-                    not line.lstrip().startswith(b"#")
-                    and (
-                        in_service_section
-                        or line.lstrip().startswith(b"[")
-                        or b"PGPASSWORD=" in line
-                        or b"PGPASS" in line
-                        or LIBPQ_CONNINFO_START.match(line)
+                if (
+                    is_named_carrier
+                    or joined
+                    or (
+                        not line.lstrip().startswith(b"#")
+                        and (
+                            in_service_section
+                            or line.lstrip().startswith(b"[")
+                            or b"PGPASSWORD=" in line
+                            or b"PGPASS" in line
+                            or LIBPQ_CONNINFO_START.match(line)
+                        )
                     )
                 ):
                     reasons.add("oversized-db-carrier-line")

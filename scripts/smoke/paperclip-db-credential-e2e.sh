@@ -107,6 +107,7 @@ grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
 for fixture in conninfo conninfo_multiline conninfo_password_only \
   conninfo_psql_d conninfo_psql_d_prefixed conninfo_psql_d_password_only \
+  conninfo_psql_d_shell \
   conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c \
   shell_env shell_leading_assignment shell_quoted_assignment shell_env_unset \
   shell_command_env shell_command_p_env shell_exec_env shell_exec_env_unset \
@@ -146,6 +147,11 @@ password=different_synthetic'
     conninfo_psql_d_password_only)
       name=psql-password-only-conninfo.sh
       content="psql -d 'password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_shell)
+      name=psql-shell-conninfo.sh
+      content='sh -c '\''psql -d "host=127.0.0.1 dbname=synthetic user=new_agent password=different_synthetic"'\'''
       reason=libpq-conninfo-password
       ;;
     conninfo_client_encoding)
@@ -366,14 +372,21 @@ PGPASSWORD=\$DB_PASS sh -c 'test \"\$PGPASSWORD\" = different_synthetic'"
 done
 printf '%s\n' 'psql -d "host=127.0.0.1 dbname=synthetic user=new_agent"' \
   > "$scratch/worktree/nested/psql-passwordless.sh"
+printf '%s\n' "curl -d 'password=different_synthetic' https://example.invalid/" \
+  "echo psql -d 'password=different_synthetic'" \
+  "sh -c 'curl -d \"password=different_synthetic\" https://example.invalid/'" \
+  > "$scratch/worktree/nested/non-psql-data.sh"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"
 grep -Eq '^Copy scan: checked=[0-9]+ failures=0$' "$scratch/scan-result"
-python3 "$scan" --old-url-file "$scratch/old-url" \
-  --carrier "$scratch/worktree/nested/psql-passwordless.sh" > "$scratch/scan-result"
-grep -Fxq 'Copy scan: checked=1 failures=0' "$scratch/scan-result"
-rm "$scratch/worktree/nested/psql-passwordless.sh"
-echo 'psql -d conninfo rejection and passwordless control passed in worktree and explicit carrier'
+for name in psql-passwordless.sh non-psql-data.sh; do
+  python3 "$scan" --old-url-file "$scratch/old-url" \
+    --carrier "$scratch/worktree/nested/$name" > "$scratch/scan-result"
+  grep -Fxq 'Copy scan: checked=1 failures=0' "$scratch/scan-result"
+done
+rm "$scratch/worktree/nested/psql-passwordless.sh" \
+  "$scratch/worktree/nested/non-psql-data.sh"
+echo 'psql -d and nested shell conninfo rejection; curl and passwordless controls passed in both modes'
 printf '%s\n' 'DB_PASS=different_synthetic' > "$scratch/worktree/nested/source.env"
 printf '%s\n' 'PGPASSWORD=$DB_PASS sh -c '\''test "$PGPASSWORD" = different_synthetic'\''' \
   > "$scratch/worktree/nested/run-from-source.sh"

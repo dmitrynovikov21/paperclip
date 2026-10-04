@@ -2,12 +2,14 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
 import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -267,6 +269,37 @@ class HostPackageTest(unittest.TestCase):
         finally:
             left.close()
             right.close()
+
+    def test_slow_disk_client_does_not_block_valid_reports_or_duplicate_alarm(self):
+        slow_client, slow_server = socket.socketpair()
+        first_client, first_server = socket.socketpair()
+        second_client, second_server = socket.socketpair()
+        requests = []
+
+        def service_request(*args):
+            time.sleep(0.1)
+            requests.append(args)
+            return {}
+
+        with slow_client, slow_server, first_client, first_server, second_client, second_server, \
+                patch.object(disk_reporter, "last_reported", {}), \
+                patch.object(disk_reporter, "measured_pressure", return_value=[("root", 5, 10)]), \
+                patch.object(disk_reporter, "service_request", side_effect=service_request), \
+                ThreadPoolExecutor(max_workers=disk_reporter.MAX_WORKERS) as workers:
+            slots = threading.BoundedSemaphore(disk_reporter.MAX_IN_FLIGHT)
+            slow_client.sendall(b'{"event":')
+            self.assertTrue(disk_reporter.dispatch_connection(slow_server, workers, slots))
+            start = time.monotonic()
+            for client, server in ((first_client, first_server), (second_client, second_server)):
+                client.settimeout(1.5)
+                client.sendall(b'{"event":"critical"}\n')
+                self.assertTrue(disk_reporter.dispatch_connection(server, workers, slots))
+            for client in (first_client, second_client):
+                self.assertEqual(json.loads(client.recv(256)), {"ok": True})
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assertEqual(len(requests), 1)
+            slow_client.settimeout(disk_reporter.REQUEST_DEADLINE_S + 1)
+            self.assertEqual(json.loads(slow_client.recv(256))["ok"], False)
 
     def test_github_reader_cannot_use_foreign_origin_or_path(self):
         for path in ("https://evil.example/", "repos/Other/repo/issues/1",

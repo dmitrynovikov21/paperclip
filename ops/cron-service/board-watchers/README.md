@@ -40,7 +40,9 @@ board comment from its own template. An arbitrary agent message or a critical
 event without measured pressure is rejected. The agent cannot read the reporter
 key, choose another issue/API path, or place its text in a service-authored wake.
 The reporter also suppresses repeat wakes for the same measured volume for two
-hours while its service process remains running.
+hours while its service process remains running. Socket reads have a two-second
+absolute deadline; four workers handle at most eight active or queued clients,
+and concurrent valid signals share one cooldown decision.
 The sdb alarm threshold matches the farm GC's 10 GB post-sweep threshold;
 the separate strict sdb cleanup escalates only below 8 GB.
 The wrapper checks the root and sdb strict tiers even when its farm GC roots are

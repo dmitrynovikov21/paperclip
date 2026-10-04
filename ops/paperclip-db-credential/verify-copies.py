@@ -15,6 +15,17 @@ URL_WHITESPACE = b" \t\n\r\f\v"
 PASSWORD_QUERY_KEY = b"password"
 MAX_QUERY_KEY_BYTES = len(PASSWORD_QUERY_KEY) * 3  # Percent-encoded bytes.
 MAX_CARRIER_LINE_BYTES = 64 * 1024
+# Search the full length of an oversized line for these DB command/carrier
+# markers. A fixed overlap catches a marker split across bounded reads.
+OVERSIZED_DB_MARKERS = (
+    b"psql",
+    b"pgpassword",
+    b"pgpassfile",
+    b"pgservicefile",
+    b"password",
+    b"passfile",
+)
+MAX_OVERSIZED_MARKER_BYTES = max(map(len, OVERSIZED_DB_MARKERS))
 SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
@@ -196,13 +207,15 @@ def shell_logical_lines(source):
     """Join shell backslash-newline continuations without retaining long lines.
 
     Shell removes an unescaped backslash and newline before parsing words, even
-    when they split an identifier. Report an overlong joined line so the caller
-    can fail closed rather than scanning only its bounded prefix.
+    when they split an identifier. Report overlong lines and DB markers found
+    anywhere in them, so the caller does not trust only a bounded prefix.
     """
     logical = bytearray()
     joined = False
     oversized_prefix = None
     oversized_joined = False
+    oversized_db_marker = False
+    marker_overlap = b""
     while fragment := source.readline(MAX_CARRIER_LINE_BYTES + 1):
         has_newline = fragment.endswith(b"\n")
         complete = has_newline or len(fragment) <= MAX_CARRIER_LINE_BYTES
@@ -214,33 +227,47 @@ def shell_logical_lines(source):
                 index -= 1
         continued = backslashes % 2 == 1
         if oversized_prefix is not None:
+            marker_window = (marker_overlap + fragment).lower()
+            oversized_db_marker |= any(
+                marker in marker_window for marker in OVERSIZED_DB_MARKERS
+            )
+            marker_overlap = marker_window[-(MAX_OVERSIZED_MARKER_BYTES - 1) :]
             oversized_joined |= continued
             if complete and not continued:
-                yield oversized_prefix, True, oversized_joined
+                yield oversized_prefix, True, oversized_joined, oversized_db_marker
                 oversized_prefix = None
+                oversized_db_marker = False
+                marker_overlap = b""
             continue
         payload = fragment[:-2] if continued else fragment
         available = MAX_CARRIER_LINE_BYTES - len(logical)
         if len(payload) > available:
             oversized_prefix = bytes(logical) + payload[:available]
             oversized_joined = joined or continued
+            marker_window = (bytes(logical) + payload).lower()
+            oversized_db_marker = any(
+                marker in marker_window for marker in OVERSIZED_DB_MARKERS
+            )
+            marker_overlap = marker_window[-(MAX_OVERSIZED_MARKER_BYTES - 1) :]
             logical.clear()
             joined = False
             if complete and not continued:
-                yield oversized_prefix, True, oversized_joined
+                yield oversized_prefix, True, oversized_joined, oversized_db_marker
                 oversized_prefix = None
+                oversized_db_marker = False
+                marker_overlap = b""
             continue
         logical.extend(payload)
         if continued:
             joined = True
         else:
-            yield bytes(logical), False, joined
+            yield bytes(logical), False, joined, False
             logical.clear()
             joined = False
     if oversized_prefix is not None:
-        yield oversized_prefix, True, oversized_joined
+        yield oversized_prefix, True, oversized_joined, oversized_db_marker
     elif logical:
-        yield bytes(logical), False, joined
+        yield bytes(logical), False, joined, False
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -432,7 +459,8 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
 
     A service file may have any name via PGSERVICEFILE. Shell assignments and
     keyword/value conninfo may also have arbitrary names. Read bounded lines
-    in every file; suspicious oversized lines fail closed. Values are not logged.
+    in every file; shell scripts and DB-bearing oversized lines fail closed.
+    Values are not logged.
     """
     is_env = path.name.startswith(".env")
     is_service = path.name in SERVICE_FILE_NAMES
@@ -447,13 +475,28 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
     assigned_variables = set()
     password_references = set()
     with path.open("rb") as source:
-        for line, oversized, joined in shell_logical_lines(source):
+        shebang = source.readline(128).split(b"\n", 1)[0]
+        source.seek(0)
+        shell_names = {b"sh", b"bash", b"dash", b"zsh", b"ksh"}
+        is_shell_script = (
+            path.suffix in {".sh", ".bash", ".zsh", ".ksh"}
+            or (
+                shebang.startswith(b"#!")
+                and any(
+                    word.rsplit(b"/", 1)[-1] in shell_names
+                    for word in shebang.split()
+                )
+            )
+        )
+        for line, oversized, joined, db_marker in shell_logical_lines(source):
             if oversized:
+                is_comment = line.lstrip().startswith(b"#")
                 if (
                     is_named_carrier
                     or joined
+                    or (not is_comment and (is_shell_script or db_marker))
                     or (
-                        not line.lstrip().startswith(b"#")
+                        not is_comment
                         and (
                             in_service_section
                             or line.lstrip().startswith(b"[")

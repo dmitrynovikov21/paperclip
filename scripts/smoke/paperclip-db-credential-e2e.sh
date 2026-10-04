@@ -505,6 +505,72 @@ if grep -q 'different_synthetic' "$scratch/scan-result"; then
   exit 1
 fi
 rm "$scratch/worktree/nested/oversized-physical.sh"
+# The .txt variant has no shell filename or shebang, so it exercises the
+# bounded scan of the tail rather than the conservative shell-file rule.
+for name in oversized-psql.sh oversized-psql.txt; do
+  fixture="$scratch/worktree/nested/$name"
+  for filler in 70000 65529; do
+    python3 - "$fixture" "$filler" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_bytes(
+    (b"#!/bin/sh\n" if path.suffix == ".sh" else b"")
+    + b"echo " + b"x" * int(sys.argv[2])
+    + b"; psql -d 'host=127.0.0.1 dbname=synthetic password=different_synthetic'\n"
+)
+PY
+    sh -n "$fixture"
+    for source in worktree carrier; do
+      if [ "$source" = worktree ]; then
+        set -- --worktree-root "$scratch/worktree"
+      else
+        set -- --carrier "$fixture"
+      fi
+      if python3 "$scan" --old-url-file "$scratch/old-url" "$@" \
+        > "$scratch/scan-result" 2>&1; then
+        echo "Copy scan did not reject oversized psql in $source" >&2
+        exit 1
+      fi
+      grep -Fxq "FAIL $fixture reasons=oversized-db-carrier-line" \
+        "$scratch/scan-result"
+      grep -Eq '^Copy scan: checked=[0-9]+ failures=1$' "$scratch/scan-result"
+      if grep -q 'different_synthetic' "$scratch/scan-result"; then
+        echo 'Copy scan printed synthetic credential material' >&2
+        exit 1
+      fi
+    done
+  done
+  rm "$fixture"
+done
+python3 - "$scratch/worktree/nested/oversized-shell.sh" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(b"#!/bin/sh\n: " + b"x" * 70000 + b"\n")
+PY
+sh -n "$scratch/worktree/nested/oversized-shell.sh"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not fail closed on an oversized shell command' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/oversized-shell.sh reasons=oversized-db-carrier-line" \
+  "$scratch/scan-result"
+rm "$scratch/worktree/nested/oversized-shell.sh"
+python3 - "$scratch/worktree/nested/ordinary-long.txt" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(b"x" * 70000 + b"\nordinary text\n")
+PY
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+python3 "$scan" --old-url-file "$scratch/old-url" \
+  --carrier "$scratch/worktree/nested/ordinary-long.txt" > "$scratch/scan-result"
+grep -Fxq 'Copy scan: checked=1 failures=0' "$scratch/scan-result"
+rm "$scratch/worktree/nested/ordinary-long.txt"
 echo 'Shell line continuation rejection and private reference control passed'
 printf '%s\n' 'client_encoding=UTF8 host=127.0.0.1 dbname=synthetic user=new_agent' \
   > "$scratch/worktree/nested/clean-conninfo.txt"

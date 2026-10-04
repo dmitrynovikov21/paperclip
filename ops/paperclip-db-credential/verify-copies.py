@@ -53,6 +53,7 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
     query_part = 0  # 0: no URL, 1: before ?, 2: parameter name, 3: value
     query_key = bytearray()
     query_key_overlong = False
+    nested_url_query = False
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             data = overlap + chunk
@@ -75,19 +76,24 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                     prefix_lengths[index] = length
                 if found_prefix and query_part == 0:
                     query_part = 1
-                elif byte in URL_WHITESPACE or byte in b"'\"<>`#":
+                elif found_prefix:
+                    nested_url_query = True
+                if byte in URL_WHITESPACE or byte in b"'\"<>`#":
                     query_part = 0
                     query_key.clear()
-                # A second URL can immediately follow a query value in the same
-                # file, so each ? starts a new parameter name candidate.
-                elif query_part and byte == ord("?"):
+                    nested_url_query = False
+                # A second URL can immediately follow a query value. A bare ?
+                # inside a value is not a new PostgreSQL parameter, however.
+                elif byte == ord("?") and (query_part == 1 or nested_url_query):
                     query_part = 2
                     query_key.clear()
                     query_key_overlong = False
+                    nested_url_query = False
                 elif query_part == 2:
                     if byte == ord("&"):
                         query_key.clear()
                         query_key_overlong = False
+                        nested_url_query = False
                     elif byte == ord("="):
                         if (
                             not query_key_overlong
@@ -104,6 +110,7 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                     query_part = 2
                     query_key.clear()
                     query_key_overlong = False
+                    nested_url_query = False
                 # A second prefix may itself be part of a password.
                 if found_prefix and credential_part == 0:
                     credential_part = 1

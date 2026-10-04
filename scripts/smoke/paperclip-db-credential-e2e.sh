@@ -53,6 +53,10 @@ printf '%s\n' 'postgres://a@127.0.0.1/db?application_name=ok;postgres://b@127.0.
   > "$scratch/worktree/nested/notes.txt"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"
+printf '%s\n' 'postgres://a@127.0.0.1/db?application_name=run?password=disabled' \
+  > "$scratch/worktree/nested/notes.txt"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
 printf '%s\n' 'no credential here' > "$scratch/worktree/nested/notes.txt"
 printf '%s\n' 'DATABASE_URL=postgresql://new_agent:different_synthetic@127.0.0.1/synthetic' \
   > "$scratch/worktree/.env.local"
@@ -123,4 +127,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

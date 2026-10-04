@@ -16,6 +16,39 @@ printf '%s\n' 'PAPERCLIP_INSTANCE_ID=synthetic' > "$scratch/worktree/.paperclip/
 printf '%s\n' 'no credential here' > "$scratch/worktree/nested/notes.txt"
 scan="$repo_root/ops/paperclip-db-credential/verify-copies.py"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree"
+printf '%s\n' 'postgres://new_agent:different_synthetic@127.0.0.1/synthetic' \
+  > "$scratch/worktree/nested/notes.txt"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a new worktree credential' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
+grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
+printf '%s\n' 'no credential here' > "$scratch/worktree/nested/notes.txt"
+printf '%s\n' 'DATABASE_URL=postgresql://new_agent:different_synthetic@127.0.0.1/synthetic' \
+  > "$scratch/worktree/.env.local"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a new .env.local credential' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
+grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
+rm "$scratch/worktree/.env.local"
+# Place the URL prefix across the 1 MiB read boundary and the @ after a
+# password longer than one chunk; neither split may bypass the scanner.
+head -c 1048570 /dev/zero > "$scratch/worktree/nested/large.bin"
+printf 'postgres://new_agent:' >> "$scratch/worktree/nested/large.bin"
+head -c 1048580 /dev/zero | tr '\000' 'x' >> "$scratch/worktree/nested/large.bin"
+printf '@127.0.0.1/synthetic\n' >> "$scratch/worktree/nested/large.bin"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a chunk-spanning worktree credential' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
+rm "$scratch/worktree/nested/large.bin"
 cp "$scratch/old-url" "$scratch/worktree/nested/notes.txt"
 if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"; then
@@ -39,4 +72,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, nested copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, .env.local, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

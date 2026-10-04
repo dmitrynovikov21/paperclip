@@ -9,7 +9,8 @@ import stat
 from pathlib import Path
 
 
-INLINE_URL = re.compile(rb"postgres(?:ql)?://[^\s:'\"]+:[^\s@'\"]+@", re.I)
+URL_PREFIXES = (b"postgres://", b"postgresql://")
+URL_WHITESPACE = b" \t\n\r\f\v"
 
 
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
@@ -20,7 +21,9 @@ def candidates(carriers: list[Path], worktree_roots: list[Path]):
             yield root, False
             continue
         walk_errors = []
-        for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_errors.append):
+        for directory, dirs, files in os.walk(
+            root, followlinks=False, onerror=walk_errors.append
+        ):
             # os.walk leaves symlinked directories in dirs without visiting them.
             # Report every one so an agent-readable copy cannot hide behind it.
             for name in dirs:
@@ -32,15 +35,61 @@ def candidates(carriers: list[Path], worktree_roots: list[Path]):
             yield Path(error.filename), False
 
 
-def contains_old_url(path: Path, old_url: bytes) -> bool:
+def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
+    """Find the old URL and any inline PostgreSQL URL with bounded memory.
+
+    Prefix and credential state continue across read boundaries, including for
+    URLs with a username or password longer than a read chunk.
+    """
     overlap = b""
+    has_old_url = False
+    has_inline_url = False
+    prefix_lengths = [0, 0]
+    credential_part = 0  # 0: none, 1: username, 2: password
+    part_has_bytes = False
     with path.open("rb") as source:
         while chunk := source.read(1024 * 1024):
             data = overlap + chunk
-            if old_url in data:
-                return True
-            overlap = data[-(len(old_url) - 1):] if len(old_url) > 1 else b""
-    return False
+            has_old_url |= old_url in data
+            overlap = data[-(len(old_url) - 1) :] if len(old_url) > 1 else b""
+            if has_inline_url:
+                continue
+            for raw_byte in chunk:
+                byte = raw_byte + 32 if 65 <= raw_byte <= 90 else raw_byte
+                found_prefix = False
+                for index, prefix in enumerate(URL_PREFIXES):
+                    length = prefix_lengths[index]
+                    if byte == prefix[length]:
+                        length += 1
+                        if length == len(prefix):
+                            found_prefix = True
+                            length = 0
+                    else:
+                        length = 1 if byte == ord("p") else 0
+                    prefix_lengths[index] = length
+                if found_prefix:
+                    credential_part = 1
+                    part_has_bytes = False
+                    continue
+                if credential_part == 1:
+                    if byte == ord(":"):
+                        credential_part = 2 if part_has_bytes else 0
+                        part_has_bytes = False
+                    elif byte in URL_WHITESPACE or byte in b"'\"":
+                        credential_part = 0
+                    else:
+                        part_has_bytes = True
+                elif credential_part == 2:
+                    if byte == ord("@"):
+                        if part_has_bytes:
+                            has_inline_url = True
+                            break
+                        credential_part = 0
+                    elif byte in URL_WHITESPACE or byte in b"'\"":
+                        credential_part = 0
+                    else:
+                        part_has_bytes = True
+    return has_old_url, has_inline_url
 
 
 def main() -> int:
@@ -62,7 +111,7 @@ def main() -> int:
         if root.is_symlink() or not root.is_dir():
             print(f"INVALID_WORKTREE_ROOT {root}")
             failures += 1
-    for path, is_carrier in paths:
+    for path, _is_carrier in paths:
         if path in args.worktree_root:
             continue
         try:
@@ -80,9 +129,13 @@ def main() -> int:
             failures += 1
             continue
         try:
-            has_old_url = contains_old_url(path, old_url)
-            is_instance_config = path.name == "config.json" and path.parent.name == ".paperclip"
-            data = path.read_bytes() if is_carrier or is_instance_config or path.name == ".env" else b""
+            has_old_url, has_inline_url = scan_credentials(path, old_url)
+            is_instance_config = (
+                path.name == "config.json" and path.parent.name == ".paperclip"
+            )
+            data = (
+                path.read_bytes() if is_instance_config or path.name == ".env" else b""
+            )
         except OSError:
             print(f"UNREADABLE {path}")
             failures += 1
@@ -91,7 +144,7 @@ def main() -> int:
         reasons = []
         if has_old_url:
             reasons.append("old-url-copy")
-        if (is_carrier or is_instance_config or path.name == ".env") and INLINE_URL.search(data):
+        if has_inline_url:
             reasons.append("inline-db-credential")
         if is_instance_config:
             try:
@@ -100,10 +153,14 @@ def main() -> int:
                     reasons.append("config-connection-string")
             except (ValueError, TypeError, AttributeError):
                 reasons.append("invalid-config-json")
-        if path.name == ".env" and re.search(rb"^\s*DATABASE_(?:MIGRATION_)?URL\s*=", data, re.M):
+        if path.name == ".env" and re.search(
+            rb"^\s*DATABASE_(?:MIGRATION_)?URL\s*=", data, re.M
+        ):
             reasons.append("env-db-url")
         if reasons:
-            print(f"FAIL {path} mode={stat.S_IMODE(info.st_mode):04o} uid={info.st_uid} reasons={','.join(reasons)}")
+            print(
+                f"FAIL {path} mode={stat.S_IMODE(info.st_mode):04o} uid={info.st_uid} reasons={','.join(reasons)}"
+            )
             failures += 1
     print(f"Copy scan: checked={checked} failures={failures}")
     return 1 if failures else 0

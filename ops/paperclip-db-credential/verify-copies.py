@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import stat
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
@@ -140,9 +141,27 @@ def skip_wrapper_options(
     return index
 
 
-def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
+def split_env_string(word: bytes) -> tuple[list[bytes], bool]:
+    """Split the ordinary env -S syntax; reject forms we cannot model safely."""
+    value = unquote_shell_word(word)
+    # GNU env also processes escapes and variable references in split strings.
+    # Their meaning differs from shell quoting, so fail closed instead of
+    # treating a possibly obfuscated DB command as harmless text.
+    if b"\\" in value or b"$" in value or b"\0" in value:
+        return [], True
+    try:
+        parts = shlex.split(value.decode("utf-8", "surrogateescape"))
+    except ValueError:
+        return [], True
+    return [part.encode("utf-8", "surrogateescape") for part in parts], False
+
+
+def executable_words(
+    words: list[bytes],
+) -> tuple[bytes, list[bytes], list[bytes], bool]:
     """Find the executable after shell control words, assignments and wrappers."""
     index = 0
+    split_words = []
     while index < len(words):
         word = unquote_shell_word(words[index])
         if word in (
@@ -165,11 +184,40 @@ def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
             index += 1
         elif word.rsplit(b"/", 1)[-1] == b"env":
             index += 1
-            while index < len(words) and words[index].startswith(b"-"):
-                option = words[index]
+            while index < len(words) and unquote_shell_word(words[index]).startswith(b"-"):
+                option = unquote_shell_word(words[index])
                 index += 1
+                if option == b"--":
+                    break
                 if option in (b"-u", b"--unset", b"-C", b"--chdir"):
                     index += 1
+                elif option in (b"-S", b"--split-string"):
+                    if index >= len(words):
+                        return b"", [], split_words, True
+                    argument = words[index]
+                    index += 1
+                    parsed, unsafe = split_env_string(argument)
+                    if unsafe:
+                        return b"", [], split_words, True
+                    split_words.extend(parsed)
+                    words = [b"env", *parsed, *words[index:]]
+                    index = 0
+                    break
+                elif option.startswith(b"--split-string=") or (
+                    option.startswith(b"-S") and len(option) > 2
+                ):
+                    argument = (
+                        option[len(b"--split-string=") :]
+                        if option.startswith(b"--split-string=")
+                        else option[2:]
+                    )
+                    parsed, unsafe = split_env_string(argument)
+                    if unsafe:
+                        return b"", [], split_words, True
+                    split_words.extend(parsed)
+                    words = [b"env", *parsed, *words[index:]]
+                    index = 0
+                    break
         elif word in (b"command", b"exec", b"builtin"):
             index += 1
             while index < len(words) and words[index].startswith(b"-"):
@@ -216,8 +264,8 @@ def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
             if index < len(words) and unquote_shell_word(words[index]) == b"--":
                 index += 1
         else:
-            return word.rsplit(b"/", 1)[-1], words[index + 1 :]
-    return b"", []
+            return word.rsplit(b"/", 1)[-1], words[index + 1 :], split_words, False
+    return b"", [], split_words, False
 
 
 def unquote_shell_word(word: bytes) -> bytes:
@@ -229,15 +277,20 @@ def unquote_shell_word(word: bytes) -> bytes:
 
 
 def libpq_conninfo_arguments(line: bytes):
-    """Yield executable psql database arguments, including shell -c commands.
+    """Find executable psql database arguments, including shell -c commands.
 
     Assignment values and arguments of other programs stay opaque, so fixture
     definitions and `curl -d` do not become psql commands.
     """
     pending = [line]
+    candidates = []
+    split_words = []
+    unsafe_split = False
     while pending:
         for command in shell_commands(pending.pop()):
-            executable, arguments = executable_words(command)
+            executable, arguments, expanded, unsafe = executable_words(command)
+            split_words.extend(expanded)
+            unsafe_split |= unsafe
             if executable in (b"sh", b"bash", b"dash", b"zsh", b"ksh"):
                 for index, word in enumerate(arguments[:-1]):
                     if re.fullmatch(rb"-[A-Za-z]*c[A-Za-z]*", word):
@@ -254,7 +307,8 @@ def libpq_conninfo_arguments(line: bytes):
                     argument = word[2:]
                 else:
                     continue
-                yield unquote_shell_word(argument)
+                candidates.append(unquote_shell_word(argument))
+    return candidates, split_words, unsafe_split
 
 
 def shell_logical_lines(source):
@@ -558,7 +612,11 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
                 if is_named_carrier:
                     break
                 continue
-            if not line.strip() or line.lstrip().startswith(b"#"):
+            if line.startswith(b"#!"):
+                # In a shebang, env -S receives and splits the interpreter
+                # arguments even though the shell treats the line as a comment.
+                line = line[2:].lstrip()
+            elif not line.strip() or line.lstrip().startswith(b"#"):
                 continue
             if re.fullmatch(rb"\[[^\]\r\n]+\]", line.strip()):
                 in_service_section = True
@@ -579,11 +637,16 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
                 rb"^[ \t]*(?:password|passfile)[ \t]*=", line, re.I
             ):
                 reasons.add("libpq-service-credential")
+            conninfo_arguments, split_words, unsafe_split = libpq_conninfo_arguments(
+                line
+            )
+            if unsafe_split:
+                reasons.add("unparsed-env-split-string")
             # A whole assignment word can follow any shell construct, including
             # a group. The caller checks direct references against definitions
             # in every scanned file, not only the file holding PGPASSWORD.
             if b"=" in line:
-                for word in shell_words(line):
+                for word in (*shell_words(line), *split_words):
                     assignments = [shell_assignment(word)]
                     if (
                         assignments[0] is None
@@ -614,7 +677,7 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
             if not is_service and not in_service_section:
                 meaningful_lines += 1
                 conninfo_lines = [line]
-                conninfo_lines.extend(libpq_conninfo_arguments(line))
+                conninfo_lines.extend(conninfo_arguments)
                 matches = [
                     (
                         bool(LIBPQ_CONNINFO_KEY.search(candidate)),

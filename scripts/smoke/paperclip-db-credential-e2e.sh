@@ -25,6 +25,14 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
 fi
 grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
 grep -Eq 'Copy scan: checked=[0-9]+ failures=[1-9][0-9]*' "$scratch/scan-result"
+printf '%s\n' 'postgres://new_agent:synthetic_postgres://suffix@127.0.0.1/synthetic' \
+  > "$scratch/worktree/nested/notes.txt"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"; then
+  echo 'Copy scan did not reject a credential containing a URL prefix' >&2
+  exit 1
+fi
+grep -q 'reasons=inline-db-credential' "$scratch/scan-result"
 printf '%s\n' 'no credential here' > "$scratch/worktree/nested/notes.txt"
 printf '%s\n' 'DATABASE_URL=postgresql://new_agent:different_synthetic@127.0.0.1/synthetic' \
   > "$scratch/worktree/.env.local"
@@ -72,4 +80,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, .env.local, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

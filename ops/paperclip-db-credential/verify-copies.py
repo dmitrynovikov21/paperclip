@@ -67,7 +67,8 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool]:
                     else:
                         length = 1 if byte == ord("p") else 0
                     prefix_lengths[index] = length
-                if found_prefix:
+                # A second prefix may itself be part of a password.
+                if found_prefix and credential_part == 0:
                     credential_part = 1
                     part_has_bytes = False
                     continue

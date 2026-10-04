@@ -113,7 +113,10 @@ for fixture in conninfo conninfo_multiline conninfo_password_only \
   conninfo_psql_d_nohup conninfo_psql_d_wrappers \
   conninfo_psql_d_quoted_wrappers conninfo_psql_d_env_split \
   conninfo_psql_d_env_split_long conninfo_psql_d_env_split_attached \
-  conninfo_psql_d_env_split_quoted_option conninfo_psql_d_env_split_shebang \
+  conninfo_psql_d_env_split_quoted_option conninfo_psql_d_env_split_verbose \
+  conninfo_psql_d_env_split_verbose_attached conninfo_psql_d_env_split_ignore \
+  conninfo_psql_d_env_split_unsupported \
+  conninfo_psql_d_env_split_shebang \
   conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c \
   shell_env shell_env_split_password shell_leading_assignment \
   shell_quoted_assignment shell_env_unset \
@@ -225,6 +228,26 @@ password=different_synthetic'
       name=psql-env-split-quoted-option-conninfo.sh
       content="env '-S' 'psql -d \"host=127.0.0.1 password=different_synthetic\"'"
       reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_env_split_verbose)
+      name=psql-env-split-verbose-conninfo.sh
+      content="env -vS 'psql -d \"host=127.0.0.1 password=different_synthetic\"'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_env_split_verbose_attached)
+      name=psql-env-split-verbose-attached-conninfo.sh
+      content="env -vS'psql -d \"host=127.0.0.1 password=different_synthetic\"'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_env_split_ignore)
+      name=psql-env-split-ignore-conninfo.sh
+      content="env -iS 'psql -d \"host=127.0.0.1 password=different_synthetic\"'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_env_split_unsupported)
+      name=psql-env-split-unsupported-conninfo.sh
+      content="env --block-signal=PIPE -S 'psql -d \"host=127.0.0.1 password=different_synthetic\"'"
+      reason=unparsed-env-split-string
       ;;
     conninfo_psql_d_env_split_shebang)
       name=psql-env-split-shebang-conninfo.sh
@@ -458,9 +481,15 @@ done
 printf '%s\n' 'psql -d "host=127.0.0.1 dbname=synthetic user=new_agent"' \
   > "$scratch/worktree/nested/psql-passwordless.sh"
 printf '%s\n' "env -S 'printf %s env-split-ok'" \
+  "env -vS 'printf %s env-split-ok'" \
+  "env -vS'printf %s env-split-ok'" \
+  "env -iS 'printf %s env-split-ok'" \
   "env --split-string='printf %s env-split-ok'" \
   > "$scratch/worktree/nested/clean-env-split.sh"
 test "$(env -S 'printf %s env-split-ok')" = env-split-ok
+test "$(env -vS 'printf %s env-split-ok' 2>/dev/null)" = env-split-ok
+test "$(env -vS'printf %s env-split-ok' 2>/dev/null)" = env-split-ok
+test "$(env -iS 'printf %s env-split-ok')" = env-split-ok
 test "$(env --split-string='printf %s env-split-ok')" = env-split-ok
 printf '%s\n' "curl -d 'password=different_synthetic' https://example.invalid/" \
   "timeout 10 curl -d 'password=different_synthetic' https://example.invalid/" \
@@ -480,7 +509,7 @@ done
 rm "$scratch/worktree/nested/psql-passwordless.sh" \
   "$scratch/worktree/nested/clean-env-split.sh" \
   "$scratch/worktree/nested/non-psql-data.sh"
-echo 'psql -d and env -S conninfo rejection; clean env -S, curl and passwordless controls passed in both modes'
+echo 'psql -d and env -S/-vS/-iS conninfo rejection; clean env, curl and passwordless controls passed in both modes'
 printf '%s\n' 'DB_PASS=different_synthetic' > "$scratch/worktree/nested/source.env"
 printf '%s\n' 'PGPASSWORD=$DB_PASS sh -c '\''test "$PGPASSWORD" = different_synthetic'\''' \
   > "$scratch/worktree/nested/run-from-source.sh"

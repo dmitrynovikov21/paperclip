@@ -184,33 +184,53 @@ def executable_words(
             index += 1
         elif word.rsplit(b"/", 1)[-1] == b"env":
             index += 1
-            while index < len(words) and unquote_shell_word(words[index]).startswith(b"-"):
+            while index < len(words) and unquote_shell_word(words[index]).startswith(
+                b"-"
+            ):
                 option = unquote_shell_word(words[index])
                 index += 1
                 if option == b"--":
                     break
-                if option in (b"-u", b"--unset", b"-C", b"--chdir"):
-                    index += 1
-                elif option in (b"-S", b"--split-string"):
-                    if index >= len(words):
+                argument = None
+                if option.startswith(b"--"):
+                    if option in (b"--unset", b"--chdir", b"--split-string"):
+                        if index >= len(words):
+                            return b"", [], split_words, True
+                        if option == b"--split-string":
+                            argument = words[index]
+                        index += 1
+                    elif option.startswith(b"--split-string="):
+                        argument = option[len(b"--split-string=") :]
+                    elif option in (
+                        b"--ignore-environment",
+                        b"--null",
+                        b"--debug",
+                    ) or option.startswith((b"--unset=", b"--chdir=")):
+                        pass
+                    else:
                         return b"", [], split_words, True
-                    argument = words[index]
-                    index += 1
-                    parsed, unsafe = split_env_string(argument)
-                    if unsafe:
-                        return b"", [], split_words, True
-                    split_words.extend(parsed)
-                    words = [b"env", *parsed, *words[index:]]
-                    index = 0
-                    break
-                elif option.startswith(b"--split-string=") or (
-                    option.startswith(b"-S") and len(option) > 2
-                ):
-                    argument = (
-                        option[len(b"--split-string=") :]
-                        if option.startswith(b"--split-string=")
-                        else option[2:]
-                    )
+                elif option == b"-":
+                    # A lone dash is GNU env's shorthand for -i.
+                    continue
+                else:
+                    # GNU env permits clusters such as -vS STRING and -iSSTRING.
+                    # Options with values consume the rest of the cluster or
+                    # the next shell word; S must be expanded before scanning.
+                    for offset, flag in enumerate(option[1:], start=2):
+                        if flag in b"iv0":
+                            continue
+                        if flag not in b"uCS":
+                            return b"", [], split_words, True
+                        attached = option[offset:]
+                        if not attached:
+                            if index >= len(words):
+                                return b"", [], split_words, True
+                            attached = words[index]
+                            index += 1
+                        if flag == ord("S"):
+                            argument = attached
+                        break
+                if argument is not None:
                     parsed, unsafe = split_env_string(argument)
                     if unsafe:
                         return b"", [], split_words, True

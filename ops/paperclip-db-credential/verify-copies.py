@@ -43,7 +43,9 @@ def candidates(carriers: list[Path], worktree_roots: list[Path]):
             yield Path(error.filename), False
 
 
-def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
+def scan_credentials(
+    path: Path, old_url: bytes, *, check_passfile: bool
+) -> tuple[bool, bool, bool]:
     """Find old URLs, inline URLs and libpq passfile entries with bounded memory.
 
     Prefix and credential state continue across read boundaries, including for
@@ -73,10 +75,10 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
             if has_inline_url:
                 continue
             for raw_byte in chunk:
-                # A custom PGPASSFILE can have any name. Recognize its five
-                # colon-separated fields in every scanned file, including
-                # explicit --carrier paths, without retaining line contents.
-                if not has_passfile_entry:
+                # A custom PGPASSFILE can have any name. Check explicitly
+                # supplied carriers and files whose permissions libpq accepts;
+                # ordinary worktree data may also have five colon fields.
+                if check_passfile and not has_passfile_entry:
                     if raw_byte in (10, 13):
                         has_passfile_entry = (
                             passfile_line_valid
@@ -197,7 +199,8 @@ def scan_credentials(path: Path, old_url: bytes) -> tuple[bool, bool, bool]:
                     else:
                         part_has_bytes = True
     has_passfile_entry |= (
-        passfile_line_valid
+        check_passfile
+        and passfile_line_valid
         and passfile_fields == 4
         and passfile_field_has_bytes
         and not passfile_escaped
@@ -285,7 +288,13 @@ def main() -> int:
             continue
         try:
             has_old_url, has_inline_url, has_passfile_entry = scan_credentials(
-                path, old_url
+                path,
+                old_url,
+                check_passfile=(
+                    _is_carrier
+                    or path.name in PASSFILE_NAMES
+                    or (info.st_mode & 0o077) == 0
+                ),
             )
             is_instance_config = (
                 path.name == "config.json" and path.parent.name == ".paperclip"

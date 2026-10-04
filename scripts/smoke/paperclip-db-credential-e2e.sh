@@ -105,6 +105,11 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
 fi
 grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
+printf '%s\n' 'region:2024:metric:dimension:value' > "$scratch/worktree/nested/metrics.txt"
+chmod 0644 "$scratch/worktree/nested/metrics.txt"
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+rm "$scratch/worktree/nested/metrics.txt"
 for service_file in pg_service.conf .pg_service.conf; do
   printf '[synthetic]\nhost=127.0.0.1\npassword=different_synthetic\n' \
     > "$scratch/worktree/$service_file"
@@ -131,6 +136,7 @@ if grep -q 'different_synthetic' "$scratch/scan-result"; then
 fi
 mv "$scratch/worktree/credentials" "$scratch/custom-passfile"
 printf '%s\n' '*:*:*:new_agent:different\:synthetic' > "$scratch/custom-passfile"
+chmod 0644 "$scratch/custom-passfile"
 if python3 "$scan" --old-url-file "$scratch/old-url" --carrier "$scratch/custom-passfile" \
   > "$scratch/scan-result"; then
   echo 'Copy scan did not reject an explicit custom-named passfile' >&2
@@ -224,4 +230,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, custom passfile in worktree and explicit carrier, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, custom passfile in worktree and explicit carrier, benign five-field data, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

@@ -124,11 +124,27 @@ def shell_commands(line: bytes):
         yield words
 
 
+def skip_wrapper_options(
+    words: list[bytes], index: int, value_options: set[bytes]
+) -> int:
+    """Skip wrapper flags, including flags whose next word is an option value."""
+    while index < len(words):
+        option = unquote_shell_word(words[index])
+        if option == b"--":
+            return index + 1
+        if not option.startswith(b"-") or option == b"-":
+            break
+        index += 1
+        if option in value_options:
+            index += 1
+    return index
+
+
 def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
     """Find the executable after shell control words, assignments and wrappers."""
     index = 0
     while index < len(words):
-        word = words[index]
+        word = unquote_shell_word(words[index])
         if word in (
             b"if",
             b"then",
@@ -161,6 +177,44 @@ def executable_words(words: list[bytes]) -> tuple[bytes, list[bytes]]:
                 index += 1
                 if word == b"exec" and option == b"-a":
                     index += 1
+        elif word.rsplit(b"/", 1)[-1] == b"timeout":
+            index = skip_wrapper_options(
+                words, index + 1, {b"-k", b"-s", b"--kill-after", b"--signal"}
+            )
+            index += 1  # DURATION precedes the executable.
+        elif word.rsplit(b"/", 1)[-1] == b"sudo":
+            index = skip_wrapper_options(
+                words,
+                index + 1,
+                {
+                    b"-C",
+                    b"-D",
+                    b"-g",
+                    b"-h",
+                    b"-p",
+                    b"-R",
+                    b"-r",
+                    b"-T",
+                    b"-t",
+                    b"-U",
+                    b"-u",
+                    b"--chdir",
+                    b"--chroot",
+                    b"--close-from",
+                    b"--command-timeout",
+                    b"--group",
+                    b"--host",
+                    b"--other-user",
+                    b"--prompt",
+                    b"--role",
+                    b"--type",
+                    b"--user",
+                },
+            )
+        elif word.rsplit(b"/", 1)[-1] == b"nohup":
+            index += 1
+            if index < len(words) and unquote_shell_word(words[index]) == b"--":
+                index += 1
         else:
             return word.rsplit(b"/", 1)[-1], words[index + 1 :]
     return b"", []
@@ -478,15 +532,9 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
         shebang = source.readline(128).split(b"\n", 1)[0]
         source.seek(0)
         shell_names = {b"sh", b"bash", b"dash", b"zsh", b"ksh"}
-        is_shell_script = (
-            path.suffix in {".sh", ".bash", ".zsh", ".ksh"}
-            or (
-                shebang.startswith(b"#!")
-                and any(
-                    word.rsplit(b"/", 1)[-1] in shell_names
-                    for word in shebang.split()
-                )
-            )
+        is_shell_script = path.suffix in {".sh", ".bash", ".zsh", ".ksh"} or (
+            shebang.startswith(b"#!")
+            and any(word.rsplit(b"/", 1)[-1] in shell_names for word in shebang.split())
         )
         for line, oversized, joined, db_marker in shell_logical_lines(source):
             if oversized:

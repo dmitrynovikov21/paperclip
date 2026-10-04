@@ -107,7 +107,11 @@ grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
 for fixture in conninfo conninfo_multiline conninfo_password_only \
   conninfo_psql_d conninfo_psql_d_prefixed conninfo_psql_d_password_only \
-  conninfo_psql_d_shell \
+  conninfo_psql_d_shell conninfo_psql_d_timeout conninfo_psql_d_timeout_options \
+  conninfo_psql_d_timeout_long_option conninfo_psql_d_sudo \
+  conninfo_psql_d_sudo_options conninfo_psql_d_sudo_long_option \
+  conninfo_psql_d_nohup conninfo_psql_d_wrappers \
+  conninfo_psql_d_quoted_wrappers \
   conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c \
   shell_env shell_leading_assignment shell_quoted_assignment shell_env_unset \
   shell_command_env shell_command_p_env shell_exec_env shell_exec_env_unset \
@@ -152,6 +156,51 @@ password=different_synthetic'
     conninfo_psql_d_shell)
       name=psql-shell-conninfo.sh
       content='sh -c '\''psql -d "host=127.0.0.1 dbname=synthetic user=new_agent password=different_synthetic"'\'''
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_timeout)
+      name=psql-timeout-conninfo.sh
+      content="timeout 10 psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_timeout_options)
+      name=psql-timeout-options-conninfo.sh
+      content="timeout -s TERM -k 2 -- 10 psql --dbname='host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_timeout_long_option)
+      name=psql-timeout-long-option-conninfo.sh
+      content="timeout --signal TERM 10 psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_sudo)
+      name=psql-sudo-conninfo.sh
+      content="sudo psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_sudo_options)
+      name=psql-sudo-options-conninfo.sh
+      content="sudo -u postgres -- psql --dbname='host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_sudo_long_option)
+      name=psql-sudo-long-option-conninfo.sh
+      content="sudo --user postgres psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_nohup)
+      name=psql-nohup-conninfo.sh
+      content="nohup -- psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_wrappers)
+      name=psql-nested-wrappers-conninfo.sh
+      content="timeout 10 sudo -n nohup psql -d 'host=127.0.0.1 password=different_synthetic'"
+      reason=libpq-conninfo-password
+      ;;
+    conninfo_psql_d_quoted_wrappers)
+      name=psql-quoted-wrappers-conninfo.sh
+      content="'timeout' 10 \"sudo\" 'nohup' \"psql\" -d 'host=127.0.0.1 password=different_synthetic'"
       reason=libpq-conninfo-password
       ;;
     conninfo_client_encoding)
@@ -373,6 +422,9 @@ done
 printf '%s\n' 'psql -d "host=127.0.0.1 dbname=synthetic user=new_agent"' \
   > "$scratch/worktree/nested/psql-passwordless.sh"
 printf '%s\n' "curl -d 'password=different_synthetic' https://example.invalid/" \
+  "timeout 10 curl -d 'password=different_synthetic' https://example.invalid/" \
+  "sudo -u psql curl -d 'password=different_synthetic' https://example.invalid/" \
+  "nohup curl -d 'password=different_synthetic' https://example.invalid/" \
   "echo psql -d 'password=different_synthetic'" \
   "sh -c 'curl -d \"password=different_synthetic\" https://example.invalid/'" \
   > "$scratch/worktree/nested/non-psql-data.sh"

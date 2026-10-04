@@ -106,7 +106,9 @@ fi
 grep -q 'reasons=env-libpq-credential-reference' "$scratch/scan-result"
 rm "$scratch/worktree/.env.local"
 for fixture in conninfo conninfo_multiline conninfo_password_only \
-  conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c; do
+  conninfo_client_encoding conninfo_client_encoding_multiline shell shell_ansi_c \
+  shell_env shell_default shell_command_substitution shell_multiple \
+  shell_env_multiple; do
   case "$fixture" in
     conninfo)
       name=conninfo.txt
@@ -145,6 +147,31 @@ password=different_synthetic'
       content="export PGPASSWORD=\$'different_synthetic'"
       reason=env-libpq-password
       ;;
+    shell_env)
+      name=run-env.sh
+      content='env PGPASSWORD=different_synthetic psql'
+      reason=env-libpq-password
+      ;;
+    shell_default)
+      name=run-default.sh
+      content='export PGPASSWORD=${DB_PASS:-different_synthetic}'
+      reason=env-libpq-password
+      ;;
+    shell_command_substitution)
+      name=run-substitution.sh
+      content="export PGPASSWORD=\$(printf '%s' different_synthetic)"
+      reason=env-libpq-password
+      ;;
+    shell_multiple)
+      name=run-multiple.sh
+      content='export PGPASSWORD=$FROM_PRIVATE_SOURCE; '"PGPASSWORD=different_synthetic"
+      reason=env-libpq-password
+      ;;
+    shell_env_multiple)
+      name=run-env-multiple.sh
+      content='env PGPASSWORD=$FROM_PRIVATE_SOURCE PGPASSWORD=different_synthetic psql'
+      reason=env-libpq-password
+      ;;
   esac
   printf '%s\n' "$content" > "$scratch/worktree/nested/$name"
   chmod 0600 "$scratch/worktree/nested/$name"
@@ -175,13 +202,18 @@ printf '%s\n' 'client_encoding=UTF8 host=127.0.0.1 dbname=synthetic user=new_age
   > "$scratch/worktree/nested/clean-conninfo.txt"
 printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' 'export PGPASSWORD=$FROM_PRIVATE_SOURCE' \
   > "$scratch/worktree/nested/clean-run.sh"
+printf '%s\n' '#!/bin/sh' 'env PGPASSWORD=$FROM_PRIVATE_SOURCE psql' \
+  > "$scratch/worktree/nested/clean-env-run.sh"
+printf '%s\n' '#!/bin/sh' 'export PGPASSWORD="${FROM_PRIVATE_SOURCE}"' \
+  > "$scratch/worktree/nested/clean-braced-run.sh"
 python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
   > "$scratch/scan-result"
-for name in clean-conninfo.txt clean-run.sh; do
+for name in clean-conninfo.txt clean-run.sh clean-env-run.sh clean-braced-run.sh; do
   python3 "$scan" --old-url-file "$scratch/old-url" \
     --carrier "$scratch/worktree/nested/$name" > "$scratch/scan-result"
 done
-rm "$scratch/worktree/nested/clean-conninfo.txt" "$scratch/worktree/nested/clean-run.sh"
+rm "$scratch/worktree/nested/clean-conninfo.txt" "$scratch/worktree/nested/clean-run.sh" \
+  "$scratch/worktree/nested/clean-env-run.sh" "$scratch/worktree/nested/clean-braced-run.sh"
 printf '%s\n' 'region:2024:metric:dimension:value' > "$scratch/worktree/nested/metrics.txt"
 chmod 0644 "$scratch/worktree/nested/metrics.txt"
 if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
@@ -341,4 +373,4 @@ if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/w
   exit 1
 fi
 grep -q '^SYMLINK ' "$scratch/scan-result"
-echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo (including client_encoding) and shell (including ANSI-C literal) password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'
+echo 'Worktree copy scan assertions passed: clean tree, new DSN, nested-prefix password, .env.local, libpq env/service/passfile, conninfo (including client_encoding) and shell (including env, default and command substitution) password in worktree and explicit carrier, custom service and passfile in worktree and explicit carrier, ambiguous five-field record fail closed, safe libpq carriers, query password, encoded query key, adjacent URL, nested query URL, clean adjacent URLs, literal query ?, chunk-spanning DSN, old copy, external file symlink, external directory symlink'

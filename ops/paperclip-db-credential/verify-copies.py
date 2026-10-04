@@ -19,7 +19,21 @@ SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
-PGPASSWORD_ASSIGNMENT = re.compile(rb"^[ \t]*(?:export[ \t]+)?PGPASSWORD[ \t]*=[ \t]*(.*)")
+# Recognize shell assignments, including `env`, preceding env arguments and
+# commands after a shell separator. Anchoring avoids matching fixture strings
+# embedded in source code that is itself part of an agent worktree.
+PGPASSWORD_ASSIGNMENT = re.compile(
+    rb"(?:^|[;|&])[ \t]*(?:(?:export|env)[ \t]+"
+    rb"(?:(?:-[^ \t;|&]+|[A-Za-z_][A-Za-z_0-9]*=[^ \t;|&]+)[ \t]+)*)?"
+    rb"PGPASSWORD[ \t]*=[ \t]*"
+)
+PGPASSWORD_TOKEN = re.compile(rb"(?:^|[ \t;|&])PGPASSWORD[ \t]*=")
+SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
+SAFE_PASSWORD_REFERENCE = re.compile(
+    rb"^(?:\$(?:" + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb"\})"
+    rb'|"\$(?:' + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb'\})")'
+    rb"(?=$|[ \t;|&])"
+)
 # A connection string may begin with any libpq parameter, not just host/user.
 # Keep this set aligned with libpq's documented keyword/value parameters.
 LIBPQ_CONNINFO_KEYS = frozenset(
@@ -260,7 +274,7 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                     and (
                         in_service_section
                         or line.lstrip().startswith(b"[")
-                        or PGPASSWORD_ASSIGNMENT.match(line)
+                        or PGPASSWORD_ASSIGNMENT.search(line)
                         or LIBPQ_CONNINFO_START.match(line)
                     )
                 ):
@@ -290,17 +304,15 @@ def scan_libpq_carrier(path: Path) -> list[str]:
                 rb"^[ \t]*(?:password|passfile)[ \t]*=", line, re.I
             ):
                 reasons.add("libpq-service-credential")
-            # Ignore computed source-code expressions such as
-            # PGPASSWORD=unquote(url.password); Bash $'...' and $"..." are
-            # literal strings even though they begin with a dollar sign.
-            shell_assignment = PGPASSWORD_ASSIGNMENT.match(line)
-            if shell_assignment:
-                value = shell_assignment.group(1).strip()
-                is_shell_literal = value.startswith((b"$'", b'$"'))
+            # A direct reference to a private variable is safe here. Reject
+            # defaults, command substitutions and other computed shell values:
+            # they can contain a literal credential in this readable file.
+            for shell_assignment in PGPASSWORD_ASSIGNMENT.finditer(line):
+                value = line[shell_assignment.end() :].strip()
                 if value and (
-                    is_shell_literal
+                    PGPASSWORD_TOKEN.search(value)
                     or (
-                        not value.startswith((b"$", b"`"))
+                        not SAFE_PASSWORD_REFERENCE.match(value)
                         and not re.match(rb"[A-Za-z_][A-Za-z_0-9]*\(", value)
                     )
                 ):

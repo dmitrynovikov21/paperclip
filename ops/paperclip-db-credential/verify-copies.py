@@ -95,6 +95,57 @@ def shell_assignment(word: bytes) -> tuple[bytes, bytes] | None:
     return (match.group(1), match.group(2)) if match else None
 
 
+def shell_logical_lines(source):
+    """Join shell backslash-newline continuations without retaining long lines.
+
+    Shell removes an unescaped backslash and newline before parsing words, even
+    when they split an identifier. Report an overlong joined line so the caller
+    can fail closed rather than scanning only its bounded prefix.
+    """
+    logical = bytearray()
+    joined = False
+    oversized_prefix = None
+    oversized_joined = False
+    while fragment := source.readline(MAX_CARRIER_LINE_BYTES + 1):
+        has_newline = fragment.endswith(b"\n")
+        complete = has_newline or len(fragment) <= MAX_CARRIER_LINE_BYTES
+        backslashes = 0
+        if has_newline:
+            index = len(fragment) - 2
+            while index >= 0 and fragment[index] == ord("\\"):
+                backslashes += 1
+                index -= 1
+        continued = backslashes % 2 == 1
+        if oversized_prefix is not None:
+            oversized_joined |= continued
+            if complete and not continued:
+                yield oversized_prefix, True, oversized_joined
+                oversized_prefix = None
+            continue
+        payload = fragment[:-2] if continued else fragment
+        available = MAX_CARRIER_LINE_BYTES - len(logical)
+        if len(payload) > available:
+            oversized_prefix = bytes(logical) + payload[:available]
+            oversized_joined = joined or continued
+            logical.clear()
+            joined = False
+            if complete and not continued:
+                yield oversized_prefix, True, oversized_joined
+                oversized_prefix = None
+            continue
+        logical.extend(payload)
+        if continued:
+            joined = True
+        else:
+            yield bytes(logical), False, joined
+            logical.clear()
+            joined = False
+    if oversized_prefix is not None:
+        yield oversized_prefix, True, oversized_joined
+    elif logical:
+        yield bytes(logical), False, joined
+
+
 def candidates(carriers: list[Path], worktree_roots: list[Path]):
     for carrier in carriers:
         yield carrier, True
@@ -292,7 +343,6 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
     is_named_carrier = is_env or is_service or is_passfile
     reasons = set()
     in_service_section = False
-    skipping_oversized_line = False
     conninfo_has_key = False
     conninfo_has_password = False
     meaningful_lines = 0
@@ -300,24 +350,21 @@ def scan_libpq_carrier(path: Path) -> tuple[list[str], set[bytes], set[bytes]]:
     assigned_variables = set()
     password_references = set()
     with path.open("rb") as source:
-        while line := source.readline(MAX_CARRIER_LINE_BYTES + 1):
-            if skipping_oversized_line:
-                skipping_oversized_line = not line.endswith(b"\n")
-                continue
-            if len(line) > MAX_CARRIER_LINE_BYTES:
-                if is_named_carrier or (
+        for line, oversized, joined in shell_logical_lines(source):
+            if oversized:
+                if is_named_carrier or joined or (
                     not line.lstrip().startswith(b"#")
                     and (
                         in_service_section
                         or line.lstrip().startswith(b"[")
                         or b"PGPASSWORD=" in line
+                        or b"PGPASS" in line
                         or LIBPQ_CONNINFO_START.match(line)
                     )
                 ):
                     reasons.add("oversized-db-carrier-line")
                 if is_named_carrier:
                     break
-                skipping_oversized_line = not line.endswith(b"\n")
                 continue
             if not line.strip() or line.lstrip().startswith(b"#"):
                 continue

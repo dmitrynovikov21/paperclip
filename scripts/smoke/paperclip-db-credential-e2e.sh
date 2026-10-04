@@ -384,6 +384,89 @@ if grep -q 'different_synthetic' "$scratch/scan-result"; then
 fi
 rm "$scratch/worktree/nested/source.env" "$scratch/worktree/nested/run-from-source.sh"
 echo 'Shell group and local/cross-file password reference rejection passed in worktree and explicit carriers'
+cat > "$scratch/worktree/nested/run-continued.sh" <<'SH'
+#!/bin/sh
+PGPASS\
+WORD=different_synthetic sh -c 'test "$PGPASSWORD" = different_synthetic'
+SH
+chmod 0600 "$scratch/worktree/nested/run-continued.sh"
+sh "$scratch/worktree/nested/run-continued.sh"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject a continued worktree password assignment' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/run-continued.sh reasons=env-libpq-password" \
+  "$scratch/scan-result"
+grep -Eq '^Copy scan: checked=[0-9]+ failures=1$' "$scratch/scan-result"
+test "$(wc -l < "$scratch/scan-result")" -eq 2
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+if python3 "$scan" --old-url-file "$scratch/old-url" \
+  --carrier "$scratch/worktree/nested/run-continued.sh" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject a continued explicit carrier password assignment' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/run-continued.sh reasons=env-libpq-password" \
+  "$scratch/scan-result"
+grep -Fxq 'Copy scan: checked=1 failures=1' "$scratch/scan-result"
+test "$(wc -l < "$scratch/scan-result")" -eq 2
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+rm "$scratch/worktree/nested/run-continued.sh"
+cat > "$scratch/worktree/nested/clean-continued.sh" <<'SH'
+#!/bin/sh
+PGPASS\
+WORD=$FROM_PRIVATE_SOURCE sh -c 'test "$PGPASSWORD" = different_synthetic'
+SH
+python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result"
+python3 "$scan" --old-url-file "$scratch/old-url" \
+  --carrier "$scratch/worktree/nested/clean-continued.sh" > "$scratch/scan-result"
+rm "$scratch/worktree/nested/clean-continued.sh"
+python3 - "$scratch/worktree/nested/oversized-continued.sh" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(b"PGPASS\\\nWORD=" + b"x" * (64 * 1024))
+PY
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject an oversized continued worktree line' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/oversized-continued.sh reasons=oversized-db-carrier-line" \
+  "$scratch/scan-result"
+rm "$scratch/worktree/nested/oversized-continued.sh"
+python3 - "$scratch/worktree/nested/oversized-physical.sh" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(
+    b"#!/bin/sh\n"
+    + b"env " + b" " * (64 * 1024) + b"PGPASS\\\n"
+    + b"WORD=different_synthetic sh -c 'test \"$PGPASSWORD\" = different_synthetic'\n"
+)
+PY
+sh "$scratch/worktree/nested/oversized-physical.sh"
+if python3 "$scan" --old-url-file "$scratch/old-url" --worktree-root "$scratch/worktree" \
+  > "$scratch/scan-result" 2>&1; then
+  echo 'Copy scan did not reject an oversized physical line with a continued password assignment' >&2
+  exit 1
+fi
+grep -Fxq "FAIL $scratch/worktree/nested/oversized-physical.sh reasons=oversized-db-carrier-line" \
+  "$scratch/scan-result"
+if grep -q 'different_synthetic' "$scratch/scan-result"; then
+  echo 'Copy scan printed synthetic credential material' >&2
+  exit 1
+fi
+rm "$scratch/worktree/nested/oversized-physical.sh"
+echo 'Shell line continuation rejection and private reference control passed'
 printf '%s\n' 'client_encoding=UTF8 host=127.0.0.1 dbname=synthetic user=new_agent' \
   > "$scratch/worktree/nested/clean-conninfo.txt"
 printf '%s\n' '#!/bin/sh' 'export PGAPPNAME=synthetic' 'export PGPASSWORD=$FROM_PRIVATE_SOURCE' \

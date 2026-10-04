@@ -19,16 +19,27 @@ SERVICE_FILE_NAMES = {".pg_service.conf", "pg_service.conf"}
 PASSFILE_NAMES = {".pgpass", "pgpass", "pgpass.conf"}
 ENV_DB_URL_KEYS = {b"DATABASE_URL", b"DATABASE_MIGRATION_URL"}
 ENV_LIBPQ_KEYS = {b"PGPASSWORD", b"PGPASSFILE", b"PGSERVICEFILE", b"PGSYSCONFDIR"}
-# Recognize shell assignments, including `env`, preceding env arguments and
-# commands after a shell separator. Anchoring avoids matching fixture strings
-# embedded in source code that is itself part of an agent worktree.
+# Recognize shell assignments, including leading assignments, `env` options,
+# `command env`, and commands after a shell separator. A preceding assignment
+# must be a complete shell token so quoted fixture strings in source code do
+# not make the scanner reject the file that defines the fixture.
+SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
+SHELL_ASSIGNMENT_VALUE = rb"(?:[^ \t;|&'\"\\]+|'[^']*'|\"[^\"\\]*\")?"
+SHELL_PREFIX_ASSIGNMENT = SHELL_IDENTIFIER + rb"=" + SHELL_ASSIGNMENT_VALUE
+SHELL_ENV_OPTION = (
+    rb"(?:-u[ \t]+"
+    + SHELL_IDENTIFIER
+    + rb"|--unset(?:=|[ \t]+)"
+    + SHELL_IDENTIFIER
+    + rb"|-[^ \t;|&]+)"
+)
 PGPASSWORD_ASSIGNMENT = re.compile(
-    rb"(?:^|[;|&])[ \t]*(?:(?:export|env)[ \t]+"
-    rb"(?:(?:-[^ \t;|&]+|[A-Za-z_][A-Za-z_0-9]*=[^ \t;|&]+)[ \t]+)*)?"
+    rb"(?:^|[;|&])[ \t]*(?:" + SHELL_PREFIX_ASSIGNMENT + rb"[ \t]+)*"
+    rb"(?:command[ \t]+)?(?:export[ \t]+|env[ \t]+)?"
+    rb"(?:(?:" + SHELL_ENV_OPTION + rb"|" + SHELL_PREFIX_ASSIGNMENT + rb")[ \t]+)*"
     rb"PGPASSWORD[ \t]*=[ \t]*"
 )
 PGPASSWORD_TOKEN = re.compile(rb"(?:^|[ \t;|&])PGPASSWORD[ \t]*=")
-SHELL_IDENTIFIER = rb"[A-Za-z_][A-Za-z_0-9]*"
 SAFE_PASSWORD_REFERENCE = re.compile(
     rb"^(?:\$(?:" + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb"\})"
     rb'|"\$(?:' + SHELL_IDENTIFIER + rb"|\{" + SHELL_IDENTIFIER + rb'\})")'

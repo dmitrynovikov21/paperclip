@@ -4674,7 +4674,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
+      return row?.status === "blocked" && row.executionRunId === null ? row : null;
     }, 8_000);
     expect(sourceIssue).toMatchObject({
       status: "blocked",

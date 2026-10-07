@@ -320,7 +320,7 @@ describeEmbeddedPostgres("heartbeat archived-company guard", () => {
       .then((rows) => rows.find((row) => row.status === "cancelled") ?? null);
     expect(run).toMatchObject({
       status: "cancelled",
-      error: "Run failed",
+      error: "Cancelled because the agent is not invokable: manager_terminated",
     });
 
     const wakeup = await db

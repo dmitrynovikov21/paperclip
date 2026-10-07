@@ -172,6 +172,8 @@ describeDb("safe central run carriers and feedback export", () => {
       contextSnapshot: {
         issueId,
         wakeReason: promptMarker,
+        reviewPathConsumedRef: promptMarker,
+        activeTreeHold: { rootIssueId: issueId, mode: "pause", interaction: true, reason: toolMarker },
         paperclipWake: { issue: { description: promptMarker }, toolOutput: toolMarker },
         paperclipSecrets: { manifest: [{ bindingId: randomUUID() }] },
       },

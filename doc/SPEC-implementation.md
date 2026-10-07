@@ -188,6 +188,18 @@ Invariants:
 
 Invariant: plaintext key shown once at creation; only hash stored.
 
+### Agent cryptographic identity
+
+Each agent also has one Ed25519 identity in `agent_identity_keys`, separate from
+API bearer keys and company secrets. New-agent creation provisions it atomically;
+existing agents provision lazily before their first managed run. The schema-only
+migration and public reads never provision existing agents. Private PKCS#8 PEM
+material uses `local_encrypted`; public SPKI PEM and its SHA-256 key ID are readable
+through `GET /api/agents/:id/identity` and the agent Identity section. Managed
+processes receive the pair through runtime-only environment fields. See
+[Agent cryptographic identity](AGENT-IDENTITY.md) for storage, runtime, and copy
+semantics.
+
 ## 7.4 `goals`
 
 - `id` uuid pk
@@ -572,6 +584,18 @@ conversation lifecycles, and protection against replaying superseded requests.
 - Board has full read/write across all companies in deployment
 - Every board mutation writes to `activity_log`
 
+Human invitations default to the Operator role. Its default grants allow agent
+creation and configuration, skill editing, environment management, invitations,
+task assignment, pipeline editing, connection and tool management/use, and tool
+and agent-action audit views. Operators do not receive `joins:approve` or
+`users:manage_permissions`. Explicit invitation grants remain authoritative.
+Creating a human invitation also requires any of these two membership powers
+included in its selected role. Operators can invite Operators and Viewers;
+inviting an Admin requires join approval, and inviting an Owner also requires
+member-permission management.
+This preset change adds no database migration; existing role-default seeding
+continues to insert missing grants without replacing custom scopes.
+
 ## 9.2 Agent Auth
 
 - Bearer API key mapped to one agent and company
@@ -592,7 +616,7 @@ conversation lifecycles, and protection against replaying superseded requests.
 | Action | Board | Agent |
 |---|---|---|
 | Create company | yes | no |
-| Hire/create agent | yes (direct) | request via approval |
+| Hire/create agent | yes (direct) | new standard agents: direct via `canCreateAgents`; low-trust policy or approval gates can restrict |
 | Pause/resume agent | yes | pause: no; resume: direct `agents:configure` grant only |
 | Create/update task | yes | yes |
 | Force reassign task | yes | limited |
@@ -610,6 +634,14 @@ agent actor calling `POST /agents/:agentId/resume` must pass the protected
 access does not bypass that decision, and `agents:suggest-changes` alone cannot
 apply the lifecycle change. Pause, clear-error, terminate, approval, and
 key-management routes remain board-only.
+
+An ordinary standard agent receives a direct `agents:configure` grant on
+creation. Existing agents keep their current permissions; no backfill runs.
+Low-trust and managed built-in agents do not receive this default. See
+[agent permission defaults](agent-permission-defaults.md) for the full inventory.
+Agent-authenticated changes cannot set or restore host-executed process adapter
+configuration, including commands and environment values. Agent-authenticated
+rollbacks cannot restore host-executed workspace commands either.
 
 ### 9.3.1 Shared default-open issue writes
 
@@ -1502,6 +1534,25 @@ Required UX behaviors:
 - conflict toasts on atomic checkout failure
 - no silent background failures; every failed run visible in UI
 
+Regular task chats and Agent Chat keep unanswered questions as compact,
+reopenable entries at their original position in the feed. Dismissing a question
+or sending a newer message clears its form from the composer without resolving
+the saved question. Questions do not contribute to composer pending counts.
+Dismissal persists locally for the person and task across reloads; reopening
+restores the original form and draft. Approval and permission gates are unchanged.
+
+A saved ordinary question becomes historical when a newer human task message
+moves it out of the current composer. Agent context, completion feedback, and
+native finalization apply the same rule. The historical question remains pending
+and answerable, including after completion; a later human answer records history
+without reopening the task or waking its agent. Its presence alone does not
+request another answer or prevent completion. Cancellation still expires pending
+questions. Agents continue work that does not need the missing input and withdraw
+obsolete questions when later evidence satisfies them. A real current input
+blocker must identify what is still needed. Approval, permission, connection,
+and configured review gates remain active. No server-side UI dismissal record
+is required.
+
 ## 15. Operational Requirements
 
 ## 15.1 Environment
@@ -1726,6 +1777,13 @@ Legacy agents retain their authentication until validated adoption. See
 [AI Connections](connections/AI-CONNECTIONS.md) for company isolation, compatible
 methods, lifecycle, runtime enforcement, and migration details.
 
+Missing personal AI credentials detected before adapter dispatch also produce
+the inline connection card. Every missing binding must belong to the same
+compatible AI provider. The responsible user connects their own account and
+explicitly adopts Connections; another user's onboarding key is never reused.
+Acceptance resumes only the matching configuration-blocked task through durable
+continuation delivery. Unrelated configuration gaps retain operator recovery.
+
 The selected AI connection supports an on-demand usage probe through the common
 connection service, independent of legacy/native execution. The board usage
 endpoint rechecks company membership and the credential's human audience before
@@ -1899,3 +1957,54 @@ unavailable. Preserve current ownership and newer-work fences. See
   endpoints delegate to sources while retaining response shapes.
 - GitHub.com, manual refresh only. No upstream editing, polling, webhook sync, commits,
   or pull-request creation in this milestone.
+
+## Public assistant connection (opt-in)
+
+The user-authorized MCP surface connects assistants to an explicitly selected
+company as the consenting person. It exposes first-party task reads, additive
+task creation and comments, durable documents and approval links. It reuses
+existing domain authorization and scheduling; OAuth does not grant agent
+identity, native run ownership, approval decisions or third-party credentials.
+See [Public MCP](public-mcp.md) for the implemented instance-side boundary,
+configuration, plugin packages and outstanding hosted release gates. The
+[delivery plan](plans/2026-09-30-paperclip-public-mcp-and-plugins.md) separates
+external agent participation and granted third-party tools into later releases.
+
+### Experimental AI connection routing
+
+Opt-in plugin routers may represent a pool as an AI runtime binding. Core keeps
+company and credential authorization, atomically records task/agent affinity and
+a pool cursor, and persists concrete native recovery evidence. The full contract
+is in [AI-CONNECTION-ROUTERS.md](connections/AI-CONNECTION-ROUTERS.md). Disabled
+routing cannot allocate new tasks; already admitted native runs remain recoverable.
+
+### Connection instructions
+
+Connections can store optional, versioned agent instructions independently of
+provider and transport. Catalog templates control editor visibility; saved
+settings and runtime delivery also support connections without a template.
+The server includes instructions only when the connection and at least one
+action are available to the run's agent and responsible identity. An immutable
+per-turn snapshot participates in session compatibility, so subsequent turns
+remove stale instructions after edits or access revocation. See
+[Connection instructions](connections/CONNECTION-INSTRUCTIONS.md) for contracts,
+UI conventions, custom adapter integration, and initial memory templates.
+
+### Native provider capacity retry
+
+Committed, run-bound Codex `serverOverloaded` terminal failures display the model
+capacity error directly and schedule at most two automatic retries, after one
+and two minutes. Retries share the execution failure budget, retain task history,
+and honor current ownership, review, governance, pause, dependency, budget, and
+cleanup gates. Restart or duplicate finalization must not create another
+successor. Permanent model/auth incompatibility and usage-limit exhaustion retain
+their existing operator recovery requirements.
+
+## Internal agent commentary
+
+`agent_commentary` stores company-scoped, attributed complaints and suggestions
+as free-form text in the instance database. Legacy agents use the default
+`complain` and `suggestion-box` runtime skills; native runs use dedicated tools
+in standard, ask, and planning modes. Submission never changes task disposition
+or routes feedback externally. See [Agent commentary](agent-commentary.md) for
+authentication, replay, document-sized limits, inspection, and deletion semantics.

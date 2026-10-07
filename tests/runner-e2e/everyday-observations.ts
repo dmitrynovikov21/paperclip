@@ -1,3 +1,5 @@
+import type { IssueComment } from "../../packages/shared/src/types/issue.js";
+
 export interface StoryCheck {
   id: string;
   passed: boolean;
@@ -24,9 +26,8 @@ export interface StoryIssue {
   wakeDiagnostics?: StoryWakeDiagnostics;
   blockedTransitionAt?: string | null;
 }
-export interface StoryComment {
+export interface StoryComment extends Partial<Pick<IssueComment, "authorAgentId" | "createdByRunId">> {
   id?: string;
-  authorAgentId?: string | null;
   body?: unknown;
   createdAt?: string;
 }

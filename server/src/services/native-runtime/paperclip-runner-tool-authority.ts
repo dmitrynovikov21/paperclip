@@ -1,3 +1,5 @@
+import { readTaskQuestionContext } from "../issue-question-context.js";
+import { isConversation } from "../agent-conversations.js";
 import { setIssueTitle } from "../issue-title.js";
 import { externalObjectService } from "../external-objects.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -6,6 +8,8 @@ import { authorizeInstructionCommit } from "../agent-instruction-authorization.j
 import { executeAgentInstructionTool } from "./agent-instruction-tools.js";
 import { createReadStream } from "node:fs";
 import { publicChatTaskUrl } from "../chat-task-url.js";
+import { agentCommentaryToolInputSchema } from "@paperclipai/shared";
+import { submitAgentCommentary } from "../agent-commentary.js";
 import type { createAssignedMcpTools } from "./assigned-mcp-tools.js";
 import { assertAssignableAgent } from "../agent-assignability.js";
 import { authorizationService } from "../authorization.js";
@@ -13,7 +17,7 @@ import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
 import { buildLowTrustSourceTrust } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
-import { callCreateSkillTool } from "../skill-tools.js";
+import { callCreateSkillTool, callUpdateSkillTool } from "../skill-tools.js";
 import { callProjectTool } from "../project-tools.js";
 import { isConnectorTool, executeConnectorTool, type ConnectorAssignment } from "../connector-runtime.js";
 import { resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
@@ -48,6 +52,7 @@ import {
   agentWakeupRequests,
   chatEndpoints,
   chatConversations,
+  companies,
   documentRevisions,
   heartbeatRuns,
   issueApprovals,
@@ -93,11 +98,12 @@ import {
 } from "./chat-attachment-read.js";
 
 const IMPLEMENTED_OPERATIONS = new Set([
+  "submit_complaint", "submit_suggestion",
   "read_agent_instructions", "update_agent_instructions", "get_agent_instruction_history", "restore_agent_instructions",
   "search_api", "call_api", "hire_agent",
   "get_task_context", "get_task_history", "search_tasks", "report_progress", "set_task_title",
   "request_human_input",
-  "create_skill", "create_task", "reassign_task", "set_dependencies", "create_project", "list_project_repositories", "list_projects", "register_deliverable",
+  "create_skill", "update_skill", "create_task", "reassign_task", "set_dependencies", "create_project", "list_project_repositories", "list_projects", "register_deliverable",
   "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -303,7 +309,7 @@ export class PaperclipRunnerToolAuthority {
         return connections.search(claims, input.query, { retryProviderChoice: input.retryProviderChoice });
       }
       const input = connectionRequestInputSchema.parse(call.arguments);
-      const result = await connections.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService });
+      const result = await connections.request(claims, input.service, { selectionInteractionId: input.selectionInteractionId, targetService: input.targetService, connectionId: input.connectionId, toolNames: input.toolNames });
       if (result.state === "ready" && this.binding.pinnedMcpDigest && this.binding.enqueueWakeup) {
         const current = await resolveNativeRuntimeMcpSnapshot({ db: this.db, agent: { id: this.binding.agentId, companyId: this.binding.companyId }, runId: this.binding.runId });
         if (current.digest !== this.binding.pinnedMcpDigest) {
@@ -399,6 +405,14 @@ export class PaperclipRunnerToolAuthority {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
     switch (call.tool) {
+      case "submit_complaint":
+      case "submit_suggestion": {
+        const parsed = agentCommentaryToolInputSchema.safeParse(call.arguments);
+        if (!parsed.success) throw badRequest("Feedback accepts only a nonempty body of at most 524288 characters and a retry key of at most 240 characters");
+        return submitAgentCommentary(this.db, this.binding, {
+          ...parsed.data, kind: call.tool === "submit_complaint" ? "complaint" : "suggestion",
+        }, (tx) => this.#lockAuthorizedMutationContext(tx));
+      }
       case "read_agent_instructions":
       case "get_agent_instruction_history":
         return executeAgentInstructionTool({ db: this.db, binding: {
@@ -413,6 +427,12 @@ export class PaperclipRunnerToolAuthority {
         const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
         if (!apiUrl || !token) throw new Error("Skill tool authentication is unavailable");
         return callCreateSkillTool({ arguments: input, apiUrl, token, companyId: this.binding.companyId });
+      }
+      case "update_skill": {
+        const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
+        const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, context.actor.adapterType, this.binding.runId, context.run.responsibleUserId);
+        if (!apiUrl || !token) throw new Error("Skill tool authentication is unavailable");
+        return callUpdateSkillTool({ arguments: input, apiUrl, token, companyId: this.binding.companyId });
       }
       case "create_project":
       case "list_project_repositories":
@@ -468,6 +488,9 @@ export class PaperclipRunnerToolAuthority {
         return {
           company: { id: this.binding.companyId },
           actor: redactedActor(context.actor),
+          taskQuestionContext: await readTaskQuestionContext(this.db, {
+            ...this.binding, conversationMode: isConversation(context.issue),
+          }),
           activeTask: redactedTask(context.issue),
           childTasks: childTasks.slice(0, 100).map(redactedTask),
           childTasksTruncated: childTasks.length > 100,
@@ -922,10 +945,15 @@ export class PaperclipRunnerToolAuthority {
         },
       });
       publication = activity.publication;
+      const [target] = await tx.select({ identifier: issues.identifier, issuePrefix: companies.issuePrefix })
+        .from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(and(eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId)));
+      if (!target) throw new Error("paperclip_runner_document_task_not_found");
       return {
         disposition: "applied",
         created: write.created,
         document: write.document,
+        documentHref: `/${encodeURIComponent(target.issuePrefix)}/issues/${encodeURIComponent(target.identifier ?? this.binding.issueId)}#document-${encodeURIComponent(write.document.key)}`,
       };
     });
     if (publication) publishActivity(publication);

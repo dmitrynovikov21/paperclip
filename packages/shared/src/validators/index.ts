@@ -391,6 +391,7 @@ export {
 } from "./agent.js";
 
 export {
+  projectDiscoverySchema,
   createProjectSchema,
   updateProjectSchema,
   createProjectWorkspaceSchema,
@@ -994,3 +995,4 @@ export * from "./email.js";
 export { restoreAgentInstructionSchema } from "./agent.js";
 
 export * from "./skill-source.js";
+export * from "./agent-commentary.js";

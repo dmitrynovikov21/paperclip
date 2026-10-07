@@ -224,6 +224,12 @@ pub fn project_acpx_state_event(
                     ));
                 }
             }
+            let origin = match details.get("origin") {
+                Some(origin) => project_runtime_request_origin(Some(origin))?,
+                None => {
+                    json!({"adapter":"acpx-runtime-sidecar", "provider":"acpx", "method":"session/request_permission"})
+                }
+            };
             one(
                 "runtime_request.created",
                 EventPriority::P0,
@@ -232,11 +238,12 @@ pub fn project_acpx_state_event(
                     "requestId":request_id, "turnId":context.turn_id, "itemId":context.item_id,
                     "type":"permission", "status":"pending", "prompt":title, "choices":choices,
                     "details":details,
-                    "origin":{"adapter":"acpx-runtime-sidecar","provider":"acpx","method":"session/request_permission"},
+                    "origin":origin,
                 }}),
             )
         }
         AcpxProviderStateEvent::InputRequest {
+            tool_call_id,
             request_id,
             question_set,
             origin,
@@ -265,7 +272,7 @@ pub fn project_acpx_state_event(
                         "requestKind": "runtime",
                         "requestId": request_id,
                         "turnId": context.turn_id,
-                        "itemId": context.item_id,
+                        "itemId": tool_call_id.as_ref().map(|id| acpx_opaque_item_id(id, &context.item_id, "tool")).unwrap_or_else(|| context.item_id.to_owned()),
                         "type": "input",
                         "status": "pending",
                         "prompt": prompt,
@@ -276,6 +283,7 @@ pub fn project_acpx_state_event(
             )
         }
         AcpxProviderStateEvent::RuntimeRequestEnded {
+            tool_call_id,
             request_id,
             question_set,
             origin,
@@ -295,6 +303,7 @@ pub fn project_acpx_state_event(
                     context,
                     &AcpxProviderStateEvent::InputRequest {
                         request_id: request_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
                         question_set: question_set.clone(),
                         origin: origin.clone(),
                     },
@@ -317,6 +326,7 @@ pub fn project_acpx_state_event(
                 "reason":reason, "replayAllowed":false, "adapter":"acpx-runtime-sidecar",
             });
             if let Some(request) = request {
+                payload["itemId"] = request["itemId"].clone();
                 payload["request"] = request;
             }
             one(
@@ -928,6 +938,18 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
                     },
                     "text": provider_item.get("text").and_then(Value::as_str).map(|value| bounded_text(value, MAX_TEXT_CHARS)),
                 });
+                // Preserve only actual terminal invocation identity in the compatibility
+                // projection. Arguments, arbitrary tool names and result bodies stay omitted.
+                if item_type == "tool_call" {
+                    if let Some(name @ ("paperclip_finish" | "paperclip_block")) =
+                        provider_item.get("name").and_then(Value::as_str)
+                    {
+                        payload
+                            .as_object_mut()
+                            .expect("item payload is an object")
+                            .insert("item".to_owned(), json!({ "name": name }));
+                    }
+                }
                 if !provider_phase.is_empty() {
                     payload
                         .as_object_mut()
@@ -1558,6 +1580,40 @@ mod tests {
             assert_eq!(events[0].payload["transport"], "dynamic");
             assert_eq!(events[0].payload["executionId"], "finish-1");
             assert!(events[0].event_type.starts_with("tool.execution."));
+            assert!(!events[0].payload.to_string().contains("not-for-the-log"));
+        }
+    }
+
+    #[test]
+    fn preserves_closed_compatibility_terminal_tool_identity() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../../../tests/runner-e2e/fixtures/native-completion/terminal-tool-carrier.json"
+        )))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let events = normalize_codex_notification("item/started", &case["providerInput"]);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "item.started");
+            assert_eq!(events[0].payload, case["normalizedPayload"]);
+            assert!(!events[0].payload.to_string().contains("not-for-the-log"));
+        }
+        for (item_type, name) in [
+            ("tool_call", Some("write_document")),
+            ("tool_call", Some("mcp.paperclip_finish")),
+            ("tool_call", None),
+            ("agentMessage", Some("paperclip_finish")),
+            ("tool_result", Some("paperclip_block")),
+        ] {
+            let events = normalize_codex_notification(
+                "item/completed",
+                &json!({ "item": {
+                    "id": "terminal-call", "type": item_type, "name": name,
+                    "status": "completed", "arguments": {"secret": "not-for-the-log"},
+                    "result": {"secret": "not-for-the-log"}
+                }}),
+            );
+            assert_eq!(events[0].payload.get("item"), None);
             assert!(!events[0].payload.to_string().contains("not-for-the-log"));
         }
     }

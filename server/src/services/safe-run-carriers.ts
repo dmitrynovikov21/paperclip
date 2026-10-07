@@ -14,7 +14,8 @@ const RUN_STATUSES = new Set([
 const ISSUE_STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
 const RETRY_REASONS = new Set([
   "transient_failure", "max_turns_continuation", "interaction_continuation_infra_retry", "missing_issue_comment",
-  "provider_quota_recovery", "process_lost", "issue_continuation_needed",
+  "provider_quota_recovery", "process_lost", "issue_continuation_needed", "workspace_busy",
+  "execution_review_participant_recovery", "assignment_recovery",
 ]);
 const EVENT_TYPES = new Set(["lifecycle", "adapter.invoke", "error"]);
 const EVENT_STREAMS = new Set(["system", "stdout", "stderr"]);
@@ -693,6 +694,7 @@ export function projectSafeRunEvent(input: {
 }
 
 export function projectSafeRunPatch<T extends {
+  scheduledRetryReason?: string | null;
   sessionIdBefore?: string | null;
   sessionIdAfter?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
@@ -707,6 +709,7 @@ export function projectSafeRunPatch<T extends {
   signal?: string | null;
 }>(patch: T): T {
   const safe = { ...patch };
+  if ("scheduledRetryReason" in safe) safe.scheduledRetryReason = allowedCode(safe.scheduledRetryReason, RETRY_REASONS);
   if ("sessionIdBefore" in safe) safe.sessionIdBefore = projectSafeRunSessionId(safe.sessionIdBefore);
   if ("sessionIdAfter" in safe) safe.sessionIdAfter = projectSafeRunSessionId(safe.sessionIdAfter);
   if ("contextSnapshot" in safe) safe.contextSnapshot = projectSafeRunContextSnapshot(safe.contextSnapshot);
@@ -723,6 +726,7 @@ export function projectSafeRunPatch<T extends {
 }
 
 export function projectSafeRunRow<T extends {
+  scheduledRetryReason?: string | null;
   sessionIdBefore?: string | null;
   sessionIdAfter?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
@@ -737,6 +741,7 @@ export function projectSafeRunRow<T extends {
   signal?: string | null;
 }>(row: T): T {
   const safe = { ...row };
+  if ("scheduledRetryReason" in safe) safe.scheduledRetryReason = allowedCode(safe.scheduledRetryReason, RETRY_REASONS);
   if ("sessionIdBefore" in safe) safe.sessionIdBefore = projectSafeRunSessionId(safe.sessionIdBefore);
   if ("sessionIdAfter" in safe) safe.sessionIdAfter = projectSafeRunSessionId(safe.sessionIdAfter);
   if ("contextSnapshot" in safe) {

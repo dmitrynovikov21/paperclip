@@ -13,10 +13,12 @@ import { sessionCodec as piSessionCodec } from "@paperclipai/adapter-pi-local/se
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { errorHandler } from "../middleware/index.ts";
 import { agentRoutes } from "../routes/agents.ts";
+import { attentionRoutes } from "../routes/attention.ts";
 import { issueRoutes } from "../routes/issues.ts";
 import { secretRoutes } from "../routes/secrets.ts";
 import { feedbackService } from "../services/feedback.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { buildHostServices } from "../services/plugin-host-services.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
 import { projectSafeRunRow } from "../services/safe-run-carriers.ts";
 import { secretService } from "../services/secrets.ts";
@@ -98,6 +100,133 @@ describeDb("safe central run carriers and feedback export", () => {
     if (previousSecretKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousSecretKeyFile;
   });
+
+  it("projects legacy run errors and retry events in issue, attention, and plugin summaries", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const retryId = randomUUID();
+    const failedId = randomUUID();
+    const retryAt = new Date("2026-10-07T17:00:00.000Z");
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Legacy read projection test",
+      issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Legacy probe",
+      role: "engineer",
+      status: "idle",
+      adapterType: ADAPTER_TYPE,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Legacy error read",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: retryId,
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        invocationSource: "automation",
+        contextSnapshot: { issueId },
+        scheduledRetryAt: retryAt,
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "transient_failure",
+        error: `Provider error ${promptMarker} ${toolMarker}`,
+        errorCode: promptMarker,
+        createdAt: new Date("2026-10-07T15:00:00.000Z"),
+      },
+      {
+        id: failedId,
+        companyId,
+        agentId,
+        status: "failed",
+        invocationSource: "automation",
+        contextSnapshot: { issueId },
+        error: `Tool failed ${promptMarker} ${toolMarker}`,
+        errorCode: toolMarker,
+        createdAt: new Date("2026-10-07T15:01:00.000Z"),
+        finishedAt: new Date("2026-10-07T15:01:01.000Z"),
+      },
+    ]);
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      runId: failedId,
+      agentId,
+      seq: 1,
+      eventType: "lifecycle",
+      message: `Bounded retry exhausted: ${promptMarker} ${toolMarker}`,
+      payload: { retryReason: "transient_failure", maxAttempts: 2 },
+    });
+    const [dirtyRetry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    const [dirtyEvent] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, failedId));
+    for (const marker of [promptMarker, toolMarker]) {
+      expect(markerCount({ dirtyRetry, dirtyEvent }, marker)).toBeGreaterThan(0);
+    }
+
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board", userId: "test-board", companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+        isInstanceAdmin: true, source: "local_implicit",
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use("/api", attentionRoutes(db));
+    app.use(errorHandler);
+    const [detail, context, attention] = await Promise.all([
+      request(app).get(`/api/issues/${issueId}`),
+      request(app).get(`/api/issues/${issueId}/heartbeat-context`),
+      request(app).get(`/api/companies/${companyId}/attention`),
+    ]);
+    const host = buildHostServices(db, "test-plugin", "test-plugin", {
+      forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }),
+    } as never);
+    const summary = await host.issues.getOrchestrationSummary({ companyId, issueId });
+    host.dispose();
+
+    expect(detail.status).toBe(200);
+    expect(context.status).toBe(200);
+    expect(attention.status).toBe(200);
+    expect(detail.body.scheduledRetry).toMatchObject({
+      runId: retryId, status: "scheduled_retry", scheduledRetryAttempt: 2,
+      scheduledRetryReason: "transient_failure", error: "Run failed", errorCode: "adapter_failed",
+    });
+    expect(context.body.issue.scheduledRetry).toMatchObject({ runId: retryId, error: "Run failed" });
+    const failedAttention = attention.body.items.find((item: { sourceKind: string; subject: { id: string } }) =>
+      item.sourceKind === "failed_run" && item.subject.id === failedId);
+    expect(failedAttention).toMatchObject({
+      subject: { metadata: { error: "Run failed", errorCode: "adapter_failed", retryExhaustedReason: "Bounded retry exhausted" } },
+      detail: { failureReasonExcerpt: "Run failed" },
+    });
+    expect(summary.runs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: retryId, error: "Run failed", status: "scheduled_retry" }),
+      expect.objectContaining({ id: failedId, error: "Run failed", status: "failed" }),
+    ]));
+    await db.update(heartbeatRuns).set({ error: null }).where(eq(heartbeatRuns.id, failedId));
+    const eventOnlyAttention = await request(app).get(`/api/companies/${companyId}/attention`);
+    expect(eventOnlyAttention.status).toBe(200);
+    expect(eventOnlyAttention.body.items.find((item: { sourceKind: string; subject: { id: string } }) =>
+      item.sourceKind === "failed_run" && item.subject.id === failedId)?.detail)
+      .toMatchObject({ failureReasonExcerpt: "Bounded retry exhausted" });
+    for (const marker of [promptMarker, toolMarker]) {
+      expect(markerCount({ detail: detail.body, context: context.body, attention: attention.body, eventOnlyAttention: eventOnlyAttention.body, summary }, marker)).toBe(0);
+    }
+  }, 60_000);
 
   it("drops two unknown markers on write and legacy read while preserving status, usage and exit", async () => {
     returnedSessionId = `20261007_123456_${promptMarker}`;

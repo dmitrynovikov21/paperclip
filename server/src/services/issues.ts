@@ -92,6 +92,7 @@ import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
+import { projectSafeRunRow } from "./safe-run-carriers.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { DEFAULT_INSERT_CHUNK_ROWS, insertRowsInChunks } from "./batch-insert.js";
@@ -4399,7 +4400,7 @@ export function issueService(db: Db) {
       .limit(1)
       .then((rows) => rows[0] ?? null);
 
-    return row ? { ...row, status: "scheduled_retry" } : null;
+    return row ? { ...projectSafeRunRow(row), status: "scheduled_retry" } : null;
   }
 
   function deriveIssueCommentAuthorType(comment: {

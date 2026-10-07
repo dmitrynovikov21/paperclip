@@ -15756,7 +15756,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: agent.id,
         runId: run.id,
         sessionCorrelationId,
-        priorRunId: !sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
+        priorRunId: nextProviderSessionId && !sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
           ? taskKey
             ? taskSessionForRun?.lastRunId ?? null
             : runtime.lastRunId

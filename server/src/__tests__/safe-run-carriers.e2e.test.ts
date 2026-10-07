@@ -499,6 +499,60 @@ describeDb("safe central run carriers and feedback export", () => {
     }
   }, 60_000);
 
+  it("does not delta cumulative usage across runs without a provider session", async () => {
+    const adapterType = "no_session_cumulative_probe";
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        usage: { inputTokens: 17, outputTokens: 9 },
+        usageBasis: "session_cumulative",
+      }),
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "No session usage test",
+        issuePrefix: `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "No session usage probe",
+        role: "engineer",
+        status: "idle",
+        adapterType,
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+        permissions: {},
+      });
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(first).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const second = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(second).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+      const [secondRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second!.id));
+      expect(firstRun?.status).toBe("succeeded");
+      expect(secondRun?.status).toBe("succeeded");
+      expect(firstRun?.sessionCorrelationId).toBeNull();
+      expect(secondRun?.sessionCorrelationId).toBeNull();
+      expect(firstRun?.usageJson).toMatchObject({ inputTokens: 17, outputTokens: 9 });
+      expect(secondRun?.usageJson).toMatchObject({ inputTokens: 17, outputTokens: 9 });
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  }, 60_000);
+
   it("keeps a run-bound secret redaction after adapter runtime services refresh the snapshot", async () => {
     failWithMarkers = false;
     reportRuntimeService = true;

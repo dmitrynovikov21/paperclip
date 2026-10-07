@@ -15,7 +15,6 @@ function makeCompany(overrides: Partial<Company>): Company {
     budgetMonthlyCents: 0,
     spentMonthlyCents: 0,
     attachmentMaxBytes: 10 * 1024 * 1024,
-    wipCapInProgress: 9,
     requireBoardApprovalForNewAgents: false,
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,
@@ -28,6 +27,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
+    interactionResolverGovernance: overrides.interactionResolverGovernance ?? {},
   };
 }
 

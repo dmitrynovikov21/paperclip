@@ -8,6 +8,7 @@ import type { PaperclipConfig } from "../config/schema.js";
 const ORIGINAL_ENV = { ...process.env };
 const ORIGINAL_CWD = process.cwd();
 const ORIGINAL_PATH = process.env.PATH;
+const ORIGINAL_EXIT_CODE = process.exitCode;
 
 function createExistingConfigFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-onboard-"));
@@ -87,6 +88,14 @@ describe("onboard", () => {
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    delete process.env.PAPERCLIP_DB_BACKUP_DIR;
+    delete process.env.PAPERCLIP_DB_BACKUP_ENABLED;
+    delete process.env.PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES;
+    delete process.env.PAPERCLIP_DB_BACKUP_RETENTION_DAYS;
+    delete process.env.PAPERCLIP_STORAGE_PROVIDER;
+    delete process.env.PAPERCLIP_STORAGE_LOCAL_DIR;
+    delete process.env.PAPERCLIP_SECRETS_PROVIDER;
+    delete process.env.PAPERCLIP_SECRETS_STRICT_MODE;
     delete process.env.PAPERCLIP_HOME;
     delete process.env.PAPERCLIP_CONFIG;
     delete process.env.PAPERCLIP_INSTANCE_ID;
@@ -99,6 +108,7 @@ describe("onboard", () => {
   afterEach(() => {
     process.env = { ...ORIGINAL_ENV };
     process.chdir(ORIGINAL_CWD);
+    process.exitCode = ORIGINAL_EXIT_CODE;
   });
 
   it("preserves an existing config when rerun without flags", async () => {
@@ -119,6 +129,33 @@ describe("onboard", () => {
     expect(fs.readFileSync(fixture.configPath, "utf8")).toBe(fixture.configText);
     expect(fs.existsSync(`${fixture.configPath}.backup`)).toBe(false);
     expect(fs.existsSync(path.join(path.dirname(fixture.configPath), ".env"))).toBe(true);
+  });
+
+  it("backs up invalid config bytes and refuses --yes replacement", async () => {
+    const configPath = createFreshConfigPath();
+    const invalidBytes = Buffer.from('{"database": invalid}\n', "utf8");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, invalidBytes);
+
+    await onboard({ config: configPath, yes: true, invokedByRun: true });
+
+    expect(process.exitCode).toBe(1);
+    expect(fs.readFileSync(configPath)).toEqual(invalidBytes);
+    expect(fs.readFileSync(`${configPath}.invalid-1`)).toEqual(invalidBytes);
+    expect(fs.existsSync(`${configPath}.backup`)).toBe(false);
+  });
+
+  it("onboard leaves no signing key on disk when the env file enables ephemeral mode", async () => {
+    const fixture = createExistingConfigFixture();
+    const envPath = path.join(path.dirname(fixture.configPath), ".env");
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL;
+    fs.writeFileSync(envPath, "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n", { mode: 0o600 });
+
+    await onboard({ config: fixture.configPath, yes: true, invokedByRun: true });
+
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toMatch(/^[0-9a-f]{64}$/);
+    expect(fs.readFileSync(envPath, "utf8")).toBe("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n");
   });
 
   it("keeps --yes onboarding on local trusted loopback defaults", async () => {

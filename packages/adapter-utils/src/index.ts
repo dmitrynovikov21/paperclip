@@ -5,8 +5,10 @@ export type {
   AdapterBillingType,
   AdapterRuntimeServiceReport,
   AdapterExecutionResult,
-  AdapterExecutionCancellationHandle,
   AdapterInvocationMeta,
+  AdapterRuntimeEvent,
+  AdapterRuntimeMcpServer,
+  AdapterRuntimeMcpAccess,
   AdapterExecutionContext,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentCheck,
@@ -63,6 +65,11 @@ export {
   redactCommandText,
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
+export {
+  buildAdapterEnvConfig,
+  parseEnvBindings,
+  parseEnvVars,
+} from "./env-bindings.js";
 export { createRuntimeProgressReporter } from "./runtime-progress.js";
 export type {
   RuntimeProgressSink,

@@ -68,21 +68,10 @@ export interface AdapterRuntimeServiceReport {
 export type AdapterExecutionErrorFamily =
   | "transient_upstream"
   | "provider_quota"
-  | "auth_required"
-  | "model_refusal";
-
-/**
- * A cancellation hook for adapters whose work is not represented by the
- * legacy child-process registry (for example, an embedded ACPX turn).
- *
- * `drained` must settle only after the adapter can no longer emit output or
- * perform work for the turn. The control plane keeps the concurrency slot
- * occupied until this promise settles.
- */
-export interface AdapterExecutionCancellationHandle {
-  cancel: (reason: string) => Promise<void>;
-  drained: Promise<void>;
-}
+  | "model_refusal"
+  | "refresh_token_reused"
+  | "refresh_token_expired"
+  | "refresh_token_invalidated";
 
 export interface AdapterExecutionResult {
   exitCode: number | null;
@@ -95,6 +84,13 @@ export interface AdapterExecutionResult {
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /**
+   * How `usage` totals are scoped. "per_run" means the tokens cover only this
+   * execution; "session_cumulative" means they are running totals for the
+   * persisted session, and the server must delta consecutive runs. Absent
+   * means unknown — the server applies its legacy session-delta heuristic.
+   */
+  usageBasis?: "per_run" | "session_cumulative" | null;
+  /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.
    */
   sessionId?: string | null;
@@ -105,8 +101,22 @@ export interface AdapterExecutionResult {
   model?: string | null;
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
+  /**
+   * Provider-billed cost after prompt-cache discounts. Adapters should set
+   * this when they expose it separately; otherwise the server treats a
+   * provider-reported `costUsd` as the cache-adjusted billed amount.
+   */
+  cacheAdjustedCostUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
   runtimeServices?: AdapterRuntimeServiceReport[];
+  /**
+   * Each referenced (mentioned) project that failed to stage into the remote sandbox for this run,
+   * by `projectId`. The run continues without a failed project (per-project failure isolation); this
+   * field carries the failure back so the server counts it in the requested-vs-synced observability
+   * instead of losing it to a warning line. Absent or empty on a local target, or when every staged
+   * referenced project succeeded.
+   */
+  referencedProjectStagingFailures?: Array<{ projectId: string }>;
   summary?: string | null;
   clearSession?: boolean;
   question?: {
@@ -137,6 +147,26 @@ export interface AdapterInvocationMeta {
   context?: Record<string, unknown>;
 }
 
+export interface AdapterRuntimeMcpServer {
+  name: string;
+  url: string;
+  token: string;
+  connectionId: string;
+}
+
+export interface AdapterRuntimeMcpAccess {
+  getServers(): AdapterRuntimeMcpServer[];
+}
+
+export interface AdapterRuntimeEvent {
+  eventType: string;
+  stream?: "system" | "stdout" | "stderr";
+  level?: "info" | "warn" | "error";
+  color?: string;
+  message?: string;
+  payload?: Record<string, unknown>;
+}
+
 export interface AdapterExecutionContext {
   runId: string;
   agent: AdapterAgent;
@@ -152,12 +182,21 @@ export interface AdapterExecutionContext {
   executionTransport?: {
     remoteExecution?: Record<string, unknown> | null;
   };
+  runtimeMcp?: AdapterRuntimeMcpAccess;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
-  onCancellationHandle?: (handle: AdapterExecutionCancellationHandle) => Promise<void>;
   authToken?: string;
+  /**
+   * The injected OpenTelemetry startup trace context (tracer + root
+   * parent-context helper). The server passes the real, endpoint-gated
+   * implementation; when absent, the ACPX engine uses a no-op, so the whole
+   * span path stays inert. The type is an inline import so this module keeps no
+   * top-level dependency on the timing helper.
+   */
+  startupTraceContext?: import("./acpx-engine/startup-timing.js").StartupTraceContext;
 }
 
 export interface AdapterModel {
@@ -316,6 +355,8 @@ export interface ProviderQuotaResult {
   source?: string | null;
   /** true when the fetch succeeded and windows is populated */
   ok: boolean;
+  /** machine-readable error family when ok is false */
+  errorFamily?: AdapterExecutionErrorFamily | null;
   /** error message when ok is false */
   error?: string;
   windows: QuotaWindow[];
@@ -469,7 +510,7 @@ export type TranscriptEntry =
   | { kind: "assistant"; ts: string; text: string; delta?: boolean }
   | { kind: "thinking"; ts: string; text: string; delta?: boolean }
   | { kind: "user"; ts: string; text: string }
-  | { kind: "tool_call"; ts: string; name: string; input: unknown; toolUseId?: string }
+  | { kind: "tool_call"; ts: string; name: string; input: unknown; toolUseId?: string; invocationId?: string; actionRequestId?: string }
   | { kind: "tool_result"; ts: string; toolUseId: string; toolName?: string; content: string; isError: boolean }
   | { kind: "init"; ts: string; model: string; sessionId: string }
   | { kind: "result"; ts: string; text: string; inputTokens: number; outputTokens: number; cachedTokens: number; costUsd: number; subtype: string; isError: boolean; errors: string[] }

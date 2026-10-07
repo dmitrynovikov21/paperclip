@@ -7,12 +7,13 @@ export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code
 
 export const models = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
   { id: "claude-mythos-5", label: "Claude Mythos 5" },
+  { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-6", label: "Claude Haiku 4.6" },
   { id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
   { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
 ];
@@ -39,9 +40,8 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime
 - model (string, optional): Claude model id
-- effort (string, optional): reasoning effort passed via --effort (low|medium|high|xhigh|max)
-- chrome (boolean, optional, default false): CLI lane only — pass --chrome to enable Claude's native browser. The default (ACP) lane has no --chrome flag; use mcpConfigPath for a browser there.
-- mcpConfigPath (string, optional): absolute path to an MCP config JSON ({"mcpServers":{...}}), e.g. a Playwright/computer-use browser server. Strongest cross-lane browser access. CLI lane passes --mcp-config <path>. See "Browser access" below for the ACP lane.
+- effort (string, optional): reasoning effort passed via --effort (low|medium|high)
+- chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
 - dangerouslySkipPermissions (boolean, optional, default true): allow non-interactive Claude runs to proceed without approval prompts. Local targets receive --dangerously-skip-permissions; remote targets receive a curated --allowedTools list so they do not inherit local bypass permissions.
@@ -50,6 +50,11 @@ Core fields:
 - env (object, optional): KEY=VALUE environment variables
 - workspaceStrategy (object, optional): execution workspace strategy; currently supports { type: "git_worktree", baseRef?, branchTemplate?, worktreeParentDir? }
 - workspaceRuntime (object, optional): reserved for workspace runtime metadata; workspace runtime services are manually controlled from the workspace UI and are not auto-started by heartbeats
+- filesystemScope (string, optional): set to "workspace" to confine local CLI filesystem access with Bubblewrap. Off by default. The workspace and Claude config remain writable; other host paths are hidden.
+- filesystemExtraPaths (array, optional): additional absolute host paths exposed inside the workspace sandbox. String entries are read-only; object entries use { path: "/absolute/path", access: "ro" | "rw" }.
+- filesystemSandboxCommand (string, optional): Bubblewrap executable name or absolute path; defaults to "bwrap". Linux only.
+- networkScope (string, optional): "deny" blocks all network egress; "allowlist" permits only networkAllowlist targets through Paperclip's HTTP(S) proxy. Off by default.
+- networkAllowlist (string[], optional): exact hostnames, hostname:port entries, or origin URLs. Include the configured Claude provider origin, such as "api.anthropic.com", Bedrock/Vertex endpoints, or a custom gateway.
 
 ACP fields (only when engine="acp"):
 - agentCommand (string, optional): override for the Claude ACP server command; defaults to the package-local claude-agent-acp binary
@@ -63,13 +68,8 @@ Operational fields:
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:
+- filesystemScope and networkScope are spawn-level confinement and are orthogonal to Claude permission flags. Both require Bubblewrap on the host and select the CLI engine in auto mode; engine="acp" is rejected because ACP confinement is not yet supported. networkScope="allowlist" injects HTTP_PROXY/HTTPS_PROXY for the CLI while its private network namespace blocks direct sockets, so every required provider/API hostname must be listed explicitly.
 - The Claude ACP lane requires Node >=22.12.0 and @agentclientprotocol/claude-agent-acp to be installed with this adapter package. Auto engine selection falls back to CLI when those prerequisites are unavailable; explicit engine="acp" fails loudly.
 - For ACP runs, model selection is passed through ANTHROPIC_MODEL at ACP server startup; Paperclip-managed Claude permissions and ephemeral skill materialization are handled by the shared ACP engine.
 - When Paperclip realizes a workspace/runtime for a run, it injects PAPERCLIP_WORKSPACE_* and PAPERCLIP_RUNTIME_* env vars for agent-side tooling.
-
-Browser access (MCP path):
-- The Claude CLI's native --chrome browser is a CLI-lane-only flag. The default (ACP) lane runs claude-agent-acp, which has no --chrome flag.
-- Both lanes can drive a browser through an MCP server (e.g. Playwright MCP or a computer-use server). Point mcpConfigPath at a JSON file shaped like {"mcpServers": {"browser": {"command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless"]}}}.
-  - CLI lane: passed as --mcp-config <path>.
-  - ACP lane: claude-agent-acp runs the Claude Agent SDK with settingSources ["user","project","local"], so it discovers a project .mcp.json and .claude/settings.json. Place the same mcpServers block in a project .mcp.json at the agent cwd. Non-interactive runs also need the server allow-listed (settings enabledMcpjsonServers) so the SDK does not block an unapproved project server.
 `;

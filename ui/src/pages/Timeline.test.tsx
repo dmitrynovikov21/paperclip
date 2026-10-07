@@ -5,7 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { WorkTimelineResult } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Timeline } from "./Timeline";
+import { loadTimelineWindow, Timeline, timelineSummary } from "./Timeline";
 
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockWorkTimelineApi = vi.hoisted(() => ({
@@ -203,6 +203,55 @@ describe("Timeline", () => {
     expect(footer).not.toBeUndefined();
   });
 
+  it("loads every timeline page in the selected window", async () => {
+    mockWorkTimelineApi.get
+      .mockResolvedValueOnce({
+        ...populatedTimeline,
+        actors: [populatedTimeline.actors[0]],
+        spans: [populatedTimeline.spans[0]],
+        pagination: {
+          limit: 500,
+          offset: 0,
+          totalIssues: 501,
+          hasMore: true,
+        },
+      })
+      .mockResolvedValueOnce({
+        ...populatedTimeline,
+        actors: [populatedTimeline.actors[1]],
+        spans: [populatedTimeline.spans[1]],
+        pagination: {
+          limit: 500,
+          offset: 500,
+          totalIssues: 501,
+          hasMore: false,
+        },
+      });
+
+    const controller = new AbortController();
+    const result = await loadTimelineWindow("company-1", {
+      from: populatedTimeline.window.from,
+      to: populatedTimeline.window.to,
+    }, controller.signal);
+
+    expect(mockWorkTimelineApi.get).toHaveBeenNthCalledWith(1, "company-1", expect.objectContaining({
+      limit: 500,
+      offset: 0,
+    }), { signal: controller.signal });
+    expect(mockWorkTimelineApi.get).toHaveBeenNthCalledWith(2, "company-1", expect.objectContaining({
+      limit: 500,
+      offset: 500,
+    }), { signal: controller.signal });
+    expect(result.actors.map((actor) => actor.id)).toEqual(["agent:codex", "agent:qa"]);
+    expect(result.spans.map((span) => span.runId)).toEqual(["run-1", "run-2"]);
+    expect(result.pagination).toEqual({
+      limit: 500,
+      offset: 0,
+      totalIssues: 501,
+      hasMore: false,
+    });
+  });
+
   it("clamps open run summary time to the returned timeline window", async () => {
     mockWorkTimelineApi.get.mockResolvedValue({
       ...populatedTimeline,
@@ -272,6 +321,20 @@ describe("Timeline", () => {
     expect(container.textContent).not.toContain("4K");
   });
 
+  it("summarizes only runs that overlap the visible timeline window", () => {
+    const summary = timelineSummary(populatedTimeline, {
+      fromMs: new Date("2026-07-02T10:15:00.000Z").getTime(),
+      toMs: new Date("2026-07-02T11:05:00.000Z").getTime(),
+    });
+
+    expect(summary).toEqual({
+      runs: 2,
+      agents: 2,
+      activeMs: 20 * 60 * 1000,
+      totalTokens: 1_250,
+    });
+  });
+
   it("requests the company timeline without a user lens parameter", async () => {
     root = createRoot(container);
 
@@ -290,6 +353,7 @@ describe("Timeline", () => {
         from: expect.any(String),
         to: expect.any(String),
       }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(mockWorkTimelineApi.get.mock.calls[0]?.[1]).not.toHaveProperty("userId");
   });

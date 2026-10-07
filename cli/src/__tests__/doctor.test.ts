@@ -99,4 +99,16 @@ describe("doctor", () => {
     expect(summary.warned).toBe(0);
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeTruthy();
   });
+
+  it("doctor --repair leaves no signing key on disk when the env file enables ephemeral mode", async () => {
+    const configPath = createTempConfig();
+    const envPath = path.join(path.dirname(configPath), ".env");
+    delete process.env.PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL;
+    fs.writeFileSync(envPath, "PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n", { mode: 0o600 });
+
+    await doctor({ config: configPath, repair: true, yes: true });
+
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toMatch(/^[0-9a-f]{64}$/);
+    expect(fs.readFileSync(envPath, "utf8")).toBe("PAPERCLIP_AGENT_JWT_SECRET_EPHEMERAL=true\n");
+  });
 });

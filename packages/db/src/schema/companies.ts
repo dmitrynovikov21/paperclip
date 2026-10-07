@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, timestamp, boolean, uniqueIndex } from "drizzle-orm/pg-core";
+import type { InteractionResolverGovernance } from "@paperclipai/shared";
+import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
   "companies",
@@ -13,9 +14,6 @@ export const companies = pgTable(
     issueCounter: integer("issue_counter").notNull().default(0),
     budgetMonthlyCents: integer("budget_monthly_cents").notNull().default(0),
     spentMonthlyCents: integer("spent_monthly_cents").notNull().default(0),
-    // Company-level cap on concurrent `in_progress` issues (WIP limit). Enforced in
-    // issueService.checkout()/update() via ensureWipCapNotExceeded (HELA-3909).
-    wipCapInProgress: integer("wip_cap_in_progress").notNull().default(9),
     attachmentMaxBytes: integer("attachment_max_bytes")
       .notNull()
       .default(10 * 1024 * 1024),
@@ -23,6 +21,10 @@ export const companies = pgTable(
     requireBoardApprovalForNewAgents: boolean("require_board_approval_for_new_agents")
       .notNull()
       .default(false),
+    interactionResolverGovernance: jsonb("interaction_resolver_governance")
+      .$type<InteractionResolverGovernance>()
+      .notNull()
+      .default({}),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

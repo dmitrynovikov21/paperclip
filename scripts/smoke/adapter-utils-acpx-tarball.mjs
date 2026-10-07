@@ -5,7 +5,6 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // The smoke runs inside CI and agent processes. Keep only host context needed
@@ -95,7 +94,15 @@ async function runProbe({ root, createExecutor, variant, permissionMode, createR
 const scratchBase = process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir();
 const root = await fs.mkdtemp(path.join(scratchBase, "adapter-utils-tarball-"));
 try {
-  execFileSync("pnpm", ["pack", "--pack-destination", root], { cwd: adapterRoot, stdio: "pipe", timeout: 120_000 });
+  // Match the repository's release pack path: pnpm's isolated node linker
+  // cannot pack bundleDependencies directly from the workspace checkout.
+  const staged = path.join(root, "staged");
+  execFileSync(process.execPath, [path.join(repoRoot, "scripts", "prepare-bundled-package.mjs"), adapterRoot, staged], {
+    cwd: repoRoot, stdio: "pipe", timeout: 120_000,
+  });
+  execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", root], {
+    cwd: staged, stdio: "pipe", timeout: 120_000,
+  });
   const archiveName = (await fs.readdir(root)).find((name) => name.endsWith(".tgz"));
   assert.ok(archiveName, "pnpm pack did not create a tarball");
   const archive = path.join(root, archiveName);
@@ -103,7 +110,7 @@ try {
   assert.ok(entries.every((entry) => entry.startsWith("package/") && !entry.split("/").includes("..")));
   assert.ok(entries.includes("package/dist/acpx-engine/runtime.js"), "patched runtime missing from tarball");
   assert.ok(entries.includes("package/dist/acpx-engine/THIRD_PARTY_LICENSES.txt"), "bundled licenses missing from tarball");
-  assert.ok(entries.every((entry) => !entry.includes("node_modules/")), "tarball contains node_modules");
+  assert.ok(entries.includes("package/node_modules/acpx/dist/runtime.js"), "patched ACPX dependency missing from tarball");
 
   const consumer = path.join(root, "consumer");
   await fs.mkdir(consumer);
@@ -111,12 +118,13 @@ try {
   execFileSync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--silent", "--registry=https://registry.npmjs.org", archive], {
     cwd: consumer, stdio: "pipe", timeout: 120_000,
   });
-  const requireFromConsumer = createRequire(path.join(consumer, "package.json"));
-  assert.equal(requireFromConsumer("acpx/package.json").version, "0.12.0");
+  const bundledAcpx = path.join(consumer, "node_modules", "@paperclipai", "adapter-utils", "node_modules", "acpx");
+  const bundledAcpxPackage = JSON.parse(await fs.readFile(path.join(bundledAcpx, "package.json"), "utf8"));
+  assert.equal(bundledAcpxPackage.version, "0.12.0");
   const importPath = path.join(consumer, "imports.mjs");
   await fs.writeFile(importPath, [
     'export { createAcpxEngineExecutor } from "@paperclipai/adapter-utils/acpx-engine/execute";',
-    'export { createAcpRuntime } from "acpx/runtime";',
+    `export { createAcpRuntime } from ${JSON.stringify(pathToFileURL(path.join(bundledAcpx, "dist", "runtime.js")).href)};`,
   ].join("\n"));
   const { createAcpxEngineExecutor, createAcpRuntime } = await import(pathToFileURL(importPath).href);
 
@@ -157,7 +165,11 @@ try {
       createExecutor: createAcpxEngineExecutor,
       variant,
       permissionMode: "approve-all",
-      createRuntime: (options) => createAcpRuntime(options),
+      createRuntime: (options) => {
+        const withoutTerminalEnv = { ...options };
+        delete withoutTerminalEnv.terminalEnv;
+        return createAcpRuntime(withoutTerminalEnv);
+      },
     });
     assert.equal(control.report.agent.PAPERCLIP_AGENT_JWT_SECRET, false);
     assert.equal(control.report.terminal.PAPERCLIP_AGENT_JWT_SECRET, true, `${variant}: unpatched ACPX did not reproduce inheritance`);

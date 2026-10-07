@@ -264,12 +264,12 @@ describe("ACPX agent launch environment", () => {
   );
 
   it.skipIf(process.platform === "win32")(
-    "control: ACPX hands its own process.env to an agent it spawns without the Paperclip wrapper",
+    "direct ACPX launch stays isolated without the old Paperclip wrapper",
     async () => {
       const root = await makeTempRoot();
       const serverEnv = serverOnlyEnv();
-      // The same real ACPX runtime, but it spawns the probe directly instead of
-      // the wrapper Paperclip generated for it.
+      // Master launches the ACPX agent directly. The patched runtime must use
+      // the explicit launch env even without the old Paperclip wrapper.
       const { report } = await runProbe({
         root,
         serverEnv,
@@ -280,11 +280,9 @@ describe("ACPX agent launch environment", () => {
           }),
       });
 
-      expect(report.agent.PAPERCLIP_AGENT_JWT_SECRET).toBe(true);
-      expect(report.shell.PAPERCLIP_AGENT_JWT_SECRET).toBe(true);
-      // Without the wrapper the agent only holds the server process's key, which
-      // the fake API rejects: the 200 above comes from the run-scoped key.
-      expect(report.apiStatus).toBe(401);
+      expect(report.agent.PAPERCLIP_AGENT_JWT_SECRET).toBe(false);
+      expect(report.shell.PAPERCLIP_AGENT_JWT_SECRET).toBe(false);
+      expect(report.apiStatus).toBe(200);
     },
     30_000,
   );

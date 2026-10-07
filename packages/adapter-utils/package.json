@@ -34,6 +34,9 @@
   "files": [
     "dist"
   ],
+  "bundleDependencies": [
+    "acpx"
+  ],
   "scripts": {
     "build": "tsc && node ../../scripts/bundle-adapter-utils-acpx.mjs",
     "clean": "rm -rf dist",
@@ -45,7 +48,7 @@
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
-    "@types/node": "^22.19.21",
+    "@types/node": "^22.20.1",
     "typescript": "^5.7.3"
   }
 }

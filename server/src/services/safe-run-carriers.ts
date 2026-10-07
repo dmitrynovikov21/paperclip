@@ -173,6 +173,10 @@ const CONTEXT_CODES: Record<string, Set<string>> = {
   handoffReason: new Set(["successful_run_missing_state"]),
   missingDisposition: new Set(["clear_next_step"]),
   errorFamily: ERROR_FAMILIES,
+  recoveryCause: new Set([
+    "workspace_validation_failed", "configuration_incomplete", "execution_review_participant_recovery",
+    "successful_run_missing_state", "stranded_assigned_issue", "process_lost",
+  ]),
   workspaceRefreshReason: new Set(["accepted_plan_confirmation"]),
   interactionContinuationPolicy: new Set(["wake_assignee", "wake_assignee_on_accept", "none"]),
   codexTransientFallbackMode: new Set(["same_session", "safer_invocation", "fresh_session", "fresh_session_safer_invocation"]),
@@ -181,7 +185,7 @@ const CONTEXT_CODES: Record<string, Set<string>> = {
   mutation: new Set(["interaction", "comment"]),
 };
 const CONTEXT_UUID_KEYS = [
-  "commentId", "wakeCommentId", "projectId", "responsibleUserId", "interactionId",
+  "commentId", "wakeCommentId", "projectId", "projectWorkspaceId", "responsibleUserId", "interactionId",
   "annotationCommentId", "retryOfRunId", "missingIssueCommentForRunId",
   "livenessContinuationSourceRunId", "recoveryActionId", "resumeFromRunId",
   "interruptedRunId", "executionWorkspaceId", "sourceIssueId",
@@ -192,7 +196,7 @@ const CONTEXT_BOOLEANS = [
   "workspaceBusyDeferredWhileAssignee", "dependencyBlockedInteraction", "treeHoldInteraction",
   "childIssueSummaryTruncated", "checkedOutByHarness",
   "allowDeliverableWork", "allowDocumentUpdates", "resumeRequiresNormalModel",
-  "handoffRequired", "reviewPathLost",
+  "handoffRequired", "reviewPathLost", "resumeIntent", "followUpRequested",
 ] as const;
 const CONTEXT_COUNTS = [
   "scheduledRetryAttempt", "livenessContinuationAttempt", "livenessContinuationMaxAttempts",

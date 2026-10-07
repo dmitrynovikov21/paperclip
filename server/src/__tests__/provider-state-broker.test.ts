@@ -429,6 +429,16 @@ describe("[e2e_db] provider-state broker", () => {
     expect(await commit(s, binding)).toBe(false);
   });
 
+  it("destroys all provider state before deleting a company", async () => {
+    const s = await seed(); const binding = await acquire(s); await commit(s, binding);
+    await companyService(db).remove(s.companyId);
+    expect(s.fixture.artifacts.size).toBe(0);
+    expect((await db.select().from(companies)).length).toBe(0);
+    expect((await db.select().from(environmentLeases)).length).toBe(0);
+    expect((await db.select().from(agentTaskSessions)).length).toBe(0);
+    expect((await db.select().from(providerStateScopes)).every((row) => row.currentLeaseId === null)).toBe(true);
+  });
+
   it.each(["terminal", "agent", "company"] as const)("cleans state via real %s service lifecycle", async (kind) => {
     const s = await seed(); const binding = await acquire(s); await commit(s, binding);
     if (kind === "terminal") await issueService(db).update(s.issueId, { status: "cancelled" });

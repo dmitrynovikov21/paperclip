@@ -110,6 +110,19 @@ import {
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
 import {
+  projectSafeError,
+  projectSafeErrorCode,
+  projectSafeLivenessReason,
+  projectSafeResultJson,
+  projectSafeRunContextSnapshot,
+  projectSafeRunEvent,
+  projectSafeRunLogChunk,
+  projectSafeRunPatch,
+  projectSafeRunRow,
+  projectSafeRunSessionId,
+  projectSafeUsageJson,
+} from "./safe-run-carriers.js";
+import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
@@ -264,7 +277,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
-import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import { createRunSecretRedactionRegistry, safeRunContextSnapshotUpdate } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -630,6 +643,7 @@ function isRetryableInteractionContinuationInfrastructureFailure(
 
   const resultJson = parseObject(run.resultJson);
   return (
+    resultJson.spawnFailure === true ||
     isSpawnLikeFailureMessage(run.error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message)
@@ -3754,34 +3768,23 @@ export async function resolveLedgerScopeForRun(
 type ResumeSessionRow = {
   sessionParamsJson: Record<string, unknown> | null;
   sessionDisplayId: string | null;
+  sessionCorrelationId: string | null;
   lastRunId: string | null;
 };
 
 export function buildExplicitResumeSessionOverride(input: {
   adapterType?: string | null;
   resumeFromRunId: string;
-  resumeRunSessionIdBefore: string | null;
-  resumeRunSessionIdAfter: string | null;
-  resumeRunSessionParams?: Record<string, unknown> | null;
+  resumeRunSessionCorrelationId: string | null;
   taskSession: ResumeSessionRow | null;
   sessionCodec: AdapterSessionCodec;
 }) {
-  const resumeRunSessionIdAfter = truncateDisplayId(input.resumeRunSessionIdAfter);
-  const resumeRunSessionIdBefore = truncateDisplayId(input.resumeRunSessionIdBefore);
-  const desiredDisplayId = requiresCanonicalSessionIds(input.adapterType)
-    ? isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdAfter)
-      ? resumeRunSessionIdAfter
-      : isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdBefore)
-        ? resumeRunSessionIdBefore
-        : null
-    : resumeRunSessionIdAfter ?? resumeRunSessionIdBefore;
-  const runSessionParams = requiresCanonicalSessionIds(input.adapterType)
-    ? normalizeResumeParamsForAdapter(
-        input.adapterType,
-        input.sessionCodec.deserialize(input.resumeRunSessionParams ?? null),
-      )
-    : null;
-  const runSessionDisplayId = truncateDisplayId(readNonEmptyString(runSessionParams?.sessionId));
+  if (!input.taskSession || (
+    input.taskSession.lastRunId !== input.resumeFromRunId &&
+    (!input.resumeRunSessionCorrelationId ||
+      input.taskSession.sessionCorrelationId !== input.resumeRunSessionCorrelationId)
+  )) return null;
+
   const taskSessionParams = normalizeResumeParamsForAdapter(
     input.adapterType,
     input.sessionCodec.deserialize(input.taskSession?.sessionParamsJson ?? null),
@@ -3795,31 +3798,10 @@ export function buildExplicitResumeSessionOverride(input: {
         (input.sessionCodec.getDisplayId ? input.sessionCodec.getDisplayId(taskSessionParams) : null) ??
         readNonEmptyString(taskSessionParams?.sessionId),
   );
-  const canReuseTaskSessionParams =
-    input.taskSession != null &&
-    (!requiresCanonicalSessionIds(input.adapterType) || taskSessionParams != null) &&
-    (
-      input.taskSession.lastRunId === input.resumeFromRunId ||
-      (!!desiredDisplayId && taskSessionDisplayId === desiredDisplayId)
-    );
-  const sessionParams =
-    canReuseTaskSessionParams
-      ? taskSessionParams
-      : runSessionParams
-        ? runSessionParams
-        : desiredDisplayId
-          ? { sessionId: desiredDisplayId }
-          : null;
-  const sessionDisplayId = canReuseTaskSessionParams
-    ? taskSessionDisplayId
-    : runSessionParams
-      ? runSessionDisplayId
-      : desiredDisplayId;
-
-  if (!sessionDisplayId && !sessionParams) return null;
+  if (!taskSessionDisplayId && !taskSessionParams) return null;
   return {
-    sessionDisplayId,
-    sessionParams,
+    sessionDisplayId: taskSessionDisplayId,
+    sessionParams: taskSessionParams,
   };
 }
 
@@ -5829,13 +5811,11 @@ export function buildHeartbeatRunStatusLiveEventPayload(
     status: run.status,
     invocationSource: run.invocationSource,
     triggerDetail: run.triggerDetail,
-    error: run.error ?? null,
-    errorCode: run.errorCode ?? null,
+    error: projectSafeError(run.error),
+    errorCode: projectSafeErrorCode(run.errorCode),
     startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
     finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
-    finalText: isHeartbeatRunTerminalStatus(run.status)
-      ? buildHeartbeatRunIssueComment(parseObject(run.resultJson))
-      : null,
+    finalText: null,
   };
 }
 
@@ -6947,12 +6927,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       status: leaseReleaseStatusForRunStatus(input.status),
       failureReason: input.failureReason ?? undefined,
     }).catch((err) => {
-      logger.warn({ err, runId: input.runId }, "failed to release environment leases for heartbeat run");
+      logger.warn({ runId: input.runId }, "failed to release environment leases for heartbeat run");
       return null;
     });
     for (const releaseError of releaseResult?.errors ?? []) {
       logger.warn(
-        { err: releaseError.error, leaseId: releaseError.leaseId, runId: input.runId },
+        { leaseId: releaseError.leaseId, runId: input.runId },
         "failed to release environment lease for heartbeat run",
       );
     }
@@ -7390,12 +7370,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function getLatestRunForSession(
     agentId: string,
-    sessionId: string,
+    sessionCorrelationId: string,
     opts?: { excludeRunId?: string | null },
   ) {
     const conditions = [
       eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
+      eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId),
     ];
     if (opts?.excludeRunId) {
       conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
@@ -8143,14 +8123,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function getOldestRunForSession(agentId: string, sessionId: string) {
+  async function getOldestRunForSession(agentId: string, sessionCorrelationId: string) {
     return db
       .select({
         id: heartbeatRuns.id,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId)))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
@@ -8159,15 +8139,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function resolveNormalizedUsageForSession(input: {
     agentId: string;
     runId: string;
-    sessionId: string | null;
+    sessionCorrelationId: string | null;
+    priorRunId: string | null;
     rawUsage: UsageTotals | null;
     usageBasis?: "per_run" | "session_cumulative" | null;
   }) {
-    const { agentId, runId, sessionId, rawUsage, usageBasis } = input;
+    const { agentId, runId, sessionCorrelationId, priorRunId, rawUsage, usageBasis } = input;
     // Adapters that declare per-run usage (e.g. the ACPX lane reports each
     // turn's tokens, not session totals) must not be session-delta'd, or
     // consecutive runs would be undercounted.
-    if (!sessionId || !rawUsage || usageBasis === "per_run") {
+    if ((!sessionCorrelationId && !priorRunId) || !rawUsage || usageBasis === "per_run") {
       return {
         normalizedUsage: rawUsage,
         previousRawUsage: null as UsageTotals | null,
@@ -8175,7 +8156,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const previousRun = await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId });
+    const correlatedRun = sessionCorrelationId
+      ? await getLatestRunForSession(agentId, sessionCorrelationId, { excludeRunId: runId })
+      : null;
+    // The first run after migration has no correlation ID on older rows.
+    // lastRunId comes from the private session store, so this does not query
+    // or expose legacy provider IDs in central run fields.
+    const previousRun = correlatedRun ?? (priorRunId
+      ? await db.select({ id: heartbeatRuns.id, usageJson: heartbeatRuns.usageJson })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, priorRunId), eq(heartbeatRuns.agentId, agentId)))
+          .then((rows) => rows[0] ?? null)
+      : null);
     const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
     return {
       normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
@@ -8186,12 +8178,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function evaluateSessionCompaction(input: {
     agent: typeof agents.$inferSelect;
-    sessionId: string | null;
+    sessionCorrelationId: string | null;
     issueId: string | null;
     continuationSummaryBody?: string | null;
   }): Promise<SessionCompactionDecision> {
-    const { agent, sessionId, issueId } = input;
-    if (!sessionId) {
+    const { agent, sessionCorrelationId, issueId } = input;
+    if (!sessionCorrelationId) {
       return {
         rotate: false,
         reason: null,
@@ -8220,7 +8212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId)))
       .orderBy(desc(heartbeatRuns.createdAt))
       .limit(fetchLimit);
 
@@ -8236,7 +8228,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const latestRun = runs[0] ?? null;
     const oldestRun =
       policy.maxSessionAgeHours > 0
-        ? await getOldestRunForSession(agent.id, sessionId)
+        ? await getOldestRunForSession(agent.id, sessionCorrelationId)
         : runs[runs.length - 1] ?? latestRun;
     const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     const sessionAgeHours =
@@ -8288,7 +8280,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const handoffMarkdown = [
       "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
+      `- Previous session: ${sessionCorrelationId}`,
       issueId ? `- Issue: ${issueId}` : "",
       `- Rotation reason: ${reason}`,
       latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
@@ -8379,9 +8371,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .select({
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
-        resultJson: heartbeatRuns.resultJson,
-        sessionIdBefore: heartbeatRuns.sessionIdBefore,
-        sessionIdAfter: heartbeatRuns.sessionIdAfter,
+        sessionCorrelationId: heartbeatRuns.sessionCorrelationId,
       })
       .from(heartbeatRuns)
       .where(
@@ -8400,16 +8390,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
-    const resumeRunResult = parseObject(resumeRun.resultJson);
-    const resumeRunSessionId = requiresCanonicalSessionIds(agent.adapterType)
-      ? readNonEmptyString(resumeRunResult.sessionId) ?? readNonEmptyString(resumeRunResult.session_id)
-      : null;
     const sessionOverride = buildExplicitResumeSessionOverride({
       adapterType: agent.adapterType,
       resumeFromRunId,
-      resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
-      resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
-      resumeRunSessionParams: resumeRunSessionId ? { sessionId: resumeRunSessionId } : null,
+      resumeRunSessionCorrelationId: resumeRun.sessionCorrelationId,
       taskSession: resumeTaskSession,
       sessionCodec,
     });
@@ -8707,6 +8691,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     taskKey: string;
     sessionParamsJson: Record<string, unknown> | null;
     sessionDisplayId: string | null;
+    sessionCorrelationId: string | null;
     lastRunId: string | null;
     lastError: string | null;
   }) {
@@ -8722,6 +8707,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           sessionParamsJson: input.sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
+          sessionCorrelationId: input.sessionCorrelationId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
           updatedAt: new Date(),
@@ -8740,6 +8726,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         taskKey: input.taskKey,
         sessionParamsJson: input.sessionParamsJson,
         sessionDisplayId: input.sessionDisplayId,
+        sessionCorrelationId: input.sessionCorrelationId,
         lastRunId: input.lastRunId,
         lastError: input.lastError,
       })
@@ -8803,7 +8790,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...projectSafeRunPatch(patch ?? {}), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -8844,7 +8831,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const updated = await db
       .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({ status, ...projectSafeRunPatch(patch ?? {}), updatedAt: new Date() })
       .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, fromStatuses)))
       .returning()
       .then((rows) => rows[0] ?? null);
@@ -8967,8 +8954,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         status: run.status,
         invocationSource: run.invocationSource,
         triggerDetail: run.triggerDetail,
-        error: run.error ?? null,
-        errorCode: run.errorCode ?? null,
+        error: projectSafeError(run.error),
+        errorCode: projectSafeErrorCode(run.errorCode),
         issueId: typeof run.contextSnapshot === "object" && run.contextSnapshot !== null
           ? (run.contextSnapshot as Record<string, unknown>).issueId ?? null
           : null,
@@ -8986,7 +8973,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!wakeupRequestId) return;
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({
+        status,
+        ...patch,
+        ...(patch && "error" in patch ? { error: projectSafeError(patch.error) } : {}),
+        updatedAt: new Date(),
+      })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -9457,7 +9449,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           livenessReason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-          resultJson: withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson)),
+          resultJson: projectSafeResultJson(withUnmanagedBackgroundTaskStopReason(parseObject(run.resultJson))),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -9602,20 +9594,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
   ) {
     const eventAt = new Date();
-    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
-      : event.message;
-    const boundedPayload = event.payload
-      ? boundHeartbeatRunEventPayloadForStorage(event.payload)
-      : event.payload;
-    const secretSanitizedPayload = boundedPayload ? redactEventPayload(boundedPayload) : boundedPayload;
-    const sanitizedPayload = secretSanitizedPayload
-      ? redactCurrentUserValue(secretSanitizedPayload, currentUserRedactionOptions)
-      : secretSanitizedPayload;
+    const safeEvent = projectSafeRunEvent(event);
+    const sanitizedMessage = safeEvent.message;
+    const sanitizedPayload = safeEvent.payload;
     const issueId = readRuntimeStatusIssueIdCandidate(run) ?? null;
     const progress = buildRunEventRuntimeProgress({
-      eventType: event.eventType,
+      eventType: safeEvent.eventType,
       message: sanitizedMessage ?? null,
       payload: sanitizedPayload ?? null,
       at: eventAt,
@@ -9626,10 +9610,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runId: run.id,
       agentId: run.agentId,
       seq,
-      eventType: event.eventType,
-      stream: event.stream,
-      level: event.level,
-      color: event.color,
+      eventType: safeEvent.eventType,
+      stream: safeEvent.stream,
+      level: safeEvent.level,
+      color: null,
       message: sanitizedMessage,
       payload: sanitizedPayload,
     });
@@ -9642,10 +9626,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: run.agentId,
         issueId,
         seq,
-        eventType: event.eventType,
-        stream: event.stream ?? null,
-        level: event.level ?? null,
-        color: event.color ?? null,
+        eventType: safeEvent.eventType,
+        stream: safeEvent.stream,
+        level: safeEvent.level,
+        color: null,
         message: sanitizedMessage ?? null,
         currentToolName: progress?.currentToolName ?? null,
         lastAssistantSnippet: progress?.lastAssistantSnippet ?? null,
@@ -9865,9 +9849,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           issueCommentStatus: "not_applicable",
           updatedAt: now,
@@ -10115,9 +10099,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
@@ -10475,9 +10459,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const updated = await db
         .update(heartbeatRuns)
         .set({
-          resultJson,
-          error: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.error,
-          errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : run.errorCode,
+          resultJson: projectSafeResultJson(resultJson),
+          error: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : projectSafeError(run.error),
+          errorCode: run.errorCode === DETACHED_PROCESS_ERROR_CODE ? null : projectSafeErrorCode(run.errorCode),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
@@ -10880,7 +10864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: gate.reason,
+        error: projectSafeError(gate.reason),
         errorCode: gate.errorCode,
         updatedAt: now,
       })
@@ -10902,7 +10886,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "cancelled",
           finishedAt: now,
-          error: gate.reason,
+          error: projectSafeError(gate.reason),
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
@@ -11482,9 +11466,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "scheduled_retry",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           scheduledRetryAt: schedule.dueAt,
           scheduledRetryAttempt: schedule.attempt,
@@ -11977,8 +11961,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: row.run.scheduledRetryAt,
       scheduledRetryAttempt: row.run.scheduledRetryAttempt,
       scheduledRetryReason: row.run.scheduledRetryReason,
-      error: row.run.error,
-      errorCode: row.run.errorCode,
+      error: projectSafeError(row.run.error),
+      errorCode: projectSafeErrorCode(row.run.errorCode),
     };
   }
 
@@ -12025,7 +12009,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           scheduledRetryAt: now,
-          contextSnapshot,
+          contextSnapshot: safeRunContextSnapshotUpdate(contextSnapshot),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
@@ -12888,7 +12872,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: options?.errorCode ?? null,
       errorMessage: options?.errorMessage ?? null,
     });
-    return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
+    const merged = mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
+    return (options?.errorCode === "adapter_failed" || options?.errorCode === "setup_failed") &&
+      isSpawnLikeFailureMessage(options.errorMessage)
+      ? { ...merged, spawnFailure: true }
+      : merged;
   }
 
   function countValue(value: unknown) {
@@ -13073,15 +13061,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect,
     resultJson?: Record<string, unknown> | null,
   ) {
-    const classification = classifyRunLiveness(await buildRunLivenessInput(run, resultJson));
+    const livenessInput = await buildRunLivenessInput(run, resultJson);
+    const classification = classifyRunLiveness({
+      ...livenessInput,
+      errorCode: projectSafeErrorCode(livenessInput.errorCode),
+    });
     return db
       .update(heartbeatRuns)
       .set({
         livenessState: classification.livenessState,
-        livenessReason: classification.livenessReason,
+        livenessReason: projectSafeLivenessReason(classification.livenessReason),
         continuationAttempt: classification.continuationAttempt,
         lastUsefulActionAt: classification.lastUsefulActionAt,
-        nextAction: classification.nextAction,
+        nextAction: null,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id))
@@ -13366,7 +13358,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
-    session: { legacySessionId: string | null },
+    session: { legacySessionId: string | null; sessionCorrelationId: string | null },
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
@@ -13393,6 +13385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         adapterType: agent.adapterType,
         sessionId: session.legacySessionId,
+        sessionCorrelationId: session.sessionCorrelationId,
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: result.errorMessage ?? null,
@@ -13504,7 +13497,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const claimedRun of claimedRuns) {
         const execution = executeRun(claimedRun.id).catch((err) => {
-          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+          logger.error({ runId: claimedRun.id }, "queued heartbeat execution failed");
         });
         // Register the in-flight execution so drainActiveRunExecutions() can await
         // it. executeRun resolves only after its finally block finishes flushing
@@ -13598,6 +13591,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
+    const executionStage = parseObject(context.executionStage);
+    const reviewRequest = parseObject(parseObject(issueContext?.executionState).reviewRequest);
+    if (Object.keys(executionStage).length > 0 && typeof reviewRequest.instructions === "string") {
+      // Review instructions stay in the issue record; hydrate them only for the
+      // adapter invocation, then discard them at the snapshot write boundary.
+      context.executionStage = { ...executionStage, reviewRequest: { instructions: reviewRequest.instructions } };
+    }
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
       : null;
@@ -13778,12 +13778,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskSessionDecodedParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
+    // Rebuild the explicit override from its run ID at dispatch time. Session
+    // params can include provider state and must not live in contextSnapshot.
+    const explicitResumeSession = readNonEmptyString(context.resumeFromRunId)
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: context.resumeFromRunId }, taskKey)
+      : null;
     const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
       agent.adapterType,
-      sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
+      sessionCodec.deserialize(explicitResumeSession?.sessionParams ?? parseObject(context.resumeSessionParams)),
     );
     const explicitResumeSessionDisplayId = truncateDisplayId(
-      readNonEmptyString(context.resumeSessionDisplayId) ??
+      explicitResumeSession?.sessionDisplayId ?? readNonEmptyString(context.resumeSessionDisplayId) ??
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
         readNonEmptyString(explicitResumeSessionParams?.sessionId),
     );
@@ -14283,6 +14288,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
+    const previousSessionCorrelationId = resetTaskSession || explicitResumeSession
+      ? null
+      : taskKey
+        ? taskSessionForRun?.sessionCorrelationId ?? null
+        : runtime.sessionCorrelationId;
     const previousSessionParams =
       explicitResumeSessionParams ??
       (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
@@ -14553,7 +14563,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             runId: run.id,
             issueId,
             executionWorkspaceCwd: executionWorkspace.cwd,
-            error: error instanceof Error ? error.message : String(error),
+            error: "worktree ownership inspection failed",
           },
           "Could not record managed worktree instance ownership",
         );
@@ -14707,7 +14717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: safeRunContextSnapshotUpdate(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -14840,7 +14850,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: safeRunContextSnapshotUpdate(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -14967,7 +14977,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const sessionCompaction = await evaluateSessionCompaction({
       agent,
-      sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
+      sessionCorrelationId: (previousSessionDisplayId ?? runtimeSessionIdForAdapter)
+        ? previousSessionCorrelationId
+        : null,
       issueId,
       continuationSummaryBody: continuationSummary?.body ?? null,
     });
@@ -15069,8 +15081,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           startedAt,
-          sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: context,
+          sessionIdBefore: projectSafeRunSessionId(runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId),
+          contextSnapshot: safeRunContextSnapshotUpdate(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -15148,9 +15160,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
-        );
+        const sanitizedChunk = projectSafeRunLogChunk(chunk);
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
         const ts = new Date().toISOString();
@@ -15283,7 +15293,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: safeRunContextSnapshotUpdate(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -15611,11 +15621,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and surface the original error to the caller.
         try {
           await recordWorkspaceFinalize("failed", {
-            errorMessage: adapterErr instanceof Error ? adapterErr.message : String(adapterErr),
+            errorMessage: "Adapter execution failed",
           });
         } catch (recordErr) {
           logger.warn(
-            { err: recordErr, runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
+            { runId: run.id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? null },
             "failed to record workspace_finalize=failed operation; dependents may remain gated",
           );
         }
@@ -15629,7 +15639,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
         } catch (revokeErr) {
           logger.warn(
-            { err: revokeErr, runId: run.id, companyId: agent.companyId },
+            { runId: run.id, companyId: agent.companyId },
             "failed to revoke heartbeat-run MCP gateway tokens",
           );
         }
@@ -15691,7 +15701,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: safeRunContextSnapshotUpdate(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -15734,11 +15744,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         previousDisplayId: runtimeForAdapter.sessionDisplayId,
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
+      const nextProviderSessionId = nextSessionState.legacySessionId ?? nextSessionState.displayId;
+      const previousProviderSessionId = runtimeForAdapter.sessionId ?? runtimeForAdapter.sessionDisplayId;
+      const sessionCorrelationId = nextProviderSessionId
+        ? (!sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
+          ? previousSessionCorrelationId
+          : null) ?? randomUUID()
+        : null;
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
         runId: run.id,
-        sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionCorrelationId,
+        priorRunId: nextProviderSessionId && !sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
+          ? taskKey
+            ? taskSessionForRun?.lastRunId ?? null
+            : runtime.lastRunId
+          : null,
         rawUsage,
         usageBasis: adapterResult.usageBasis ?? null,
       });
@@ -15821,7 +15843,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
-      const persistedResultJson = mergeHeartbeatRunResultJson(
+      const rawResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
@@ -15839,6 +15861,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }),
         adapterResult.summary ?? null,
       );
+      const persistedResultJson = projectSafeResultJson(rawResultJson);
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
@@ -15848,7 +15871,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         signal: adapterResult.signal,
         usageJson,
         resultJson: persistedResultJson,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionCorrelationId,
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,
@@ -15869,7 +15892,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
-        persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+        persistedRun = await classifyAndPersistRunLiveness(persistedRun, rawResultJson) ?? persistedRun;
       }
 
       await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
@@ -15914,7 +15937,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingRunComment) {
-              const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
+              const issueComment = buildHeartbeatRunIssueComment(rawResultJson);
               if (issueComment) {
                 await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
               }
@@ -15996,6 +16019,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
+          sessionCorrelationId,
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
@@ -16015,6 +16039,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 sessionConfigMetadata,
               ),
               sessionDisplayId: nextSessionState.displayId,
+              sessionCorrelationId,
               lastRunId: finalizedRun.id,
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
             });
@@ -16047,14 +16072,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ?? configurationIncompleteFailure?.code
         ?? recordedResponsibleUserDenialCode
         ?? "adapter_failed";
-      logger.error({ err, runId }, "heartbeat execution failed");
+      logger.error({ runId, errorCode: failureErrorCode }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
         try {
           logSummary = await runLogStore.finalize(handle);
         } catch (finalizeErr) {
-          logger.warn({ err: finalizeErr, runId }, "failed to finalize run log after error");
+          logger.warn({ runId }, "failed to finalize run log after error");
         }
       }
       const finalLogBytes = logSummary?.bytes;
@@ -16062,7 +16087,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outputProgressState.pending.bytes = finalLogBytes;
       }
       await flushOutputProgress({ force: true }).catch((flushErr) => {
-        logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
+        logger.warn({ runId }, "failed to flush run output progress after error");
       });
 
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
@@ -16135,6 +16160,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorMessage: message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
+          sessionCorrelationId: runtimeForAdapter.sessionId || runtimeForAdapter.sessionDisplayId
+            ? previousSessionCorrelationId
+            : null,
         });
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
@@ -16149,6 +16177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sessionConfigMetadata,
             ),
             sessionDisplayId: previousSessionDisplayId,
+            sessionCorrelationId: previousSessionCorrelationId,
             lastRunId: failedRun.id,
             lastError: message,
           });
@@ -16168,7 +16197,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // leases, runtime services, and scratch for this run.
             await finalizeWorkspaceBusyDeferral(run, outerErr).catch((deferralErr) => {
               logger.error(
-                { err: deferralErr, runId },
+                { runId },
                 "failed to finalize workspace-busy deferral",
               );
             });
@@ -16191,7 +16220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             configurationIncompleteSetupFailure?.code ??
             recordedResponsibleUserDenialCode ??
             "setup_failed";
-          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          logger.error({ runId, errorCode: projectSafeErrorCode(setupFailureErrorCode) }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
             error: message,
@@ -16241,7 +16270,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 error: message,
               }).catch((completionErr) => {
                 logger.warn(
-                  { err: completionErr, runId: livenessRun.id, issueId: setupFailureIssueId },
+                  { runId: livenessRun.id, issueId: setupFailureIssueId },
                   "failed to complete skill test run after heartbeat setup failure",
                 );
               });
@@ -16254,20 +16283,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }
               await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent).catch((retryError) => {
                 logger.warn(
-                  { err: retryError, runId: livenessRun.id },
+                  { runId: livenessRun.id },
                   "failed to schedule interaction continuation retry after setup failure",
                 );
               });
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch((releaseError) => {
               logger.error(
-                { err: releaseError, runId },
+                { runId },
                 "failed to release issue execution after heartbeat setup failure",
               );
             });
             await handleIssueReviewPathDisposition(livenessRun).catch((reviewPathError) => {
               logger.error(
-                { err: reviewPathError, runId },
+                { runId },
                 "failed to evaluate review-path disposition after heartbeat setup failure",
               );
             });
@@ -16290,7 +16319,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (latestRun) {
             latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch((terminalizeErr) => {
               logger.error(
-                { err: terminalizeErr, runId: run.id },
+                { runId: run.id },
                 "failed to terminalize run before environment lease release",
               );
               return latestRun;
@@ -16316,9 +16345,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } catch (scratchCleanupError) {
               logger.warn(
                 {
-                  err: scratchCleanupError,
                   runId: run.id,
-                  scratchDir: scratchForCleanup.dir,
                 },
                 "failed to clean heartbeat run scratch directory",
               );
@@ -16347,9 +16374,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               }).catch((scratchCleanupEventError) => {
                 logger.warn(
                   {
-                    err: scratchCleanupEventError,
                     runId: run.id,
-                    scratchDir: scratchForCleanup.dir,
                   },
                   "failed to record heartbeat run scratch cleanup event",
                 );
@@ -16725,9 +16750,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: promotedTriggerDetail,
             status: "queued",
             wakeupRequestId: deferred.id,
-            contextSnapshot: promotedContextSnapshot,
+            contextSnapshot: projectSafeRunContextSnapshot(promotedContextSnapshot),
             responsibleUserId: promotedResponsibleUserId,
-            sessionIdBefore: sessionBefore,
+            sessionIdBefore: projectSafeRunSessionId(sessionBefore),
             continuationAttempt: promotedContinuationAttempt,
           })
           .returning()
@@ -16879,7 +16904,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: "system",
             status: "queued",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: withRecoveryModelProfileHint({
+            contextSnapshot: projectSafeRunContextSnapshot(withRecoveryModelProfileHint({
               issueId: issue.id,
               taskId: issue.id,
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
@@ -16890,8 +16915,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               currentStageType: executionState?.currentStageType ?? null,
               reviewRecoveryInstruction:
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
-            }, "normal_model"),
-            sessionIdBefore: recoverySessionBefore,
+            }, "normal_model")),
+            sessionIdBefore: projectSafeRunSessionId(recoverySessionBefore),
             retryOfRunId: run.id,
             updatedAt: now,
           })
@@ -17044,9 +17069,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: recoveryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(recoveryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: recoverySessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(recoverySessionBefore),
           retryOfRunId: run.id,
           updatedAt: now,
         })
@@ -17167,6 +17192,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         finishedAt: new Date(),
         ...patch,
+        ...("error" in patch ? { error: projectSafeError(patch.error) } : {}),
       });
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
@@ -17507,7 +17533,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: now,
-              error: reason,
+              error: projectSafeError(reason),
               errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
               updatedAt: now,
             })
@@ -17523,7 +17549,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: reason,
+                error: projectSafeError(reason),
                 updatedAt: now,
               })
               .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
@@ -17554,18 +17580,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eventType: "lifecycle",
             stream: "system",
             level: "warn",
-            message: issueCancelled
-              ? "Scheduled retry cancelled because issue was cancelled before it became due"
-              : "Scheduled retry cancelled because issue ownership changed before it became due",
-            payload: {
-              issueId: issue.id,
-              issueStatus: issue.status,
-              scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
-              scheduledRetryAt: cancelled.scheduledRetryAt ? new Date(cancelled.scheduledRetryAt).toISOString() : null,
-              scheduledRetryReason: cancelled.scheduledRetryReason,
-              previousRetryAgentId: cancelled.agentId,
-              currentAssigneeAgentId: issue.assigneeAgentId,
-            },
+            message: "run event",
+            payload: null,
           });
 
           return true;
@@ -17618,7 +17634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .set({
               status: "cancelled",
               finishedAt: new Date(),
-              error: "Execution lock released after issue reassigned to a different agent",
+              error: projectSafeError("Execution lock released after issue reassigned to a different agent"),
               errorCode: "lock_released_on_reassignment",
               updatedAt: new Date(),
             })
@@ -17902,7 +17918,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const mergedRun = await tx
               .update(heartbeatRuns)
               .set({
-                contextSnapshot: mergedContextSnapshot,
+                contextSnapshot: safeRunContextSnapshotUpdate(mergedContextSnapshot),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
@@ -18170,8 +18186,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "queued",
             responsibleUserId: await resolveQueuedResponsibleUserId(),
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: enrichedContextSnapshot,
-            sessionIdBefore: sessionBefore,
+            contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
+            sessionIdBefore: projectSafeRunSessionId(sessionBefore),
             continuationAttempt,
           })
           .returning()
@@ -18252,7 +18268,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: safeRunContextSnapshotUpdate(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
@@ -18344,8 +18360,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
-          sessionIdBefore: sessionBefore,
+          contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           continuationAttempt,
         })
         .returning()
@@ -18624,7 +18640,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: reason,
+        error: projectSafeError(reason),
         updatedAt: now,
       })
       .where(inArray(agentWakeupRequests.id, wakeupIds));
@@ -18754,7 +18770,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resultCostUsdCamel?: string | null;
         };
 
-        return {
+        return projectSafeRunRow({
           ...rest,
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
@@ -18766,9 +18782,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             wakeSource: contextWakeSource,
             wakeTriggerDetail: contextWakeTriggerDetail,
           }),
+          error: projectSafeError(rest.error),
+          errorCode: projectSafeErrorCode(rest.errorCode),
+          usageJson: projectSafeUsageJson(rest.usageJson),
+          stdoutExcerpt: null,
+          stderrExcerpt: null,
           resultJson: safeForLegacyEncoding || summary
             ? null
-            : summarizeHeartbeatRunListResultJson({
+            : projectSafeResultJson(summarizeHeartbeatRunListResultJson({
                 summary: resultSummary,
                 result: resultResult,
                 message: resultMessage,
@@ -18776,8 +18797,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 totalCostUsd: resultTotalCostUsd,
                 costUsd: resultCostUsd,
                 costUsdCamel: resultCostUsdCamel,
-              }),
-        };
+              })),
+        });
       });
     },
 
@@ -18860,7 +18881,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .from(heartbeatRunEvents)
         .where(and(eq(heartbeatRunEvents.runId, runId), gt(heartbeatRunEvents.seq, afterSeq)))
         .orderBy(asc(heartbeatRunEvents.seq))
-        .limit(Math.max(1, Math.min(limit, 1000))),
+        .limit(Math.max(1, Math.min(limit, 1000)))
+        .then((rows) => rows.map((row) => ({ ...row, ...projectSafeRunEvent(row), color: null }))),
 
     getRetryExhaustedReason: async (runId: string) => {
       const row = await db
@@ -18878,7 +18900,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .orderBy(desc(heartbeatRunEvents.id))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      return row?.message ?? null;
+      return row ? "Bounded retry exhausted" : null;
     },
 
     readLog: async (
@@ -18908,9 +18930,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         store: run.logStore,
         logRef: run.logRef,
         ...result,
-        // Run-log chunks are already redacted before they are appended to the store.
-        // Rewriting the full chunk again on every poll creates avoidable string copies.
-        content: result.content,
+        // Apply the same projection on read so legacy logs cannot expose
+        // content saved before the write boundary was hardened.
+        content: result.content ? projectSafeRunLogChunk(result.content) : "",
       };
     },
 

@@ -87,9 +87,9 @@ describeEmbeddedPostgres("heartbeat list", () => {
       expect(runs[0]?.processGroupId ?? null).toBeNull();
       expect(runs[0]).toMatchObject({
         livenessState: "advanced",
-        livenessReason: "run produced action evidence",
+        livenessReason: "Run liveness classified",
         continuationAttempt: 1,
-        nextAction: "continue implementation",
+        nextAction: null,
       });
       expect(runs[0]?.lastUsefulActionAt).toEqual(new Date("2026-04-18T12:00:00Z"));
     } finally {
@@ -176,7 +176,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
       agentId,
       invocationSource: "assignment",
       status: "failed",
-      error: "Failed after doing useful work",
+      error: "Run failed",
       usageJson: {
         provider: "openai",
         model: "gpt-5",
@@ -207,7 +207,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
       companyId,
       agentId,
       status: "failed",
-      error: "Failed after doing useful work",
+      error: "Run failed",
       usageJson: null,
       resultJson: null,
       sessionIdBefore: null,

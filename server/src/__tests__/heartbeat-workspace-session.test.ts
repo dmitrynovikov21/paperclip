@@ -2457,17 +2457,14 @@ describe("comment wake batching", () => {
 });
 
 describe("buildExplicitResumeSessionOverride", () => {
-  it("reuses saved task session params when they belong to the selected failed run", () => {
+  it("reuses saved task session params when they belong to the selected run", () => {
     const result = buildExplicitResumeSessionOverride({
       resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: "session-before",
-      resumeRunSessionIdAfter: "session-after",
+      resumeRunSessionCorrelationId: "correlation-1",
       taskSession: {
-        sessionParamsJson: {
-          sessionId: "session-after",
-          cwd: "/tmp/project",
-        },
+        sessionParamsJson: { sessionId: "session-after", cwd: "/tmp/project" },
         sessionDisplayId: "session-after",
+        sessionCorrelationId: "correlation-1",
         lastRunId: "run-1",
       },
       sessionCodec: codexSessionCodec,
@@ -2475,125 +2472,54 @@ describe("buildExplicitResumeSessionOverride", () => {
 
     expect(result).toEqual({
       sessionDisplayId: "session-after",
-      sessionParams: {
-        sessionId: "session-after",
-        cwd: "/tmp/project",
-      },
+      sessionParams: { sessionId: "session-after", cwd: "/tmp/project" },
     });
   });
 
-  it("falls back to the selected run session id when no matching task session params are available", () => {
-    const result = buildExplicitResumeSessionOverride({
+  it("reuses a later task session only when its server correlation ID matches", () => {
+    const taskSession = {
+      sessionParamsJson: { sessionId: "same-provider-session" },
+      sessionDisplayId: "same-provider-session",
+      sessionCorrelationId: "correlation-1",
+      lastRunId: "run-2",
+    };
+    const input = {
       resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: "session-before",
-      resumeRunSessionIdAfter: "session-after",
-      taskSession: {
-        sessionParamsJson: {
-          sessionId: "other-session",
-          cwd: "/tmp/project",
-        },
-        sessionDisplayId: "other-session",
-        lastRunId: "run-2",
-      },
+      taskSession,
       sessionCodec: codexSessionCodec,
+    };
+    expect(buildExplicitResumeSessionOverride({
+      ...input,
+      resumeRunSessionCorrelationId: "correlation-1",
+    })).toEqual({
+      sessionDisplayId: "same-provider-session",
+      sessionParams: { sessionId: "same-provider-session" },
     });
-
-    expect(result).toEqual({
-      sessionDisplayId: "session-after",
-      sessionParams: {
-        sessionId: "session-after",
-      },
-    });
+    expect(buildExplicitResumeSessionOverride({
+      ...input,
+      resumeRunSessionCorrelationId: "correlation-2",
+    })).toBeNull();
   });
 
-  it("does not synthesize Hermes resume params from a truncated display id", () => {
+  it("does not resume from provider text stored in a legacy run without matching private state", () => {
+    expect(buildExplicitResumeSessionOverride({
+      adapterType: "hermes_local",
+      resumeFromRunId: "run-1",
+      resumeRunSessionCorrelationId: null,
+      taskSession: null,
+      sessionCodec: truncatingHermesSessionCodec,
+    })).toBeNull();
+  });
+
+  it("uses full validated Hermes params from the private task session", () => {
     const result = buildExplicitResumeSessionOverride({
       adapterType: "hermes_local",
       resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: null,
-      resumeRunSessionIdAfter: "20260601_141558_",
+      resumeRunSessionCorrelationId: "correlation-1",
       taskSession: {
-        sessionParamsJson: {
-          sessionId: "20260601_141000_c861e4",
-        },
-        sessionDisplayId: "20260601_141000_",
-        lastRunId: "run-2",
-      },
-      sessionCodec: truncatingHermesSessionCodec,
-    });
-
-    expect(result).toBeNull();
-  });
-
-  it("uses validated Hermes run result params before truncated display ids", () => {
-    const result = buildExplicitResumeSessionOverride({
-      adapterType: "hermes_local",
-      resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: null,
-      resumeRunSessionIdAfter: "20260601_141558_",
-      resumeRunSessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
-      taskSession: null,
-      sessionCodec: truncatingHermesSessionCodec,
-    });
-
-    expect(result).toEqual({
-      sessionDisplayId: "20260601_141558_c861e4",
-      sessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
-    });
-  });
-
-  it("keeps Hermes run result params and display id together when falling back from a prior session", () => {
-    const result = buildExplicitResumeSessionOverride({
-      adapterType: "hermes_local",
-      resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: "20260601_140000_old123",
-      resumeRunSessionIdAfter: "20260601_141558_",
-      resumeRunSessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
-      taskSession: null,
-      sessionCodec: truncatingHermesSessionCodec,
-    });
-
-    expect(result).toEqual({
-      sessionDisplayId: "20260601_141558_c861e4",
-      sessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
-    });
-  });
-
-  it("ignores invalid Hermes run result params", () => {
-    const result = buildExplicitResumeSessionOverride({
-      adapterType: "hermes_local",
-      resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: null,
-      resumeRunSessionIdAfter: "20260601_141558_",
-      resumeRunSessionParams: {
-        sessionId: "from",
-      },
-      taskSession: null,
-      sessionCodec: truncatingHermesSessionCodec,
-    });
-
-    expect(result).toBeNull();
-  });
-
-  it("keeps full Hermes task-session params even when the saved display id is truncated", () => {
-    const result = buildExplicitResumeSessionOverride({
-      adapterType: "hermes_local",
-      resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: null,
-      resumeRunSessionIdAfter: "20260601_141558_",
-      taskSession: {
-        sessionParamsJson: {
-          sessionId: "20260601_141558_c861e4",
-        },
+        sessionParamsJson: { sessionId: "20260601_141558_c861e4" },
         sessionDisplayId: "20260601_141558_",
+        sessionCorrelationId: "correlation-1",
         lastRunId: "run-1",
       },
       sessionCodec: truncatingHermesSessionCodec,
@@ -2601,27 +2527,7 @@ describe("buildExplicitResumeSessionOverride", () => {
 
     expect(result).toEqual({
       sessionDisplayId: "20260601_141558_c861e4",
-      sessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
-    });
-  });
-
-  it("falls back from a poisoned Hermes session-after value to a valid session-before value", () => {
-    const result = buildExplicitResumeSessionOverride({
-      adapterType: "hermes_local",
-      resumeFromRunId: "run-1",
-      resumeRunSessionIdBefore: "20260601_141558_c861e4",
-      resumeRunSessionIdAfter: "from",
-      taskSession: null,
-      sessionCodec: hermesSessionCodec,
-    });
-
-    expect(result).toEqual({
-      sessionDisplayId: "20260601_141558_c861e4",
-      sessionParams: {
-        sessionId: "20260601_141558_c861e4",
-      },
+      sessionParams: { sessionId: "20260601_141558_c861e4" },
     });
   });
 });

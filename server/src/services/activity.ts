@@ -18,6 +18,7 @@ import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { projectSafeError, projectSafeErrorCode, projectSafeLivenessReason, projectSafeRunRow } from "./safe-run-carriers.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -277,7 +278,7 @@ export function activityService(db: Db) {
         stdoutExcerpt: run.stdoutExcerpt,
         stderrExcerpt: run.stderrExcerpt,
         error: run.error,
-        errorCode: run.errorCode,
+        errorCode: projectSafeErrorCode(run.errorCode),
         continuationAttempt,
         evidence: {
           issueCommentsCreated: countValue(commentStats?.count),
@@ -302,10 +303,10 @@ export function activityService(db: Db) {
         .update(heartbeatRuns)
         .set({
           livenessState: classification.livenessState,
-          livenessReason: classification.livenessReason,
+          livenessReason: projectSafeLivenessReason(classification.livenessReason),
           continuationAttempt: classification.continuationAttempt,
           lastUsefulActionAt: classification.lastUsefulActionAt,
-          nextAction: classification.nextAction,
+          nextAction: null,
           updatedAt: new Date(),
         })
         .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.livenessState)));
@@ -490,7 +491,7 @@ export function activityService(db: Db) {
               ? leaseMetadata.remoteWorkspacePath
               : null;
         return {
-          ...run,
+          ...projectSafeRunRow(run),
           environment: leaseRow
             ? {
                 id: leaseRow.environment.id,
@@ -507,13 +508,13 @@ export function activityService(db: Db) {
                 providerLeaseId: leaseRow.lease.providerLeaseId,
                 executionWorkspaceId: leaseRow.lease.executionWorkspaceId,
                 workspacePath,
-                failureReason: leaseRow.lease.failureReason,
+                failureReason: projectSafeError(leaseRow.lease.failureReason),
                 cleanupStatus: leaseRow.lease.cleanupStatus,
                 acquiredAt: leaseRow.lease.acquiredAt,
                 releasedAt: leaseRow.lease.releasedAt,
               }
             : null,
-          retryExhaustedReason: retryExhaustedReasonByRunId.get(run.runId) ?? null,
+          retryExhaustedReason: retryExhaustedReasonByRunId.has(run.runId) ? "Bounded retry exhausted" : null,
         };
       });
     },

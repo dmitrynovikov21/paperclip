@@ -1,5 +1,4 @@
 import type { HeartbeatRunStatusPhase } from "@paperclipai/shared";
-import { redactSensitiveText } from "../redaction.js";
 
 export const HEARTBEAT_RUN_RUNTIME_STATUS_TTL_MS = 90_000;
 export const MAX_HEARTBEAT_RUN_RUNTIME_STATUS_MESSAGE_CHARS = 180;
@@ -29,24 +28,15 @@ function cloneStatus(status: HeartbeatRunRuntimeStatus): HeartbeatRunRuntimeStat
   };
 }
 
-function sanitizeRuntimeStatusText(value: string, maxChars: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  const redacted = redactSensitiveText(normalized);
-  if (redacted.length <= maxChars) return redacted;
-  return `${redacted.slice(0, maxChars - 3)}...`;
-}
-
-export function sanitizeHeartbeatRunRuntimeStatusMessage(message: string): string {
-  return sanitizeRuntimeStatusText(message, MAX_HEARTBEAT_RUN_RUNTIME_STATUS_MESSAGE_CHARS);
-}
-
-export function sanitizeHeartbeatRunRuntimeToolName(toolName: string): string {
-  return sanitizeRuntimeStatusText(toolName, MAX_HEARTBEAT_RUN_RUNTIME_TOOL_NAME_CHARS);
-}
-
-export function sanitizeHeartbeatRunRuntimeAssistantSnippet(snippet: string): string {
-  return sanitizeRuntimeStatusText(snippet, MAX_HEARTBEAT_RUN_RUNTIME_ASSISTANT_SNIPPET_CHARS);
-}
+const PHASE_MESSAGES: Record<HeartbeatRunStatusPhase, string> = {
+  git_sync: "Syncing git workspace",
+  config_sync: "Syncing workspace configuration",
+  adapter_startup: "Starting adapter",
+  restore: "Restoring workspace",
+  export: "Exporting workspace",
+  finalize: "Finalizing run",
+  run_activity: "Agent working",
+};
 
 function isExpired(status: HeartbeatRunRuntimeStatus, now: Date, ttlMs: number) {
   return now.getTime() - status.updatedAt.getTime() > ttlMs;
@@ -64,11 +54,9 @@ export function setHeartbeatRunRuntimeStatus(
     lastEventAt?: Date | null;
   },
 ): HeartbeatRunRuntimeStatus | null {
-  const message = sanitizeHeartbeatRunRuntimeStatusMessage(input.message);
-  if (!message) {
-    clearHeartbeatRunRuntimeStatus(input.runId);
-    return null;
-  }
+  // Adapter progress strings and tool/assistant snippets are arbitrary provider
+  // output, including unknown secrets. The phase is the only safe display input.
+  const message = PHASE_MESSAGES[input.phase] ?? "Agent working";
 
   const status: HeartbeatRunRuntimeStatus = {
     companyId: input.companyId,
@@ -78,12 +66,8 @@ export function setHeartbeatRunRuntimeStatus(
     phase: input.phase,
     message,
     updatedAt: input.updatedAt ? new Date(input.updatedAt) : new Date(),
-    currentToolName: input.currentToolName
-      ? sanitizeHeartbeatRunRuntimeToolName(input.currentToolName)
-      : null,
-    lastAssistantSnippet: input.lastAssistantSnippet
-      ? sanitizeHeartbeatRunRuntimeAssistantSnippet(input.lastAssistantSnippet)
-      : null,
+    currentToolName: null,
+    lastAssistantSnippet: null,
     lastEventAt: input.lastEventAt ? new Date(input.lastEventAt) : null,
   };
   runtimeStatusesByRunId.set(status.runId, status);

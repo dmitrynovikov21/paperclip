@@ -159,9 +159,9 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
         agentId,
         runId,
         phase: "config_sync",
-        message: "Syncing workspace to sandbox",
-        currentToolName: "bash",
-        lastAssistantSnippet: "Inspecting the repository",
+        message: "Syncing workspace configuration",
+        currentToolName: null,
+        lastAssistantSnippet: null,
         lastEventAt: new Date("2026-06-24T00:00:05.000Z"),
       });
       expect(heartbeat.decorateActiveRunStatus({
@@ -171,9 +171,9 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
         issueId,
         status: "running",
       })).toMatchObject({
-        currentStatusMessage: "Syncing workspace to sandbox",
-        currentToolName: "bash",
-        lastAssistantSnippet: "Inspecting the repository",
+        currentStatusMessage: "Syncing workspace configuration",
+        currentToolName: null,
+        lastAssistantSnippet: null,
         lastEventAt: new Date("2026-06-24T00:00:05.000Z"),
       });
       expect(liveEvents).toContainEqual(expect.objectContaining({
@@ -184,9 +184,9 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
           agentId,
           issueId,
           phase: "config_sync",
-          message: "Syncing workspace to sandbox",
-          currentToolName: "bash",
-          lastAssistantSnippet: "Inspecting the repository",
+          message: "Syncing workspace configuration",
+          currentToolName: null,
+          lastAssistantSnippet: null,
           lastEventAt: "2026-06-24T00:00:05.000Z",
         }),
       }));

@@ -685,7 +685,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       name: "renamed branch",
       workspaceValidation: (workspaceId: string) => ({
         reason: "git_worktree_branch_incoherence",
-        fingerprint: "workspace_incoherence:v1:sha256:renamed",
+        fingerprint: `workspace_incoherence:v1:sha256:${"a".repeat(64)}`,
         executionWorkspaceId: workspaceId,
         expectedBranch: "stale-plan-approval-workspace",
         actualBranch: "feat/skill-studio-test-runs",
@@ -696,7 +696,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       name: "dirty worktree",
       workspaceValidation: (workspaceId: string) => ({
         reason: "git_worktree_branch_incoherence",
-        fingerprint: "workspace_incoherence:v1:sha256:dirty",
+        fingerprint: `workspace_incoherence:v1:sha256:${"b".repeat(64)}`,
         executionWorkspaceId: workspaceId,
         expectedBranch: "stale-plan-approval-workspace",
         actualBranch: "feat/skill-studio-test-runs",
@@ -873,7 +873,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const validation = {
       reason: "git_worktree_branch_incoherence",
-      fingerprint: "workspace_incoherence:v1:sha256:stale",
+      fingerprint: `workspace_incoherence:v1:sha256:${"c".repeat(64)}`,
       executionWorkspaceId: foreignWorkspaceId,
       expectedBranch: "current-issue-branch",
       actualBranch: "foreign-issue-branch",
@@ -1011,7 +1011,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const currentWorkspaceId = randomUUID();
     const validation = {
       reason: "git_worktree_branch_incoherence",
-      fingerprint: "workspace_incoherence:v1:sha256:stale-owned",
+      fingerprint: `workspace_incoherence:v1:sha256:${"d".repeat(64)}`,
       executionWorkspaceId: staleWorkspaceId,
       expectedBranch: "old-plan-approval-workspace",
       actualBranch: "current-plan-approval-workspace",

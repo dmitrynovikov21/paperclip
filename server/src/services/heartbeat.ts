@@ -641,6 +641,7 @@ function isRetryableInteractionContinuationInfrastructureFailure(
 
   const resultJson = parseObject(run.resultJson);
   return (
+    resultJson.spawnFailure === true ||
     isSpawnLikeFailureMessage(run.error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message)
@@ -12889,7 +12890,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       errorCode: options?.errorCode ?? null,
       errorMessage: options?.errorMessage ?? null,
     });
-    return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
+    const merged = mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
+    return (options?.errorCode === "adapter_failed" || options?.errorCode === "setup_failed") &&
+      isSpawnLikeFailureMessage(options.errorMessage)
+      ? { ...merged, spawnFailure: true }
+      : merged;
   }
 
   function countValue(value: unknown) {

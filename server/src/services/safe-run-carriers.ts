@@ -54,6 +54,7 @@ const RESULT_NUMBERS = new Set([
 const RESULT_BOOLEANS = new Set([
   "timeoutConfigured", "timeoutFired", "sessionReused", "taskSessionReused", "freshSession",
   "sessionRotated", "stopped", "truncated", "outputOmitted",
+  "spawnFailure",
 ]);
 const RETRY_TIMESTAMPS = new Set([
   "retryNotBefore", "transientRetryNotBefore", "providerQuotaRetryNotBefore",
@@ -80,8 +81,10 @@ const SAFE_EVIDENCE_LABELS = new Set([
 ]);
 const WORKSPACE_VALIDATION_REASONS = new Set([
   "git_worktree_branch_incoherence", "git_worktree_not_reusable",
-  "git_worktree_base_fallback_not_project_workspace", "missing_git_push_remote",
+  "git_worktree_base_fallback_not_project_workspace", "missing_git_push_remote", "missing_project_id",
 ]);
+const CONFIGURATION_INCOMPLETE_REASONS = new Set(["secret_binding_missing", "codex_credentials_missing"]);
+const INTERRUPT_SOURCES = new Set(["issue_comment_interrupt"]);
 const WORKSPACE_CLEANLINESS = new Set(["clean", "dirty", "unknown"]);
 const WORKSPACE_ANCESTRY_VERDICTS = new Set(["diverged", "ancestor", "descendant", "same", "unknown"]);
 const WATCHDOG_CLEANUP_OUTCOMES = new Set([
@@ -109,6 +112,10 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function positivePid(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 function allowedCode(value: unknown, allowed: Set<string>): string | null {
   return typeof value === "string" && allowed.has(value) ? value : null;
 }
@@ -123,6 +130,11 @@ function safeWorkspaceValidation(value: unknown): Record<string, unknown> | null
     const id = source[key];
     if (typeof id === "string" && UUID_RE.test(id)) safe[key] = id;
   }
+  const projectWorkspaceId = source.issueProjectWorkspaceId;
+  if (typeof projectWorkspaceId === "string" && UUID_RE.test(projectWorkspaceId)) {
+    safe.issueProjectWorkspaceId = projectWorkspaceId;
+  }
+  if (source.issueProjectId === null) safe.issueProjectId = null;
   const fingerprint = source.fingerprint;
   if (typeof fingerprint === "string" && /^workspace_incoherence:v1:sha256:[a-f0-9]{64}$/.test(fingerprint)) {
     safe.fingerprint = fingerprint;
@@ -245,6 +257,39 @@ export function projectSafeResultJson(value: unknown): Record<string, unknown> |
     } else if (key === "workspaceValidation") {
       const validation = safeWorkspaceValidation(entry);
       if (validation) safe[key] = validation;
+    } else if (key === "configurationIncomplete") {
+      const configuration = record(entry);
+      if (!configuration) continue;
+      const reason = allowedCode(configuration.reason, CONFIGURATION_INCOMPLETE_REASONS);
+      if (reason) {
+        safe[key] = {
+          reason,
+          missingBindingCount: Array.isArray(configuration.missingBindings)
+            ? configuration.missingBindings.length : 0,
+        };
+      }
+    } else if (key === "hotRestart") {
+      const adoption = record(entry);
+      if (adoption?.adopted !== true || typeof adoption.adoptedAt !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(adoption.adoptedAt)) continue;
+      const adoptedAt = new Date(adoption.adoptedAt);
+      if (Number.isNaN(adoptedAt.getTime())) continue;
+      const safeAdoption: Record<string, unknown> = { adopted: true, adoptedAt: adoptedAt.toISOString() };
+      for (const pidKey of ["previousServerPid", "newServerPid", "processPid", "processGroupId"] as const) {
+        if (adoption[pidKey] === null) safeAdoption[pidKey] = null;
+        else {
+          const pid = positivePid(adoption[pidKey]);
+          if (pid !== null) safeAdoption[pidKey] = pid;
+        }
+      }
+      safe[key] = safeAdoption;
+    } else if (key === "operatorInterrupted" && entry === true) {
+      safe[key] = true;
+    } else if (key === "interruptionSource") {
+      const source = allowedCode(entry, INTERRUPT_SOURCES);
+      if (source) safe[key] = source;
+    } else if (key === "interruptedIssueId" && typeof entry === "string" && UUID_RE.test(entry)) {
+      safe[key] = entry;
     } else if (key === "sourceResolvedWatchdogFold") {
       const fold = record(entry);
       if (!fold) continue;
@@ -278,7 +323,21 @@ export function projectSafeResultJson(value: unknown): Record<string, unknown> |
       }
       if (Object.keys(safeFold).length) safe[key] = safeFold;
     } else if (key === "unmanagedBackgroundTask" && record(entry)?.stopped === true) {
-      safe[key] = { stopped: true, stopReason: "unmanaged_background_task_stopped" };
+      const task = record(entry)!;
+      const safeTask: Record<string, unknown> = {
+        stopped: true,
+        stopReason: "unmanaged_background_task_stopped",
+      };
+      if (task.kind === "orphaned_process_group_cleanup") safeTask.kind = task.kind;
+      if (task.reason === "unmanaged background task stopped; no durable live path") safeTask.reason = task.reason;
+      for (const pidKey of ["processPid", "processGroupId"] as const) {
+        if (task[pidKey] === null) safeTask[pidKey] = null;
+        else {
+          const pid = positivePid(task[pidKey]);
+          if (pid !== null) safeTask[pidKey] = pid;
+        }
+      }
+      safe[key] = safeTask;
     }
   }
   if (Object.keys(safe).length === 0) safe.outputOmitted = true;
@@ -304,6 +363,8 @@ export function projectSafeRunEvent(input: {
       ? "run terminalized by recovery backstop: issue reached a terminal status"
     : rawMessage.startsWith("run terminalized by recovery backstop: process and sandbox gone")
       ? "run terminalized by recovery backstop: process and sandbox gone"
+    : rawMessage === "run interrupted by board comment" && eventType === "lifecycle"
+      ? rawMessage
     : rawMessage.includes("no longer in_progress")
       ? "Run cancelled because issue is no longer in_progress"
     : eventType === "adapter.invoke"
@@ -337,6 +398,12 @@ export function projectSafeRunEvent(input: {
     }
     const usage = projectSafeUsageJson(payload.usage);
     if (usage) safePayload.usage = usage;
+    if (rawMessage === "run interrupted by board comment" && eventType === "lifecycle") {
+      const issueId = payload.issueId;
+      if (typeof issueId === "string" && UUID_RE.test(issueId)) safePayload.issueId = issueId;
+      const source = allowedCode(payload.source, INTERRUPT_SOURCES);
+      if (source) safePayload.source = source;
+    }
   }
   return {
     eventType,

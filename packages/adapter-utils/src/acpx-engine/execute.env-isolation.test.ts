@@ -39,6 +39,17 @@ function serverOnlyEnv(): Record<string, string> {
     PAPERCLIP_SECRETS_MASTER_KEY: `sentinel-master-key-${randomUUID()}`,
     PAPERCLIP_SECRETS_MASTER_KEY_FILE: `/sentinel/master-key-${randomUUID()}`,
     PAPERCLIP_HEARTBEAT_GLOBAL_CONCURRENCY_LIMIT: `sentinel-server-config-${randomUUID()}`,
+    AWS_ACCESS_KEY_ID: `sentinel-server-access-key-${randomUUID()}`,
+    AWS_SECRET_ACCESS_KEY: `sentinel-server-secret-key-${randomUUID()}`,
+    AWS_SESSION_TOKEN: `sentinel-server-session-${randomUUID()}`,
+    AWS_PROFILE: `sentinel-server-profile-${randomUUID()}`,
+    AWS_SHARED_CREDENTIALS_FILE: `/sentinel/server-credentials-${randomUUID()}`,
+    AWS_CONFIG_FILE: `/sentinel/server-aws-config-${randomUUID()}`,
+    AWS_BEARER_TOKEN_BEDROCK: `sentinel-server-bedrock-token-${randomUUID()}`,
+    AWS_REGION: `sentinel-server-region-${randomUUID()}`,
+    AWS_DEFAULT_REGION: `sentinel-server-default-region-${randomUUID()}`,
+    CLAUDE_CODE_USE_BEDROCK: `sentinel-server-bedrock-flag-${randomUUID()}`,
+    ANTHROPIC_BEDROCK_BASE_URL: `https://bedrock-sentinel-${randomUUID()}.example`,
   };
 }
 
@@ -188,6 +199,17 @@ describe("ACPX agent launch environment", () => {
     LC_ALL: "C.UTF-8",
     https_proxy: "http://proxy.local:3128",
     ANTHROPIC_API_KEY: "anthropic-provider-key",
+    AWS_ACCESS_KEY_ID: "server-aws-access-key",
+    AWS_SECRET_ACCESS_KEY: "server-aws-secret-key",
+    AWS_SESSION_TOKEN: "server-aws-session-token",
+    AWS_PROFILE: "server-aws-profile",
+    AWS_SHARED_CREDENTIALS_FILE: "/server/.aws/credentials",
+    AWS_CONFIG_FILE: "/server/.aws/config",
+    AWS_BEARER_TOKEN_BEDROCK: "server-bedrock-token",
+    AWS_REGION: "us-east-1",
+    AWS_DEFAULT_REGION: "us-east-1",
+    CLAUDE_CODE_USE_BEDROCK: "1",
+    ANTHROPIC_BEDROCK_BASE_URL: "https://bedrock.server.example",
     OPENAI_API_KEY: "openai-provider-key",
     PAPERCLIP_AGENT_JWT_SECRET: "jwt-signing-secret",
     BETTER_AUTH_SECRET: "better-auth-secret",
@@ -233,6 +255,29 @@ describe("ACPX agent launch environment", () => {
       PAPERCLIP_API_KEY: "run-scoped-key",
       TOOL_TOKEN: "adapter-tool-token",
     });
+  });
+
+  it("accepts Bedrock settings only when supplied by the agent run", () => {
+    const launchEnv = buildAcpxLaunchEnvironment(
+      {
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        AWS_ACCESS_KEY_ID: "agent-aws-access-key",
+        AWS_SECRET_ACCESS_KEY: "agent-aws-secret-key",
+        AWS_REGION: "eu-west-1",
+      },
+      "claude",
+      hostEnv,
+    );
+    expect(launchEnv.AWS_ACCESS_KEY_ID).toBe("agent-aws-access-key");
+    expect(launchEnv.AWS_SECRET_ACCESS_KEY).toBe("agent-aws-secret-key");
+    expect(launchEnv.AWS_REGION).toBe("eu-west-1");
+    expect(launchEnv.CLAUDE_CODE_USE_BEDROCK).toBe("1");
+    expect(launchEnv.AWS_SESSION_TOKEN).toBeUndefined();
+    expect(launchEnv.AWS_PROFILE).toBeUndefined();
+    expect(launchEnv.AWS_SHARED_CREDENTIALS_FILE).toBeUndefined();
+    expect(launchEnv.AWS_CONFIG_FILE).toBeUndefined();
+    expect(launchEnv.AWS_BEARER_TOKEN_BEDROCK).toBeUndefined();
+    expect(launchEnv.ANTHROPIC_BEDROCK_BASE_URL).toBeUndefined();
   });
 
   it("gives the agent a default PATH when the host has none", () => {

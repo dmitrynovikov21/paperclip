@@ -135,7 +135,7 @@ Rough tiers, richest first:
 
 ### ACP terminal environment
 
-For these local ACP adapters, `terminal/create` receives the agent's projected host environment and explicit run/adapter environment. An ACP terminal request may override names already present in that environment; additional names are ignored. Control-plane signing credentials stay out of the terminal and its child processes. Configure variables needed by agent tools in adapter `env` (using secret references for sensitive values), rather than relying on the Paperclip server's environment. The selected ACP permission mode still controls whether a terminal command may run.
+For these local ACP adapters, `terminal/create` receives the agent's projected host environment and explicit run/adapter environment. An ACP terminal request may override names already present in that environment; additional names are ignored. Control-plane signing credentials stay out of the terminal and its child processes. Configure variables needed by agent tools in adapter `env` (using secret references for sensitive values), rather than relying on the Paperclip server's environment. Claude ACPX does not inherit the server's AWS credentials or Bedrock settings; Bedrock runs need those values in the agent's explicit environment. The selected ACP permission mode still controls whether a terminal command may run.
 
 ## UI Parser Contract
 

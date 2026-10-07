@@ -1379,10 +1379,9 @@ const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<stri
   claude: new Set([
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
-    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL",
-    "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
-    "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+    // Bedrock mode and its AWS credential chain must be supplied by this
+    // agent's run config, not inherited from the server's Secrets Manager.
+    "CLAUDE_CONFIG_DIR",
   ]),
   gemini: new Set([
     "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",

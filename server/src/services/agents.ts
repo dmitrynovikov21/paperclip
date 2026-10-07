@@ -129,6 +129,7 @@ interface UpdateAgentOptions {
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
+  cronServiceWatchdogRecovery?: boolean;
   claudeLogin?: ClaudeLoginContext;
 }
 
@@ -804,6 +805,12 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       }
       if (current.status === "pending_approval" && data.status && data.status !== "pending_approval" && data.status !== "terminated") {
         throw conflict("Pending approval agents cannot be activated directly");
+      }
+      // The scoped key guard reads before this transaction. A board or budget
+      // pause may win that race, so recheck the recovery origin under the lock.
+      if (options?.cronServiceWatchdogRecovery
+        && (data.status !== "idle" || !["error", "offline", "crashed"].includes(current.status))) {
+        throw conflict("Watchdog recovery requires an error, offline, or crashed agent");
       }
       const updated = await txDb
         .update(agents)

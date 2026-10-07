@@ -5748,6 +5748,10 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      cronServiceWatchdogRecovery: req.actor.type === "agent"
+        && req.actor.source === "agent_key"
+        && req.actor.keyScope?.kind === "cron_service"
+        && req.actor.keyScope.service === "agent_watchdog",
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

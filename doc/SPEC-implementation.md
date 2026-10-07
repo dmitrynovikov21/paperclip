@@ -523,6 +523,10 @@ Allowed transitions:
 - `paused -> idle`
 - `* -> terminated` (board only, irreversible)
 
+The scoped agent watchdog may set `idle` only from `error`, `offline`, or
+`crashed`. Check the current status in the write transaction. A board or budget
+pause that takes effect first must remain in force.
+
 ## 8.2 Issue Status
 
 Allowed transitions:

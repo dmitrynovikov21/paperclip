@@ -2466,11 +2466,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryOfRunId: runId,
     });
 
-    const blockedIssue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+    const blockedIssue = await waitForValue(
+      async () => db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
         const issue = rows[0] ?? null;
-        return issue?.status === "blocked" ? issue : null;
-      })
+        return issue?.status === "blocked" && issue.executionRunId === null && issue.checkoutRunId === null
+          ? issue : null;
+      }),
+      5_000,
     );
     expect(blockedIssue?.status).toBe("blocked");
     expect(blockedIssue?.executionRunId).toBeNull();
@@ -2618,7 +2620,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0]?.status).toBe("failed");
 
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    const issue = await waitForValue(
+      async () => db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row?.status === "in_progress" && row.executionRunId === null && row.checkoutRunId === null
+          ? row : null;
+      }),
+      5_000,
+    );
     expect(issue?.status).toBe("in_progress");
     expect(issue?.executionRunId).toBeNull();
     // Terminal run cleanup releases the checkout lock even when paused-tree recovery is suppressed.
@@ -3253,8 +3262,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issue = await waitForValue(async () =>
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
         const row = rows[0] ?? null;
-        return row?.status === "blocked" ? row : null;
+        return row?.status === "blocked" && row.executionRunId === null ? row : null;
       }),
+      5_000,
     );
     expect(issue?.executionRunId).toBeNull();
 

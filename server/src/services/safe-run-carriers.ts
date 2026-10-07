@@ -111,7 +111,6 @@ const SAFE_ERROR_MESSAGES = new Set([
   "Cancelled because the issue was reassigned before the scheduled retry became due",
   "Execution lock released after issue reassigned to a different agent",
 ]);
-const SESSION_ID_RE = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d{8}_\d{6}_[0-9a-fA-F]{6,16})$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const MONITOR_CLEAR_REASONS = new Set<string>([...ISSUE_EXECUTION_MONITOR_CLEAR_REASONS, "cleared"]);
 const INVOKABILITY_REASONS = new Set([
@@ -462,12 +461,11 @@ export function projectSafeLivenessReason(value: unknown): string | null {
   return "Run liveness classified";
 }
 
-export function projectSafeRunSessionId(value: unknown): string | null {
-  // Run rows and their API projections may contain only canonical, bounded
-  // session identifiers. Opaque provider state stays in the session store.
-  return typeof value === "string" && value.length <= 128 && SESSION_ID_RE.exec(value)?.[0] === value
-    ? value
-    : null;
+export function projectSafeRunSessionId(_value: unknown): null {
+  // Provider output can imitate any session ID format, including a UUID.
+  // Legacy run fields are never trusted; server-issued correlation IDs live
+  // in a separate run column and provider IDs stay in the session store.
+  return null;
 }
 
 export function projectSafeRunLogChunk(_chunk: string): string {
@@ -523,10 +521,6 @@ export function projectSafeResultJson(value: unknown): Record<string, unknown> |
     } else if (RETRY_TIMESTAMPS.has(key) && typeof entry === "string") {
       const parsed = new Date(entry);
       if (!Number.isNaN(parsed.getTime())) safe[key] = parsed.toISOString();
-    } else if (key === "sessionId" || key === "session_id") {
-      // Hermes uses this canonical ID for an explicit resume override.
-      const sessionId = projectSafeRunSessionId(entry);
-      if (sessionId) safe[key] = sessionId;
     } else if (key === "workspaceBusy") {
       const busy = record(entry);
       if (!busy) continue;

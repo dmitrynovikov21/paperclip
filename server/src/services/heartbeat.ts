@@ -3768,34 +3768,23 @@ export async function resolveLedgerScopeForRun(
 type ResumeSessionRow = {
   sessionParamsJson: Record<string, unknown> | null;
   sessionDisplayId: string | null;
+  sessionCorrelationId: string | null;
   lastRunId: string | null;
 };
 
 export function buildExplicitResumeSessionOverride(input: {
   adapterType?: string | null;
   resumeFromRunId: string;
-  resumeRunSessionIdBefore: string | null;
-  resumeRunSessionIdAfter: string | null;
-  resumeRunSessionParams?: Record<string, unknown> | null;
+  resumeRunSessionCorrelationId: string | null;
   taskSession: ResumeSessionRow | null;
   sessionCodec: AdapterSessionCodec;
 }) {
-  const resumeRunSessionIdAfter = truncateDisplayId(input.resumeRunSessionIdAfter);
-  const resumeRunSessionIdBefore = truncateDisplayId(input.resumeRunSessionIdBefore);
-  const desiredDisplayId = requiresCanonicalSessionIds(input.adapterType)
-    ? isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdAfter)
-      ? resumeRunSessionIdAfter
-      : isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdBefore)
-        ? resumeRunSessionIdBefore
-        : null
-    : resumeRunSessionIdAfter ?? resumeRunSessionIdBefore;
-  const runSessionParams = requiresCanonicalSessionIds(input.adapterType)
-    ? normalizeResumeParamsForAdapter(
-        input.adapterType,
-        input.sessionCodec.deserialize(input.resumeRunSessionParams ?? null),
-      )
-    : null;
-  const runSessionDisplayId = truncateDisplayId(readNonEmptyString(runSessionParams?.sessionId));
+  if (!input.taskSession || (
+    input.taskSession.lastRunId !== input.resumeFromRunId &&
+    (!input.resumeRunSessionCorrelationId ||
+      input.taskSession.sessionCorrelationId !== input.resumeRunSessionCorrelationId)
+  )) return null;
+
   const taskSessionParams = normalizeResumeParamsForAdapter(
     input.adapterType,
     input.sessionCodec.deserialize(input.taskSession?.sessionParamsJson ?? null),
@@ -3809,31 +3798,10 @@ export function buildExplicitResumeSessionOverride(input: {
         (input.sessionCodec.getDisplayId ? input.sessionCodec.getDisplayId(taskSessionParams) : null) ??
         readNonEmptyString(taskSessionParams?.sessionId),
   );
-  const canReuseTaskSessionParams =
-    input.taskSession != null &&
-    (!requiresCanonicalSessionIds(input.adapterType) || taskSessionParams != null) &&
-    (
-      input.taskSession.lastRunId === input.resumeFromRunId ||
-      (!!desiredDisplayId && taskSessionDisplayId === desiredDisplayId)
-    );
-  const sessionParams =
-    canReuseTaskSessionParams
-      ? taskSessionParams
-      : runSessionParams
-        ? runSessionParams
-        : desiredDisplayId
-          ? { sessionId: desiredDisplayId }
-          : null;
-  const sessionDisplayId = canReuseTaskSessionParams
-    ? taskSessionDisplayId
-    : runSessionParams
-      ? runSessionDisplayId
-      : desiredDisplayId;
-
-  if (!sessionDisplayId && !sessionParams) return null;
+  if (!taskSessionDisplayId && !taskSessionParams) return null;
   return {
-    sessionDisplayId,
-    sessionParams,
+    sessionDisplayId: taskSessionDisplayId,
+    sessionParams: taskSessionParams,
   };
 }
 
@@ -7402,12 +7370,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function getLatestRunForSession(
     agentId: string,
-    sessionId: string,
+    sessionCorrelationId: string,
     opts?: { excludeRunId?: string | null },
   ) {
     const conditions = [
       eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
+      eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId),
     ];
     if (opts?.excludeRunId) {
       conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
@@ -8155,14 +8123,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function getOldestRunForSession(agentId: string, sessionId: string) {
+  async function getOldestRunForSession(agentId: string, sessionCorrelationId: string) {
     return db
       .select({
         id: heartbeatRuns.id,
         createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId)))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
@@ -8171,15 +8139,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function resolveNormalizedUsageForSession(input: {
     agentId: string;
     runId: string;
-    sessionId: string | null;
+    sessionCorrelationId: string | null;
+    priorRunId: string | null;
     rawUsage: UsageTotals | null;
     usageBasis?: "per_run" | "session_cumulative" | null;
   }) {
-    const { agentId, runId, sessionId, rawUsage, usageBasis } = input;
+    const { agentId, runId, sessionCorrelationId, priorRunId, rawUsage, usageBasis } = input;
     // Adapters that declare per-run usage (e.g. the ACPX lane reports each
     // turn's tokens, not session totals) must not be session-delta'd, or
     // consecutive runs would be undercounted.
-    if (!sessionId || !rawUsage || usageBasis === "per_run") {
+    if ((!sessionCorrelationId && !priorRunId) || !rawUsage || usageBasis === "per_run") {
       return {
         normalizedUsage: rawUsage,
         previousRawUsage: null as UsageTotals | null,
@@ -8187,7 +8156,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const previousRun = await getLatestRunForSession(agentId, sessionId, { excludeRunId: runId });
+    const correlatedRun = sessionCorrelationId
+      ? await getLatestRunForSession(agentId, sessionCorrelationId, { excludeRunId: runId })
+      : null;
+    // The first run after migration has no correlation ID on older rows.
+    // lastRunId comes from the private session store, so this does not query
+    // or expose legacy provider IDs in central run fields.
+    const previousRun = correlatedRun ?? (priorRunId
+      ? await db.select({ id: heartbeatRuns.id, usageJson: heartbeatRuns.usageJson })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, priorRunId), eq(heartbeatRuns.agentId, agentId)))
+          .then((rows) => rows[0] ?? null)
+      : null);
     const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
     return {
       normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
@@ -8198,12 +8178,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function evaluateSessionCompaction(input: {
     agent: typeof agents.$inferSelect;
-    sessionId: string | null;
+    sessionCorrelationId: string | null;
     issueId: string | null;
     continuationSummaryBody?: string | null;
   }): Promise<SessionCompactionDecision> {
-    const { agent, sessionId, issueId } = input;
-    if (!sessionId) {
+    const { agent, sessionCorrelationId, issueId } = input;
+    if (!sessionCorrelationId) {
       return {
         rotate: false,
         reason: null,
@@ -8232,7 +8212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionIdAfter, sessionId)))
+      .where(and(eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.sessionCorrelationId, sessionCorrelationId)))
       .orderBy(desc(heartbeatRuns.createdAt))
       .limit(fetchLimit);
 
@@ -8248,7 +8228,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const latestRun = runs[0] ?? null;
     const oldestRun =
       policy.maxSessionAgeHours > 0
-        ? await getOldestRunForSession(agent.id, sessionId)
+        ? await getOldestRunForSession(agent.id, sessionCorrelationId)
         : runs[runs.length - 1] ?? latestRun;
     const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     const sessionAgeHours =
@@ -8300,7 +8280,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const handoffMarkdown = [
       "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
+      `- Previous session: ${sessionCorrelationId}`,
       issueId ? `- Issue: ${issueId}` : "",
       `- Rotation reason: ${reason}`,
       latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
@@ -8391,9 +8371,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .select({
         id: heartbeatRuns.id,
         contextSnapshot: heartbeatRuns.contextSnapshot,
-        resultJson: heartbeatRuns.resultJson,
-        sessionIdBefore: heartbeatRuns.sessionIdBefore,
-        sessionIdAfter: heartbeatRuns.sessionIdAfter,
+        sessionCorrelationId: heartbeatRuns.sessionCorrelationId,
       })
       .from(heartbeatRuns)
       .where(
@@ -8412,16 +8390,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, resumeTaskKey)
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
-    const resumeRunResult = parseObject(resumeRun.resultJson);
-    const resumeRunSessionId = requiresCanonicalSessionIds(agent.adapterType)
-      ? readNonEmptyString(resumeRunResult.sessionId) ?? readNonEmptyString(resumeRunResult.session_id)
-      : null;
     const sessionOverride = buildExplicitResumeSessionOverride({
       adapterType: agent.adapterType,
       resumeFromRunId,
-      resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
-      resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
-      resumeRunSessionParams: resumeRunSessionId ? { sessionId: resumeRunSessionId } : null,
+      resumeRunSessionCorrelationId: resumeRun.sessionCorrelationId,
       taskSession: resumeTaskSession,
       sessionCodec,
     });
@@ -8719,6 +8691,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     taskKey: string;
     sessionParamsJson: Record<string, unknown> | null;
     sessionDisplayId: string | null;
+    sessionCorrelationId: string | null;
     lastRunId: string | null;
     lastError: string | null;
   }) {
@@ -8734,6 +8707,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           sessionParamsJson: input.sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
+          sessionCorrelationId: input.sessionCorrelationId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
           updatedAt: new Date(),
@@ -8752,6 +8726,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         taskKey: input.taskKey,
         sessionParamsJson: input.sessionParamsJson,
         sessionDisplayId: input.sessionDisplayId,
+        sessionCorrelationId: input.sessionCorrelationId,
         lastRunId: input.lastRunId,
         lastError: input.lastError,
       })
@@ -13383,7 +13358,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
-    session: { legacySessionId: string | null },
+    session: { legacySessionId: string | null; sessionCorrelationId: string | null },
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
@@ -13410,6 +13385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         adapterType: agent.adapterType,
         sessionId: session.legacySessionId,
+        sessionCorrelationId: session.sessionCorrelationId,
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: result.errorMessage ?? null,
@@ -14312,6 +14288,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
+    const previousSessionCorrelationId = resetTaskSession || explicitResumeSession
+      ? null
+      : taskKey
+        ? taskSessionForRun?.sessionCorrelationId ?? null
+        : runtime.sessionCorrelationId;
     const previousSessionParams =
       explicitResumeSessionParams ??
       (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
@@ -14996,7 +14977,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const sessionCompaction = await evaluateSessionCompaction({
       agent,
-      sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
+      sessionCorrelationId: (previousSessionDisplayId ?? runtimeSessionIdForAdapter)
+        ? previousSessionCorrelationId
+        : null,
       issueId,
       continuationSummaryBody: continuationSummary?.body ?? null,
     });
@@ -15761,11 +15744,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         previousDisplayId: runtimeForAdapter.sessionDisplayId,
         previousLegacySessionId: runtimeForAdapter.sessionId,
       });
+      const nextProviderSessionId = nextSessionState.legacySessionId ?? nextSessionState.displayId;
+      const previousProviderSessionId = runtimeForAdapter.sessionId ?? runtimeForAdapter.sessionDisplayId;
+      const sessionCorrelationId = nextProviderSessionId
+        ? (!sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
+          ? previousSessionCorrelationId
+          : null) ?? randomUUID()
+        : null;
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
         runId: run.id,
-        sessionId: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionCorrelationId,
+        priorRunId: !sessionCompaction.rotate && previousProviderSessionId === nextProviderSessionId
+          ? taskKey
+            ? taskSessionForRun?.lastRunId ?? null
+            : runtime.lastRunId
+          : null,
         rawUsage,
         usageBasis: adapterResult.usageBasis ?? null,
       });
@@ -15876,7 +15871,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         signal: adapterResult.signal,
         usageJson,
         resultJson: persistedResultJson,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionCorrelationId,
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,
@@ -16024,6 +16019,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
+          sessionCorrelationId,
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
@@ -16043,6 +16039,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 sessionConfigMetadata,
               ),
               sessionDisplayId: nextSessionState.displayId,
+              sessionCorrelationId,
               lastRunId: finalizedRun.id,
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
             });
@@ -16163,6 +16160,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           errorMessage: message,
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
+          sessionCorrelationId: runtimeForAdapter.sessionId || runtimeForAdapter.sessionDisplayId
+            ? previousSessionCorrelationId
+            : null,
         });
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
@@ -16177,6 +16177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sessionConfigMetadata,
             ),
             sessionDisplayId: previousSessionDisplayId,
+            sessionCorrelationId: previousSessionCorrelationId,
             lastRunId: failedRun.id,
             lastError: message,
           });

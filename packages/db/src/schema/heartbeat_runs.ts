@@ -24,6 +24,7 @@ export const heartbeatRuns = pgTable(
     resultJson: jsonb("result_json").$type<Record<string, unknown>>(),
     sessionIdBefore: text("session_id_before"),
     sessionIdAfter: text("session_id_after"),
+    sessionCorrelationId: uuid("session_correlation_id"),
     logStore: text("log_store"),
     logRef: text("log_ref"),
     logBytes: bigint("log_bytes", { mode: "number" }),
@@ -64,6 +65,11 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.agentId,
       table.startedAt,
+    ),
+    agentSessionCorrelationIdx: index("heartbeat_runs_agent_session_correlation_idx").on(
+      table.agentId,
+      table.sessionCorrelationId,
+      table.createdAt,
     ),
     companyResponsibleUserIdx: index("heartbeat_runs_company_responsible_user_idx").on(
       table.companyId,

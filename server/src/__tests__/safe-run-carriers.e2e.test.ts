@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,8 +7,9 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues, workspaceRuntimeServices,
+  agentTaskSessions, agentWakeupRequests, agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues, workspaceRuntimeServices,
 } from "@paperclipai/db";
+import { sessionCodec as piSessionCodec } from "@paperclipai/adapter-pi-local/server";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { errorHandler } from "../middleware/index.ts";
 import { agentRoutes } from "../routes/agents.ts";
@@ -37,8 +38,9 @@ describeDb("safe central run carriers and feedback export", () => {
   let previousLogPath: string | undefined;
   let previousSecretKeyFile: string | undefined;
   let db: ReturnType<typeof createDb>;
-  const promptMarker = `prompt-${randomUUID()}`;
-  const toolMarker = `tool-${randomUUID()}`;
+  // Hex-only markers also fit a real Hermes-style session ID suffix.
+  const promptMarker = randomBytes(8).toString("hex");
+  const toolMarker = randomBytes(8).toString("hex");
   const dirtySources: string[] = [];
   const runtimeServiceId = randomUUID();
   let failWithMarkers = false;
@@ -59,12 +61,12 @@ describeDb("safe central run carriers and feedback export", () => {
       type: ADAPTER_TYPE,
       execute: async (ctx) => {
         if (failWithMarkers) throw new Error(`Adapter failure: ${promptMarker} ${toolMarker}`);
-        dirtySources.push(promptMarker, toolMarker);
+        dirtySources.push(promptMarker, toolMarker, returnedSessionId ?? "", returnedSessionDisplayId ?? "");
         await ctx.onMeta({ adapterType: ADAPTER_TYPE, command: "probe", prompt: promptMarker });
         await ctx.onRuntimeProgress?.({ phase: "adapter_startup", message: promptMarker, lastAssistantSnippet: toolMarker });
-        await ctx.onEvent({ eventType: "tool.output", message: toolMarker, payload: { output: toolMarker } });
-        await ctx.onLog("stdout", `${promptMarker}\n`);
-        await ctx.onLog("stderr", `${toolMarker}\n`);
+        await ctx.onEvent({ eventType: "tool.output", message: toolMarker, payload: { output: returnedSessionId ?? toolMarker } });
+        await ctx.onLog("stdout", `${promptMarker} ${returnedSessionId ?? ""}\n`);
+        await ctx.onLog("stderr", `${toolMarker} ${returnedSessionDisplayId ?? ""}\n`);
         await onAdapterExecute?.(ctx.runId);
         return {
           exitCode: 0,
@@ -75,7 +77,10 @@ describeDb("safe central run carriers and feedback export", () => {
           ...(returnedSessionId ? { sessionId: returnedSessionId } : {}),
           ...(returnedSessionDisplayId ? { sessionDisplayId: returnedSessionDisplayId } : {}),
           summary: toolMarker,
-          resultJson: { summary: promptMarker, stdout: toolMarker, costUsd: 0.025 },
+          resultJson: {
+            summary: promptMarker, stdout: toolMarker, costUsd: 0.025,
+            sessionId: returnedSessionId, session_id: returnedSessionDisplayId,
+          },
           runtimeServices: reportRuntimeService ? [{ id: runtimeServiceId, serviceName: "synthetic-preview", status: "stopped" }] : undefined,
         };
       },
@@ -95,6 +100,8 @@ describeDb("safe central run carriers and feedback export", () => {
   });
 
   it("drops two unknown markers on write and legacy read while preserving status, usage and exit", async () => {
+    returnedSessionId = `20261007_123456_${promptMarker}`;
+    returnedSessionDisplayId = `20261007_123456_${toolMarker}`;
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -198,6 +205,8 @@ describeDb("safe central run carriers and feedback export", () => {
       nextAction: toolMarker,
       livenessReason: promptMarker,
       resultJson: { summary: promptMarker, stdout: toolMarker, inputTokens: 17 },
+      sessionIdBefore: returnedSessionId,
+      sessionIdAfter: returnedSessionDisplayId,
     }).where(eq(heartbeatRuns.id, run!.id));
     await db.update(heartbeatRunEvents).set({ message: toolMarker, stream: promptMarker, level: toolMarker, payload: { output: promptMarker } })
       .where(eq(heartbeatRunEvents.runId, run!.id));
@@ -245,6 +254,8 @@ describeDb("safe central run carriers and feedback export", () => {
     for (const marker of [promptMarker, toolMarker]) {
       expect(markerCount({ safeRead, runApi: runResponse.body, safeEvents, safeLog, traces, bundle, upload: uploadTraceBundle.mock.calls[0]?.[0] }, marker)).toBe(0);
     }
+    returnedSessionId = null;
+    returnedSessionDisplayId = null;
   }, 60_000);
 
   it("omits arbitrary provider session IDs on write and hides legacy IDs in run APIs", async () => {
@@ -281,6 +292,7 @@ describeDb("safe central run carriers and feedback export", () => {
       const [firstStored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
       expect(firstStored?.status).toBe("succeeded");
       expect(firstStored?.sessionIdAfter).toBeNull();
+      expect(firstStored?.sessionCorrelationId).toMatch(/^[0-9a-f-]{36}$/);
       for (const marker of [promptMarker, toolMarker]) expect(markerCount(firstStored, marker)).toBe(0);
 
       returnedSessionId = canonicalSessionId;
@@ -291,19 +303,23 @@ describeDb("safe central run carriers and feedback export", () => {
       const [secondStored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second!.id));
       expect(secondStored?.status).toBe("succeeded");
       expect(secondStored?.sessionIdBefore).toBeNull();
-      expect(secondStored?.sessionIdAfter).toBe(canonicalSessionId);
+      expect(secondStored?.sessionIdAfter).toBeNull();
+      expect(secondStored?.sessionCorrelationId).not.toBe(firstStored?.sessionCorrelationId);
       for (const marker of [promptMarker, toolMarker]) expect(markerCount(secondStored, marker)).toBe(0);
 
       // Simulate pre-fix rows without altering the provider's private state.
       await db.update(heartbeatRuns).set({
         sessionIdBefore: `20261007_123456_${promptMarker}`,
         sessionIdAfter: `20261007_123456_${toolMarker}`,
+        resultJson: { sessionId: `20261007_123456_${promptMarker}`, session_id: canonicalSessionId },
       })
         .where(eq(heartbeatRuns.id, first!.id));
       const legacy = await heartbeat.getRun(first!.id);
       expect(legacy?.sessionIdBefore).toContain(promptMarker); // Positive dirty-source control.
       expect(projectSafeRunRow(legacy!).sessionIdBefore).toBeNull();
       expect(projectSafeRunRow(legacy!).sessionIdAfter).toBeNull();
+      expect(projectSafeRunRow(legacy!).resultJson).not.toHaveProperty("sessionId");
+      expect(projectSafeRunRow(legacy!).resultJson).not.toHaveProperty("session_id");
 
       const app = express();
       app.use((req, _res, next) => {
@@ -323,7 +339,7 @@ describeDb("safe central run carriers and feedback export", () => {
       expect(detail.body).toMatchObject({ sessionIdBefore: null, sessionIdAfter: null });
       expect(list.body).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: first!.id, sessionIdBefore: null, sessionIdAfter: null }),
-        expect.objectContaining({ id: second!.id, sessionIdAfter: canonicalSessionId }),
+        expect.objectContaining({ id: second!.id, sessionIdAfter: null }),
       ]));
       for (const marker of [promptMarker, toolMarker]) {
         expect(markerCount({ detail: detail.body, list: list.body }, marker)).toBe(0);
@@ -331,6 +347,155 @@ describeDb("safe central run carriers and feedback export", () => {
     } finally {
       returnedSessionId = null;
       returnedSessionDisplayId = null;
+    }
+  }, 60_000);
+
+  it("rotates a Pi path session on the second run using only a server correlation ID", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const taskKey = randomUUID();
+    const resumedIds: Array<string | null> = [];
+    const providerPaths: string[] = [];
+    registerServerAdapter({
+      type: "pi_local",
+      sessionCodec: piSessionCodec,
+      execute: async (ctx) => {
+        resumedIds.push(ctx.runtime.sessionId);
+        const sessionPath = join(logDir, `pi-session-${resumedIds.length}.jsonl`);
+        providerPaths.push(sessionPath);
+        await ctx.onLog("stdout", sessionPath);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          sessionId: sessionPath,
+          sessionDisplayId: sessionPath,
+          sessionParams: { sessionId: sessionPath, cwd: logDir },
+          usage: { inputTokens: 17, outputTokens: 9 },
+          usageBasis: "session_cumulative",
+          resultJson: { sessionId: sessionPath },
+        };
+      },
+      testEnvironment: async () => ({ adapterType: "pi_local", status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Pi rotation test",
+        issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Pi rotation probe",
+        role: "engineer",
+        status: "idle",
+        adapterType: "pi_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: {
+          wakeOnDemand: true,
+          sessionCompaction: { enabled: true, maxSessionRuns: 0, maxRawInputTokens: 1, maxSessionAgeHours: 0 },
+        } },
+        permissions: {},
+      });
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.invoke(agentId, "on_demand", { taskKey }, "manual");
+      expect(first).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [firstRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+      const [firstSession] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId));
+      expect(firstRun?.status).toBe("succeeded");
+      expect(firstRun?.sessionIdAfter).toBeNull();
+      expect(firstRun?.sessionCorrelationId).toBe(firstSession?.sessionCorrelationId);
+      expect(firstSession?.sessionParamsJson?.sessionId).toBe(providerPaths[0]); // Positive private-source control.
+      expect(markerCount(firstRun, providerPaths[0]!)).toBe(0);
+
+      const second = await heartbeat.invoke(agentId, "on_demand", { taskKey }, "manual");
+      expect(second).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [secondRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second!.id));
+      expect(secondRun?.status).toBe("succeeded");
+      expect(resumedIds).toEqual([null, null]);
+      expect(secondRun?.sessionCorrelationId).not.toBe(firstRun?.sessionCorrelationId);
+      expect(secondRun?.usageJson).toMatchObject({ inputTokens: 17, sessionRotated: true });
+      expect(markerCount({ firstRun, secondRun }, providerPaths[0]!)).toBe(0);
+      expect(markerCount({ firstRun, secondRun }, providerPaths[1]!)).toBe(0);
+    } finally {
+      unregisterServerAdapter("pi_local");
+    }
+  }, 60_000);
+
+  it("uses the private lastRunId for cumulative usage when a legacy session has no correlation ID", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const taskKey = randomUUID();
+    const sessionPath = join(logDir, "pi-legacy-session.jsonl");
+    const resumedIds: Array<string | null> = [];
+    registerServerAdapter({
+      type: "pi_local",
+      sessionCodec: piSessionCodec,
+      execute: async (ctx) => {
+        resumedIds.push(ctx.runtime.sessionId);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          sessionId: sessionPath,
+          sessionDisplayId: sessionPath,
+          sessionParams: { sessionId: sessionPath, cwd: logDir },
+          usage: { inputTokens: resumedIds.length * 17, outputTokens: resumedIds.length * 9 },
+          usageBasis: "session_cumulative",
+        };
+      },
+      testEnvironment: async () => ({ adapterType: "pi_local", status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Pi legacy usage test",
+        issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Pi legacy usage probe",
+        role: "engineer",
+        status: "idle",
+        adapterType: "pi_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true,
+          sessionCompaction: { enabled: true, maxSessionRuns: 0, maxRawInputTokens: 0, maxSessionAgeHours: 0 },
+        } },
+        permissions: {},
+      });
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.invoke(agentId, "on_demand", { taskKey }, "manual");
+      expect(first).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      await db.update(heartbeatRuns).set({
+        sessionCorrelationId: null,
+        sessionIdAfter: sessionPath,
+      }).where(eq(heartbeatRuns.id, first!.id));
+      await db.update(agentTaskSessions).set({ sessionCorrelationId: null })
+        .where(eq(agentTaskSessions.agentId, agentId));
+      const [legacy] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+      expect(legacy?.sessionIdAfter).toBe(sessionPath); // Positive dirty-source control.
+      expect(projectSafeRunRow(legacy!).sessionIdAfter).toBeNull();
+
+      const second = await heartbeat.invoke(agentId, "on_demand", { taskKey }, "manual");
+      expect(second).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [secondRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second!.id));
+      expect(resumedIds).toEqual([null, sessionPath]);
+      expect(secondRun?.sessionCorrelationId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(secondRun?.usageJson).toMatchObject({ inputTokens: 17, rawInputTokens: 34 });
+      expect(markerCount(secondRun, sessionPath)).toBe(0);
+    } finally {
+      unregisterServerAdapter("pi_local");
     }
   }, 60_000);
 

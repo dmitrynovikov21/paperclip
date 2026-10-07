@@ -168,6 +168,7 @@ const CONTEXT_CODES: Record<string, Set<string>> = {
   currentStageType: new Set(["review", "approval"]),
   livenessContinuationState: new Set([
     "completed", "advanced", "plan_only", "empty_response", "blocked", "failed", "needs_followup",
+    "quarantined_low_trust_handoff",
   ]),
   handoffReason: new Set(["successful_run_missing_state"]),
   missingDisposition: new Set(["clear_next_step"]),
@@ -391,6 +392,12 @@ export function projectSafeRunContextSnapshot(value: unknown): Record<string, un
   }
   if (source.livenessContinuationReason != null) {
     safe.livenessContinuationReason = projectSafeLivenessReason(source.livenessContinuationReason);
+  }
+  if (source.livenessContinuationState === "quarantined_low_trust_handoff") {
+    // This instruction is generated from a known state; never copy a supplied
+    // continuation instruction or reason into the persistent run snapshot.
+    safe.livenessContinuationReason = "Low-trust review output requires sanitized follow-up.";
+    safe.livenessContinuationInstruction = "Continue from the sanitized quarantine stub only.";
   }
   const wakeCommentIds = source.wakeCommentIds;
   if (Array.isArray(wakeCommentIds)) {

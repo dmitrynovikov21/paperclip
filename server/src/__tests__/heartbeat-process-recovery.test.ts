@@ -3141,6 +3141,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
+    await heartbeat.drainActiveRunExecutions();
 
     expect(mockAdapterExecute).not.toHaveBeenCalled();
 
@@ -3163,12 +3164,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
 
-    const issue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+    const issue = await waitForValue(
+      async () => db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
         const row = rows[0] ?? null;
-        return row?.status === "blocked" ? row : null;
+        return row?.status === "blocked" && row.executionRunId === null ? row : null;
       }),
+      5_000,
     );
+    expect(issue?.status).toBe("blocked");
     expect(issue?.executionRunId).toBeNull();
 
     const recoveryAction = await db

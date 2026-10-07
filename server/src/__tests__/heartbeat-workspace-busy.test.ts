@@ -467,9 +467,10 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
     expect(finishedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
     expect(executedRunIds).toContain(run!.id);
-    expect((finishedRun?.contextSnapshot as Record<string, unknown>)?.paperclipTaskMarkdown).toContain(
+    expect(executedInputs.get(run!.id)?.context.paperclipTaskMarkdown).toContain(
       `shared workspace is concurrently held by run ${fixture.holderRunId}`,
     );
+    expect(finishedRun?.contextSnapshot).not.toHaveProperty("paperclipTaskMarkdown");
     const retryRuns = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)

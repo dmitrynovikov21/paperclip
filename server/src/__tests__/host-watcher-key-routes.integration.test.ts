@@ -193,6 +193,16 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
       .set("Authorization", auth("watchdog")).send({ status: "terminated" })).status).toBe(403);
   });
 
+  it.each(["offline", "crashed"] as const)("recovers a %s agent through the watchdog route", async (status) => {
+    await db.update(agents).set({ status }).where(eq(agents.id, watchdogRecoverAgentId));
+    const recovered = await request(app).patch(`/api/agents/${watchdogRecoverAgentId}`)
+      .set("Authorization", auth("watchdog")).send({ status: "idle" });
+    expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    const [current] = await db.select({ status: agents.status }).from(agents)
+      .where(eq(agents.id, watchdogRecoverAgentId));
+    expect(current?.status).toBe("idle");
+  });
+
   it.each(["manual", "budget"] as const)("preserves a %s pause made after the watchdog scope guard", async (reason) => {
     const path = `/api/agents/${watchdogRecoverAgentId}`;
     await db.update(agents).set({ status: "error", pauseReason: null, pausedAt: null })

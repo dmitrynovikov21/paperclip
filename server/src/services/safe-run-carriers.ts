@@ -111,7 +111,7 @@ const SAFE_ERROR_MESSAGES = new Set([
   "Cancelled because the issue was reassigned before the scheduled retry became due",
   "Execution lock released after issue reassigned to a different agent",
 ]);
-const SESSION_ID_RE = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d{8}_\d{6}_[A-Za-z0-9_-]{4,})$/;
+const SESSION_ID_RE = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d{8}_\d{6}_[0-9a-fA-F]{6,16})$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const MONITOR_CLEAR_REASONS = new Set<string>([...ISSUE_EXECUTION_MONITOR_CLEAR_REASONS, "cleared"]);
 const INVOKABILITY_REASONS = new Set([
@@ -462,6 +462,14 @@ export function projectSafeLivenessReason(value: unknown): string | null {
   return "Run liveness classified";
 }
 
+export function projectSafeRunSessionId(value: unknown): string | null {
+  // Run rows and their API projections may contain only canonical, bounded
+  // session identifiers. Opaque provider state stays in the session store.
+  return typeof value === "string" && value.length <= 128 && SESSION_ID_RE.exec(value)?.[0] === value
+    ? value
+    : null;
+}
+
 export function projectSafeRunLogChunk(_chunk: string): string {
   return `${OMITTED_RUN_CONTENT}\n`;
 }
@@ -515,10 +523,10 @@ export function projectSafeResultJson(value: unknown): Record<string, unknown> |
     } else if (RETRY_TIMESTAMPS.has(key) && typeof entry === "string") {
       const parsed = new Date(entry);
       if (!Number.isNaN(parsed.getTime())) safe[key] = parsed.toISOString();
-    } else if ((key === "sessionId" || key === "session_id") &&
-      typeof entry === "string" && entry.length <= 128 && SESSION_ID_RE.test(entry)) {
+    } else if (key === "sessionId" || key === "session_id") {
       // Hermes uses this canonical ID for an explicit resume override.
-      safe[key] = entry;
+      const sessionId = projectSafeRunSessionId(entry);
+      if (sessionId) safe[key] = sessionId;
     } else if (key === "workspaceBusy") {
       const busy = record(entry);
       if (!busy) continue;
@@ -691,6 +699,8 @@ export function projectSafeRunEvent(input: {
 }
 
 export function projectSafeRunPatch<T extends {
+  sessionIdBefore?: string | null;
+  sessionIdAfter?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
   error?: string | null;
   errorCode?: string | null;
@@ -703,6 +713,8 @@ export function projectSafeRunPatch<T extends {
   signal?: string | null;
 }>(patch: T): T {
   const safe = { ...patch };
+  if ("sessionIdBefore" in safe) safe.sessionIdBefore = projectSafeRunSessionId(safe.sessionIdBefore);
+  if ("sessionIdAfter" in safe) safe.sessionIdAfter = projectSafeRunSessionId(safe.sessionIdAfter);
   if ("contextSnapshot" in safe) safe.contextSnapshot = projectSafeRunContextSnapshot(safe.contextSnapshot);
   if ("error" in safe) safe.error = projectSafeError(safe.error);
   if ("errorCode" in safe) safe.errorCode = projectSafeErrorCode(safe.errorCode);
@@ -717,6 +729,8 @@ export function projectSafeRunPatch<T extends {
 }
 
 export function projectSafeRunRow<T extends {
+  sessionIdBefore?: string | null;
+  sessionIdAfter?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
   error?: string | null;
   errorCode?: string | null;
@@ -729,6 +743,8 @@ export function projectSafeRunRow<T extends {
   signal?: string | null;
 }>(row: T): T {
   const safe = { ...row };
+  if ("sessionIdBefore" in safe) safe.sessionIdBefore = projectSafeRunSessionId(safe.sessionIdBefore);
+  if ("sessionIdAfter" in safe) safe.sessionIdAfter = projectSafeRunSessionId(safe.sessionIdAfter);
   if ("contextSnapshot" in safe) {
     const context = projectSafeRunContextSnapshot(safe.contextSnapshot);
     delete context.paperclipSecrets;

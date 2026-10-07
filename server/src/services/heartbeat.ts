@@ -119,6 +119,7 @@ import {
   projectSafeRunLogChunk,
   projectSafeRunPatch,
   projectSafeRunRow,
+  projectSafeRunSessionId,
   projectSafeUsageJson,
 } from "./safe-run-carriers.js";
 import {
@@ -9875,7 +9876,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           issueCommentStatus: "not_applicable",
           updatedAt: now,
@@ -10125,7 +10126,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
           updatedAt: now,
@@ -11492,7 +11493,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           retryOfRunId: run.id,
           scheduledRetryAt: schedule.dueAt,
           scheduledRetryAttempt: schedule.attempt,
@@ -15097,7 +15098,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           startedAt,
-          sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
+          sessionIdBefore: projectSafeRunSessionId(runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId),
           contextSnapshot: safeRunContextSnapshotUpdate(context),
           updatedAt: new Date(),
         })
@@ -16750,7 +16751,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             wakeupRequestId: deferred.id,
             contextSnapshot: projectSafeRunContextSnapshot(promotedContextSnapshot),
             responsibleUserId: promotedResponsibleUserId,
-            sessionIdBefore: sessionBefore,
+            sessionIdBefore: projectSafeRunSessionId(sessionBefore),
             continuationAttempt: promotedContinuationAttempt,
           })
           .returning()
@@ -16914,7 +16915,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               reviewRecoveryInstruction:
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
             }, "normal_model")),
-            sessionIdBefore: recoverySessionBefore,
+            sessionIdBefore: projectSafeRunSessionId(recoverySessionBefore),
             retryOfRunId: run.id,
             updatedAt: now,
           })
@@ -17069,7 +17070,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: projectSafeRunContextSnapshot(recoveryContextSnapshot),
           responsibleUserId,
-          sessionIdBefore: recoverySessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(recoverySessionBefore),
           retryOfRunId: run.id,
           updatedAt: now,
         })
@@ -18185,7 +18186,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             responsibleUserId: await resolveQueuedResponsibleUserId(),
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
-            sessionIdBefore: sessionBefore,
+            sessionIdBefore: projectSafeRunSessionId(sessionBefore),
             continuationAttempt,
           })
           .returning()
@@ -18359,7 +18360,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: projectSafeRunSessionId(sessionBefore),
           continuationAttempt,
         })
         .returning()

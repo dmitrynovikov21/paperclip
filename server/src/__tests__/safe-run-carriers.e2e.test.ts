@@ -42,6 +42,8 @@ describeDb("safe central run carriers and feedback export", () => {
   const dirtySources: string[] = [];
   const runtimeServiceId = randomUUID();
   let failWithMarkers = false;
+  let returnedSessionId: string | null = null;
+  let returnedSessionDisplayId: string | null = null;
   let onAdapterExecute: ((runId: string) => Promise<void>) | null = null;
   let reportRuntimeService = false;
 
@@ -70,6 +72,8 @@ describeDb("safe central run carriers and feedback export", () => {
           timedOut: false,
           usage: { inputTokens: 17, outputTokens: 9 },
           usageBasis: "per_run",
+          ...(returnedSessionId ? { sessionId: returnedSessionId } : {}),
+          ...(returnedSessionDisplayId ? { sessionDisplayId: returnedSessionDisplayId } : {}),
           summary: toolMarker,
           resultJson: { summary: promptMarker, stdout: toolMarker, costUsd: 0.025 },
           runtimeServices: reportRuntimeService ? [{ id: runtimeServiceId, serviceName: "synthetic-preview", status: "stopped" }] : undefined,
@@ -240,6 +244,93 @@ describeDb("safe central run carriers and feedback export", () => {
     expect(safeRead.usageJson).toMatchObject({ inputTokens: 17, outputTokens: 9 });
     for (const marker of [promptMarker, toolMarker]) {
       expect(markerCount({ safeRead, runApi: runResponse.body, safeEvents, safeLog, traces, bundle, upload: uploadTraceBundle.mock.calls[0]?.[0] }, marker)).toBe(0);
+    }
+  }, 60_000);
+
+  it("omits arbitrary provider session IDs on write and hides legacy IDs in run APIs", async () => {
+    failWithMarkers = false;
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const canonicalSessionId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Safe session ID test",
+      issuePrefix: `I${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Session ID probe",
+      role: "engineer",
+      status: "idle",
+      adapterType: ADAPTER_TYPE,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    try {
+      returnedSessionId = `20261007_123456_${promptMarker}`;
+      returnedSessionDisplayId = `20261007_123456_${toolMarker}`;
+      const first = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(first).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [firstStored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+      expect(firstStored?.status).toBe("succeeded");
+      expect(firstStored?.sessionIdAfter).toBeNull();
+      for (const marker of [promptMarker, toolMarker]) expect(markerCount(firstStored, marker)).toBe(0);
+
+      returnedSessionId = canonicalSessionId;
+      returnedSessionDisplayId = canonicalSessionId;
+      const second = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      expect(second).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [secondStored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second!.id));
+      expect(secondStored?.status).toBe("succeeded");
+      expect(secondStored?.sessionIdBefore).toBeNull();
+      expect(secondStored?.sessionIdAfter).toBe(canonicalSessionId);
+      for (const marker of [promptMarker, toolMarker]) expect(markerCount(secondStored, marker)).toBe(0);
+
+      // Simulate pre-fix rows without altering the provider's private state.
+      await db.update(heartbeatRuns).set({
+        sessionIdBefore: `20261007_123456_${promptMarker}`,
+        sessionIdAfter: `20261007_123456_${toolMarker}`,
+      })
+        .where(eq(heartbeatRuns.id, first!.id));
+      const legacy = await heartbeat.getRun(first!.id);
+      expect(legacy?.sessionIdBefore).toContain(promptMarker); // Positive dirty-source control.
+      expect(projectSafeRunRow(legacy!).sessionIdBefore).toBeNull();
+      expect(projectSafeRunRow(legacy!).sessionIdAfter).toBeNull();
+
+      const app = express();
+      app.use((req, _res, next) => {
+        req.actor = {
+          type: "board", userId: "test-board", companyIds: [companyId],
+          memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+          isInstanceAdmin: true, source: "local_implicit",
+        };
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      const detail = await request(app).get(`/api/heartbeat-runs/${first!.id}`);
+      const list = await request(app).get(`/api/companies/${companyId}/heartbeat-runs`);
+      expect(detail.status).toBe(200);
+      expect(list.status).toBe(200);
+      expect(detail.body).toMatchObject({ sessionIdBefore: null, sessionIdAfter: null });
+      expect(list.body).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: first!.id, sessionIdBefore: null, sessionIdAfter: null }),
+        expect.objectContaining({ id: second!.id, sessionIdAfter: canonicalSessionId }),
+      ]));
+      for (const marker of [promptMarker, toolMarker]) {
+        expect(markerCount({ detail: detail.body, list: list.body }, marker)).toBe(0);
+      }
+    } finally {
+      returnedSessionId = null;
+      returnedSessionDisplayId = null;
     }
   }, 60_000);
 

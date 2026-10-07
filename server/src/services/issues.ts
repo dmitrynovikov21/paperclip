@@ -1,3 +1,4 @@
+import { invalidateProviderStateInTx, providerStateBroker } from "./provider-state-broker.js";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
@@ -7713,6 +7714,8 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            await invalidateProviderStateInTx(tx as unknown as Parameters<typeof invalidateProviderStateInTx>[0],
+              { companyId: updated.companyId, issueId: updated.id }, "terminal");
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
@@ -7883,6 +7886,9 @@ export function issueService(db: Db) {
       };
 
       const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+      if (dbOrTx === db && result && (result.status === "done" || result.status === "cancelled")) {
+        await providerStateBroker(db).destroy({ companyId: result.companyId, issueId: result.id }, "terminal");
+      }
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications) publishActivity(publication);
       }
@@ -7922,8 +7928,17 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
+    remove: async (id: string) => {
+      const existing = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+      await db.transaction(async (tx) => {
+        await tx.update(issues).set({ status: "cancelled" }).where(eq(issues.id, id));
+        await invalidateProviderStateInTx(tx, { companyId: existing.companyId, issueId: id }, "terminal");
+      });
+      const cleanup = await providerStateBroker(db).destroy({ companyId: existing.companyId, issueId: id }, "terminal");
+      if (cleanup.some((result) => result.status !== "destroyed")) throw conflict(
+        "Provider state cleanup must finish before issue deletion", { code: "provider_state_cleanup_pending" });
+      return db.transaction(async (tx) => {
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -7954,7 +7969,8 @@ export function issueService(db: Db) {
         if (!removedIssue) return null;
         const [enriched] = await withIssueLabels(tx, [removedIssue]);
         return enriched;
-      }),
+      });
+    },
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db

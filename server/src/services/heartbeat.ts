@@ -1,3 +1,6 @@
+import { providerStateScope, invalidateProviderStateInTx } from "./provider-state-broker.js";
+import { isProviderStateAdapter, providerStateEnforced } from "./provider-state-execution.js";
+import { ProviderSessionIsolationRequired, type ProviderSessionBinding, type ProviderStateScope } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -8709,7 +8712,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    providerScope?: ProviderStateScope | null;
+    providerBinding?: ProviderSessionBinding | null;
+    requiresProviderState?: boolean;
   }) {
+    if (input.requiresProviderState) {
+      if (!input.providerScope || !input.providerBinding || !input.lastRunId) return null;
+      return await environmentRuntime.providerStateBroker.commitSession({ scope: input.providerScope,
+        binding: input.providerBinding, taskKey: input.taskKey,
+        sessionParamsJson: input.sessionParamsJson, sessionDisplayId: input.sessionDisplayId,
+        runId: input.lastRunId });
+    }
     const existing = await getTaskSession(
       input.companyId,
       input.agentId,
@@ -13392,7 +13405,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .update(agentRuntimeState)
       .set({
         adapterType: agent.adapterType,
-        sessionId: session.legacySessionId,
+        sessionId: isProviderStateAdapter(agent.adapterType) && providerStateEnforced(runtimeEnv) ? null : session.legacySessionId,
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: result.errorMessage ?? null,
@@ -13594,7 +13607,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
-    const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
+    const requiresProviderState = isProviderStateAdapter(agent.adapterType) && providerStateEnforced(runtimeEnv);
+    const taskKey = requiresProviderState
+      ? readNonEmptyString(context.issueId) ?? deriveTaskKeyWithHeartbeatFallback(context, null)
+      : deriveTaskKeyWithHeartbeatFallback(context, null);
+    if (requiresProviderState && getServerAdapter(agent.adapterType).supportsProviderStateIsolation !== true) {
+      throw new ProviderSessionIsolationRequired();
+    }
+    const providerScope = requiresProviderState ? providerStateScope({ companyId: agent.companyId,
+      agentId: agent.id, adapterType: agent.adapterType, taskKey: taskKey ?? run.id }) : null;
+    let providerBinding: ProviderSessionBinding | null = null;
+    let providerGeneration = providerScope ? await environmentRuntime.providerStateBroker.snapshot(providerScope) : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
@@ -14281,11 +14304,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       preserveLegacySessionWithoutConfigMetadata: acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
     });
     const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+    if (providerScope && resetTaskSession) {
+      await environmentRuntime.providerStateBroker.destroy({ companyId: agent.companyId,
+        agentId: agent.id, taskScopeId: providerScope.taskScopeId }, "reset");
+      providerGeneration = await environmentRuntime.providerStateBroker.snapshot(providerScope);
+    }
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
-    const taskSessionForRun = resetTaskSession ? null : taskSession;
+    const taskSessionForRun = resetTaskSession || (requiresProviderState && !taskSession?.providerStateLeaseId)
+      ? null : taskSession;
     const previousSessionParams =
-      explicitResumeSessionParams ??
-      (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
+      (requiresProviderState ? null : explicitResumeSessionParams) ??
+      (!requiresProviderState && isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
         ? { sessionId: explicitResumeSessionDisplayId }
         : null) ??
       normalizeResumeParamsForAdapter(
@@ -14722,6 +14751,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentId: agent.id,
       persistedExecutionWorkspace,
       executionWorkspaceSettings: environmentExecutionWorkspaceSettings,
+      taskScopeId: providerScope?.taskScopeId ?? (taskKey ? providerStateScope({ companyId: agent.companyId,
+        agentId: agent.id, adapterType: agent.adapterType, taskKey }).taskScopeId : null),
     });
     const selectedEnvironment = acquiredEnvironment.environment;
     // Defense-in-depth: re-check the actually-acquired environment against the
@@ -14772,6 +14803,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
     const remoteExecution = realizationResult.remoteExecution;
+    if (providerScope) {
+      // Adapter migrations opt in only after all durable homes use this binding.
+      if (getServerAdapter(agent.adapterType).supportsProviderStateIsolation !== true) {
+        throw new ProviderSessionIsolationRequired();
+      }
+      providerBinding = await environmentRuntime.prepareProviderSession({
+        scope: providerScope, expectedGeneration: providerGeneration!,
+        environment: selectedEnvironment, lease: activeEnvironmentLease.lease,
+        linkedLeaseId: taskSessionForRun?.providerStateLeaseId,
+        linkedGeneration: taskSessionForRun?.providerStateGeneration,
+      });
+    }
     if (!executionTarget || executionTarget.kind === "local") {
       try {
         runScratch = await prepareHeartbeatRunScratch({
@@ -14989,6 +15032,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.paperclipPreviousSessionId;
     }
 
+    if (requiresProviderState) {
+      // Legacy/runtime/explicit pointers have no verified lease link. Start fresh.
+      const linkedParams = taskSessionForRun?.providerStateLeaseId
+        ? normalizeSessionParams(stripPaperclipSessionMetadataFromSessionParams(
+            sessionCodec.deserialize(taskSessionForRun.sessionParamsJson))) : null;
+      runtimeSessionParamsForAdapter = linkedParams;
+      runtimeSessionIdForAdapter = readNonEmptyString(linkedParams?.sessionId);
+      previousSessionDisplayId = taskSessionForRun?.providerStateLeaseId ? taskSessionForRun.sessionDisplayId : null;
+    }
     const runtimeForAdapter = {
       sessionId: runtimeSessionIdForAdapter,
       sessionParams: runtimeSessionParamsForAdapter,
@@ -15561,6 +15613,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (managedMcpConfig) {
           adapterContext.paperclipManagedMcp = managedMcpConfig;
         }
+        if (requiresProviderState) {
+          if (!providerBinding) throw new ProviderSessionIsolationRequired();
+          await providerBinding.assertWritable();
+        }
         adapterResult = await adapter.execute({
           runId: run.id,
           agent,
@@ -15569,6 +15625,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           context: adapterContext,
           runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
           executionTarget,
+          providerSession: providerBinding,
           executionTransport: remoteExecution
             ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
             : undefined,
@@ -15848,7 +15905,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         signal: adapterResult.signal,
         usageJson,
         resultJson: persistedResultJson,
-        sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        sessionIdAfter: requiresProviderState ? null : (nextSessionState.displayId ?? nextSessionState.legacySessionId),
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,
@@ -15999,16 +16056,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
+            if (requiresProviderState && providerBinding) {
+              await environmentRuntime.providerStateBroker.destroy({ companyId: agent.companyId,
+                leaseId: providerBinding.leaseId }, "reset");
+            } else {
+              await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType });
+            }
           } else {
             await upsertTaskSession({
               companyId: agent.companyId,
               agentId: agent.id,
               adapterType: agent.adapterType,
               taskKey,
+              providerScope, providerBinding, requiresProviderState,
               sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
                 nextSessionState.params,
                 configuredModel,
@@ -16143,6 +16203,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
+            providerScope, providerBinding, requiresProviderState,
             sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
               previousSessionParams,
               configuredModel,
@@ -16187,6 +16248,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const recordedResponsibleUserDenialCode =
             normalizeResponsibleUserDenialCode((await getRun(runId).catch(() => null))?.errorCode);
           const setupFailureErrorCode =
+            (outerErr instanceof ProviderSessionIsolationRequired ? outerErr.code : null) ??
             workspaceValidationSetupFailure?.code ??
             configurationIncompleteSetupFailure?.code ??
             recordedResponsibleUserDenialCode ??
@@ -18505,6 +18567,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
+    if (agent && isProviderStateAdapter(agent.adapterType)) {
+      const runContext = parseObject(run.contextSnapshot);
+      const taskKey = readNonEmptyString(runContext.issueId) ?? deriveTaskKeyWithHeartbeatFallback(runContext, null) ?? run.id;
+      const scope = providerStateScope({ companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey });
+      await environmentRuntime.providerStateBroker.destroy({ companyId: agent.companyId,
+        agentId: agent.id, taskScopeId: scope.taskScopeId }, "terminal");
+    }
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
@@ -18816,7 +18885,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .select()
         .from(agentTaskSessions)
         .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId)))
-        .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt));
+        .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt))
+        .then((rows) => rows.map(({ providerStateLeaseId: _lease, providerStateGeneration: _generation, ...row }) => row));
     },
 
     resetRuntimeSession: async (agentId: string, opts?: { taskKey?: string | null }) => {
@@ -18824,34 +18894,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!agent) throw notFound("Agent not found");
       await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
-      const clearedTaskSessions = await clearTaskSessions(
-        agent.companyId,
-        agent.id,
-        taskKey ? { taskKey, adapterType: agent.adapterType } : undefined,
-      );
-      const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
-        sessionId: null,
-        lastError: null,
-        updatedAt: new Date(),
-      };
-      if (!taskKey) {
-        runtimePatch.stateJson = {};
-      }
-
-      const updated = await db
-        .update(agentRuntimeState)
-        .set(runtimePatch)
-        .where(eq(agentRuntimeState.agentId, agentId))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      if (!updated) return null;
-      return {
-        ...updated,
-        sessionDisplayId: null,
-        sessionParamsJson: null,
-        clearedTaskSessions,
-      };
+      const result = await db.transaction(async (tx) => {
+        const scope = taskKey ? providerStateScope({ companyId: agent.companyId, agentId,
+          adapterType: agent.adapterType, taskKey }) : null;
+        const cleanupIds = await invalidateProviderStateInTx(tx, { companyId: agent.companyId,
+          agentId, ...(scope ? { taskScopeId: scope.taskScopeId } : {}) }, "reset");
+        const deleted = await tx.delete(agentTaskSessions).where(and(
+          eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId),
+          ...(taskKey ? [eq(agentTaskSessions.taskKey, taskKey), eq(agentTaskSessions.adapterType, agent.adapterType)] : []),
+        )).returning();
+        const updated = (await tx.update(agentRuntimeState).set({ sessionId: null, lastError: null,
+          ...(!taskKey ? { stateJson: {} } : {}), updatedAt: new Date(),
+        }).where(eq(agentRuntimeState.agentId, agentId)).returning())[0];
+        return { updated, cleanupIds, clearedTaskSessions: deleted.length };
+      });
+      for (const id of result.cleanupIds) await environmentRuntime.providerStateBroker.retryCleanup(id);
+      return result.updated ? { ...result.updated, sessionDisplayId: null, sessionParamsJson: null,
+        clearedTaskSessions: result.clearedTaskSessions } : null;
     },
 
     listEvents: (runId: string, afterSeq = 0, limit = 200) =>

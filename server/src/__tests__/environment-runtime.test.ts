@@ -142,7 +142,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("environment-runtime");
-    stopDb = started.stop;
+    stopDb = started.cleanup;
     db = createDb(started.connectionString);
     runtime = environmentRuntimeService(db);
   });
@@ -2198,6 +2198,34 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const firstMetadata = JSON.stringify(first.lease.metadata);
     expect(firstMetadata).not.toContain("resolved-provider-key");
     expect(firstMetadata).not.toContain("rotated-provider-key");
+  });
+
+  it("reuses only the same task scope and preserves another task's lease", async () => {
+    const { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease } =
+      await seedReusablePluginSandboxLease();
+    const foreignScopeId = randomUUID(), taskScopeId = randomUUID();
+    await db.update(environmentLeases).set({ metadata: {
+      ...reusableLease.metadata,
+      reusableSandboxLease: { ...(reusableLease.metadata?.reusableSandboxLease as Record<string, unknown>),
+        version: 2, taskScopeId: foreignScopeId },
+    } }).where(eq(environmentLeases.id, reusableLease.id));
+    const call = vi.fn(async (_id: string, method: string) => {
+      if (method !== "environmentAcquireLease") throw new Error("unexpected_plugin_method");
+      return { providerLeaseId: "synthetic-task-boundary", metadata: { remoteCwd: "/workspace" } };
+    });
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: (id: string) => id === pluginId, call,
+    } as unknown as PluginWorkerManager });
+    const input = { companyId, environment, issueId: null, agentId, heartbeatRunId: runId, taskScopeId,
+      persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } };
+    const acquired = await runtimeWithPlugin.acquireRunLease(input);
+    expect(acquired.lease.providerLeaseId).toBe("synthetic-task-boundary");
+    const resumed = await runtimeWithPlugin.acquireRunLease(input);
+    expect(resumed.lease.providerLeaseId).toBe(acquired.lease.providerLeaseId);
+    expect(call).toHaveBeenCalledOnce();
+    await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
+      status: "active", cleanupStatus: null,
+    });
   });
 
   it("preserves active reusable sandbox leases held by another running run", async () => {

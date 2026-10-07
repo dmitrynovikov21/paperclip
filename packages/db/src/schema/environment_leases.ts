@@ -1,4 +1,4 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { environments } from "./environments.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
@@ -18,6 +18,20 @@ export const environmentLeases = pgTable(
     leasePolicy: text("lease_policy").notNull().default("ephemeral"),
     provider: text("provider"),
     providerLeaseId: text("provider_lease_id"),
+    // Broker-private lifecycle fields. Never project stateRef through the API.
+    taskScopeId: uuid("task_scope_id"),
+    providerStateAgentId: uuid("provider_state_agent_id"),
+    providerStateAdapterType: text("provider_state_adapter_type"),
+    providerStateGeneration: integer("provider_state_generation").notNull().default(0),
+    providerStateStatus: text("provider_state_status"),
+    providerStateRef: uuid("provider_state_ref"),
+    providerStateDriverId: text("provider_state_driver_id"),
+    providerStateDriverRevision: text("provider_state_driver_revision"),
+    providerStateConfigurationDigest: text("provider_state_configuration_digest"),
+    providerStateHardExpiresAt: timestamp("provider_state_hard_expires_at", { withTimezone: true }),
+    providerStateTombstonedAt: timestamp("provider_state_tombstoned_at", { withTimezone: true }),
+    providerStateCleanupClaim: uuid("provider_state_cleanup_claim"),
+    providerStateCleanupClaimExpiresAt: timestamp("provider_state_cleanup_claim_expires_at", { withTimezone: true }),
     acquiredAt: timestamp("acquired_at", { withTimezone: true }).notNull().defaultNow(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
@@ -42,5 +56,8 @@ export const environmentLeases = pgTable(
     heartbeatRunIdx: index("environment_leases_heartbeat_run_idx").on(table.heartbeatRunId),
     companyLastUsedIdx: index("environment_leases_company_last_used_idx").on(table.companyId, table.lastUsedAt),
     providerLeaseIdx: index("environment_leases_provider_lease_idx").on(table.providerLeaseId),
+    providerStateScopeIdx: index("environment_leases_provider_state_scope_idx").on(
+      table.companyId, table.providerStateAgentId, table.providerStateAdapterType, table.taskScopeId,
+    ),
   }),
 );

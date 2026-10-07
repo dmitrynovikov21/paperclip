@@ -5,6 +5,7 @@
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import type { AdapterExecutionTarget } from "./execution-target.js";
 import type { RuntimeStatusSink } from "./runtime-progress.js";
+import type { ProviderSessionBinding } from "./provider-session-isolation.js";
 
 export interface AdapterAgent {
   id: string;
@@ -175,6 +176,7 @@ export interface AdapterExecutionContext {
   context: Record<string, unknown>;
   runtimeCommandSpec?: AdapterRuntimeCommandSpec | null;
   executionTarget?: AdapterExecutionTarget | null;
+  providerSession?: ProviderSessionBinding | null;
   /**
    * Legacy remote transport view. Prefer `executionTarget`, which is the
    * provider-neutral contract produced by core runtime code.
@@ -417,6 +419,8 @@ export interface AcpTargetDescriptor {
 }
 
 export interface ServerAdapterModule {
+  /** Set only after the adapter binds all provider state to core's attested vault. */
+  supportsProviderStateIsolation?: boolean;
   type: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
   testEnvironment(ctx: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult>;

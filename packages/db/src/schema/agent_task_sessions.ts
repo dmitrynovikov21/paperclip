@@ -1,7 +1,8 @@
-import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
+import { environmentLeases } from "./environment_leases.js";
 
 export const agentTaskSessions = pgTable(
   "agent_task_sessions",
@@ -11,6 +12,8 @@ export const agentTaskSessions = pgTable(
     agentId: uuid("agent_id").notNull().references(() => agents.id),
     adapterType: text("adapter_type").notNull(),
     taskKey: text("task_key").notNull(),
+    providerStateLeaseId: uuid("provider_state_lease_id").references(() => environmentLeases.id, { onDelete: "restrict" }),
+    providerStateGeneration: integer("provider_state_generation"),
     sessionParamsJson: jsonb("session_params_json").$type<Record<string, unknown>>(),
     sessionDisplayId: text("session_display_id"),
     lastRunId: uuid("last_run_id").references(() => heartbeatRuns.id),

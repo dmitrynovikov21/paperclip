@@ -58,11 +58,19 @@ PR policy passed. Code jobs stop at frozen dependency installation with
 The automatic review job also stops before reviewing code because its
 `COMMITPERCLIP_KEY` environment binding is absent.
 
-Evidence: [dependency job](https://github.com/dmitrynovikov21/paperclip/actions/runs/37609401443/job/112752910157),
-[review prerequisite](https://github.com/dmitrynovikov21/paperclip/actions/runs/37609401213/job/112752700734).
+Evidence on head `dab9fa2a6f29975e40c0d8882d796665329c3626`:
+[dependency job](https://github.com/dmitrynovikov21/paperclip/actions/runs/37612699527/job/112763764000),
+[review prerequisite](https://github.com/dmitrynovikov21/paperclip/actions/runs/37612696191/job/112763529372).
 Workflow configuration was unchanged. No GitHub run was cancelled or disabled.
 The PR remains a draft. Native code and security review have not been requested
 while these code checks are red.
+
+The lockfile repair already has [PR #14](https://github.com/dmitrynovikov21/paperclip/pull/14),
+which remains open and awaits a human decision. This broker branch does not copy
+its lockfile or depend on its unmerged branch. After the repair reaches the base,
+rebuild this branch on that base and complete the code checks before native review.
+The missing automatic-review key is a known, non-applicable check on this fork;
+restoring that key is not a prerequisite for this change.
 
 ## Counts-only inventory
 
@@ -78,10 +86,13 @@ Snapshot time: 2026-10-07 10:28:38 UTC. Existing provider carrier contents opene
 The inventory contains counts only. It contains no paths, transcript values,
 credential values or copied provider data.
 
-## Control-plane handoff limitation
+## Control-plane handoff recovery
 
-The current heartbeat credential expired at 10:49 UTC. Paperclip returned HTTP
+The previous heartbeat credential expired at 10:49 UTC. Paperclip returned HTTP
 401 for both agent authentication and blocker creation. The report and PR are
-saved in GitHub because issue attachment upload and final status mutation need a
-fresh authorized heartbeat. The intended next action is to restore the fork's
-CI prerequisites, then request the configured code and security review stages.
+saved in GitHub. The previous run later ended on its output-inactivity monitor.
+Access was restored in a fresh authorized heartbeat at 11:37 UTC, which recorded
+the recovery checkpoint and confirmed the exact PR head and current CI failures.
+No product code changed during recovery, and the earlier test results above were
+not rerun. The next action is the existing lockfile repair's human decision, then
+green code checks and the configured native code and security review stages.

@@ -2210,19 +2210,19 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         version: 2, taskScopeId: foreignScopeId },
     } }).where(eq(environmentLeases.id, reusableLease.id));
     const call = vi.fn(async (_id: string, method: string) => {
-      if (method !== "environmentAcquireLease") throw new Error("unexpected_plugin_method");
+      if (method !== "environmentAcquireLease" && method !== "environmentResumeLease") throw new Error("unexpected_plugin_method");
       return { providerLeaseId: "synthetic-task-boundary", metadata: { remoteCwd: "/workspace" } };
     });
     const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: {
       isRunning: (id: string) => id === pluginId, call,
     } as unknown as PluginWorkerManager });
     const input = { companyId, environment, issueId: null, agentId, heartbeatRunId: runId, taskScopeId,
-      persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" } };
+      persistedExecutionWorkspace: { id: executionWorkspaceId, mode: "shared_workspace" as const } };
     const acquired = await runtimeWithPlugin.acquireRunLease(input);
     expect(acquired.lease.providerLeaseId).toBe("synthetic-task-boundary");
     const resumed = await runtimeWithPlugin.acquireRunLease(input);
     expect(resumed.lease.providerLeaseId).toBe(acquired.lease.providerLeaseId);
-    expect(call).toHaveBeenCalledOnce();
+    expect(call.mock.calls.map((args) => args[1])).toEqual(["environmentAcquireLease", "environmentResumeLease"]);
     await expect(environmentService(db).getLeaseById(reusableLease.id)).resolves.toMatchObject({
       status: "active", cleanupStatus: null,
     });

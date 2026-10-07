@@ -9,6 +9,22 @@ import { projectSafeRunContextSnapshot } from "./safe-run-carriers.js";
 
 const REGISTRY_KEY = "paperclipSecretRedactions";
 
+/**
+ * Keep registrations made during a run when another writer refreshes the safe
+ * context. Read the registry from the current row inside UPDATE so a secret
+ * registered after the writer built its in-memory context cannot be lost.
+ */
+export function safeRunContextSnapshotUpdate(context: unknown) {
+  const safe = projectSafeRunContextSnapshot(context);
+  return sql<Record<string, unknown>>`(
+    ${JSON.stringify(safe)}::jsonb ||
+    case when ${heartbeatRuns.contextSnapshot} ? ${REGISTRY_KEY}::text
+      then jsonb_build_object(${REGISTRY_KEY}::text, ${heartbeatRuns.contextSnapshot} -> ${REGISTRY_KEY}::text)
+      else '{}'::jsonb
+    end
+  )`;
+}
+
 type RegistryEntry = {
   fingerprintSha256: string;
   material: StoredSecretVersionMaterial;

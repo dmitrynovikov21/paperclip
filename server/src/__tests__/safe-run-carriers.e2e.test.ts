@@ -7,15 +7,18 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues,
+  agentWakeupRequests, agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues, workspaceRuntimeServices,
 } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { errorHandler } from "../middleware/index.ts";
 import { agentRoutes } from "../routes/agents.ts";
+import { issueRoutes } from "../routes/issues.ts";
+import { secretRoutes } from "../routes/secrets.ts";
 import { feedbackService } from "../services/feedback.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
 import { projectSafeRunRow } from "../services/safe-run-carriers.ts";
+import { secretService } from "../services/secrets.ts";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.ts";
 
@@ -32,11 +35,15 @@ describeDb("safe central run carriers and feedback export", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let logDir: string;
   let previousLogPath: string | undefined;
+  let previousSecretKeyFile: string | undefined;
   let db: ReturnType<typeof createDb>;
   const promptMarker = `prompt-${randomUUID()}`;
   const toolMarker = `tool-${randomUUID()}`;
   const dirtySources: string[] = [];
+  const runtimeServiceId = randomUUID();
   let failWithMarkers = false;
+  let onAdapterExecute: ((runId: string) => Promise<void>) | null = null;
+  let reportRuntimeService = false;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("safe-run-carriers-");
@@ -44,6 +51,8 @@ describeDb("safe central run carriers and feedback export", () => {
     logDir = await mkdtemp(join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir(), "safe-run-carriers-logs-"));
     previousLogPath = process.env.RUN_LOG_BASE_PATH;
     process.env.RUN_LOG_BASE_PATH = logDir;
+    previousSecretKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = join(logDir, "synthetic-master.key");
     registerServerAdapter({
       type: ADAPTER_TYPE,
       execute: async (ctx) => {
@@ -54,6 +63,7 @@ describeDb("safe central run carriers and feedback export", () => {
         await ctx.onEvent({ eventType: "tool.output", message: toolMarker, payload: { output: toolMarker } });
         await ctx.onLog("stdout", `${promptMarker}\n`);
         await ctx.onLog("stderr", `${toolMarker}\n`);
+        await onAdapterExecute?.(ctx.runId);
         return {
           exitCode: 0,
           signal: null,
@@ -62,6 +72,7 @@ describeDb("safe central run carriers and feedback export", () => {
           usageBasis: "per_run",
           summary: toolMarker,
           resultJson: { summary: promptMarker, stdout: toolMarker, costUsd: 0.025 },
+          runtimeServices: reportRuntimeService ? [{ id: runtimeServiceId, serviceName: "synthetic-preview", status: "stopped" }] : undefined,
         };
       },
       testEnvironment: async () => ({ adapterType: ADAPTER_TYPE, status: "pass", checks: [], testedAt: new Date().toISOString() }),
@@ -75,6 +86,8 @@ describeDb("safe central run carriers and feedback export", () => {
     await rm(logDir, { recursive: true, force: true });
     if (previousLogPath === undefined) delete process.env.RUN_LOG_BASE_PATH;
     else process.env.RUN_LOG_BASE_PATH = previousLogPath;
+    if (previousSecretKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousSecretKeyFile;
   });
 
   it("drops two unknown markers on write and legacy read while preserving status, usage and exit", async () => {
@@ -227,6 +240,133 @@ describeDb("safe central run carriers and feedback export", () => {
     expect(safeRead.usageJson).toMatchObject({ inputTokens: 17, outputTokens: 9 });
     for (const marker of [promptMarker, toolMarker]) {
       expect(markerCount({ safeRead, runApi: runResponse.body, safeEvents, safeLog, traces, bundle, upload: uploadTraceBundle.mock.calls[0]?.[0] }, marker)).toBe(0);
+    }
+  }, 60_000);
+
+  it("keeps a run-bound secret redaction after adapter runtime services refresh the snapshot", async () => {
+    failWithMarkers = false;
+    reportRuntimeService = true;
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const secretValue = `synthetic-${randomUUID()}`;
+    const commentId = randomUUID();
+    let secretReadStatus = 0;
+    let commentWritten = false;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Run redaction test",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Secret reader",
+      role: "engineer",
+      status: "idle",
+      adapterType: ADAPTER_TYPE,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Secret redaction source",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      createdByUserId: "user-1",
+    });
+    const secrets = secretService(db);
+    const secret = await secrets.create(companyId, {
+      key: "RUN_TOKEN",
+      name: "Synthetic run token",
+      provider: "local_encrypted",
+      value: secretValue,
+    });
+    await secrets.createBinding({
+      companyId,
+      secretId: secret.id,
+      targetType: "agent",
+      targetId: agentId,
+      configPath: "access.RUN_TOKEN",
+      projectionClass: "class_2_runtime_only",
+    });
+
+    onAdapterExecute = async (runId) => {
+      const agentApp = express();
+      agentApp.use(express.json());
+      agentApp.use((req, _res, next) => {
+        req.actor = {
+          type: "agent", agentId, companyId, runId,
+          keyScope: { kind: "standard" }, source: "agent_jwt",
+        };
+        next();
+      });
+      agentApp.use("/api", secretRoutes(db));
+      agentApp.use(errorHandler);
+      const fetched = await request(agentApp).post("/api/agents/me/secrets/run_token/value");
+      secretReadStatus = fetched.status;
+      if (fetched.status !== 200 || fetched.body.value !== secretValue) {
+        throw new Error(`Synthetic secret read failed: ${fetched.status}`);
+      }
+      await db.insert(issueComments).values({
+        id: commentId, companyId, issueId, authorAgentId: agentId,
+        createdByRunId: runId, body: `agent comment: ${fetched.body.value}`,
+      });
+      commentWritten = true;
+    };
+
+    try {
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.invoke(agentId, "on_demand", { issueId, taskId: issueId }, "manual");
+      expect(queued).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [storedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+      expect(secretReadStatus).toBe(200);
+      expect(commentWritten).toBe(true);
+      const services = await db.select().from(workspaceRuntimeServices).where(eq(workspaceRuntimeServices.startedByRunId, queued!.id));
+      expect(services).toHaveLength(1);
+      expect(storedRun?.status).toBe("succeeded");
+      expect(storedRun?.contextSnapshot).toMatchObject({
+        issueId,
+        paperclipSecretRedactions: [expect.objectContaining({ fingerprintSha256: expect.any(String) })],
+      });
+      expect(markerCount(storedRun, secretValue)).toBe(0);
+      const [rawComment] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+      expect(rawComment?.body).toContain(secretValue); // The source is deliberately dirty.
+
+      const boardApp = express();
+      boardApp.use((req, _res, next) => {
+        req.actor = {
+          type: "board", userId: "test-board", companyIds: [companyId],
+          memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+          isInstanceAdmin: true, source: "local_implicit",
+        };
+        next();
+      });
+      boardApp.use("/api", issueRoutes(db, {} as never));
+      boardApp.use("/api", agentRoutes(db));
+      boardApp.use(errorHandler);
+      const comments = await request(boardApp).get(`/api/issues/${issueId}/comments`);
+      const wakeContext = await request(boardApp)
+        .get(`/api/issues/${issueId}/heartbeat-context`)
+        .query({ wakeCommentId: commentId });
+      const runApi = await request(boardApp).get(`/api/heartbeat-runs/${queued!.id}`);
+      expect(comments.status).toBe(200);
+      expect(wakeContext.status).toBe(200);
+      expect(runApi.status).toBe(200);
+      expect(markerCount({ comments: comments.body, wakeContext: wakeContext.body, runApi: runApi.body }, secretValue)).toBe(0);
+      expect(comments.body).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: commentId, body: "agent comment: ***REDACTED***" }),
+      ]));
+      expect(runApi.body.contextSnapshot).not.toHaveProperty("paperclipSecretRedactions");
+    } finally {
+      onAdapterExecute = null;
+      reportRuntimeService = false;
     }
   }, 60_000);
 });

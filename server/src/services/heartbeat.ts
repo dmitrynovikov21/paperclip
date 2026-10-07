@@ -276,7 +276,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
-import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import { createRunSecretRedactionRegistry, safeRunContextSnapshotUpdate } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -12033,7 +12033,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           scheduledRetryAt: now,
-          contextSnapshot: projectSafeRunContextSnapshot(contextSnapshot),
+          contextSnapshot: safeRunContextSnapshotUpdate(contextSnapshot),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
@@ -14735,7 +14735,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: projectSafeRunContextSnapshot(context),
+          contextSnapshot: safeRunContextSnapshotUpdate(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -14868,7 +14868,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: projectSafeRunContextSnapshot(context),
+        contextSnapshot: safeRunContextSnapshotUpdate(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -15098,7 +15098,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: projectSafeRunContextSnapshot(context),
+          contextSnapshot: safeRunContextSnapshotUpdate(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -15309,7 +15309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: projectSafeRunContextSnapshot(context),
+            contextSnapshot: safeRunContextSnapshotUpdate(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -15717,7 +15717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: projectSafeRunContextSnapshot(context),
+            contextSnapshot: safeRunContextSnapshotUpdate(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -17916,7 +17916,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const mergedRun = await tx
               .update(heartbeatRuns)
               .set({
-                contextSnapshot: projectSafeRunContextSnapshot(mergedContextSnapshot),
+                contextSnapshot: safeRunContextSnapshotUpdate(mergedContextSnapshot),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
@@ -18266,7 +18266,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: projectSafeRunContextSnapshot(mergedContextSnapshot),
+          contextSnapshot: safeRunContextSnapshotUpdate(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))

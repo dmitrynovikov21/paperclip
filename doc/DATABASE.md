@@ -226,6 +226,17 @@ When authoring migrations or one-time backfills:
 - Split schema changes, index creation, and data backfill into separate phases so each step has clear locking and rollback behavior.
 - Treat the `check:migrations` CI gate as the enforcement backstop for these rules. If it flags a migration, rewrite the migration or add a suppression comment with the indexed predicate, batch bound, and reason the remaining scan is safe.
 
+Private-task migrations `0313` and `0314` are explicitly allowlisted in the
+Paperclip executor to run outside a file-wide transaction. Their idempotent
+keyset batches commit every 1,000 rows, and migration history is recorded only
+when all batches finish. The executor repairs invalid concurrent indexes on
+retry. A reserved connection holds a session advisory lock across all batch
+commits, so concurrent migrators recheck history only after the preceding runner
+finishes. Privacy triggers are replaced atomically. Bootstrap uses the same
+executor; other migrations remain transactional
+per file. Apply these migrations through `pnpm db:migrate` using a direct
+connection, before enabling the new server and UI.
+
 ## Migration snapshots
 
 `drizzle-kit generate` diffs `packages/db/src/schema/` against the newest snapshot in `packages/db/src/migrations/meta/`. That snapshot must describe the schema that every migration produces when they run in order. A snapshot that drifts from the schema makes the *next* migration wrong, because `generate` folds the drift into it. The drift can add a column that an earlier migration already created, which makes that migration fail on a fresh database. It can also drop a column that the schema still uses.
@@ -289,6 +300,8 @@ Paperclip stores current-user sidebar membership state in:
 These rows are company-scoped and user-scoped. A missing row means the user is joined, so existing users keep seeing projects and agents in the sidebar until they explicitly leave them. Rows only control sidebar visibility; they do not affect project/agent detail access, all-pages, selectors, assignment flows, or existing company permissions.
 
 Both tables use a unique key on `(company_id, user_id, resource_id)` and keep `state` as `joined` or `left`. Join/leave mutations are idempotent board-user `/me` operations and write activity entries when the effective state changes.
+
+Private-project authorization uses the separate `project_access_members` table. Its user/agent rows are security grants, not sidebar preferences, and are evaluated by the same issue-read predicate as issue-level grants. Do not merge or overload these two concepts.
 
 ## Decision training snapshot retention
 
@@ -600,6 +613,7 @@ write requires operator reconciliation before an unattached reservation is
 removed. The table stores no response bodies. See `doc/runner-api-tools.md` for
 limits and the operator override.
 
+Project `privacy_owner_user_id` records who may manage its audience independently of project read membership. Creation assigns the authenticated user or run responsible user; migration recovers legacy ownership from creation audit evidence. Missing evidence leaves management with administrators.
 ## Internal agent commentary
 
 `agent_commentary` stores company-scoped, attributed complaints and suggestions

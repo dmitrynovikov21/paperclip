@@ -508,7 +508,7 @@ describe("AI repair inside the card", () => {
     setupOptionsMock.mockResolvedValue({ interaction, existingConnections: [], aiConnection: binding, aiConnectionRequiresAdoption: true });
     if (fails) adoptMock.mockRejectedValue(new Error("Connection test failed"));
     else adoptMock.mockResolvedValue({ ...interaction, status: "accepted" });
-    renderBody(interaction); await flush();
+    renderBody(interaction);
     await waitForAssertion(() => expect(button("Connect OpenAI")).toBeDefined());
     await act(() => button("Connect OpenAI")!.click());
     await act(() => button("Reconnect selected account")!.click());

@@ -244,6 +244,19 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents manager-only task privacy hints without protected scope identity", () => {
+    const spec = buildOpenApiSpec() as any;
+    const operation = spec.paths["/api/issues/{id}/privacy-constraints"].get;
+    const schema = operation.responses["200"].content["application/json"].schema;
+    expect(schema.properties).toEqual({
+      publicBlockedBy: { type: "string", enum: ["parent", "project"], nullable: true },
+      leavesPersonalProject: { type: "boolean" },
+    });
+    expect(schema.required).toEqual(["publicBlockedBy", "leavesPersonalProject"]);
+    expect(operation.responses["403"]).toBeDefined();
+    expect(operation.responses["404"]).toBeDefined();
+  });
+
   it("documents strict run-attributed feedback without a read endpoint", () => {
     const { spec } = loadSpecRoutes();
     const path = spec.paths["/api/companies/{companyId}/agent-commentary"];

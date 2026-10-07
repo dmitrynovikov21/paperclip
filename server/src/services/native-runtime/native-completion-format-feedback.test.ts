@@ -4,7 +4,10 @@ import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 
 const state = vi.hoisted(() => ({ blockers: 0 }));
-vi.mock("./native-deliverable-feedback.js", () => ({ validateNativeDeliverableEvidence: vi.fn(async () => undefined) }));
+vi.mock("./native-deliverable-feedback.js", () => ({
+  validateNativeDeliverableEvidence: vi.fn(async () => undefined),
+  publishedTaskDocuments: vi.fn(async () => []),
+}));
 vi.mock("./automatic-completion-reviews.js", () => ({ findAutomaticCompletionReviews: vi.fn(async () => []) }));
 vi.mock("../agent-invokability.js", () => ({ evaluateAgentInvokabilityFromDb: vi.fn() }));
 vi.mock("../issues.js", () => ({ issueService: () => ({ getDependencyReadiness: async () => ({ unresolvedBlockerCount: state.blockers }) }) }));

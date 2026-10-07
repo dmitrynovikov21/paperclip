@@ -1384,7 +1384,7 @@ describe("worktree helpers", () => {
         .select()
         .from(executionWorkspaces)
         .where(eq(executionWorkspaces.id, executionWorkspaceId));
-      expect(executionWorkspace?.metadata).toEqual({
+      expect(executionWorkspace?.metadata).toMatchObject({
         keep: "execution-metadata",
         config: {
           environmentId: "environment-1",

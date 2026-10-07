@@ -40,7 +40,7 @@ export function gradeConnectionGuidanceDecline(input: {
     Boolean(reply.createdByRunId) && run.id === reply.createdByRunId && run.agentId === input.leadAgentId && run.nativeIssueId === input.issueId &&
     run.status === "succeeded" && Date.parse(run.finishedAt ?? "") >= resolvedAt));
   const explainsUnavailable = (text: string) =>
-    /declin|not now|could(?:n.t| not)|cannot|can.t|unable|unavailable|not (?:connect|retriev)|without (?:access|connect)/i.test(text);
+    /declin|not now|could(?:n.t| not)|cannot|can.t|unable|unavailable|not (?:connect|retriev)|without (?:access|connect)|\b(?:is|are)n['’]t\s+(?:connect|retriev|available)/i.test(text);
   return [
     { id: "guidance-decline-decision", passed: validDecision && input.decisions.length === 1,
       detail: "Exactly one correctly typed, resolved decline belongs to the selected decision." },

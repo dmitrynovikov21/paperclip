@@ -183,6 +183,71 @@ fn runtime_context_session_identity(context: &Value) -> Option<Value> {
     Some(identity)
 }
 
+// Mirrors only the canonical asset suffix from composeNativeSystemInstructions.
+// No replacement is allowed inside the prompt or a user's custom entry.
+fn registered_asset_suffix(context: &Value) -> Option<String> {
+    let instructions = context.get("instructions")?;
+    let root = instructions.pointer("/bundle/rootPath")?.as_str()?;
+    if root.is_empty() {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    if let Some(copy) = instructions
+        .get("workingCopy")
+        .filter(|value| !value.is_null())
+    {
+        let path = copy.get("rootPath")?.as_str()?;
+        let entry = copy.get("entryPath")?.as_str()?;
+        if path.is_empty() || entry.is_empty() {
+            return None;
+        }
+        blocks.push(if copy.get("kind").and_then(Value::as_str) == Some("agent_files") {
+            format!("Your persistent agent directory (AGENT_HOME) is {path}. Your instruction entry is {entry}, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence.")
+        } else {
+            format!("Your editable agent instruction file is {path}/{entry}. Edit this registered private copy normally. After this run stops, Paperclip saves changed content as a persistent revision if your responsible user still has permission and the baseline has not changed. Check the run's instruction-save receipt before claiming persistence. Conflicts are preserved for explicit resolution. Repository instruction files, skills, and this run's loaded prompt are separate and are not collected.")
+        });
+    }
+    blocks.push(format!("Read-only instruction sibling root: {root}"));
+    Some(blocks.join("\n\n"))
+}
+
+fn only_registered_asset_text_changed(
+    current: &AcpxProviderDescriptor,
+    prior: &AcpxProviderDescriptor,
+) -> bool {
+    if current.instructions == prior.instructions
+        && current
+            .runtime_context
+            .pointer("/instructions/workingCopy/rootPath")
+            == prior
+                .runtime_context
+                .pointer("/instructions/workingCopy/rootPath")
+        && current
+            .runtime_context
+            .pointer("/instructions/bundle/rootPath")
+            == prior
+                .runtime_context
+                .pointer("/instructions/bundle/rootPath")
+    {
+        return true;
+    }
+    let Some(current_suffix) = registered_asset_suffix(&current.runtime_context) else {
+        return false;
+    };
+    let Some(prior_suffix) = registered_asset_suffix(&prior.runtime_context) else {
+        return false;
+    };
+    current
+        .instructions
+        .strip_suffix(&format!("\n\n{current_suffix}"))
+        .zip(
+            prior
+                .instructions
+                .strip_suffix(&format!("\n\n{prior_suffix}")),
+        )
+        .is_some_and(|(current_prefix, prior_prefix)| current_prefix == prior_prefix)
+}
+
 impl AcpxProviderDescriptor {
     fn validate_session(
         &self,
@@ -1055,7 +1120,8 @@ impl AcpxCommandExecutor {
                 object.remove("aggregateDigest");
             }
         }
-        if run_attachment_policy(&descriptor.agent) == RunAttachmentPolicy::AuthenticatedRunGrants {
+        let attachment_policy = run_attachment_policy(&descriptor.agent);
+        if attachment_policy != RunAttachmentPolicy::ImmutableInstructions {
             // New runs rotate authenticated instruction text and registered
             // file-copy grants. Preserve mainline MCP refresh while comparing
             // every remaining context identity, including unknown policy fields.
@@ -1066,7 +1132,12 @@ impl AcpxCommandExecutor {
                 .is_some_and(|(current, prior)| current == prior);
             let grants_changed = descriptor.instructions != state.descriptor.instructions
                 || descriptor.runtime_context != state.descriptor.runtime_context;
-            if !compatible || (grants_changed && descriptor.run_id == state.descriptor.run_id) {
+            let text_compatible = attachment_policy == RunAttachmentPolicy::AuthenticatedRunGrants
+                || only_registered_asset_text_changed(&descriptor, &state.descriptor);
+            if !compatible
+                || !text_compatible
+                || (grants_changed && descriptor.run_id == state.descriptor.run_id)
+            {
                 return Err(DurableRunnerError::invalid(
                     "ACPX run.attach changed runtime context outside a new authenticated run",
                 ));
@@ -2953,6 +3024,30 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn attachment_asset_suffix_matches_typescript_composer() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../test/fixtures/registered-asset-instructions.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let suffix = registered_asset_suffix(&fixture["context"]).unwrap();
+            assert_eq!(
+                fixture["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .strip_suffix(&format!("\n\n{suffix}")),
+                Some(
+                    format!(
+                        "Pinned prompt.\n\n{}\n\nPinned connection policy.",
+                        fixture["entry"].as_str().unwrap()
+                    )
+                    .as_str()
+                )
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn restores_settled_session_for_explicit_run_attachment_only() {
@@ -3157,6 +3252,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cursor_attachment_rotates_only_authenticated_run_grants() {
+        authenticated_run_grant_attachment("cursor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_attachment_rotates_only_authenticated_asset_paths() {
+        authenticated_run_grant_attachment("claude");
+    }
+
+    #[cfg(unix)]
+    fn authenticated_run_grant_attachment(agent: &str) {
         let directory = temporary_directory("cursor-cross-run-attach");
         let runtime = directory.join("runtime");
         let workspace = directory.join("workspace");
@@ -3177,7 +3283,7 @@ mod tests {
             args: Vec::new(),
             artifacts: vec![artifact(&command)],
         };
-        let mut descriptor_value = descriptor("cursor");
+        let mut descriptor_value = descriptor(agent);
         descriptor_value["sidecarCommand"] = json!(command);
         descriptor_value["runtimeContext"] = json!({ "instructions": { "digest": "stable" }, "mcp": { "digest": "before" }, "aggregateDigest": "before" });
         descriptor_value["sidecarArgs"] = json!([]);
@@ -3203,6 +3309,12 @@ mod tests {
             "mcp": {"assignmentSetId": "assignment-1", "digest": "e".repeat(64), "bindingId": "old-run-binding"},
             "futurePolicy": {"companyId": "company-1"},
         });
+        if agent == "claude" {
+            descriptor_value["instructions"] = json!(format!(
+                "Pinned prompt. Custom entry mentioning /old-bundle.\n\n{}",
+                registered_asset_suffix(&descriptor_value["runtimeContext"]).unwrap()
+            ));
+        }
         let original_descriptor: AcpxProviderDescriptor =
             serde_json::from_value(descriptor_value.clone()).unwrap();
         let identity = AcpxProviderSessionIdentity {
@@ -3330,6 +3442,52 @@ mod tests {
             json!("/new-bundle");
         descriptor_value["runtimeContext"]["skills"][0]["bundle"]["rootPath"] = json!("/new-skill");
         descriptor_value["runtimeContext"]["mcp"]["bindingId"] = json!("new-run-binding");
+        if agent == "claude" {
+            descriptor_value["instructions"] = json!(format!(
+                "Pinned prompt. Custom entry mentioning /old-bundle.\n\n{}",
+                registered_asset_suffix(&descriptor_value["runtimeContext"]).unwrap()
+            ));
+            let mut stale_text = descriptor_value.clone();
+            stale_text["instructions"] =
+                json!(original.state.as_ref().unwrap().descriptor.instructions);
+            assert!(attached
+                .attach_run(&json!({"provider": stale_text}))
+                .is_err());
+            let mut changed_text = descriptor_value.clone();
+            changed_text["instructions"] = json!(descriptor_value["instructions"]
+                .as_str()
+                .unwrap()
+                .replace("Custom entry", "Changed entry"));
+            assert!(attached
+                .attach_run(&json!({"provider": changed_text}))
+                .is_err());
+            // A path inside the custom entry is content, not a relocatable grant.
+            let mut changed_example = descriptor_value.clone();
+            changed_example["instructions"] = json!(descriptor_value["instructions"]
+                .as_str()
+                .unwrap()
+                .replace("mentioning /old-bundle", "mentioning /new-bundle"));
+            assert!(attached
+                .attach_run(&json!({"provider": changed_example}))
+                .is_err());
+            for pointer in [
+                "/prompt/digest",
+                "/instructions/bundle/digest",
+                "/skills/0/bundle/digest",
+                "/futurePolicy/companyId",
+            ] {
+                let mut changed_identity = descriptor_value.clone();
+                *changed_identity["runtimeContext"]
+                    .pointer_mut(pointer)
+                    .unwrap() = json!("changed");
+                assert!(
+                    attached
+                        .attach_run(&json!({"provider": changed_identity}))
+                        .is_err(),
+                    "{pointer}"
+                );
+            }
+        }
         attached
             .attach_run(&json!({"provider": descriptor_value}))
             .unwrap();

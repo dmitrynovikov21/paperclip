@@ -1,5 +1,5 @@
 {
-  "id": "bcdcbf49-41b0-40ee-a743-1c3b6b650652",
+  "id": "adf783f2-c391-4fd5-b93a-d85e6d3c60a0",
   "prevId": "9134843c-7e84-421e-915b-beab3c30acb3",
   "version": "7",
   "dialect": "postgresql",
@@ -1688,22 +1688,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_api_keys_active_host_watcher_uq": {
-          "name": "agent_api_keys_active_host_watcher_uq",
-          "columns": [
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"agent_api_keys\".\"revoked_at\" is null and \"agent_api_keys\".\"scope_config\"->>'kind' = 'host_watcher'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -26289,6 +26273,19 @@
           "primaryKey": false,
           "notNull": true
         },
+        "scope_kind": {
+          "name": "scope_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'company'"
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "invocation_source": {
           "name": "invocation_source",
           "type": "text",
@@ -26846,6 +26843,33 @@
           "method": "btree",
           "with": {}
         },
+        "heartbeat_runs_company_issue_created_idx": {
+          "name": "heartbeat_runs_company_issue_created_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "heartbeat_runs_company_responsible_user_idx": {
           "name": "heartbeat_runs_company_responsible_user_idx",
           "columns": [
@@ -27084,6 +27108,19 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
+        "heartbeat_runs_issue_id_issues_id_fk": {
+          "name": "heartbeat_runs_issue_id_issues_id_fk",
+          "tableFrom": "heartbeat_runs",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
         "heartbeat_runs_wakeup_request_id_agent_wakeup_requests_id_fk": {
           "name": "heartbeat_runs_wakeup_request_id_agent_wakeup_requests_id_fk",
           "tableFrom": "heartbeat_runs",
@@ -27134,7 +27171,12 @@
         }
       },
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "heartbeat_runs_scope_binding_check": {
+          "name": "heartbeat_runs_scope_binding_check",
+          "value": "(\"heartbeat_runs\".\"scope_kind\" = 'company' AND \"heartbeat_runs\".\"issue_id\" IS NULL)\n        OR \"heartbeat_runs\".\"scope_kind\" = 'issue'"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.inbox_dismissals": {
@@ -28575,6 +28617,166 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.issue_access_grants": {
+      "name": "issue_access_grants",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subject_type": {
+          "name": "subject_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subject_id": {
+          "name": "subject_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "granted_by_user_id": {
+          "name": "granted_by_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "granted_by_agent_id": {
+          "name": "granted_by_agent_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "issue_access_grants_subject_active_issue_idx": {
+          "name": "issue_access_grants_subject_active_issue_idx",
+          "columns": [
+            {
+              "expression": "subject_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "revoked_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issue_access_grants_issue_idx": {
+          "name": "issue_access_grants_issue_idx",
+          "columns": [
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "issue_access_grants_issue_id_issues_id_fk": {
+          "name": "issue_access_grants_issue_id_issues_id_fk",
+          "tableFrom": "issue_access_grants",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "issue_access_grants_granted_by_agent_id_agents_id_fk": {
+          "name": "issue_access_grants_granted_by_agent_id_agents_id_fk",
+          "tableFrom": "issue_access_grants",
+          "tableTo": "agents",
+          "columnsFrom": [
+            "granted_by_agent_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "issue_access_grants_subject_type_check": {
+          "name": "issue_access_grants_subject_type_check",
+          "value": "\"issue_access_grants\".\"subject_type\" in ('user', 'agent')"
+        },
+        "issue_access_grants_source_check": {
+          "name": "issue_access_grants_source_check",
+          "value": "\"issue_access_grants\".\"source\" in ('explicit', 'assignment', 'project')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.issue_approvals": {
@@ -33449,6 +33651,25 @@
           "primaryKey": false,
           "notNull": false
         },
+        "visibility": {
+          "name": "visibility",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'open'"
+        },
+        "privacy_root_issue_id": {
+          "name": "privacy_root_issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "privacy_parent_issue_id": {
+          "name": "privacy_parent_issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "title": {
           "name": "title",
           "type": "text",
@@ -33933,6 +34154,48 @@
           "method": "btree",
           "with": {}
         },
+        "issues_company_privacy_parent_idx": {
+          "name": "issues_company_privacy_parent_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "privacy_parent_issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issues_company_privacy_root_idx": {
+          "name": "issues_company_privacy_root_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "privacy_root_issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "issues_company_project_idx": {
           "name": "issues_company_project_idx",
           "columns": [
@@ -33977,34 +34240,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "issues_open_host_watcher_order_uq": {
-          "name": "issues_open_host_watcher_order_uq",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "origin_kind",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "origin_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"issues\".\"origin_kind\" = 'host_watcher'\n        and \"issues\".\"origin_id\" is not null\n        and \"issues\".\"hidden_at\" is null\n        and \"issues\".\"status\" not in ('done', 'cancelled')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -34530,6 +34765,32 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
+        "issues_privacy_root_issue_id_issues_id_fk": {
+          "name": "issues_privacy_root_issue_id_issues_id_fk",
+          "tableFrom": "issues",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "privacy_root_issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "issues_privacy_parent_issue_id_issues_id_fk": {
+          "name": "issues_privacy_parent_issue_id_issues_id_fk",
+          "tableFrom": "issues",
+          "tableTo": "issues",
+          "columnsFrom": [
+            "privacy_parent_issue_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
         "issues_assignee_agent_id_agents_id_fk": {
           "name": "issues_assignee_agent_id_agents_id_fk",
           "tableFrom": "issues",
@@ -34609,6 +34870,10 @@
       },
       "policies": {},
       "checkConstraints": {
+        "issues_visibility_check": {
+          "name": "issues_visibility_check",
+          "value": "\"issues\".\"visibility\" in ('open', 'private')"
+        },
         "issues_conversation_identity_check": {
           "name": "issues_conversation_identity_check",
           "value": "(\n      \"issues\".\"conversation_agent_id\" is null and \"issues\".\"conversation_user_id\" is null and \"issues\".\"conversation_state\" is null\n    ) or (\n      \"issues\".\"conversation_agent_id\" is not null and \"issues\".\"conversation_user_id\" is not null\n      and \"issues\".\"assignee_agent_id\" = \"issues\".\"conversation_agent_id\" and \"issues\".\"assignee_agent_id\" is not null\n      and \"issues\".\"assignee_user_id\" is null and \"issues\".\"conversation_state\" is not null\n      and \"issues\".\"conversation_state\" in ('active', 'waiting')\n      and \"issues\".\"status\" not in ('done', 'cancelled')\n    )"
@@ -39898,6 +40163,150 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.project_access_members": {
+      "name": "project_access_members",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subject_type": {
+          "name": "subject_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subject_id": {
+          "name": "subject_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "project_access_members_project_subject_uq": {
+          "name": "project_access_members_project_subject_uq",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "project_access_members_subject_lookup_idx": {
+          "name": "project_access_members_subject_lookup_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject_type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "subject_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "project_access_members_company_id_companies_id_fk": {
+          "name": "project_access_members_company_id_companies_id_fk",
+          "tableFrom": "project_access_members",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "project_access_members_project_id_projects_id_fk": {
+          "name": "project_access_members_project_id_projects_id_fk",
+          "tableFrom": "project_access_members",
+          "tableTo": "projects",
+          "columnsFrom": [
+            "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "project_access_members_subject_type_check": {
+          "name": "project_access_members_subject_type_check",
+          "value": "\"project_access_members\".\"subject_type\" in ('user', 'agent')"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.project_goals": {
       "name": "project_goals",
       "schema": "",
@@ -40527,6 +40936,25 @@
           "primaryKey": false,
           "notNull": false
         },
+        "visibility": {
+          "name": "visibility",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'open'"
+        },
+        "privacy_owner_user_id": {
+          "name": "privacy_owner_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "personal_owner_user_id": {
+          "name": "personal_owner_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "status": {
           "name": "status",
           "type": "text",
@@ -40618,6 +41046,28 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "projects_company_personal_owner_uq": {
+          "name": "projects_company_personal_owner_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "personal_owner_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"projects\".\"personal_owner_user_id\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -40664,7 +41114,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "projects_visibility_check": {
+          "name": "projects_visibility_check",
+          "value": "\"projects\".\"visibility\" in ('open', 'private')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.provider_trace_records": {

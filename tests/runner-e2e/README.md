@@ -37,13 +37,19 @@ provider, or tell the model not to retry. The approval and second-provider
 prompts remain identical to the original stories. The historical
 everyday-workflows cases and their original grades remain unchanged.
 
-Each cell allows one attempt, expects two provider turns, retains a twelve-run
+Each cell allows one attempt and expects two provider turns (three for choosing
+Arcade and then granting tool access). Each retains a twelve-run
 maximum and twelve-minute deadline, and verifies 1,000-cent company and agent
 hard stops through public records before task creation. All actual runs,
 usage/cost gaps, controller retries and cleanup must remain in the report.
 No real third-party mutation occurs. The external-provider decline includes
-the same deterministic installed Arcade gateway as the positive control, so its
-zero-call assertion has an actual counter rather than a missing-fixture default.
+the same deterministic company Arcade gateway as the positive control, with
+no agent install or allowed tool at task creation. Public effective-access
+readback verifies that precondition. The positive case selects Arcade, then
+approves its separate scoped access card through the browser. Only that grant
+permits the single HubSpot call. Decline has a real zero-call counter.
+The browser matches the task route and visible identifier, so agent title
+changes cannot invalidate the checkpoint.
 
 The new decline oracle requires the saved decision, exactly one interaction,
 unchanged connection identities, and an explanation after the decision from a
@@ -60,7 +66,8 @@ Use the existing report publisher and retained artifact boundary. The suite
 definition digest includes its prompts, flow, graders, fixture setup and browser
 submission code. Compare frozen sources under identical fixture/model/budget
 controls before using it to qualify a production instruction change. See
-[the connection audit](../../doc/plans/2026-10-06-native-connection-guidance.md).
+[the connection audit](../../doc/plans/2026-10-06-native-connection-guidance.md) and
+[the preserved baseline failures and repair](../../doc/plans/2026-10-07-native-connection-baseline-repair.md).
 
 ## Native procedure guidance comparison (explicit only)
 

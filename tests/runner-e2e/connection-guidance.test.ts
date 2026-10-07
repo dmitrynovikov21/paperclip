@@ -14,7 +14,7 @@ describe("neutral connection guidance selection", () => {
       expect(row.environment.id).toBe("local");
       expect(row.task.automaticRetryPolicy).toBe("single_attempt");
       expect(row.task.attemptTimeoutMs.local).toBe(720_000);
-      expect(row.task.expectedRunCount).toBe(2);
+      expect(row.task.expectedRunCount).toBe(row.task.id === "provider-second" ? 3 : 2);
     }
     for (const args of [["--all"], ["--profile", "runner-opencode"]]) {
       expect(selectRunnerExecutions(parseRunnerSelectors(args), runnerMatrix).some(row => row.suite.id === CONNECTION_GUIDANCE_SUITE)).toBe(false);
@@ -54,6 +54,16 @@ describe("neutral decline evidence", () => {
       expect(passes({ ...valid, caseId, decisions: [{ ...valid.decisions[0], kind, status: "rejected" }] })).toBe(true);
     }
   });
+  it("recognizes unavailable-connection contractions without accepting positive or unrelated claims", () => {
+    for (const body of [
+      "HubSpot isn't connected because you chose None for now.",
+      "HubSpot isn’t connected after the provider decision.",
+      "The pages aren't retrievable after the connection decision.",
+    ]) expect(passes({ ...valid, replies: [{ ...valid.replies[0], body }] })).toBe(true);
+    for (const body of ["HubSpot is connected.", "HubSpot isn't disconnected.", "HubSpot isn't slow.", "Contacts are available."]) {
+      expect(passes({ ...valid, replies: [{ ...valid.replies[0], body }] })).toBe(false);
+    }
+  });
   it("rejects missing, stale, unattributed, wrong-agent, or unsuccessful explanations", () => {
     for (const input of [
       { ...valid, replies: [] },
@@ -87,4 +97,34 @@ describe("neutral decline evidence", () => {
       { ...valid, replies: [{ ...valid.replies[0], body: "Unavailable, but PRIVATE_MARKER" }] },
     ]) expect(passes(input)).toBe(false);
   });
+});
+
+
+import { requireProviderAccessCard, gradeProviderOutcome } from "./connection-routing-evidence.js";
+const access = { id: "access", kind: "connection_intent", status: "pending", payload: {
+  serviceSlug: "arcade", requestingAgentId: "lead", upstreamService: { slug: "hubspot", selectionInteractionId: "choice" },
+  accessRequest: { connectionId: "connection", tools: [{ catalogEntryId: "tool", toolName: "Hubspot_ListContacts", permission: "allowed" }] },
+} };
+const accessInput = { rows: [{ id: "choice", kind: "ask_user_questions", status: "answered" }, access],
+  decisionId: "choice", connectionId: "connection", agentId: "lead", catalogEntryIds: ["tool"], calls: 0 };
+it("requires the exact scoped access card and rejects early calls, swapped identities and duplicates", () => {
+  expect(requireProviderAccessCard(accessInput)).toBe(access);
+  for (const input of [
+    { ...accessInput, rows: [] }, { ...accessInput, calls: 1 }, { ...accessInput, catalogEntryIds: [] },
+    { ...accessInput, connectionId: "other" }, { ...accessInput, agentId: "other" }, { ...accessInput, decisionId: "other" },
+    { ...accessInput, rows: [...accessInput.rows, access] },
+    { ...accessInput, rows: [accessInput.rows[0], { ...access, status: "accepted" }] },
+    { ...accessInput, rows: [accessInput.rows[0], { ...access, payload: { ...access.payload, upstreamService: { slug: "hubspot", selectionInteractionId: "other" } } }] },
+  ]) expect(() => requireProviderAccessCard(input)).toThrow();
+});
+it("requires the real accepted access result without allowing repeated provider questions", () => {
+  const choice = { id: "choice", kind: "ask_user_questions", status: "answered", result: { answers: [{ questionId: "connection-provider:hubspot", optionIds: ["via:arcade:hubspot"] }] } };
+  const granted = { ...access, status: "accepted", result: { outcome: "connected", connectionId: "connection" } };
+  const input = { rows: [choice, granted], decisionId: "choice", selected: "via:arcade:hubspot", calls: 1,
+    response: "Ada Fixture MARKER", marker: "MARKER", sameConnections: true, accessDecision: { id: "access", connectionId: "connection" } };
+  expect(gradeProviderOutcome(input).every(c => c.passed)).toBe(true);
+  for (const bad of [{ ...input, rows: [choice] }, { ...input, rows: [choice, granted, choice] },
+    { ...input, rows: [choice, { ...granted, status: "pending" }] }, { ...input, accessDecision: { id: "access", connectionId: "other" } },
+    { ...input, calls: 0 }, { ...input, calls: 2 }, { ...input, response: "Done" }])
+    expect(gradeProviderOutcome(bad).every(c => c.passed)).toBe(false);
 });

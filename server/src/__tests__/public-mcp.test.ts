@@ -6,7 +6,7 @@ import { projectRoutes } from "../routes/projects.js";
 import { agentRoutes } from "../routes/agents.js";
 import { companySkillRoutes } from "../routes/company-skills.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-import { mcpAttachmentUploads, mcpFileTickets, principalPermissionGrants, heartbeatRuns } from "@paperclipai/db";
+import { mcpAttachmentUploads, mcpFileTickets, principalPermissionGrants, heartbeatRuns, issueAccessGrants } from "@paperclipai/db";
 import { createHmac, createHash, randomBytes, randomUUID } from "node:crypto";
 import express, { type Request } from "express";
 import request from "supertest";
@@ -656,6 +656,52 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     const call = (name: string, a: Record<string, unknown> = {}) => execute(f.tokens.access_token, name, { companyId: f.company.id, ...a });
     return { ...f, issue: issue!, call, dispatch, transfers, storage, cleanup: () => rm(storageDir, { recursive: true, force: true }) };
   }
+
+  async function makePrivate(f: Awaited<ReturnType<typeof expandedFixture>>) {
+    const owner = randomUUID();
+    await db.insert(authUsers).values({ id: owner, name: "Private owner", email: owner + "@example.com", createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId: f.company.id, principalType: "user", principalId: owner, membershipRole: "member", status: "active" });
+    await db.update(issues).set({ visibility: "private", privacyRootIssueId: f.issue.id, responsibleUserId: owner, createdByUserId: owner }).where(eq(issues.id, f.issue.id));
+    return owner;
+  }
+
+  it("hides private tasks from assistant search, reads, edits and file-link creation", async () => {
+    const f = await expandedFixture();
+    try {
+      await makePrivate(f);
+      expect(await f.call("paperclip_search_tasks")).toMatchObject({ tasks: [] });
+      for (const name of ["paperclip_read_task", "paperclip_list_deliverables", "paperclip_list_document_revisions"]) {
+        await expect(f.call(name, { taskId: f.issue.id, ...(name === "paperclip_list_document_revisions" ? { key: "plan" } : {}) })).rejects.toMatchObject({ status: 404 });
+      }
+      expect(await f.call("paperclip_update_task", { taskId: f.issue.id, requestId: randomUUID(), changes: { title: "Unauthorized edit" } })).toMatchObject({ outcome: "rejected", status: 404 });
+      await expect(f.call("paperclip_get_upload_url", { taskId: f.issue.id, requestId: randomUUID(), filename: "data.txt", contentType: "text/plain", byteSize: 2, sha256: createHash("sha256").update("hi").digest("hex") })).rejects.toThrow();
+      expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0]?.title).toBe("Work");
+      expect(await db.select().from(mcpAttachmentUploads).where(eq(mcpAttachmentUploads.taskId, f.issue.id))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  });
+
+  it("revokes existing assistant upload and download links when private task sharing is removed", async () => {
+    const f = await expandedFixture();
+    try {
+      const owner = await makePrivate(f);
+      const [grant] = await db.insert(issueAccessGrants).values({ issueId: f.issue.id, subjectType: "user", subjectId: f.actor.userId!, source: "explicit", grantedByUserId: owner }).returning();
+      const bytes = Buffer.from("Private attachment");
+      const args = { taskId: f.issue.id, filename: "private.txt", contentType: "text/plain", byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+      const app = express(); app.use(f.transfers.router);
+      const uploadedUrl = new URL((await f.call("paperclip_get_upload_url", { ...args, requestId: randomUUID() })).url as string);
+      const uploaded = await request(app).put(uploadedUrl.pathname + uploadedUrl.search).set("Content-Type", args.contentType).send(bytes);
+      expect(uploaded.status).toBe(200);
+      const download = new URL((await f.call("paperclip_get_download_url", { attachmentId: uploaded.body.attachment.id })).url as string);
+      const pending = await f.call("paperclip_get_upload_url", { ...args, requestId: randomUUID() });
+      const pendingUrl = new URL(pending.url as string);
+      expect((await request(app).get(download.pathname + download.search)).status).toBe(200);
+      await db.update(issueAccessGrants).set({ revokedAt: new Date() }).where(eq(issueAccessGrants.id, grant!.id));
+      expect((await request(app).get(download.pathname + download.search)).status).not.toBe(200);
+      expect((await request(app).put(pendingUrl.pathname + pendingUrl.search).set("Content-Type", args.contentType).send(bytes)).status).toBe(403);
+      expect((await db.select().from(mcpAttachmentUploads).where(eq(mcpAttachmentUploads.id, pending.uploadId as string)))[0]?.attachmentId).toBeNull();
+      await expect(f.call("paperclip_get_download_url", { attachmentId: uploaded.body.attachment.id })).rejects.toThrow();
+    } finally { await f.cleanup(); }
+  });
 
   it("edits, blocks and completes tasks through real routes and rejects review overrides", async () => {
     const f = await expandedFixture();

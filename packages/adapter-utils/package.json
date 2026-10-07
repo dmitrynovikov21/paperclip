@@ -40,7 +40,6 @@
   "scripts": {
     "build": "tsc && node ../../scripts/bundle-adapter-utils-acpx.mjs",
     "clean": "rm -rf dist",
-    "prepack": "pnpm run build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

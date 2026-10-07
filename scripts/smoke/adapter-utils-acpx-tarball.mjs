@@ -100,7 +100,7 @@ try {
   execFileSync(process.execPath, [path.join(repoRoot, "scripts", "prepare-bundled-package.mjs"), adapterRoot, staged], {
     cwd: repoRoot, stdio: "pipe", timeout: 120_000,
   });
-  execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", root], {
+  execFileSync("npm", ["pack", "--pack-destination", root], {
     cwd: staged, stdio: "pipe", timeout: 120_000,
   });
   const archiveName = (await fs.readdir(root)).find((name) => name.endsWith(".tgz"));

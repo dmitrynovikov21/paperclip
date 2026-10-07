@@ -35,6 +35,7 @@ vi.mock("../services/heartbeat.js", async (importOriginal) => ({
     wakeup: vi.fn(async () => null),
     getRun: async () => null,
     getActiveRunForAgent: async () => null,
+    cancelActiveForAgent: vi.fn(async () => undefined),
   }),
 }));
 
@@ -75,6 +76,7 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
   const tokens: Record<string, string> = {};
   const serviceAgents: Record<string, string> = {};
   const responsibleUserId = "host-watcher-fixture-user";
+  let afterWatchdogGuard: (() => Promise<void>) | null = null;
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("host-watcher-key-routes-");
@@ -109,10 +111,9 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
       id, companyId, name: `Target ${id.slice(0, 8)}`,
       adapterType: "process", adapterConfig: {}, runtimeConfig: {}, status: "idle" as const,
     })));
-    await db.insert(principalPermissionGrants).values({
-      companyId, principalType: "user", principalId: responsibleUserId,
-      permissionKey: "agents:configure",
-    });
+    await db.insert(principalPermissionGrants).values(["agents:configure", "agents:create"].map((permissionKey) => ({
+      companyId, principalType: "user" as const, principalId: responsibleUserId, permissionKey,
+    })));
     const fixtureIssues = [targets.disk, targets.pr923, targets.be1198, targets.fe1042, targets.fleet];
     await db.insert(issues).values(fixtureIssues.map((target, index) => ({
       id: target.issueId, companyId, issueNumber: index + 1, identifier: `HWT-${index + 1}`,
@@ -129,9 +130,28 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     });
     app = express();
     app.use(express.json());
-    app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
+    app.use(actorMiddleware(db, {
+      deploymentMode: "authenticated",
+      resolveSession: async (req) => req.header("x-test-board-session") === "pause"
+        ? {
+            session: { id: "fixture-board-session", userId: responsibleUserId },
+            user: { id: responsibleUserId, name: "Fixture owner", email: "host-watcher@example.test" },
+          }
+        : null,
+    }));
     app.use(hostWatcherKeyGuard(db));
     app.use(cronServiceKeyGuard(db));
+    app.use(async (req, _res, next) => {
+      if (req.method !== "PATCH" || req.path !== `/api/agents/${watchdogRecoverAgentId}`
+        || req.actor.type !== "agent" || req.actor.keyScope?.kind !== "cron_service"
+        || !afterWatchdogGuard) return next();
+      try {
+        await afterWatchdogGuard();
+        next();
+      } catch (error) {
+        next(error);
+      }
+    });
     app.use("/api", agentRoutes(db, { deploymentMode: "authenticated" }));
     app.use("/api", issueRoutes(db, {} as never));
     app.use(errorHandler);
@@ -171,6 +191,50 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
     expect((await request(app).patch(`/api/agents/${watchdogRecoverAgentId}`)
       .set("Authorization", auth("watchdog")).send({ status: "terminated" })).status).toBe(403);
+  });
+
+  it("preserves a board pause made after the watchdog scope guard", async () => {
+    const path = `/api/agents/${watchdogRecoverAgentId}`;
+    await db.update(agents).set({ status: "error", pauseReason: null, pausedAt: null })
+      .where(eq(agents.id, watchdogRecoverAgentId));
+    let reachedGuard = false;
+    let releasePatch!: () => void;
+    const held = new Promise<void>((resolve) => { releasePatch = resolve; });
+    afterWatchdogGuard = async () => {
+      reachedGuard = true;
+      await held;
+    };
+    const patch = request(app).patch(path).set("Authorization", auth("watchdog"))
+      .send({ status: "idle" }).then((response) => response);
+    try {
+      await vi.waitFor(() => expect(reachedGuard).toBe(true), { timeout: 5_000 });
+      const paused = await request(app).post(`${path}/pause`).set("x-test-board-session", "pause");
+      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+    } finally {
+      releasePatch();
+      afterWatchdogGuard = null;
+    }
+    const response = await patch;
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    const [current] = await db.select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents).where(eq(agents.id, watchdogRecoverAgentId));
+    expect(current).toMatchObject({ status: "paused", pauseReason: "manual" });
+  });
+
+  it("denies watchdog recovery of an agent in another company", async () => {
+    const otherCompanyId = randomUUID();
+    const otherAgentId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Foreign fixture", issuePrefix: "FRA" });
+    await db.insert(agents).values({
+      id: otherAgentId, companyId: otherCompanyId, name: "Foreign agent",
+      adapterType: "process", adapterConfig: {}, runtimeConfig: {}, status: "error",
+    });
+    const response = await request(app).patch(`/api/agents/${otherAgentId}`)
+      .set("Authorization", auth("watchdog")).send({ status: "idle" });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    const [current] = await db.select({ status: agents.status }).from(agents)
+      .where(eq(agents.id, otherAgentId));
+    expect(current?.status).toBe("error");
   });
 
   it("quota can create a scoped nudge and cannot act on a foreign issue", async () => {

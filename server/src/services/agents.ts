@@ -130,6 +130,7 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  watchdogRecovery?: boolean;
 }
 
 interface CreateAgentOptions {
@@ -799,6 +800,13 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
+      // The scope guard reads status before this transaction; repeat its check under the write lock.
+      if (options?.watchdogRecovery && (
+        data.status !== "idle"
+        || (current.status !== "error" && current.status !== "offline" && current.status !== "crashed")
+      )) {
+        throw conflict("Watchdog can recover only error, offline, or crashed agents");
+      }
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }

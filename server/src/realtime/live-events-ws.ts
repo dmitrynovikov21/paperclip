@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, heartbeatRuns, instanceUserRoles, issues, projects } from "@paperclipai/db";
-import { agentApiKeyScopeSchema, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
+import { agentApiKeyScopeSchema, isUuidLike, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -317,11 +317,19 @@ export function setupLiveEventsWebSocketServer(
       }
       if (event.type.startsWith("heartbeat.run.")) return runId ? event : null;
       if (event.type === "agent.session.goal.changed") return issueId ? event : null;
-      // Company-wide invalidations carry no task-derived content. Authorized
-      // clients obtain details through viewer-filtered HTTP reads.
-      if (event.type === "activity.logged") return { ...event, payload: {
-        action: payload.action, entityType: payload.entityType, entityId: payload.entityId,
-      } };
+      // Comment IDs let an authorized viewer hydrate the open conversation.
+      // Forward no comment body or other task-derived activity details.
+      if (event.type === "activity.logged") {
+        const details = payload.details;
+        const commentId = payload.action === "issue.comment_added" && payload.entityType === "issue"
+          && issueId && payload.entityId === issueId
+          && details && typeof details === "object" && !Array.isArray(details)
+          ? (details as Record<string, unknown>).commentId : null;
+        return { ...event, payload: {
+          action: payload.action, entityType: payload.entityType, entityId: payload.entityId,
+          ...(typeof commentId === "string" && isUuidLike(commentId) ? { details: { commentId } } : {}),
+        } };
+      }
       if (event.type === "agent.status") return { ...event, payload: { agentId: payload.agentId, status: payload.status } };
       if (event.type === "external_object.updated") return { ...event, payload: { externalObjectId: payload.externalObjectId } };
       if (event.type.startsWith("plugin.")) return event;

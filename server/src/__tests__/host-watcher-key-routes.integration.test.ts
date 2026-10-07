@@ -413,19 +413,25 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
         });
         standardSocket!.once("error", reject);
       });
+      const commentId = randomUUID();
       publishLiveEvent({
         companyId, type: "activity.logged",
         payload: {
           action: "issue.comment_added", entityType: "issue", entityId: targets.pr923.issueId,
-          issueId: targets.pr923.issueId, bodySnippet: "private issue comment",
+          issueId: targets.pr923.issueId, details: { commentId, body: "private issue comment" },
+          bodySnippet: "private issue comment",
         },
       });
       const event = await received;
       expect(event).toMatchObject({
-        companyId, payload: { action: "issue.comment_added", entityType: "issue", entityId: targets.pr923.issueId },
+        companyId, payload: {
+          action: "issue.comment_added", entityType: "issue", entityId: targets.pr923.issueId,
+          details: { commentId },
+        },
       });
       expect(event.payload).not.toHaveProperty("issueId");
       expect(event.payload).not.toHaveProperty("bodySnippet");
+      expect(event.payload.details).not.toHaveProperty("body");
     } finally {
       standardSocket?.terminate();
       await new Promise<void>((resolve) => wss.close(resolve));

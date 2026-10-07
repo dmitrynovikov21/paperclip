@@ -101,6 +101,83 @@ const SAFE_ERROR_MESSAGES = new Set([
 ]);
 const SESSION_ID_RE = /^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d{8}_\d{6}_[A-Za-z0-9_-]{4,})$/;
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const WAKE_REASONS = new Set([
+  "heartbeat_timer", "issue_assigned", "issue_checked_out", "issue_commented",
+  "issue_comment_mentioned", "issue_status_changed", "issue_children_completed",
+  "issue_blockers_resolved", "issue_reopened_via_comment", "issue_tree_restored",
+  "issue_recovery_action_restored", "issue_monitor_due", "issue_monitor_recovery",
+  "issue_monitor_recovery_issue", "execution_review_requested", "execution_approval_requested",
+  "execution_changes_requested", "execution_review_participant_recovery",
+  "interaction_pending", "approval_approved", "missing_issue_comment", "process_lost_retry",
+  "workspace_busy_retry", "transient_failure_retry", "max_turns_continuation_retry",
+  "interaction_continuation_infra_retry", "skill_test_run_created", "secret_proposal_resolved",
+  "issue_execution_promoted", "issue_execution_deferred", "issue_execution_same_name",
+  "issue_rewake_throttled", "issue_dependencies_blocked", "summary_slot_generation_requested",
+  "status_card_compile_assigned", "status_card_update_assigned", "retry_failed_run",
+  "issue_assignment_recovery", "issue_continuation_needed", "provider_quota_recovery", "manual",
+  "finish_successful_run_handoff", "run_liveness_continuation", "issue_review_path_lost",
+]);
+const CONTEXT_SOURCES = new Set([
+  "scheduler", "issue.assignment_recovery", "issue.continuation_recovery",
+  "issue.assigned_todo_liveness_dispatch", "issue.execution_review_recovery",
+  "issue.execution_stage", "issue.monitor", "issue.monitor.recovery",
+  "issue.monitor.recovery_issue", "issue.comment", "issue.update", "issue.checkout",
+  "issue.status_change", "issue.children_completed", "issue.blockers_resolved",
+  "issue.comment.reopen", "issue.tree_restore", "approval.approved",
+  "execution_workspace.quarantine_restore", "issue.recovery_action_resolution",
+  "issue.interaction.accept", "issue.interaction.reject", "issue.interaction.respond",
+  "issue.interaction.verdicts", "issue.interaction.created", "issue.interaction.cancel",
+  "issue.interaction.withdraw", "comment.mention", "issue.stop_relay",
+  "issue_recovery_action",
+]);
+const REVIEW_RECOVERY_INSTRUCTION =
+  "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.";
+const CONTEXT_CODES: Record<string, Set<string>> = {
+  wakeReason: WAKE_REASONS,
+  retryReason: new Set([
+    "transient_failure", "max_turns_continuation", "interaction_continuation_infra_retry",
+    "missing_issue_comment", "provider_quota_recovery", "workspace_busy",
+    "execution_review_participant_recovery", "assignment_recovery", "issue_continuation_needed",
+  ]),
+  source: CONTEXT_SOURCES,
+  wakeSource: new Set(["timer", "assignment", "on_demand", "automation"]),
+  wakeTriggerDetail: new Set(["manual", "ping", "callback", "system"]),
+  modelProfile: new Set(["cheap", "status_only"]),
+  recoveryIntent: new Set(["status_only"]),
+  interactionKind: new Set(["ask_user_questions", "request_confirmation", "suggest_tasks"]),
+  interactionStatus: new Set(["pending", "accepted", "answered", "rejected", "responded", "cancelled"]),
+  continuationPolicy: new Set(["wake_assignee", "wake_assignee_on_accept", "none"]),
+  currentStageType: new Set(["review", "approval"]),
+  livenessContinuationState: new Set([
+    "completed", "advanced", "plan_only", "empty_response", "blocked", "failed", "needs_followup",
+  ]),
+  handoffReason: new Set(["successful_run_missing_state"]),
+  missingDisposition: new Set(["clear_next_step"]),
+  errorFamily: ERROR_FAMILIES,
+  workspaceRefreshReason: new Set(["accepted_plan_confirmation"]),
+};
+const CONTEXT_UUID_KEYS = [
+  "commentId", "wakeCommentId", "projectId", "responsibleUserId", "interactionId",
+  "annotationCommentId", "retryOfRunId", "missingIssueCommentForRunId",
+  "livenessContinuationSourceRunId", "recoveryActionId", "resumeFromRunId",
+  "interruptedRunId", "executionWorkspaceId", "sourceIssueId",
+  "currentStageId", "sourceRunId", "strandedRunId",
+] as const;
+const CONTEXT_BOOLEANS = [
+  "forceFreshSession", "skipIssueComment", "timerClaimWasFirstHeartbeat",
+  "workspaceBusyDeferredWhileAssignee", "dependencyBlockedInteraction", "treeHoldInteraction",
+  "childIssueSummaryTruncated", "checkedOutByHarness",
+  "allowDeliverableWork", "allowDocumentUpdates", "resumeRequiresNormalModel",
+  "handoffRequired",
+] as const;
+const CONTEXT_COUNTS = [
+  "scheduledRetryAttempt", "livenessContinuationAttempt", "livenessContinuationMaxAttempts",
+  "continuationAttempt",
+  "handoffAttempt", "maxHandoffAttempts",
+] as const;
+const CONTEXT_TIMESTAMPS = [
+  "scheduledRetryAt", "retryNowRequestedAt", "transientRetryNotBefore", "providerQuotaRetryNotBefore",
+] as const;
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -169,6 +246,87 @@ export function projectSafeErrorCode(value: unknown): string | null {
 export function projectSafeError(value: unknown): string | null {
   if (value == null) return null;
   return typeof value === "string" && SAFE_ERROR_MESSAGES.has(value) ? value : "Run failed";
+}
+
+/** Persist only typed routing metadata. The adapter receives its full context in memory. */
+export function projectSafeRunContextSnapshot(value: unknown): Record<string, unknown> {
+  const source = record(value);
+  if (!source) return {};
+  const safe: Record<string, unknown> = {};
+  for (const key of ["issueId", "taskId", "taskKey"] as const) {
+    const id = source[key];
+    if (typeof id === "string" && (UUID_RE.test(id) || ISSUE_IDENTIFIER_RE.test(id))) safe[key] = id;
+  }
+  for (const key of CONTEXT_UUID_KEYS) {
+    const id = source[key];
+    if (typeof id === "string" && UUID_RE.test(id)) safe[key] = id;
+  }
+  for (const [key, allowed] of Object.entries(CONTEXT_CODES)) {
+    const code = allowedCode(source[key], allowed);
+    if (code) safe[key] = code;
+  }
+  for (const key of CONTEXT_BOOLEANS) {
+    if (typeof source[key] === "boolean") safe[key] = source[key];
+  }
+  for (const key of CONTEXT_COUNTS) {
+    const count = finiteNumber(source[key]);
+    if (count !== null && Number.isSafeInteger(count) && count >= 0) safe[key] = count;
+  }
+  for (const key of CONTEXT_TIMESTAMPS) {
+    const timestamp = source[key];
+    if (typeof timestamp === "string" && /^\d{4}-\d{2}-\d{2}T/.test(timestamp)) {
+      const date = new Date(timestamp);
+      if (!Number.isNaN(date.getTime())) safe[key] = date.toISOString();
+    }
+  }
+  if (source.reviewRecoveryInstruction === REVIEW_RECOVERY_INSTRUCTION) {
+    safe.reviewRecoveryInstruction = REVIEW_RECOVERY_INSTRUCTION;
+  }
+  if (source.livenessContinuationReason != null) {
+    safe.livenessContinuationReason = projectSafeLivenessReason(source.livenessContinuationReason);
+  }
+  const wakeCommentIds = source.wakeCommentIds;
+  if (Array.isArray(wakeCommentIds)) {
+    safe.wakeCommentIds = wakeCommentIds.filter((id): id is string => typeof id === "string" && UUID_RE.test(id));
+  }
+  const blockers = source.unresolvedBlockerIssueIds;
+  if (Array.isArray(blockers)) {
+    safe.unresolvedBlockerIssueIds = blockers.filter((id): id is string => typeof id === "string" && UUID_RE.test(id));
+  }
+  const manifest = record(source.paperclipSecrets)?.manifest;
+  if (Array.isArray(manifest)) {
+    safe.paperclipSecrets = {
+      manifest: manifest.flatMap((item) => {
+        const bindingId = record(item)?.bindingId;
+        return typeof bindingId === "string" && UUID_RE.test(bindingId) ? [{ bindingId }] : [];
+      }),
+    };
+  }
+  const stage = record(source.executionStage);
+  if (stage) {
+    const safeStage: Record<string, unknown> = {};
+    const wakeRole = allowedCode(stage.wakeRole, new Set(["reviewer", "approver", "executor"]));
+    const stageType = allowedCode(stage.stageType, new Set(["review", "approval"]));
+    const outcome = allowedCode(stage.lastDecisionOutcome, new Set(["approved", "changes_requested"]));
+    if (wakeRole) safeStage.wakeRole = wakeRole;
+    if (stageType) safeStage.stageType = stageType;
+    if (outcome) safeStage.lastDecisionOutcome = outcome;
+    if (typeof stage.stageId === "string" && UUID_RE.test(stage.stageId)) safeStage.stageId = stage.stageId;
+    if (Array.isArray(stage.allowedActions)) {
+      const actions = new Set(["approve", "request_changes", "address_changes", "resubmit"]);
+      safeStage.allowedActions = stage.allowedActions.filter((action): action is string => typeof action === "string" && actions.has(action));
+    }
+    for (const key of ["currentParticipant", "returnAssignee"] as const) {
+      const participant = record(stage[key]);
+      const type = allowedCode(participant?.type, new Set(["agent", "user"]));
+      if (!type) continue;
+      const idKey = type === "agent" ? "agentId" : "userId";
+      const id = participant?.[idKey];
+      if (typeof id === "string" && UUID_RE.test(id)) safeStage[key] = { type, [idKey]: id };
+    }
+    if (Object.keys(safeStage).length) safe.executionStage = safeStage;
+  }
+  return safe;
 }
 
 export function projectSafeLivenessReason(value: unknown): string | null {
@@ -415,6 +573,7 @@ export function projectSafeRunEvent(input: {
 }
 
 export function projectSafeRunPatch<T extends {
+  contextSnapshot?: Record<string, unknown> | null;
   error?: string | null;
   errorCode?: string | null;
   resultJson?: Record<string, unknown> | null;
@@ -426,6 +585,7 @@ export function projectSafeRunPatch<T extends {
   signal?: string | null;
 }>(patch: T): T {
   const safe = { ...patch };
+  if ("contextSnapshot" in safe) safe.contextSnapshot = projectSafeRunContextSnapshot(safe.contextSnapshot);
   if ("error" in safe) safe.error = projectSafeError(safe.error);
   if ("errorCode" in safe) safe.errorCode = projectSafeErrorCode(safe.errorCode);
   if ("resultJson" in safe) safe.resultJson = projectSafeResultJson(safe.resultJson);
@@ -439,6 +599,7 @@ export function projectSafeRunPatch<T extends {
 }
 
 export function projectSafeRunRow<T extends {
+  contextSnapshot?: Record<string, unknown> | null;
   error?: string | null;
   errorCode?: string | null;
   resultJson?: Record<string, unknown> | null;
@@ -450,6 +611,11 @@ export function projectSafeRunRow<T extends {
   signal?: string | null;
 }>(row: T): T {
   const safe = { ...row };
+  if ("contextSnapshot" in safe) {
+    const context = projectSafeRunContextSnapshot(safe.contextSnapshot);
+    delete context.paperclipSecrets;
+    safe.contextSnapshot = context;
+  }
   if ("error" in safe) safe.error = projectSafeError(safe.error);
   if ("errorCode" in safe) safe.errorCode = projectSafeErrorCode(safe.errorCode);
   if ("resultJson" in safe) safe.resultJson = projectSafeResultJson(safe.resultJson);

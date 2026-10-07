@@ -2,12 +2,16 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import express from "express";
+import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues,
+  agentWakeupRequests, agents, companies, createDb, feedbackExports, heartbeatRunEvents, heartbeatRuns, issueComments, issues,
 } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
+import { errorHandler } from "../middleware/index.ts";
+import { agentRoutes } from "../routes/agents.ts";
 import { feedbackService } from "../services/feedback.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { getRunLogStore } from "../services/run-log-store.ts";
@@ -32,6 +36,7 @@ describeDb("safe central run carriers and feedback export", () => {
   const promptMarker = `prompt-${randomUUID()}`;
   const toolMarker = `tool-${randomUUID()}`;
   const dirtySources: string[] = [];
+  let failWithMarkers = false;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("safe-run-carriers-");
@@ -42,6 +47,7 @@ describeDb("safe central run carriers and feedback export", () => {
     registerServerAdapter({
       type: ADAPTER_TYPE,
       execute: async (ctx) => {
+        if (failWithMarkers) throw new Error(`Adapter failure: ${promptMarker} ${toolMarker}`);
         dirtySources.push(promptMarker, toolMarker);
         await ctx.onMeta({ adapterType: ADAPTER_TYPE, command: "probe", prompt: promptMarker });
         await ctx.onRuntimeProgress?.({ phase: "adapter_startup", message: promptMarker, lastAssistantSnippet: toolMarker });
@@ -95,7 +101,11 @@ describeDb("safe central run carriers and feedback export", () => {
       permissions: {},
     });
     const heartbeat = heartbeatService(db);
-    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const queued = await heartbeat.invoke(agentId, "on_demand", {
+      wakeReason: promptMarker,
+      untrustedPrompt: promptMarker,
+      toolOutput: { body: toolMarker },
+    }, "manual");
     expect(queued).not.toBeNull();
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     const run = await heartbeat.getRun(queued!.id);
@@ -107,9 +117,24 @@ describeDb("safe central run carriers and feedback export", () => {
     expect(dirtySources.join(" ")).toContain(toolMarker);
 
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run!.id));
+    const [storedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
     const storedLog = await getRunLogStore().read({ store: "local_file", logRef: run!.logRef! });
-    const stored = { run, events, storedLog };
+    const stored = { run, storedRun, events, storedLog };
     for (const marker of [promptMarker, toolMarker]) expect(markerCount(stored, marker)).toBe(0);
+
+    failWithMarkers = true;
+    const failed = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(failed).not.toBeNull();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed!.id));
+    const [failedWakeup] = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, failedRun!.wakeupRequestId!));
+    expect(failedRun?.status).toBe("failed");
+    expect(failedWakeup?.status).toBe("failed");
+    expect(failedWakeup?.error).toBe("Run failed");
+    for (const marker of [promptMarker, toolMarker]) {
+      expect(markerCount({ failedRun, failedWakeup }, marker)).toBe(0);
+    }
 
     await db.insert(issues).values({
       id: issueId,
@@ -144,6 +169,12 @@ describeDb("safe central run carriers and feedback export", () => {
     // construct a fresh safe projection instead of trusting stored snapshots.
     await db.update(heartbeatRuns).set({
       error: promptMarker,
+      contextSnapshot: {
+        issueId,
+        wakeReason: promptMarker,
+        paperclipWake: { issue: { description: promptMarker }, toolOutput: toolMarker },
+        paperclipSecrets: { manifest: [{ bindingId: randomUUID() }] },
+      },
       signal: promptMarker,
       nextAction: toolMarker,
       livenessReason: promptMarker,
@@ -164,6 +195,24 @@ describeDb("safe central run carriers and feedback export", () => {
 
     const legacy = await heartbeat.getRun(run!.id);
     const safeRead = projectSafeRunRow(legacy!);
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "test-board",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+        isInstanceAdmin: true,
+        source: "local_implicit",
+      };
+      next();
+    });
+    app.use("/api", agentRoutes(db));
+    app.use(errorHandler);
+    const runResponse = await request(app).get(`/api/heartbeat-runs/${run!.id}`);
+    expect(runResponse.status).toBe(200);
+    expect(runResponse.body).toMatchObject({ status: "succeeded", contextSnapshot: { issueId } });
+    expect(runResponse.body.contextSnapshot).not.toHaveProperty("paperclipSecrets");
     const safeEvents = await heartbeat.listEvents(run!.id);
     const safeLog = await heartbeat.readLog(run!.id);
     const traces = await feedback.listFeedbackTraces({ companyId, issueId, includePayload: true });
@@ -172,10 +221,10 @@ describeDb("safe central run carriers and feedback export", () => {
     expect(uploadTraceBundle).toHaveBeenCalledTimes(1);
     expect(bundle?.captureStatus).toBe("partial");
     expect(bundle?.rawAdapterTrace).toBeNull();
-    expect(safeRead).toMatchObject({ status: "succeeded", exitCode: 0 });
+    expect(safeRead).toMatchObject({ status: "succeeded", exitCode: 0, contextSnapshot: { issueId } });
     expect(safeRead.usageJson).toMatchObject({ inputTokens: 17, outputTokens: 9 });
     for (const marker of [promptMarker, toolMarker]) {
-      expect(markerCount({ safeRead, safeEvents, safeLog, traces, bundle, upload: uploadTraceBundle.mock.calls[0]?.[0] }, marker)).toBe(0);
+      expect(markerCount({ safeRead, runApi: runResponse.body, safeEvents, safeLog, traces, bundle, upload: uploadTraceBundle.mock.calls[0]?.[0] }, marker)).toBe(0);
     }
-  }, 30_000);
+  }, 60_000);
 });

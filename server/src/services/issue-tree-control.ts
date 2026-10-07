@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
+import { projectSafeError } from "./safe-run-carriers.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -1178,7 +1179,7 @@ export function issueTreeControlService(db: Db) {
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: reason,
+        error: projectSafeError(reason),
         updatedAt: now,
       })
       .where(

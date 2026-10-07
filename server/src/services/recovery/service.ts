@@ -53,7 +53,7 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
-import { projectSafeError, projectSafeErrorCode, projectSafeResultJson, projectSafeRunEvent, projectSafeRunLogChunk } from "../safe-run-carriers.js";
+import { projectSafeError, projectSafeErrorCode, projectSafeResultJson, projectSafeRunContextSnapshot, projectSafeRunEvent, projectSafeRunLogChunk } from "../safe-run-carriers.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -3066,13 +3066,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: 1,
           scheduledRetryReason: "provider_quota_recovery",
-          contextSnapshot: withRecoveryModelProfileHint({
+          contextSnapshot: projectSafeRunContextSnapshot(withRecoveryModelProfileHint({
             issueId: input.issue.id,
             taskId: input.issue.id,
             wakeReason: "provider_quota_recovery",
             retryReason: "provider_quota_recovery",
             providerQuotaRetryNotBefore: retryAt.toISOString(),
-          }, "normal_model"),
+          }, "normal_model")),
           updatedAt: now,
         })
         .returning()

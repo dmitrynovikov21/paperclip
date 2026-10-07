@@ -114,6 +114,7 @@ import {
   projectSafeErrorCode,
   projectSafeLivenessReason,
   projectSafeResultJson,
+  projectSafeRunContextSnapshot,
   projectSafeRunEvent,
   projectSafeRunLogChunk,
   projectSafeRunPatch,
@@ -8996,7 +8997,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!wakeupRequestId) return;
     await db
       .update(agentWakeupRequests)
-      .set({ status, ...patch, updatedAt: new Date() })
+      .set({
+        status,
+        ...patch,
+        ...(patch && "error" in patch ? { error: projectSafeError(patch.error) } : {}),
+        updatedAt: new Date(),
+      })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
@@ -9867,7 +9873,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -10117,7 +10123,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -10904,7 +10910,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           status: "cancelled",
           finishedAt: now,
-          error: gate.reason,
+          error: projectSafeError(gate.reason),
           updatedAt: now,
         })
         .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
@@ -11484,7 +11490,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "scheduled_retry",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(retryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -12027,7 +12033,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .update(heartbeatRuns)
         .set({
           scheduledRetryAt: now,
-          contextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(contextSnapshot),
           updatedAt: now,
         })
         .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
@@ -13608,6 +13614,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
+    const executionStage = parseObject(context.executionStage);
+    const reviewRequest = parseObject(parseObject(issueContext?.executionState).reviewRequest);
+    if (Object.keys(executionStage).length > 0 && typeof reviewRequest.instructions === "string") {
+      // Review instructions stay in the issue record; hydrate them only for the
+      // adapter invocation, then discard them at the snapshot write boundary.
+      context.executionStage = { ...executionStage, reviewRequest: { instructions: reviewRequest.instructions } };
+    }
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
       : null;
@@ -13788,12 +13801,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskSessionDecodedParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
+    // Rebuild the explicit override from its run ID at dispatch time. Session
+    // params can include provider state and must not live in contextSnapshot.
+    const explicitResumeSession = readNonEmptyString(context.resumeFromRunId)
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: context.resumeFromRunId }, taskKey)
+      : null;
     const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
       agent.adapterType,
-      sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
+      sessionCodec.deserialize(explicitResumeSession?.sessionParams ?? parseObject(context.resumeSessionParams)),
     );
     const explicitResumeSessionDisplayId = truncateDisplayId(
-      readNonEmptyString(context.resumeSessionDisplayId) ??
+      explicitResumeSession?.sessionDisplayId ?? readNonEmptyString(context.resumeSessionDisplayId) ??
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
         readNonEmptyString(explicitResumeSessionParams?.sessionId),
     );
@@ -14717,7 +14735,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: projectSafeRunContextSnapshot(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -14850,7 +14868,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: projectSafeRunContextSnapshot(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -15080,7 +15098,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-          contextSnapshot: context,
+          contextSnapshot: projectSafeRunContextSnapshot(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))
@@ -15291,7 +15309,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: projectSafeRunContextSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -15699,7 +15717,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(heartbeatRuns)
           .set({
-            contextSnapshot: context,
+            contextSnapshot: projectSafeRunContextSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
@@ -16730,7 +16748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: promotedTriggerDetail,
             status: "queued",
             wakeupRequestId: deferred.id,
-            contextSnapshot: promotedContextSnapshot,
+            contextSnapshot: projectSafeRunContextSnapshot(promotedContextSnapshot),
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
             continuationAttempt: promotedContinuationAttempt,
@@ -16884,7 +16902,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             triggerDetail: "system",
             status: "queued",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: withRecoveryModelProfileHint({
+            contextSnapshot: projectSafeRunContextSnapshot(withRecoveryModelProfileHint({
               issueId: issue.id,
               taskId: issue.id,
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
@@ -16895,7 +16913,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               currentStageType: executionState?.currentStageType ?? null,
               reviewRecoveryInstruction:
                 "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
-            }, "normal_model"),
+            }, "normal_model")),
             sessionIdBefore: recoverySessionBefore,
             retryOfRunId: run.id,
             updatedAt: now,
@@ -17049,7 +17067,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: recoveryContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(recoveryContextSnapshot),
           responsibleUserId,
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
@@ -17172,6 +17190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey: opts.idempotencyKey ?? null,
         finishedAt: new Date(),
         ...patch,
+        ...("error" in patch ? { error: projectSafeError(patch.error) } : {}),
       });
     };
     const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
@@ -17528,7 +17547,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 status: "cancelled",
                 finishedAt: now,
-                error: reason,
+                error: projectSafeError(reason),
                 updatedAt: now,
               })
               .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
@@ -17897,7 +17916,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const mergedRun = await tx
               .update(heartbeatRuns)
               .set({
-                contextSnapshot: mergedContextSnapshot,
+                contextSnapshot: projectSafeRunContextSnapshot(mergedContextSnapshot),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
@@ -18165,7 +18184,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "queued",
             responsibleUserId: await resolveQueuedResponsibleUserId(),
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: enrichedContextSnapshot,
+            contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
             sessionIdBefore: sessionBefore,
             continuationAttempt,
           })
@@ -18247,7 +18266,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
@@ -18339,7 +18358,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: projectSafeRunContextSnapshot(enrichedContextSnapshot),
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })
@@ -18619,7 +18638,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         status: "cancelled",
         finishedAt: now,
-        error: reason,
+        error: projectSafeError(reason),
         updatedAt: now,
       })
       .where(inArray(agentWakeupRequests.id, wakeupIds));

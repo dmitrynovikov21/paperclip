@@ -193,7 +193,7 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
       .set("Authorization", auth("watchdog")).send({ status: "terminated" })).status).toBe(403);
   });
 
-  it("preserves a board pause made after the watchdog scope guard", async () => {
+  it.each(["manual", "budget"] as const)("preserves a %s pause made after the watchdog scope guard", async (reason) => {
     const path = `/api/agents/${watchdogRecoverAgentId}`;
     await db.update(agents).set({ status: "error", pauseReason: null, pausedAt: null })
       .where(eq(agents.id, watchdogRecoverAgentId));
@@ -208,8 +208,13 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
       .send({ status: "idle" }).then((response) => response);
     try {
       await vi.waitFor(() => expect(reachedGuard).toBe(true), { timeout: 5_000 });
-      const paused = await request(app).post(`${path}/pause`).set("x-test-board-session", "pause");
-      expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      if (reason === "manual") {
+        const paused = await request(app).post(`${path}/pause`).set("x-test-board-session", "pause");
+        expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+      } else {
+        const paused = await agentService(db).pause(watchdogRecoverAgentId, "budget");
+        expect(paused?.status).toBe("paused");
+      }
     } finally {
       releasePatch();
       afterWatchdogGuard = null;
@@ -218,7 +223,7 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(409);
     const [current] = await db.select({ status: agents.status, pauseReason: agents.pauseReason })
       .from(agents).where(eq(agents.id, watchdogRecoverAgentId));
-    expect(current).toMatchObject({ status: "paused", pauseReason: "manual" });
+    expect(current).toMatchObject({ status: "paused", pauseReason: reason });
   });
 
   it("denies watchdog recovery of an agent in another company", async () => {

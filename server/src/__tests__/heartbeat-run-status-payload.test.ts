@@ -17,7 +17,7 @@ function run(status: string, resultJson: Record<string, unknown> | null) {
 }
 
 describe("buildHeartbeatRunStatusLiveEventPayload", () => {
-  it("attaches the canonical final assistant text to terminal status events", () => {
+  it("omits final assistant text from terminal status events", () => {
     expect(
       buildHeartbeatRunStatusLiveEventPayload(
         run("succeeded", { summary: "Hello! How can I help?", stdout: "raw logs" }),
@@ -25,7 +25,7 @@ describe("buildHeartbeatRunStatusLiveEventPayload", () => {
     ).toMatchObject({
       runId: "run-1",
       status: "succeeded",
-      finalText: "Hello! How can I help?",
+      finalText: null,
     });
   });
 

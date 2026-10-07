@@ -170,7 +170,7 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run produced concrete action evidence: 1 issue comment(s)",
       continuationAttempt: 2,
       lastUsefulActionAt: new Date("2026-04-18T19:59:00.000Z"),
-      nextAction: "Review the completed output.",
+      nextAction: null,
     });
 
     const runs = await activityService(db).runsForIssue(companyId, issueId);
@@ -210,7 +210,7 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run produced concrete action evidence: 1 issue comment(s)",
       continuationAttempt: 2,
       lastUsefulActionAt: new Date("2026-04-18T19:59:00.000Z"),
-      nextAction: "Review the completed output.",
+      nextAction: null,
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
   });

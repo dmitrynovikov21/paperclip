@@ -425,6 +425,8 @@ pnpm paperclipai run workspace-log <operation-id> [--offset 0] [--limit-bytes 16
 pnpm paperclipai run watchdog-decision <run-id> --decision continue [--reason "..."]
 ```
 
+Run APIs keep status, exit code, usage, and selected recovery metadata. `run log` shows a content-omitted marker. Run events and result fields also omit provider prompts, tool output, and free-form summaries. These read rules cover older stored runs.
+
 ## Routine Commands
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
@@ -912,6 +914,8 @@ Feedback traces can be fetched directly by ID when automating export workflows:
 pnpm paperclipai feedback trace <trace-id>
 pnpm paperclipai feedback bundle <trace-id>
 ```
+
+Feedback bundles contain run status, usage, safe result fields, and projected run events. They exclude comment and document bodies, run logs, and provider trace files, including for older traces. The raw agent output remains available only at its original execution source.
 
 ## Heartbeat Command
 

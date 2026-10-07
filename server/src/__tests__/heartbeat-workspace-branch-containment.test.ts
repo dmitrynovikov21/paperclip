@@ -600,32 +600,27 @@ async function expectContainedWorkspaceBranchFailure(input: {
   expect(workspaceValidation).toMatchObject({
     reason: "git_worktree_branch_incoherence",
     sourceIssueId: input.sourceIssueId,
-    expectedBranch: input.expectedBranch,
-    actualBranch: input.actualBranch,
     cleanliness: "clean",
     safeRepair: expect.objectContaining({
       eligible: false,
       attempted: false,
       succeeded: false,
-      reason: "expected branch and current HEAD differ",
     }),
   });
-  if (input.sourceExecutionWorkspaceId !== undefined) {
+  expect(workspaceValidation).not.toHaveProperty("expectedBranch");
+  expect(workspaceValidation).not.toHaveProperty("actualBranch");
+  expect(workspaceValidation).not.toHaveProperty("worktreePath");
+  if (typeof input.sourceExecutionWorkspaceId === "string") {
     expect(workspaceValidation.executionWorkspaceId).toBe(input.sourceExecutionWorkspaceId);
   }
   expect(workspaceValidation.fingerprint).toEqual(expect.stringMatching(/^workspace_incoherence:v1:sha256:[a-f0-9]{64}$/));
   expect(provenance).toMatchObject({
-    expectedBranchRef: `refs/heads/${input.expectedBranch}`,
-    actualBranchRef: `refs/heads/${input.actualBranch}`,
-    expectedBranchExists: true,
-    actualBranchExists: true,
-    sameHead: false,
     ancestryVerdict: "diverged",
   });
   expect(provenance.expectedHeadSha).toEqual(expect.stringMatching(/^[a-f0-9]{40}$/));
   expect(provenance.actualHeadSha).toEqual(expect.stringMatching(/^[a-f0-9]{40}$/));
   expect(provenance.expectedHeadSha).not.toBe(provenance.actualHeadSha);
-  expect(provenance.plainLanguageReason).toEqual(expect.stringContaining("cannot prove a forward-only reconciliation"));
+  expect(provenance).not.toHaveProperty("plainLanguageReason");
 
   const { issueRows, actionRows, comments } = await waitForContainmentSideEffects({
     db: input.db,
@@ -667,14 +662,11 @@ async function expectContainedWorkspaceBranchFailure(input: {
       recoveryCause: "workspace_validation_failed",
       workspaceValidation: expect.objectContaining({
         fingerprint: workspaceValidation.fingerprint,
-        expectedBranch: input.expectedBranch,
-        actualBranch: input.actualBranch,
         cleanliness: "clean",
         provenance: expect.objectContaining({
           expectedHeadSha: provenance.expectedHeadSha,
           actualHeadSha: provenance.actualHeadSha,
           ancestryVerdict: "diverged",
-          plainLanguageReason: provenance.plainLanguageReason,
         }),
       }),
     }),

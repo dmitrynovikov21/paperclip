@@ -68,10 +68,11 @@ function scopeMatches(lease: Lease, scope: ProviderStateScope) {
 }
 
 async function requireOwners(tx: Tx, scope: ProviderStateScope, issueId: string | null) {
-  const owner = await tx.select({ agentStatus: agents.status, companyStatus: companies.status })
+  const owner = await tx.select({ agentStatus: agents.status, adapterType: agents.adapterType, companyStatus: companies.status })
     .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
     .where(and(eq(agents.id, scope.agentId), eq(agents.companyId, scope.companyId))).limit(1);
-  if (!owner[0] || owner[0].agentStatus === "terminated" || owner[0].companyStatus === "archived") {
+  if (!owner[0] || owner[0].adapterType !== scope.adapterType ||
+      owner[0].agentStatus === "terminated" || owner[0].companyStatus === "archived") {
     throw new ProviderSessionIsolationRequired();
   }
   if (issueId) {
@@ -135,7 +136,8 @@ export function providerStateBroker(db: Db, options: { now?: () => Date; operati
   async function readActive(scope: ProviderStateScope, leaseId: string, generation: number, tx: Tx) {
     const fence = await lockScope(tx, scope.taskScopeId);
     const lease = (await tx.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)).for("update"))[0];
-    if (!lease || !scopeMatches(lease, scope) || lease.providerStateStatus !== "active" ||
+    if (!lease || !scopeMatches(lease, scope) || !["active", "released", "retained"].includes(lease.status) ||
+        lease.providerStateStatus !== "active" ||
         lease.providerStateTombstonedAt !== null || lease.providerStateGeneration !== generation ||
         fence.generation !== generation || fence.currentLeaseId !== leaseId ||
         !lease.expiresAt || lease.expiresAt <= now() || !lease.providerStateHardExpiresAt || lease.providerStateHardExpiresAt <= now()) {
@@ -202,6 +204,7 @@ export function providerStateBroker(db: Db, options: { now?: () => Date; operati
       const rows = await tx.update(environmentLeases).set({
         providerStateStatus: succeeded ? "destroyed" : "cleanup_failed",
         cleanupStatus: succeeded ? "success" : "failed", status: succeeded ? "expired" : "pending_cleanup",
+        releasedAt: succeeded ? now() : lease.releasedAt,
         providerStateCleanupClaim: null, providerStateCleanupClaimExpiresAt: null, updatedAt: now(),
       }).where(and(eq(environmentLeases.id, lease.id),
         eq(environmentLeases.providerStateGeneration, lease.providerStateGeneration),
@@ -232,13 +235,17 @@ export function providerStateBroker(db: Db, options: { now?: () => Date; operati
         const company = (await tx.select().from(companies).where(eq(companies.id, input.scope.companyId)).for("share"))[0];
         const agent = (await tx.select().from(agents).where(and(eq(agents.id, input.scope.agentId),
           eq(agents.companyId, input.scope.companyId))).for("share"))[0];
-        if (!company || company.status === "archived" || !agent || agent.status === "terminated") throw new ProviderSessionIsolationRequired();
+        if (!company || company.status === "archived" || !agent || agent.status === "terminated" ||
+            agent.adapterType !== input.scope.adapterType) throw new ProviderSessionIsolationRequired();
         const initial = (await tx.select().from(environmentLeases).where(eq(environmentLeases.id, input.environmentLeaseId)))[0];
         if (!initial) throw new ProviderSessionIsolationRequired();
         const environment = (await tx.select().from(environments).where(eq(environments.id, initial.environmentId)).for("share"))[0];
         if (!environment || environment.status !== "active") throw new ProviderSessionIsolationRequired();
         requireProviderStateDriverForEnvironment(input.registration, environment);
         if (initial.issueId) {
+          if (providerStateScope({ ...input.scope, taskKey: initial.issueId }).taskScopeId !== input.scope.taskScopeId) {
+            throw new ProviderSessionIsolationRequired();
+          }
           const issue = (await tx.select().from(issues).where(and(eq(issues.id, initial.issueId),
             eq(issues.companyId, input.scope.companyId))).for("share"))[0];
           if (!issue || issue.status === "done" || issue.status === "cancelled") throw new ProviderSessionIsolationRequired();

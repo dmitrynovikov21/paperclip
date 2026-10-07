@@ -313,6 +313,39 @@ describe("[e2e_db] provider-state broker", () => {
     expect(s.fixture.calls.length).toBe(0);
   });
 
+  it("rejects acquisition for a different task before driver preparation", async () => {
+    const s = await seed();
+    const scope = providerStateScope({ ...s.scope, taskKey: randomUUID() });
+    await expect(s.broker.acquire({ scope, expectedGeneration: await s.broker.snapshot(scope),
+      environmentLeaseId: s.lease.id, registration: s.registration, environmentDriver: "sandbox" }))
+      .rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(s.fixture.calls.length).toBe(0);
+  });
+
+  it("rejects an adapter scope that differs from the current owner", async () => {
+    const s = await seed(); const binding = await acquire(s);
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, s.agentId));
+    await expect(binding.assertWritable()).rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(await commit(s, binding)).toBe(false);
+    const scope = providerStateScope({ ...s.scope, adapterType: "acpx_local", taskKey: s.issueId });
+    await expect(s.broker.acquire({ scope, expectedGeneration: await s.broker.snapshot(scope),
+      environmentLeaseId: s.lease.id, registration: s.registration, environmentDriver: "sandbox" }))
+      .rejects.toMatchObject({ code: "provider_session_isolation_required" });
+  });
+
+  it("rejects state whose execution boundary lease was expired", async () => {
+    const s = await seed(); const binding = await acquire(s);
+    await environmentService(db).releaseLease(s.lease.id, "expired");
+    await expect(binding.assertWritable()).rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(await commit(s, binding)).toBe(false);
+    // A legacy release cannot restore a tombstoned provider generation.
+    await environmentService(db).releaseLease(s.lease.id, "released");
+    await expect(binding.assertWritable()).rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(s.fixture.artifacts.size).toBe(0);
+    await s.broker.destroy({ companyId: s.companyId, leaseId: binding.leaseId }, "expired");
+    expect(s.fixture.artifacts.size).toBe(0);
+  });
+
   it("terminates a stuck child and rejects late touch/sessionIdAfter after reset", async () => {
     const s = await seed(); s.fixture.setStuckChild(); const binding = await acquire(s);
     expect(await commit(s, binding)).toBe(true);

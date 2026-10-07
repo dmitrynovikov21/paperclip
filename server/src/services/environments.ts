@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { providerStateBroker } from "./provider-state-broker.js";
 import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1242,6 +1243,14 @@ export function environmentService(db: Db) {
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
       },
     ) => {
+      if (status === "expired" || status === "failed") {
+        const existing = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, id)))[0];
+        if (existing?.providerStateStatus && existing.providerStateStatus !== "destroyed") {
+          await providerStateBroker(db).destroy({ companyId: existing.companyId, leaseId: id }, "expired");
+          const row = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, id)))[0];
+          return row ? toEnvironmentLease(row) : null;
+        }
+      }
       const now = new Date();
       const row = await db
         .update(environmentLeases)

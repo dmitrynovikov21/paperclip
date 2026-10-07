@@ -54,6 +54,11 @@ asynchronous preparation. `acquire` checks that generation, reserves a
 trusted driver. Activation uses a DB compare-and-swap after the probe. A reset
 before the first acquisition invalidates the earlier snapshot as well.
 
+Acquisition checks the scope against the lease's issue and the owner's current
+adapter. A changed adapter or expired execution boundary invalidates use of an
+old binding. Expiring or failing a private execution lease tombstones and destroys
+its state; a later legacy release cannot restore the revoked generation.
+
 Reusable sandbox matching includes the task scope. A lease from another task is
 neither resumed nor destroyed as an obsolete configuration candidate. Resume also
 requires the linked environment and provider lease to match the newly acquired

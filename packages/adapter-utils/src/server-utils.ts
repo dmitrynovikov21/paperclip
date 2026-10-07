@@ -2241,10 +2241,27 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Control-plane credentials are never valid agent configuration, even when a
+// key does not use the PAPERCLIP_ prefix.
+export const PAPERCLIP_SERVER_ONLY_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+]);
+
+export function isPaperclipServerOnlyEnvKey(key: string): boolean {
+  return PAPERCLIP_SERVER_ONLY_ENV_KEYS.has(key.toUpperCase());
+}
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
+    if (isPaperclipServerOnlyEnvKey(key)) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;

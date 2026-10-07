@@ -41,6 +41,7 @@ import {
   ensurePathInEnv,
   ensurePaperclipSkillSymlink,
   isForbiddenConfigEnvKey,
+  isPaperclipServerOnlyEnvKey,
   isPaperclipRuntimeEnvKey,
   joinPromptSections,
   materializePaperclipSkillCopy,
@@ -74,7 +75,7 @@ import {
   type AcpRuntimeTurnResult,
   type AcpRuntimeUsageBreakdown,
   type AcpRuntimeUsageCost,
-} from "acpx/runtime";
+} from "./runtime.js";
 import {
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
@@ -157,6 +158,7 @@ type AcpxRuntimeFactory = (options: PaperclipAcpRuntimeOptions) => AcpRuntime;
 export interface RuntimeCacheEntry {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
+  terminalEnv: Record<string, string>;
   childStderrState: ChildStderrState;
   processIdentitySink: AcpxProcessIdentitySink;
   fingerprint: string;
@@ -364,6 +366,8 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  terminalEnv: Record<string, string>;
+  launchEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -1360,6 +1364,66 @@ async function stageAcpRemoteRuntime(input: {
   });
 }
 
+// ACPX runs inside the Paperclip server. Agents and terminals receive a closed
+// projection of host context plus this run's explicit environment.
+const ACPX_INHERITED_HOST_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "HOME", "USERPROFILE",
+  "HOMEDRIVE", "HOMEPATH", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG",
+  "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP", "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME", "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+]);
+
+const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
+  codex: new Set(["OPENAI_API_KEY", "CODEX_API_KEY"]),
+  claude: new Set([
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+    // Bedrock mode and its AWS credential chain must be supplied by this
+    // agent's run config, not inherited from the server's Secrets Manager.
+    "CLAUDE_CONFIG_DIR",
+  ]),
+  gemini: new Set([
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_GENAI_USE_GCA",
+  ]),
+};
+
+export function projectAcpxInheritedHostEnvironment(
+  inheritedEnv: NodeJS.ProcessEnv,
+  acpxAgent: string,
+): Record<string, string> {
+  const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
+  const projected: Record<string, string> = {};
+  for (const [key, value] of Object.entries(inheritedEnv)) {
+    if (typeof value !== "string") continue;
+    const normalizedKey = key.toUpperCase();
+    if (
+      ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
+      /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
+      providerKeys?.has(normalizedKey) === true
+    ) projected[key] = value;
+  }
+  return projected;
+}
+
+export function buildAcpxLaunchEnvironment(
+  env: Record<string, string>,
+  acpxAgent: string,
+  inheritedEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const merged = ensurePathInEnv({
+    ...projectAcpxInheritedHostEnvironment(inheritedEnv, acpxAgent),
+    ...env,
+  });
+  return Object.fromEntries(
+    Object.entries(merged).filter(
+      (entry): entry is [string, string] =>
+        typeof entry[1] === "string" && !isPaperclipServerOnlyEnvKey(entry[0]),
+    ),
+  );
+}
+
 async function buildRuntime(input: {
   ctx: AdapterExecutionContext;
   engine: AcpxEngineSettings;
@@ -1687,7 +1751,7 @@ async function buildRuntime(input: {
   if (acpxAgent === "gemini" && agentCommandShell) {
     const normalized = await normalizeGeminiAcpCommandShell(
       agentCommandShell,
-      ensurePathInEnv({ ...process.env, ...env }),
+      buildAcpxLaunchEnvironment(env, acpxAgent),
     );
     if (normalized !== agentCommandShell) {
       agentCommandShell = normalized;
@@ -2007,7 +2071,7 @@ async function buildRuntime(input: {
             Object.assign(env, paperclip.env);
             await input.ctx.onLog("stdout", "[paperclip] Sandbox ACP API callback bridge enabled for this run.\n");
           }
-          return (runtimeEnv = resolveRuntimeEnv(env));
+          return (runtimeEnv = resolveRuntimeEnv(env, acpxAgent));
         })());
       const processSessionStart = measureStartupStep(input.ctx, nowMs, "bridge.process-session", () =>
         startAdapterExecutionTargetProcessSessionBridge({
@@ -2042,7 +2106,7 @@ async function buildRuntime(input: {
     } else {
       // Local / runner-less lanes never start a bridge, but the returned prepared
       // runtime and the log builder still read `runtimeEnv`.
-      runtimeEnv = resolveRuntimeEnv(env);
+      runtimeEnv = resolveRuntimeEnv(env, acpxAgent);
     }
   } catch (err) {
     // On a partial concurrent bring-up failure, ONE bridge may have started while
@@ -2088,6 +2152,8 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    terminalEnv: runtimeEnv,
+    launchEnv: runtimeEnv,
     loggedEnv,
     stateDir,
     permissionMode,
@@ -2182,12 +2248,8 @@ async function applySessionConfigOptions(input: {
  * narrowed to string values. Shared by the remote concurrent bring-up and the
  * local / runner-less lane so both resolve the runtime env identically.
  */
-function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+function resolveRuntimeEnv(env: Record<string, string>, acpxAgent: string): Record<string, string> {
+  return buildAcpxLaunchEnvironment(env, acpxAgent);
 }
 
 /**
@@ -3269,6 +3331,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const canResume = isCompatibleSession(previousParams, prepared);
       const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
       const cached = canResume ? warmHandles.get(prepared.sessionKey) : undefined;
+      // ACPX may retain its client across runs. Keep the terminal base object
+      // stable while replacing every key with the current run's projection.
+      const terminalEnv = cached?.terminalEnv ?? Object.create(null) as Record<string, string>;
+      for (const key of Object.keys(terminalEnv)) delete terminalEnv[key];
+      Object.assign(terminalEnv, prepared.terminalEnv);
       const childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
       const processIdentitySink = cached?.processIdentitySink ?? {
         current: ctx.onSpawn,
@@ -3290,6 +3357,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         spawnCwd: prepared.hostSpawnCwd,
         sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
         agentRegistry: prepared.agentRegistry,
+        terminalEnv,
         permissionMode: prepared.permissionMode,
         nonInteractivePermissions: prepared.nonInteractivePermissions,
         mcpServers: prepared.mcpServers,
@@ -3359,7 +3427,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 mode: prepared.mode,
                 cwd: prepared.cwd,
                 resumeSessionId,
-                sessionOptions: { env: prepared.env },
+                sessionOptions: { env: prepared.launchEnv },
               });
               ensureSessionMs = now() - ensureSessionStart;
               return established;
@@ -3390,7 +3458,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 agent: prepared.acpxAgent,
                 mode: prepared.mode,
                 cwd: prepared.cwd,
-                sessionOptions: { env: prepared.env },
+                sessionOptions: { env: prepared.launchEnv },
               });
               retryEnsureSessionMs = now() - ensureSessionStart;
               return established;
@@ -3651,6 +3719,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             const entry: RuntimeCacheEntry = {
               runtime,
               handle: sessionHandle,
+              terminalEnv,
               childStderrState,
               processIdentitySink,
               fingerprint: prepared.fingerprint,

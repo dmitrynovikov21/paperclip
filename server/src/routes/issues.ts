@@ -13332,6 +13332,12 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      const cronWatchdogMonitorPatch = req.actor.type === "agent"
+        && req.actor.source === "agent_key" && Boolean(req.actor.keyId)
+        && req.actor.keyScope?.kind === "cron_service"
+        && req.actor.keyScope.service === "agent_watchdog"
+        && req.actor.companyId === existing.companyId
+        && req.actor.keyScope.alarmIssueIds.includes(existing.id);
       // Host watcher PATCH is authorized by the exact HTTP scope and row guard.
       // Disk guard has issue:mutate but deliberately lacks issue:read.
       const hostWatcherPatch = req.actor.type === "agent" && req.actor.source === "agent_key"
@@ -13813,6 +13819,14 @@ export function issueRoutes(
         };
       }
       Object.assign(updateFields, transition.patch);
+      if (cronWatchdogMonitorPatch && nextExecutionPolicy?.monitor) {
+        // Keep the exact review and authorization fields from the issue row.
+        // The service checks this snapshot under its write lock before saving.
+        updateFields.executionPolicy = {
+          ...(existing.executionPolicy ?? { mode: "normal", stages: [] }),
+          monitor: nextExecutionPolicy.monitor,
+        };
+      }
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -14137,6 +14151,13 @@ export function issueRoutes(
         ...(isHostWatcherKeyActor(req) && req.actor.type === "agent" ? {
           companyGuard: req.actor.companyId,
           hostWatcherScope: req.actor.keyScope,
+        } : {}),
+        ...(cronWatchdogMonitorPatch ? {
+          companyGuard: existing.companyId,
+          cronWatchdogMonitorRequest: {
+            policy: res.locals.cronWatchdogExecutionPolicy,
+            issueUpdatedAt: existing.updatedAt,
+          },
         } : {}),
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,

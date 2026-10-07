@@ -143,6 +143,7 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   buildInitialIssueMonitorFields,
+  executionPolicyOutsideMonitorEqual,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -10805,6 +10806,7 @@ export function issueService(db: Db) {
         actorUserId?: string | null;
         companyGuard?: string;
         hostWatcherScope?: HostWatcherAgentKeyScope;
+        cronWatchdogMonitorRequest?: { policy: unknown; issueUpdatedAt: Date };
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10853,6 +10855,7 @@ export function issueService(db: Db) {
         actorUserId,
         companyGuard,
         hostWatcherScope,
+        cronWatchdogMonitorRequest,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -11145,6 +11148,16 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (cronWatchdogMonitorRequest && (
+          !companyGuard || receiptExisting.companyId !== companyGuard
+          || receiptExisting.updatedAt.getTime() !== cronWatchdogMonitorRequest.issueUpdatedAt.getTime()
+          || !executionPolicyOutsideMonitorEqual(
+            cronWatchdogMonitorRequest.policy,
+            receiptExisting.executionPolicy,
+          )
+        )) {
+          throw conflict("Cron watchdog monitor target changed before the issue update");
+        }
         if (hostWatcherScope) {
           const isDiskGuard = hostWatcherScope.service === "disk_guard";
           const expectedStatus = isDiskGuard ? "todo"

@@ -1,8 +1,8 @@
-import { isDeepStrictEqual } from "node:util";
 import type { RequestHandler } from "express";
 import { and, eq } from "drizzle-orm";
 import { agents, issues, type Db } from "@paperclipai/db";
 import type { CronServiceAgentKeyScope } from "@paperclipai/shared";
+import { executionPolicyOutsideMonitorEqual } from "../services/issue-execution-policy.js";
 
 type CronIssue = {
   title: string;
@@ -32,13 +32,6 @@ function keysAre(value: unknown, required: string[], optional: string[] = []): v
     && Object.keys(data).every((key) => required.includes(key) || optional.includes(key));
 }
 
-function withoutMonitor(value: unknown) {
-  const policy = record(value);
-  if (!policy) return { mode: "normal", stages: [] };
-  const { monitor: _monitor, ...rest } = policy;
-  return { mode: "normal", stages: [], ...rest };
-}
-
 function watchdogMonitorUpdate(body: unknown, existingPolicy: unknown) {
   if (!keysAre(body, ["executionPolicy"])) return false;
   const policy = record(body.executionPolicy);
@@ -54,7 +47,7 @@ function watchdogMonitorUpdate(body: unknown, existingPolicy: unknown) {
     || nextCheckAt > Date.now() + 26 * 60 * 60_000) return false;
   if (monitor.scheduledBy !== undefined && monitor.scheduledBy !== "board") return false;
   if (monitor.notes !== undefined && (typeof monitor.notes !== "string" || monitor.notes.length > 500)) return false;
-  return isDeepStrictEqual(withoutMonitor(policy), withoutMonitor(existingPolicy));
+  return executionPolicyOutsideMonitorEqual(policy, existingPolicy);
 }
 
 const UUID_PATH = "[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}";
@@ -139,6 +132,12 @@ export function cronServiceKeyGuard(db: Db): RequestHandler {
       if (!allowed) {
         res.status(403).json({ error: "API operation is outside this cron service key's scope" });
         return;
+      }
+      if (actor.keyScope.service === "agent_watchdog" && req.method === "PATCH"
+        && ISSUE_PATH.test(url.pathname)) {
+        // Route validation normalizes the body, so retain what this guard
+        // compared for the under-lock freshness check.
+        res.locals.cronWatchdogExecutionPolicy = req.body.executionPolicy;
       }
       next();
     } catch (error) {

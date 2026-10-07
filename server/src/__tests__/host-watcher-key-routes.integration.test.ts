@@ -142,7 +142,10 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     app.use(hostWatcherKeyGuard(db));
     app.use(cronServiceKeyGuard(db));
     app.use(async (req, _res, next) => {
-      if (req.method !== "PATCH" || req.path !== `/api/agents/${watchdogRecoverAgentId}`
+      if (req.method !== "PATCH" || ![
+        `/api/agents/${watchdogRecoverAgentId}`,
+        `/api/issues/${watchdogAlarmIssueId}`,
+      ].includes(req.path)
         || req.actor.type !== "agent" || req.actor.keyScope?.kind !== "cron_service"
         || !afterWatchdogGuard) return next();
       try {
@@ -191,6 +194,79 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
     expect((await request(app).patch(`/api/agents/${watchdogRecoverAgentId}`)
       .set("Authorization", auth("watchdog")).send({ status: "terminated" })).status).toBe(403);
+  });
+
+  it("keeps board review and authorization edits made after the watchdog scope guard", async () => {
+    const path = `/api/issues/${watchdogAlarmIssueId}`;
+    const [baseline] = await db.select().from(issues).where(eq(issues.id, watchdogAlarmIssueId));
+    expect(baseline).toBeDefined();
+    const originalPolicy = baseline!.executionPolicy as Record<string, unknown>;
+    const monitor = {
+      kind: "external_service", serviceName: "paperclip-board", recoveryPolicy: "wake_owner",
+      maxAttempts: 100, nextCheckAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    };
+    let reachedGuard = false;
+    let releasePatch!: () => void;
+    const held = new Promise<void>((resolve) => { releasePatch = resolve; });
+    afterWatchdogGuard = async () => {
+      reachedGuard = true;
+      await held;
+    };
+    const pending = request(app).patch(path).set("Authorization", auth("watchdog"))
+      .send({ executionPolicy: { ...originalPolicy, monitor } }).then((response) => response);
+    try {
+      await vi.waitFor(() => expect(reachedGuard).toBe(true), { timeout: 5_000 });
+      const { monitor: _previousMonitor, ...policyWithoutMonitor } = originalPolicy;
+      const boardPolicy = {
+        ...policyWithoutMonitor,
+        stages: [{
+          id: randomUUID(), type: "review", participants: [{
+            id: randomUUID(), type: "user", userId: responsibleUserId,
+          }],
+        }],
+        authorizationPolicy: { assignmentPolicy: { mode: "protected" } },
+      };
+      const boardEdit = await request(app).patch(path).set("x-test-board-session", "pause")
+        .send({ executionPolicy: boardPolicy });
+      expect(boardEdit.status, JSON.stringify(boardEdit.body)).toBe(200);
+      releasePatch();
+      afterWatchdogGuard = null;
+      const stale = await pending;
+      expect(stale.status, JSON.stringify(stale.body)).toBe(409);
+      const [afterStale] = await db.select({ executionPolicy: issues.executionPolicy })
+        .from(issues).where(eq(issues.id, watchdogAlarmIssueId));
+      expect(afterStale!.executionPolicy).toMatchObject({
+        stages: [{ type: "review" }],
+        authorizationPolicy: { assignmentPolicy: { mode: "protected" } },
+      });
+
+      const rearmed = await request(app).patch(path).set("Authorization", auth("watchdog"))
+        .send({ executionPolicy: { ...afterStale!.executionPolicy, monitor } });
+      expect(rearmed.status, JSON.stringify(rearmed.body)).toBe(200);
+      const [afterRearm] = await db.select({ executionPolicy: issues.executionPolicy })
+        .from(issues).where(eq(issues.id, watchdogAlarmIssueId));
+      expect(afterRearm!.executionPolicy).toMatchObject({
+        stages: [{ type: "review" }],
+        authorizationPolicy: { assignmentPolicy: { mode: "protected" } },
+        monitor: { nextCheckAt: monitor.nextCheckAt },
+      });
+    } finally {
+      releasePatch();
+      afterWatchdogGuard = null;
+      await pending.catch(() => {});
+      await db.update(issues).set({
+        status: baseline!.status,
+        assigneeAgentId: baseline!.assigneeAgentId,
+        assigneeUserId: baseline!.assigneeUserId,
+        executionPolicy: baseline!.executionPolicy,
+        executionState: baseline!.executionState,
+        monitorNextCheckAt: baseline!.monitorNextCheckAt,
+        monitorWakeRequestedAt: baseline!.monitorWakeRequestedAt,
+        monitorNotes: baseline!.monitorNotes,
+        monitorScheduledBy: baseline!.monitorScheduledBy,
+        monitorAttemptCount: baseline!.monitorAttemptCount,
+      }).where(eq(issues.id, watchdogAlarmIssueId));
+    }
   });
 
   it.each(["offline", "crashed"] as const)("recovers a %s agent through the watchdog route", async (status) => {

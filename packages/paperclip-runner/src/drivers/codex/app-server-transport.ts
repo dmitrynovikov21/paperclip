@@ -1,3 +1,4 @@
+import { configuredEnvironment } from "../../configured-environment.js";
 import type { NativeTurnControlCapabilities } from "../../contracts/types.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
@@ -243,7 +244,7 @@ export function createSanitizedCodexEnvironment(
   for (const key of ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]) {
     if (explicit?.[key] !== undefined) environment[key] = explicit[key];
   }
-  Object.assign(environment, githubCredentialEnvironment(source));
+  Object.assign(environment, githubCredentialEnvironment(source), configuredEnvironment(explicit));
   return environment;
 }
 

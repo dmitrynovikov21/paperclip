@@ -22,6 +22,13 @@ the provider conversation. Company, agent, task, workspace, model, instruction,
 and skill compatibility still gate recovery. An MCP-only assignment change can
 resume only when the selected harness explicitly supports refreshing tools.
 
+Compact continuation messages include the active completion revision and criterion
+IDs plus a reminder to obtain an accepted `paperclip_finish` or `paperclip_block`
+result for this turn. Reports from earlier turns do not finish the new turn.
+Provider final text alone remains insufficient; governed waits and strict native
+completion validation keep their existing behavior. This reminder changes the
+resumed model input, not the tool catalog or automatic retry policy.
+
 When recovery needs a fresh conversation, the server supplies a deterministic
 handoff through a lazy history loader at the fresh attempt boundary.
 It includes the original request, recent messages, resolved interaction
@@ -131,6 +138,9 @@ build and include them in the server's vendored Runner output before npm packing
 Assembly requires the provider pack's source revision to match `sourceRevision`
 and its ACPX profiles and Cursor distribution to match the current source pins.
 An independently rehashed older pack is rejected.
+Provider-pack builds replace the installed Copilot platform wrappers with relative
+launchers. These wrappers remain usable after the pack moves into an image. The
+build still rejects any wrapper that retains its temporary deployment path.
 Ordinary remote Cursor startup uses the packaged Linux daemon and verifies every
 image asset against that manifest. A mismatched image fails before the provider
 starts; install the matching package and image together.

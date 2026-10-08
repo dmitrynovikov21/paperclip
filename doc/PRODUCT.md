@@ -30,6 +30,15 @@ Example: A CEO agent's adapter config tells it to "review what your executives a
 
 Then you define who reports to the CEO: a CTO managing programmers, a CMO managing the marketing team, and so on. Every agent in the tree gets their own adapter configuration.
 
+Each person also has a personal primary agent per company. Their first human-created
+agent becomes primary automatically; they can choose another from its profile.
+An existing primary is replaced only after confirmation. The crown appears on the
+profile and roster, while the primary stays first in the Agents sidebar without a
+sidebar crown. Stars remain independent. Task drafts, explicit assignments, and
+recent choices take precedence over the primary; Chat similarly reopens a valid
+recent conversation before falling back to the primary. Opening Chat does not
+start execution. This preference does not change the org chart or permissions.
+
 ### Agent Execution
 
 Paperclip supports several ways to run an agent's heartbeat:
@@ -232,3 +241,12 @@ to Tasks. A Views menu on the task list covers the inbox views (Mine, Unread,
 Blocked, Recent, Everything) and the task-status views (All, Active, Backlog,
 Done). Bare `/issues` opens the last-used view, defaulting to Mine; links that
 carry a task filter open All. Old `/inbox` links redirect to the matching view.
+
+### CSV file previews
+
+Task attachment and workspace file tabs render CSV files as tables by default.
+The first record supplies column headers. Row numbers, row and column counts,
+and sticky headers help operators scan exports. Rendered and raw view icons
+remain next to download; raw view preserves the original source. The table
+shows up to 500 data rows and 100 columns, with a notice when the preview is
+limited. Download retains the complete file.

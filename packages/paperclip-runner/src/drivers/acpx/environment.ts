@@ -1,3 +1,4 @@
+import { configuredEnvironment } from "../../configured-environment.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 
 export const ACPX_CREDENTIAL_BINDING_ENV = "PAPERCLIP_ACPX_CREDENTIAL_BINDING";
@@ -87,7 +88,7 @@ export function createSanitizedAcpxSpawnInput(
 ): SanitizedAcpxSpawnInput {
   const source = environment ?? process.env;
   const candidate = isCandidate(agent);
-  const result: NodeJS.ProcessEnv = {};
+  const result: NodeJS.ProcessEnv = configuredEnvironment(environment);
   const credentialNames = ACPX_CREDENTIAL_NAMES[agent];
   const allowed = new Set([
     "PATH",

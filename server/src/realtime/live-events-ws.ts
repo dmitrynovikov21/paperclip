@@ -59,6 +59,8 @@ interface IncomingMessageWithContext extends IncomingMessage {
   paperclipUpgradeContext?: UpgradeContext;
 }
 
+const liveEventsWsRoutePath = "/api/companies/:companyId/events/ws";
+
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -303,7 +305,7 @@ export function setupLiveEventsWebSocketServer(
     }
 
     const onRawSocketError = (err: Error) => {
-      logger.warn({ err, path: req.url }, "live websocket upgrade socket error");
+      logger.warn({ err, path: liveEventsWsRoutePath }, "live websocket upgrade socket error");
     };
     const cleanupRawSocketListeners = () => {
       socket.off("error", onRawSocketError);
@@ -350,7 +352,7 @@ export function setupLiveEventsWebSocketServer(
         });
       })
       .catch((err) => {
-        logger.error({ err, path: req.url }, "failed websocket upgrade authorization");
+        logger.error({ err, path: liveEventsWsRoutePath }, "failed websocket upgrade authorization");
         rejectUpgrade(socket, "500 Internal Server Error", "upgrade failed");
       });
   });

@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
-import type { Duplex } from "node:stream";
+import { Writable, type Duplex } from "node:stream";
+import pino from "pino";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
@@ -62,6 +63,18 @@ async function flushPromises() {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function serializePinoLog(level: "warn" | "error", fields: object, message: string) {
+  let output = "";
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      output += chunk.toString();
+      callback();
+    },
+  });
+  pino({ level: "warn" }, sink)[level](fields, message);
+  return output;
+}
+
 describe("setupLiveEventsWebSocketServer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -82,27 +95,61 @@ describe("setupLiveEventsWebSocketServer", () => {
 
   it("handles raw upgrade socket errors during async authorization", async () => {
     const server = new EventEmitter();
-    let resolveSession: (value: null) => void = () => undefined;
-    setupLiveEventsWebSocketServer(server as never, {} as never, {
-      deploymentMode: "authenticated",
-      resolveSessionFromHeaders: () =>
-        new Promise((resolve) => {
-          resolveSession = resolve;
+    const token = "synthetic_query_token_raw_socket";
+    let resolveKeys: (rows: []) => void = () => undefined;
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => new Promise<[]>((resolve) => {
+            resolveKeys = resolve;
+          }),
         }),
-    });
+      }),
+    };
+    setupLiveEventsWebSocketServer(server as never, db as never, { deploymentMode: "authenticated" });
     const socket = new FakeUpgradeSocket();
 
-    server.emit("upgrade", createUpgradeRequest(), socket as unknown as Duplex, Buffer.alloc(0));
+    const request = createUpgradeRequest({ url: `/api/companies/company-1/events/ws?token=${token}` });
+    server.emit("upgrade", request, socket as unknown as Duplex, Buffer.alloc(0));
     expect(() => socket.emitSocketError(new Error("write EPIPE"))).not.toThrow();
-    resolveSession(null);
+    resolveKeys([]);
     await flushPromises();
 
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ err: expect.any(Error), path: "/api/companies/company-1/events/ws" }),
+      expect.objectContaining({ err: expect.any(Error), path: "/api/companies/:companyId/events/ws" }),
       "live websocket upgrade socket error",
     );
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(token);
+    expect(
+      serializePinoLog("warn", vi.mocked(logger.warn).mock.calls[0]![0] as object, "live websocket upgrade socket error"),
+    ).not.toContain(token);
     expect(socket.endedChunks).toEqual([]);
     expect(socket.destroyed).toBe(true);
+  });
+
+  it("does not log a query token when upgrade authorization fails", async () => {
+    const server = new EventEmitter();
+    const token = "synthetic_query_token_auth_failure";
+    const db = {
+      select: () => { throw new Error("synthetic database failure"); },
+    };
+    setupLiveEventsWebSocketServer(server as never, db as never, { deploymentMode: "authenticated" });
+    const socket = new FakeUpgradeSocket();
+
+    const request = createUpgradeRequest({ url: `/api/companies/company-1/events/ws?token=${token}` });
+    server.emit("upgrade", request, socket as unknown as Duplex, Buffer.alloc(0));
+    await flushPromises();
+    await flushPromises();
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error), path: "/api/companies/:companyId/events/ws" }),
+      "failed websocket upgrade authorization",
+    );
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain(token);
+    expect(
+      serializePinoLog("error", vi.mocked(logger.error).mock.calls[0]![0] as object, "failed websocket upgrade authorization"),
+    ).not.toContain(token);
+    expect(socket.endedChunks[0]).toContain("500 Internal Server Error");
   });
 
   it("destroys and cleans up listeners after flushing a rejection response", async () => {

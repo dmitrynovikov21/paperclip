@@ -9,6 +9,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 import {
   createWorkspaceOperationUrlStreamRedactor,
+  redactTruncatedWorkspaceOperationOutput,
   redactWorkspaceOperationExcerpt,
   redactWorkspaceOperationUrls,
 } from "./workspace-operation-url-redaction.js";
@@ -500,25 +501,39 @@ export function workspaceOperationService(db: Db) {
             stderr: createWorkspaceOperationUrlStreamRedactor(),
             system: createWorkspaceOperationUrlStreamRedactor(),
           };
+          const pendingEvents: Record<"stdout" | "stderr" | "system", { chunk: string; ts: string } | null> = {
+            stdout: null,
+            stderr: null,
+            system: null,
+          };
+          const writePendingEvent = async (stream: "stdout" | "stderr" | "system") => {
+            const event = pendingEvents[stream];
+            pendingEvents[stream] = null;
+            if (!event?.chunk) return;
+            if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, event.chunk);
+            if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, event.chunk);
+            await logStore.append(handle, { stream, ...event });
+          };
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = streamRedactors[stream].push(redactCurrentUserText(chunk, currentUserRedactionOptions));
-            if (!sanitizedChunk) return;
-            if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-            if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
-            await logStore.append(handle, {
-              stream,
-              chunk: sanitizedChunk,
-              ts: new Date().toISOString(),
-            });
+            const sanitizedChunk = streamRedactors[stream].push(redactTruncatedWorkspaceOperationOutput(
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            ));
+            const event = pendingEvents[stream] ?? { chunk: "", ts: new Date().toISOString() };
+            event.chunk += sanitizedChunk;
+            pendingEvents[stream] = event;
+            // A possible scheme suffix may belong to this event. Keep its safe
+            // prefix with the suffix so a plain message remains one NDJSON row.
+            if (!streamRedactors[stream].hasPending() || event.chunk.length >= 256 * 1024) {
+              await writePendingEvent(stream);
+            }
           };
           const flushPendingOutput = async () => {
             for (const stream of ["stdout", "stderr", "system"] as const) {
-              const chunk = streamRedactors[stream].flush();
-              if (!chunk) continue;
-              if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, chunk);
-              if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, chunk);
-              await logStore.append(handle, { stream, chunk, ts: new Date().toISOString() });
+              const event = pendingEvents[stream] ?? { chunk: "", ts: new Date().toISOString() };
+              event.chunk += streamRedactors[stream].flush();
+              pendingEvents[stream] = event;
+              await writePendingEvent(stream);
             }
           };
 

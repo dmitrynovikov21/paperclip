@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createLocalFileWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 import {
   createWorkspaceOperationUrlStreamRedactor,
+  redactTruncatedWorkspaceOperationOutput,
   redactWorkspaceOperationExcerpt,
   redactWorkspaceOperationUrlUserInfo,
 } from "./workspace-operation-url-redaction.js";
@@ -34,6 +35,29 @@ describe("workspace operation URL redaction", () => {
       + redactor.push("gresql://synthetic-user:synthetic-password")
       + redactor.flush();
     expect(output).toBe("connect postgresql://[REDACTED]");
+  });
+
+  it("accepts an apostrophe inside userinfo and hostless PostgreSQL excerpts", () => {
+    const credential = "synthetic-reader:it's-a-password";
+    const url = `postgresql://${credential}@db.example.test/app`;
+    const redactor = createWorkspaceOperationUrlStreamRedactor();
+    const output = redactor.push(`connect ${url}`) + redactor.flush();
+    expect(output).toBe("connect postgresql://[REDACTED]@db.example.test/app");
+    expect(redactWorkspaceOperationUrlUserInfo(url)).toBe("postgresql://[REDACTED]@db.example.test/app");
+    for (const hostAndPath of ["/app", "?host=db.example.test/app"]) {
+      expect(redactWorkspaceOperationExcerpt(`word tail'password@${hostAndPath}`))
+        .toBe(`word [REDACTED]@${hostAndPath}`);
+    }
+  });
+
+  it("hides the first uncertain token of a truncated process capture", () => {
+    const captured = "[output truncated to last 262144 bytes; total 262200 bytes]\n"
+      + "thetic'password@db.example.test/app complete";
+    expect(redactTruncatedWorkspaceOperationOutput(captured))
+      .toContain("\n[REDACTED]@db.example.test/app complete");
+    expect(redactWorkspaceOperationExcerpt(captured))
+      .toContain("\n[REDACTED]@db.example.test/app complete");
+    expect(redactTruncatedWorkspaceOperationOutput(captured)).not.toContain("thetic'password");
   });
 
   describe("historical byte-range pages", () => {
@@ -121,6 +145,39 @@ describe("workspace operation URL redaction", () => {
       expected.fill(0x2a, firstAt, firstAt + first.length);
       expected.fill(0x2a, damagedAt);
 
+      let offset = 0;
+      while (offset < original.length) {
+        const page = await store.read(handle, { offset, limitBytes: 7 });
+        const nextOffset = page.nextOffset ?? original.length;
+        expect(page.content).toBe(expected.subarray(offset, nextOffset).toString("utf8"));
+        offset = nextOffset;
+      }
+      expect(await fs.readFile(filePath)).toEqual(original);
+    });
+
+    it("masks apostrophes and a capture truncated inside userinfo without changing byte offsets", async () => {
+      const store = createLocalFileWorkspaceOperationLogStore(logRoot);
+      const handle = await store.begin({ companyId: randomUUID(), operationId: randomUUID() });
+      const apostropheCredential = "synthetic-reader:it's-a-password";
+      const truncatedCredential = "thetic'password";
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: `postgresql://${apostropheCredential}@db.example.test/app`,
+        ts: new Date().toISOString(),
+      });
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: `[output truncated to last 262144 bytes; total 262200 bytes]\n${truncatedCredential}@db.example.test/app`,
+        ts: new Date().toISOString(),
+      });
+      const filePath = path.join(logRoot, handle.logRef);
+      const original = await fs.readFile(filePath);
+      const expected = Buffer.from(original);
+      for (const credential of [apostropheCredential, truncatedCredential]) {
+        const offset = original.indexOf(credential);
+        expect(offset).toBeGreaterThan(0);
+        expected.fill(0x2a, offset, offset + credential.length);
+      }
       let offset = 0;
       while (offset < original.length) {
         const page = await store.read(handle, { offset, limitBytes: 7 });

@@ -1007,7 +1007,19 @@ export function redactSensitiveText(input: string): string {
 /** Recheck historical run metadata without changing its response shape. */
 export function redactPostgresUrlsInValue<T>(input: T): T {
   if (typeof input === "string") {
-    return redactPostgresUrlUserinfo(input, REDACTED_EVENT_VALUE) as T;
+    const completeUrlsRedacted = redactPostgresUrlUserinfo(input, REDACTED_EVENT_VALUE);
+    // Run-list summaries can be shortened in SQL before reaching this reader.
+    // A cut before `@` leaves no complete URL for the ordinary matcher, so
+    // hide an undecidable authority at a text boundary as well.
+    return completeUrlsRedacted.replace(
+      /(postgres(?:ql)?:\/\/)([^@\s"`<>\\/?#]+)/gi,
+      (match, scheme: string, _authority: string, offset: number, source: string) => {
+        const next = source[offset + match.length];
+        return next === "@" || next === "/" || next === "?" || next === "#"
+          ? match
+          : `${scheme}${REDACTED_EVENT_VALUE}`;
+      },
+    ) as T;
   }
   if (Array.isArray(input)) {
     return input.map((value) => redactPostgresUrlsInValue(value)) as T;

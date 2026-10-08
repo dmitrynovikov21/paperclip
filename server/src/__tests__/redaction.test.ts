@@ -39,6 +39,19 @@ describe("redaction", () => {
       .toBe("postgresql://***REDACTED***@db");
   });
 
+  it("masks userinfo cut off by the 500-character run-list summary limit", () => {
+    const url = "postgres://worker:fragment@db.example.test/app";
+    const prefix = "x".repeat(500 - "postgres://worker:fragment".length);
+    const storedSummary = `${prefix}${url}`;
+    const shortened = storedSummary.slice(0, 500);
+    const result = redactPostgresUrlsInValue({ resultJson: { summary: shortened } });
+    expect(result.resultJson.summary).toBe(`${prefix}postgres://${REDACTED_EVENT_VALUE}`);
+    expect(result.resultJson.summary).not.toContain("worker");
+    expect(result.resultJson.summary).not.toContain("fragment");
+    expect(redactPostgresUrlsInValue("postgres://db.example.test/app"))
+      .toBe("postgres://db.example.test/app");
+  });
+
   it("preserves credential-related prose, metadata, and dotted filenames", () => {
     const input = {
       body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",

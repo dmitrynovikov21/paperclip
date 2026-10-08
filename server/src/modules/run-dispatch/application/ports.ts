@@ -19,19 +19,32 @@ export type ListDueRetriesInput = {
 export type EarlyUpstreamReprobeCandidate = {
   runId: string;
   companyId: string;
+  agentId: string;
+  /** Adapter used by the failed predecessor; absent means recovery cannot be proven. */
+  adapterType: string | null;
   retryReason: string | null;
   scheduledRetryAt: Date | null;
   pinSetAt: Date | null;
+  createdAt: Date;
+};
+
+export type EarlyUpstreamReprobeCursor = {
+  scheduledRetryAt: Date;
+  createdAt: Date;
+  runId: string;
 };
 
 export type ListEarlyUpstreamReprobeCandidatesInput = {
   now: Date;
   cutoff: Date | null;
   limit: number;
+  after?: EarlyUpstreamReprobeCursor | null;
 };
 
 export type FindUpstreamRecoveryEvidenceInput = {
   companyId: string;
+  agentId: string;
+  adapterType: string;
   now: Date;
 };
 
@@ -49,7 +62,7 @@ export interface ScheduledRetryReader {
   listEarlyUpstreamReprobeCandidates(
     input: ListEarlyUpstreamReprobeCandidatesInput,
   ): Promise<EarlyUpstreamReprobeCandidate[]>;
-  /** The company's most recent successful run inside the recovery lookback window, if any. */
+  /** A recent success by the same agent and adapter, if any. */
   findUpstreamRecoveryEvidence(
     input: FindUpstreamRecoveryEvidenceInput,
   ): Promise<UpstreamRecoveryEvidence | null>;

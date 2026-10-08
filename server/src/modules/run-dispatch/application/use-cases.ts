@@ -1,6 +1,6 @@
 import { decideEarlyUpstreamReprobe } from "../domain/policy.js";
 import type { UpstreamRecoveryEvidence } from "../domain/policy.js";
-import type { RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type { EarlyUpstreamReprobeCandidate, EarlyUpstreamReprobeCursor, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -26,12 +26,12 @@ export function createPromoteScheduledRetry(deps: { writer: RunDispatchWriter })
 }
 
 const MAX_DUE_RETRIES_PER_SWEEP = 50;
-const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
+const EARLY_UPSTREAM_REPROBE_PAGE_SIZE = 50;
 
 /**
  * Releases transient-upstream retries whose far-future pin (typically a
  * quota-reset hint) is stale because the upstream recovered early. A candidate
- * that the domain clears on its company's recovery evidence has its pin pulled
+ * that the domain clears on same-agent, same-adapter recovery evidence has its pin pulled
  * forward to `now`, then flows through the same promotion path — and therefore
  * the same gates — as a retry that became due on its own.
  */
@@ -47,59 +47,76 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
     skipRunIds?: ReadonlySet<string>;
   }) {
     const now = input.now ?? new Date();
-    const candidates = (
-      await deps.reader.listEarlyUpstreamReprobeCandidates({
-        now,
-        cutoff: input.cutoff,
-        limit: MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP,
-      })
-    ).slice(0, MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP);
-
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
-    // Recovery evidence is a property of the company at this one `now`, so
-    // several candidates of the same company share a single read.
-    const evidenceByCompany = new Map<string, UpstreamRecoveryEvidence | null>();
+    // Cache by the upstream scope, never by company alone: a green run from
+    // another agent or adapter does not prove this agent's provider recovered.
+    const evidenceByScope = new Map<string, UpstreamRecoveryEvidence | null>();
+    let after: EarlyUpstreamReprobeCursor | null = null;
+    while (true) {
+      const candidates: EarlyUpstreamReprobeCandidate[] = (
+        await deps.reader.listEarlyUpstreamReprobeCandidates({
+          now,
+          cutoff: input.cutoff,
+          limit: EARLY_UPSTREAM_REPROBE_PAGE_SIZE,
+          after,
+        })
+      ).slice(0, EARLY_UPSTREAM_REPROBE_PAGE_SIZE);
+      if (candidates.length === 0) break;
 
-    for (const candidate of candidates) {
-      if (input.skipRunIds?.has(candidate.runId)) continue;
+      for (const candidate of candidates) {
+        if (input.skipRunIds?.has(candidate.runId) || !candidate.adapterType) continue;
+        const scope = `${candidate.companyId}:${candidate.agentId}:${candidate.adapterType}`;
+        if (!evidenceByScope.has(scope)) {
+          evidenceByScope.set(scope, await deps.reader.findUpstreamRecoveryEvidence({
+            companyId: candidate.companyId,
+            agentId: candidate.agentId,
+            adapterType: candidate.adapterType,
+            now,
+          }));
+        }
 
-      if (!evidenceByCompany.has(candidate.companyId)) {
-        evidenceByCompany.set(
-          candidate.companyId,
-          await deps.reader.findUpstreamRecoveryEvidence({ companyId: candidate.companyId, now }),
+        const decision = decideEarlyUpstreamReprobe(
+          {
+            runId: candidate.runId,
+            retryReason: candidate.retryReason,
+            scheduledRetryAt: candidate.scheduledRetryAt,
+            pinSetAt: candidate.pinSetAt,
+            recoveryEvidence: evidenceByScope.get(scope) ?? null,
+          },
+          now,
         );
+        if (!decision.reprobe) continue;
+
+        const advanced = await deps.writer.advanceScheduledRetryPin({
+          runId: candidate.runId,
+          companyId: candidate.companyId,
+          now,
+          originalScheduledRetryAt: candidate.scheduledRetryAt,
+          evidenceRunId: decision.evidenceRunId,
+        });
+        if (!advanced.advanced) continue;
+
+        const result = await deps.promoteScheduledRetry({
+          runId: candidate.runId,
+          companyId: candidate.companyId,
+          now,
+        });
+        if (result.outcome !== "promoted") continue;
+        runIds.push(candidate.runId);
+        postCommitEffects.push(...result.postCommitEffects);
       }
 
-      const decision = decideEarlyUpstreamReprobe(
-        {
-          runId: candidate.runId,
-          retryReason: candidate.retryReason,
-          scheduledRetryAt: candidate.scheduledRetryAt,
-          pinSetAt: candidate.pinSetAt,
-          recoveryEvidence: evidenceByCompany.get(candidate.companyId) ?? null,
-        },
-        now,
-      );
-      if (!decision.reprobe) continue;
-
-      const advanced = await deps.writer.advanceScheduledRetryPin({
-        runId: candidate.runId,
-        companyId: candidate.companyId,
-        now,
-        originalScheduledRetryAt: candidate.scheduledRetryAt,
-        evidenceRunId: decision.evidenceRunId,
-      });
-      if (!advanced.advanced) continue;
-
-      const result = await deps.promoteScheduledRetry({
-        runId: candidate.runId,
-        companyId: candidate.companyId,
-        now,
-      });
-      if (result.outcome !== "promoted") continue;
-      runIds.push(candidate.runId);
-      postCommitEffects.push(...result.postCommitEffects);
+      const last: EarlyUpstreamReprobeCandidate = candidates[candidates.length - 1]!;
+      if (!last.scheduledRetryAt) break;
+      const next: EarlyUpstreamReprobeCursor = {
+        scheduledRetryAt: last.scheduledRetryAt,
+        createdAt: last.createdAt,
+        runId: last.runId,
+      };
+      if (after?.runId === next.runId) throw new Error("early re-probe candidate cursor did not advance");
+      after = next;
+      if (candidates.length < EARLY_UPSTREAM_REPROBE_PAGE_SIZE) break;
     }
 
     return { promoted: runIds.length, runIds, postCommitEffects };

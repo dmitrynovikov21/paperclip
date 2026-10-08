@@ -183,7 +183,7 @@ export const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.max(
 /** How recent a successful run must be to still count as proof the upstream is serving. */
 export const EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS = 30 * 60 * 1000;
 
-/** A successful run the reader found for the candidate's company. */
+/** A successful run the reader found in the candidate's upstream scope. */
 export type UpstreamRecoveryEvidence = {
   runId: string;
   finishedAt: Date;
@@ -193,9 +193,9 @@ export type EarlyUpstreamReprobeFacts = {
   runId: string;
   retryReason: string | null;
   scheduledRetryAt: Date | null;
-  /** When this run's pin was last written: its updatedAt, falling back to createdAt. */
+  /** When the transient retry row and its original pin were inserted. */
   pinSetAt: Date | null;
-  /** The most recent successful run of the same company, or null when none was found. */
+  /** The most recent successful run in the same upstream scope, if found. */
   recoveryEvidence: UpstreamRecoveryEvidence | null;
 };
 
@@ -732,8 +732,8 @@ export function decideQueuedRunStaleness(
  * parked for hours after the outage that produced it already ended.
  *
  * Releasing such a pin needs positive proof, never a guess: a successful run in
- * the same company, recent enough to describe the upstream's current state and
- * later than the pin itself, shows the account is being served again. Without
+ * the same agent and adapter, recent enough to describe that upstream's state and
+ * later than the pin itself, shows the adapter is being served again. Without
  * that proof the pin is preserved exactly, so a genuine quota wait is untouched.
  */
 export function decideEarlyUpstreamReprobe(

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { providerStateBroker } from "./provider-state-broker.js";
 import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1036,22 +1037,35 @@ export function environmentService(db: Db) {
       return row ? toEnvironment(row) : null;
     },
 
-    remove: async (id: string): Promise<Environment | null> => {
-      const row = await db
+    remove: async (id: string): Promise<Environment | null> => db.transaction(async (tx) => {
+      await tx.select({ id: environments.id }).from(environments).where(eq(environments.id, id)).for("update");
+      const pending = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.environmentId, id), sql`${environmentLeases.providerStateStatus} is not null`,
+        ne(environmentLeases.providerStateStatus, "destroyed"),
+      )).limit(1);
+      if (pending.length > 0) throw conflict("Provider state cleanup must finish before environment deletion", {
+        code: "provider_state_cleanup_pending",
+      });
+      const row = await tx
         .delete(environments)
         .where(eq(environments.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toEnvironment(row) : null;
-    },
+    }),
 
-    removeIfDeletable: async (id: string): Promise<Environment | null> => {
-      const row = await db
+    removeIfDeletable: async (id: string): Promise<Environment | null> => db.transaction(async (tx) => {
+      await tx.select({ id: environments.id }).from(environments).where(eq(environments.id, id)).for("update");
+      const row = await tx
         .delete(environments)
         .where(
           and(
             eq(environments.id, id),
             ne(environments.driver, "local"),
+            sql`not exists (select 1 from ${environmentLeases}
+              where ${environmentLeases.environmentId} = ${environments.id}
+                and ${environmentLeases.providerStateStatus} is not null
+                and ${environmentLeases.providerStateStatus} <> 'destroyed')`,
             sql`not exists (
               select 1 from ${instanceSettings}
               where ${instanceSettings.defaultEnvironmentId} = ${environments.id}
@@ -1061,7 +1075,7 @@ export function environmentService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toEnvironment(row) : null;
-    },
+    }),
 
     getDeleteBlastRadius: async (id: string): Promise<EnvironmentDeleteBlastRadius | null> => {
       const environment = await db
@@ -1229,6 +1243,14 @@ export function environmentService(db: Db) {
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
       },
     ) => {
+      if (status === "expired" || status === "failed") {
+        const existing = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, id)))[0];
+        if (existing?.providerStateStatus && existing.providerStateStatus !== "destroyed") {
+          await providerStateBroker(db).destroy({ companyId: existing.companyId, leaseId: id }, "expired");
+          const row = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, id)))[0];
+          return row ? toEnvironmentLease(row) : null;
+        }
+      }
       const now = new Date();
       const row = await db
         .update(environmentLeases)

@@ -1,3 +1,6 @@
+import { providerStateBroker, providerStateScope } from "./provider-state-broker.js";
+import type { TrustedProviderStateDriverRegistration } from "./provider-state-driver.js";
+import { ProviderSessionIsolationRequired, type ProviderStateScope } from "@paperclipai/adapter-utils";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -145,6 +148,7 @@ export interface EnvironmentDriverAcquireInput {
    * of the base image, matching what real agent runs do.
    */
   applyCustomImageTemplate?: boolean;
+  taskScopeId?: string | null;
 }
 
 export interface EnvironmentDriverReleaseInput {
@@ -457,6 +461,7 @@ function buildReusableSandboxLeaseScope(input: {
   executionWorkspaceId: string | null;
   agentId: string | null;
   adapterType: string | null;
+  taskScopeId?: string | null;
   provider: string;
   config: Record<string, unknown>;
   leaseFingerprint?: EffectiveRunConfigFingerprint | null;
@@ -470,7 +475,8 @@ function buildReusableSandboxLeaseScope(input: {
     ? { ...providerMetadata.workspaceSentinel }
     : null;
   return {
-    version: 1,
+    version: 2,
+    taskScopeId: input.taskScopeId ?? null,
     companyId: input.companyId,
     environmentId: input.environmentId,
     executionWorkspaceId: input.executionWorkspaceId,
@@ -497,6 +503,7 @@ function reusableSandboxLeaseScopeMatches(input: {
   executionWorkspaceId: string | null;
   agentId: string | null;
   adapterType: string | null;
+  taskScopeId?: string | null;
   provider: string;
   config: Record<string, unknown>;
   leaseFingerprint?: EffectiveRunConfigFingerprint | null;
@@ -505,6 +512,7 @@ function reusableSandboxLeaseScopeMatches(input: {
   if (!input.executionWorkspaceId || !input.agentId) return false;
   const scope = input.lease.metadata?.reusableSandboxLease;
   if (!isRecord(scope)) return false;
+  if ((scope.taskScopeId ?? null) !== (input.taskScopeId ?? null)) return false;
   const adapterType = input.adapterType ?? null;
   const baseScopeMatches =
     scope.companyId === input.companyId &&
@@ -914,7 +922,9 @@ function createSandboxEnvironmentDriver(
                 lease.leasePolicy === "reuse_by_environment" &&
                 reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
-                lease.metadata?.agentId === input.agentId,
+                lease.metadata?.agentId === input.agentId &&
+                (!input.taskScopeId || (isRecord(lease.metadata?.reusableSandboxLease) &&
+                  lease.metadata.reusableSandboxLease.taskScopeId === input.taskScopeId)),
               )
           : [];
         const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
@@ -925,6 +935,7 @@ function createSandboxEnvironmentDriver(
             executionWorkspaceId: input.executionWorkspaceId,
             agentId: input.agentId,
             adapterType: input.adapterType,
+            taskScopeId: input.taskScopeId ?? null,
             provider: parsed.config.provider,
             config: providerConfigForLease,
             leaseFingerprint,
@@ -1030,6 +1041,7 @@ function createSandboxEnvironmentDriver(
               executionWorkspaceId: input.executionWorkspaceId,
               agentId: input.agentId,
               adapterType: input.adapterType,
+            taskScopeId: input.taskScopeId ?? null,
               provider: parsed.config.provider,
               config: providerConfigForLease,
               leaseFingerprint,
@@ -1097,7 +1109,9 @@ function createSandboxEnvironmentDriver(
                 lease.leasePolicy === "reuse_by_environment" &&
                 reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
-                lease.metadata?.agentId === input.agentId,
+                lease.metadata?.agentId === input.agentId &&
+                (!input.taskScopeId || (isRecord(lease.metadata?.reusableSandboxLease) &&
+                  lease.metadata.reusableSandboxLease.taskScopeId === input.taskScopeId)),
               )
           : [];
       const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
@@ -1108,6 +1122,7 @@ function createSandboxEnvironmentDriver(
           executionWorkspaceId: input.executionWorkspaceId,
           agentId: input.agentId,
           adapterType: input.adapterType,
+          taskScopeId: input.taskScopeId ?? null,
           provider: parsed.config.provider,
           config: providerConfigForLease,
           leaseFingerprint,
@@ -1177,6 +1192,7 @@ function createSandboxEnvironmentDriver(
             executionWorkspaceId: input.executionWorkspaceId,
             agentId: input.agentId,
             adapterType: input.adapterType,
+            taskScopeId: input.taskScopeId ?? null,
             provider: parsed.config.provider,
             config: providerConfigForLease,
             leaseFingerprint,
@@ -1867,12 +1883,15 @@ export function environmentRuntimeService(
   db: Db,
   options: {
     drivers?: EnvironmentRuntimeDriver[];
+    /** Core-installed registrations keyed by environment ID; never adapterConfig. */
+    providerStateDrivers?: ReadonlyMap<string, TrustedProviderStateDriverRegistration>;
     pluginWorkerManager?: PluginWorkerManager;
     pluginWorkerReadyTimeoutMs?: number;
     pluginWorkerReadyPollMs?: number;
   } = {},
 ) {
   const environmentsSvc = environmentService(db);
+  const stateBroker = providerStateBroker(db);
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
   const defaultDrivers = [
@@ -1918,6 +1937,31 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+    providerStateBroker: stateBroker,
+    async prepareProviderSession(input: {
+      scope: ProviderStateScope;
+      expectedGeneration: number;
+      environment: Environment;
+      lease: EnvironmentLease;
+      linkedLeaseId?: string | null;
+      linkedGeneration?: number | null;
+    }) {
+      const registration = options.providerStateDrivers?.get(input.environment.id);
+      if (!registration) throw new ProviderSessionIsolationRequired();
+      if (input.linkedLeaseId && input.linkedGeneration != null) {
+        const linked = await db.select().from(environmentLeases)
+          .where(eq(environmentLeases.id, input.linkedLeaseId)).then((rows) => rows[0] ?? null);
+        if (!linked || linked.environmentId !== input.environment.id ||
+            !linked.providerLeaseId || linked.providerLeaseId !== input.lease.providerLeaseId) {
+          throw new ProviderSessionIsolationRequired();
+        }
+        return await stateBroker.resume({ scope: input.scope, leaseId: linked.id,
+          generation: input.linkedGeneration, registration });
+      }
+      return await stateBroker.acquire({ scope: input.scope,
+        expectedGeneration: input.expectedGeneration, environmentLeaseId: input.lease.id,
+        registration, environmentDriver: input.environment.driver });
+    },
 
     async acquireRunLease(input: {
       companyId: string;
@@ -1936,6 +1980,7 @@ export function environmentRuntimeService(
        * lease uses the operator-prepared custom image.
        */
       applyCustomImageTemplate?: boolean;
+      taskScopeId?: string | null;
     }): Promise<EnvironmentRuntimeLeaseRecord> {
       if (input.environment.status !== "active") {
         throw new Error(`Environment "${input.environment.name}" is not active.`);
@@ -1956,6 +2001,10 @@ export function environmentRuntimeService(
         executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
         adapterType: input.adapterType ?? null,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
+        taskScopeId: input.taskScopeId ?? (input.agentId && input.adapterType
+          ? providerStateScope({ companyId: input.companyId, agentId: input.agentId,
+              adapterType: input.adapterType, taskKey: input.issueId ?? input.heartbeatRunId ?? "probe" }).taskScopeId
+          : null),
       });
 
       return {
@@ -2023,6 +2072,9 @@ export function environmentRuntimeService(
         input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId) : undefined,
       ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
       if (scopeConditions.length === 0) return [];
+      await stateBroker.destroy({ companyId: input.companyId,
+        ...(input.issueId ? { issueId: input.issueId } : {}),
+        ...(input.executionWorkspaceId ? { executionWorkspaceId: input.executionWorkspaceId } : {}) }, "terminal");
 
       const leaseRows = await db
         .select()

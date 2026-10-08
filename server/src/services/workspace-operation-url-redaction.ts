@@ -1,4 +1,5 @@
 const URL_PREFIX_RE = /[a-z][a-z0-9+.-]{0,31}:\/\//gi;
+const PARTIAL_URL_PREFIX_RE = /[a-z][a-z0-9+.-]{0,31}(?::\/?)?(?![\s\S])/i;
 const URL_BOUNDARY_RE = /[@\s/\\"'?#<>]/;
 const MAX_PREFIX_LENGTH = 35;
 const MAX_PENDING_USERINFO_LENGTH = 8192;
@@ -13,7 +14,7 @@ export function redactWorkspaceOperationUrlUserInfo(value: string): string {
 export function redactWorkspaceOperationExcerpt(value: string | null): string | null {
   if (value === null) return null;
   return redactWorkspaceOperationUrlUserInfo(value)
-    .replace(/([^\s/@]+)@(?=[a-z0-9.-]+(?::\d+)?(?:\/|\s|$))/gi, `${REDACTED_USERINFO}@`);
+    .replace(/([^\s/@]+)@(?=(?:\[[^\]\s/?#@]+\]|[a-z0-9.-]+)(?::\d+)?(?:[/?#\s"'<>;,}]|$))/gi, `${REDACTED_USERINFO}@`);
 }
 
 export function redactWorkspaceOperationUrls<T>(value: T): T {
@@ -164,7 +165,9 @@ export function createWorkspaceOperationUrlStreamRedactor() {
       URL_PREFIX_RE.lastIndex = 0;
       const match = URL_PREFIX_RE.exec(input);
       if (!match) {
-        const keep = final ? 0 : Math.min(MAX_PREFIX_LENGTH - 1, input.length);
+        // Keep only a suffix that could become a URL scheme in the next chunk.
+        // Holding an arbitrary tail would split ordinary complete log lines.
+        const keep = final ? 0 : (PARTIAL_URL_PREFIX_RE.exec(input)?.[0].length ?? 0);
         output += input.slice(0, input.length - keep);
         pending = input.slice(input.length - keep);
         break;
@@ -176,7 +179,8 @@ export function createWorkspaceOperationUrlStreamRedactor() {
       const end = URL_BOUNDARY_RE.exec(afterPrefix)?.index ?? -1;
       if (end < 0) {
         if (final) {
-          output += prefix + afterPrefix;
+          // An interrupted stream may end inside userinfo, before its @ arrives.
+          output += prefix + (afterPrefix ? REDACTED_USERINFO : "");
         } else if (afterPrefix.length > MAX_PENDING_USERINFO_LENGTH) {
           output += prefix + REDACTED_USERINFO;
           droppingUserInfo = true;

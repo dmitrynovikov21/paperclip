@@ -28,6 +28,14 @@ describe("workspace operation URL redaction", () => {
       .toBe("the tail [REDACTED]@db.test/app");
   });
 
+  it("masks an unfinished URL when a stream ends before the @", () => {
+    const redactor = createWorkspaceOperationUrlStreamRedactor();
+    const output = redactor.push("connect post")
+      + redactor.push("gresql://synthetic-user:synthetic-password")
+      + redactor.flush();
+    expect(output).toBe("connect postgresql://[REDACTED]");
+  });
+
   describe("historical byte-range pages", () => {
     let logRoot: string;
     beforeAll(async () => {
@@ -85,6 +93,37 @@ describe("workspace operation URL redaction", () => {
       let offset = 0;
       while (offset < original.length) {
         const page = await store.read(handle, { offset, limitBytes: 9 });
+        const nextOffset = page.nextOffset ?? original.length;
+        expect(page.content).toBe(expected.subarray(offset, nextOffset).toString("utf8"));
+        offset = nextOffset;
+      }
+      expect(await fs.readFile(filePath)).toEqual(original);
+    });
+
+    it("hides a damaged event and the remaining log when it may complete split userinfo", async () => {
+      const store = createLocalFileWorkspaceOperationLogStore(logRoot);
+      const handle = await store.begin({ companyId: randomUUID(), operationId: randomUUID() });
+      const first = "synthetic-reader:synthetic-";
+      const second = "password";
+      const ts = new Date().toISOString();
+      await store.append(handle, { stream: "stdout", chunk: `postgres://${first}`, ts });
+      await store.append(handle, { stream: "stdout", chunk: `${second}@db.example.test/app`, ts });
+      await store.append(handle, { stream: "stdout", chunk: "later record", ts });
+      const filePath = path.join(logRoot, handle.logRef);
+      const intact = await fs.readFile(filePath, "utf8");
+      const damaged = intact.replace('"chunk":"password@', '"shunk":"password@');
+      expect(damaged).not.toBe(intact);
+      await fs.writeFile(filePath, damaged);
+      const original = await fs.readFile(filePath);
+      const expected = Buffer.from(original);
+      const firstAt = original.indexOf(first);
+      const damagedAt = original.indexOf(0x0a) + 1;
+      expected.fill(0x2a, firstAt, firstAt + first.length);
+      expected.fill(0x2a, damagedAt);
+
+      let offset = 0;
+      while (offset < original.length) {
+        const page = await store.read(handle, { offset, limitBytes: 7 });
         const nextOffset = page.nextOffset ?? original.length;
         expect(page.content).toBe(expected.subarray(offset, nextOffset).toString("utf8"));
         offset = nextOffset;

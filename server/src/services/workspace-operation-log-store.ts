@@ -76,20 +76,27 @@ export function createLocalFileWorkspaceOperationLogStore(basePath: string): Wor
     let lineStart = 0;
     let parts: Buffer[] = [];
     let lineBytes = 0;
+    let damaged = false;
 
-    function scanLine(line: Buffer) {
+    function scanLine(line: Buffer): boolean {
       const raw = line.toString("latin1");
-      const stream = /"stream":"(stdout|stderr|system)"/.exec(raw)?.[1];
-      const chunk = /"chunk":"((?:\\.|[^"\\])*)"/.exec(raw);
-      if (raw.includes('"chunk":"') && (!stream || !chunk)) {
+      const record = /^\{"ts":"(?:\\.|[^"\\])*","stream":"(stdout|stderr|system)","chunk":"((?:\\.|[^"\\])*)"\}$/.exec(raw);
+      let validJson = false;
+      try {
+        JSON.parse(raw);
+        validJson = true;
+      } catch {
         // A damaged or partially written record cannot be safely reassembled.
-        directRanges.push({ start: lineStart, end: lineStart + line.length });
-        return;
       }
-      if (stream && chunk) {
-        scanner.feed(stream, chunk[1]!, lineStart + chunk.index + '"chunk":"'.length);
+      if (!record || !validJson) {
+        // A skipped chunk could complete userinfo started in an earlier event.
+        // Hide the unknown record and the rest of the file without moving bytes.
+        directRanges.push({ start: lineStart, end: size });
+        return false;
       }
-      // Also cover complete URLs in older or malformed records outside `chunk`.
+      const chunkOffset = raw.lastIndexOf('"chunk":"') + '"chunk":"'.length;
+      scanner.feed(record[1]!, record[2]!, lineStart + chunkOffset);
+      // Also cover complete URLs in metadata outside `chunk`.
       const masked = maskWorkspaceOperationUrlUserInfoBytes(line);
       let rangeStart = -1;
       for (let index = 0; index <= line.length; index += 1) {
@@ -100,6 +107,7 @@ export function createLocalFileWorkspaceOperationLogStore(basePath: string): Wor
           rangeStart = -1;
         }
       }
+      return true;
     }
 
     scan: for await (const value of createReadStream(filePath, { end: size - 1 })) {
@@ -117,14 +125,17 @@ export function createLocalFileWorkspaceOperationLogStore(basePath: string): Wor
           break scan;
         }
         if (newline < 0) break;
-        scanLine(Buffer.concat(parts, lineBytes));
+        if (!scanLine(Buffer.concat(parts, lineBytes))) {
+          damaged = true;
+          break scan;
+        }
         lineStart += lineBytes + 1;
         parts = [];
         lineBytes = 0;
         cursor = newline + 1;
       }
     }
-    if (lineBytes > 0 && lineBytes <= maxLineBytes) scanLine(Buffer.concat(parts, lineBytes));
+    if (!damaged && lineBytes > 0 && lineBytes <= maxLineBytes) scanLine(Buffer.concat(parts, lineBytes));
 
     const ranges = [...scanner.finish(), ...directRanges].sort((left, right) => left.start - right.start);
     const merged: WorkspaceOperationMaskedByteRange[] = [];

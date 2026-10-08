@@ -34,10 +34,18 @@ const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
 const COMMAND_JWT_RE =
   /\b[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2}(?:\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})?\b/g;
 const POSTGRES_URL_WITH_USERINFO_RE =
-  /(postgres(?:ql)?:\/\/)[^@/\s"'`\\?#]+@/gi;
+  /(postgres(?:ql)?:\/\/)[^@/\s"`\\?#]+@/gi;
 const POSTGRES_URL_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
 const POSTGRES_URL_SCHEMES = ["postgres://", "postgresql://"];
 const MAX_PENDING_POSTGRES_USERINFO_CHARS = 8192;
+
+function isConfirmedPostgresHost(value: string): boolean {
+  // A path ends the authority. A dotted hostname (or localhost) followed by
+  // whitespace is also a complete credential-free URL. Keep ambiguous
+  // `user:password` prefixes hidden if a stream ends before its final @.
+  return value.includes("/") ||
+    (!value.includes(":") && (value.includes(".") || value === "localhost"));
+}
 
 /** Keep the URI scheme and host useful in diagnostics, but never expose userinfo. */
 export function redactPostgresUrlUserinfo(
@@ -75,7 +83,7 @@ export function createPostgresUrlStreamRedactor(
       while (index < input.length) {
         if (state.userinfo !== null) {
           let boundary = index;
-          while (boundary < input.length && !/[@\s"'`<>\\]/.test(input[boundary])) boundary += 1;
+          while (boundary < input.length && !/[@\s"`<>\\]/.test(input[boundary])) boundary += 1;
           if (!state.overflow) {
             state.userinfo += input.slice(index, boundary);
             if (state.userinfo.length > MAX_PENDING_POSTGRES_USERINFO_CHARS) {
@@ -86,7 +94,7 @@ export function createPostgresUrlStreamRedactor(
           if (boundary === input.length) break;
           // A path before @ proves that this authority had no userinfo.
           // Keep ordinary host/database URLs useful in diagnostics.
-          output += !state.overflow && state.userinfo.includes("/")
+          output += !state.overflow && input[boundary] !== "@" && isConfirmedPostgresHost(state.userinfo)
             ? state.userinfo
             : redactedValue;
           if (input[boundary] === "@") output += "@";
@@ -124,7 +132,10 @@ export function createPostgresUrlStreamRedactor(
       const state = streams.get(stream);
       streams.delete(stream);
       if (!state) return "";
-      return state.prefix + (state.userinfo === null ? "" : redactedValue);
+      return state.prefix + (state.userinfo === null ? "" :
+        !state.overflow && isConfirmedPostgresHost(state.userinfo) && state.userinfo.includes("/")
+          ? state.userinfo
+          : redactedValue);
     },
   };
 }

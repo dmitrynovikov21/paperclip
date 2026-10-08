@@ -19603,6 +19603,7 @@ export function heartbeatService(
       };
 
       let handle: RunLogHandle | null = null;
+      let flushRunLogRedactors: (() => Promise<void>) | null = null;
       const goalCheckpointSession: {
         current: {
           params: Record<string, unknown>;
@@ -19823,6 +19824,17 @@ export function heartbeatService(
           return redactedChunk
             ? appendIdentityRedactedLog(stream, redactedChunk)
             : Promise.resolve();
+        };
+        flushRunLogRedactors = async () => {
+          for (const stream of ["stdout", "stderr"] as const) {
+            const tail = identityRedactor.finish(stream);
+            if (tail) {
+              const redactedTail = postgresUrlRedactor.chunk(stream, tail);
+              if (redactedTail) await appendIdentityRedactedLog(stream, redactedTail);
+            }
+            const uriTail = postgresUrlRedactor.finish(stream);
+            if (uriTail) await appendIdentityRedactedLog(stream, uriTail);
+          }
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
@@ -21514,15 +21526,7 @@ export function heartbeatService(
             providerResourceDispositionForRun = "stop_and_retain";
             await recordLegacyWorkspaceRestoreFailure(db, run, requiredWorkspaceRestoreEvidence);
           }
-          for (const stream of ["stdout", "stderr"] as const) {
-            const tail = identityRedactor.finish(stream);
-            if (tail) {
-              const redactedTail = postgresUrlRedactor.chunk(stream, tail);
-              if (redactedTail) await appendIdentityRedactedLog(stream, redactedTail);
-            }
-            const uriTail = postgresUrlRedactor.finish(stream);
-            if (uriTail) await appendIdentityRedactedLog(stream, uriTail);
-          }
+          await flushRunLogRedactors();
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
 
           if (parseObject(adapterResult.executionRecovery).providerWorkStarted !== false) {
@@ -22510,6 +22514,13 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        // Adapter/setup failures still need the final buffered bytes in the
+        // persisted log before its error-path snapshot is finalized.
+        try {
+          await flushRunLogRedactors?.();
+        } catch {
+          logger.warn({ runId: run.id }, "failed to flush sanitized run-log tail after error");
+        }
         await persistUsageCaptureFailure?.();
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;

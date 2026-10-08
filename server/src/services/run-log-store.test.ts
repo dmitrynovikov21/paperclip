@@ -394,6 +394,32 @@ describe("createDurableRunLogStore", () => {
     expect((await store.read(handle)).content).toBe(raw.content);
   });
 
+  it.each([false, true])("masks historical userinfo split across NDJSON records (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    await store.append(handle, { stream: "stdout", chunk: "ps --dbname=postgres://worker:pa", ts: "t1" });
+    await store.append(handle, { stream: "stderr", chunk: "ordinary diagnostic", ts: "t2" });
+    await store.append(handle, { stream: "stdout", chunk: "'ss%40", ts: "t3" });
+    await store.append(handle, { stream: "stdout", chunk: "word@db.example.test/app done", ts: "t4" });
+    const raw = await store.read(handle);
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    const redacted = await store.read(handle, { limitBytes: 4096, redactPostgresCredentials: true });
+    const records = redacted.content.trim().split("\n").map((line) => JSON.parse(line) as { stream: string; chunk: string });
+    const stdout = records.filter((record) => record.stream === "stdout").map((record) => record.chunk).join("");
+    expect(stdout).toMatch(/postgres:\/\/\*+@db\.example\.test\/app done/);
+    expect(stdout).not.toContain("worker");
+    expect(stdout).not.toContain("pa'ss%40word");
+    expect(records.find((record) => record.stream === "stderr")?.chunk).toBe("ordinary diagnostic");
+    const pageOffset = raw.content.indexOf("ss%40");
+    expect(pageOffset).toBeGreaterThan(0);
+    expect(await store.read(handle, { offset: pageOffset, limitBytes: 5, redactPostgresCredentials: true }))
+      .toEqual({ content: "*****", nextOffset: pageOffset + 5 });
+  });
+
   it("masks credentials longer than the bounded read context", async () => {
     const store = createDurableRunLogStore({ basePath: baseDir });
     const handle = await store.begin(begin);

@@ -33,24 +33,138 @@ type RawRunLogReadResult = { bytes: Buffer; nextOffset?: number };
 const POSTGRES_URI_READ_CONTEXT_BYTES = 256 * 1024;
 const POSTGRES_URI_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
 
-/** Mask in place so API byte offsets still refer to the original log file. */
-function maskPostgresCredentialsInRange(bytes: Buffer, pageStart: number, pageEnd: number, sourceOffset: number) {
+type MappedChunk = { text: string; starts: number[]; ends: number[] };
+
+function mappedRunLogChunk(line: string, lineStart: number): MappedChunk | null {
+  const field = /"chunk"\s*:\s*"/.exec(line);
+  if (!field) return null;
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let text = "";
+  let index = field.index + field[0].length;
+  while (index < line.length && line[index] !== '"') {
+    const start = index;
+    let decoded: string;
+    if (line[index] === "\\") {
+      index += line[index + 1] === "u" ? 6 : 2;
+      if (index > line.length) return null;
+      decoded = JSON.parse(`"${line.slice(start, index)}"`) as string;
+    } else {
+      decoded = line[index]!;
+      index += 1;
+    }
+    text += decoded;
+    for (let character = 0; character < decoded.length; character += 1) {
+      starts.push(lineStart + start);
+      ends.push(lineStart + index);
+    }
+  }
+  return index < line.length ? { text, starts, ends } : null;
+}
+
+/** Mask only chunk bytes, preserving NDJSON framing and original API offsets. */
+function maskPostgresCredentialsInRange(
+  bytes: Buffer,
+  pageStart: number,
+  pageEnd: number,
+  sourceOffset: number,
+  rightTruncated: boolean,
+) {
   const source = bytes.toString("latin1");
-  for (const match of source.matchAll(POSTGRES_URI_SCHEME_RE)) {
-    const userinfoStart = match.index + match[0].length;
-    let end = userinfoStart;
-    while (end < bytes.length && !/[\s"'`<>\\/?#]/.test(source[end]) && source[end] !== "@") end += 1;
-    // A complete URL without @ has no userinfo. An unfinished right edge is
-    // ambiguous, so hide it until the next range can see the full authority.
-    if (source[end] !== "@" && end < bytes.length) continue;
-    bytes.fill(0x2a, userinfoStart, end);
+  const streams = new Map<string, MappedChunk>();
+  const maskUnclassifiedLine = (start: number, end: number) => {
+    const maskStart = Math.max(pageStart, start);
+    const maskEnd = Math.min(pageEnd, end);
+    if (maskStart < maskEnd) bytes.fill(0x2a, maskStart, maskEnd);
+  };
+  const maskPartialLine = (line: string, lineStart: number, lineEnd: number) => {
+    POSTGRES_URI_SCHEME_RE.lastIndex = 0;
+    const matches = [...line.matchAll(POSTGRES_URI_SCHEME_RE)];
+    if (matches.length === 0) {
+      maskUnclassifiedLine(lineStart, lineEnd);
+      return;
+    }
+    // A partial first record might carry the tail of an earlier URL. Its
+    // prefix is undecidable, but an explicit scheme inside the page is safe
+    // to retain for diagnostics.
+    if (sourceOffset > 0 || lineStart > 0) {
+      maskUnclassifiedLine(lineStart, lineStart + matches[0]!.index);
+    }
+    for (const match of matches) {
+      const userinfoStart = match.index + match[0].length;
+      let end = userinfoStart;
+      while (end < line.length && !/[@\s"`<>\\/?#]/.test(line[end]!)) end += 1;
+      if (line[end] === "@" || end === line.length) {
+        bytes.fill(0x2a, lineStart + userinfoStart, lineStart + end);
+      }
+    }
+  };
+  for (let lineStart = 0; lineStart < source.length;) {
+    const newline = source.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? source.length : newline;
+    const line = source.slice(lineStart, lineEnd);
+    if (line.length) {
+      try {
+        const record = JSON.parse(line) as { stream?: unknown; chunk?: unknown };
+        const streamName = record.stream;
+        const chunk = record.chunk;
+        if (typeof streamName !== "string" || typeof chunk !== "string") {
+          maskUnclassifiedLine(lineStart, lineEnd);
+        } else {
+          const mapped = mappedRunLogChunk(line, lineStart);
+          if (!mapped || mapped.text !== chunk) {
+            maskUnclassifiedLine(lineStart, lineEnd);
+          } else {
+            const stream = streams.get(streamName) ?? { text: "", starts: [], ends: [] };
+            stream.text += mapped.text;
+            for (let index = 0; index < mapped.starts.length; index += 1) {
+              stream.starts.push(mapped.starts[index]!);
+              stream.ends.push(mapped.ends[index]!);
+            }
+            streams.set(streamName, stream);
+          }
+        }
+      } catch {
+        // A bounded range may start or end mid-record. Never serve its
+        // unclassified bytes when the requested page intersects it.
+        if ((lineStart === 0 && sourceOffset > 0) || newline < 0) {
+          maskPartialLine(line, lineStart, lineEnd);
+        } else {
+          maskUnclassifiedLine(lineStart, lineEnd);
+        }
+      }
+    }
+    if (newline < 0) break;
+    lineStart = newline + 1;
   }
 
-  // If a caller starts inside an exceptionally long NDJSON line, the scheme
-  // may lie beyond the bounded lookbehind. Do not expose an unclassified tail.
-  if (sourceOffset > 0 && bytes.lastIndexOf(0x0a, pageStart - 1) < 0) {
-    const lineEnd = bytes.indexOf(0x0a, pageStart);
-    bytes.fill(0x2a, pageStart, lineEnd < 0 ? pageEnd : Math.min(pageEnd, lineEnd));
+  for (const stream of streams.values()) {
+    const maskCharacters = (start: number, end: number) => {
+      for (let index = start; index < end; index += 1) {
+        bytes.fill(0x2a, stream.starts[index], stream.ends[index]);
+      }
+    };
+    // If the bounded lookbehind began inside a prior chunk, its URL scheme
+    // may be outside this read. Hide the first undecidable token on each stream.
+    if (sourceOffset > 0) {
+      const firstScheme = stream.text.search(POSTGRES_URI_SCHEME_RE);
+      const firstBoundary = stream.text.search(/[\s@]/);
+      const end = Math.min(
+        firstScheme < 0 ? stream.text.length : firstScheme,
+        firstBoundary < 0 ? stream.text.length : firstBoundary,
+      );
+      maskCharacters(0, end);
+    }
+    POSTGRES_URI_SCHEME_RE.lastIndex = 0;
+    for (const match of stream.text.matchAll(POSTGRES_URI_SCHEME_RE)) {
+      const userinfoStart = match.index + match[0].length;
+      let end = userinfoStart;
+      while (end < stream.text.length && !/[@\s"`<>\\/?#]/.test(stream.text[end]!)) end += 1;
+      if (stream.text[end] === "@" || (end === stream.text.length &&
+        (rightTruncated || stream.text.slice(userinfoStart, end).includes(":")))) {
+        maskCharacters(userinfoStart, end);
+      }
+    }
   }
 }
 
@@ -470,7 +584,13 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         return { content: "", nextOffset: undefined };
       }
       const pageEnd = Math.min(result.bytes.length, prefixBytes + limitBytes);
-      maskPostgresCredentialsInRange(result.bytes, prefixBytes, pageEnd, contextStart);
+      maskPostgresCredentialsInRange(
+        result.bytes,
+        prefixBytes,
+        pageEnd,
+        contextStart,
+        result.nextOffset !== undefined,
+      );
       return {
         content: result.bytes.subarray(prefixBytes, pageEnd).toString("utf8"),
         nextOffset: result.bytes.length > prefixBytes + limitBytes || result.nextOffset !== undefined

@@ -27,6 +27,8 @@ describe("PostgreSQL URL credentials", () => {
     expect(result).not.toContain("p%40ss%3Aword");
     expect(redactCommandText("postgres://u:s@db"))
       .toBe("postgres://***REDACTED***@db");
+    expect(redactCommandText("postgres://worker:pa'ss@db/app"))
+      .toBe("postgres://***REDACTED***@db/app");
     expect(redactPostgresUrlUserinfo("postgres://localhost/app")).toBe("postgres://localhost/app");
   });
 
@@ -45,6 +47,15 @@ describe("PostgreSQL URL credentials", () => {
     expect(stdout).not.toContain("p%40ss%3Aword");
     expect(redactor.chunk("stdout", "connect postgres://db.example.test/app ready\n"))
       .toBe("connect postgres://db.example.test/app ready\n");
+    expect(redactor.chunk("stdout", "connect postgres://db.example.test ready\n"))
+      .toBe("connect postgres://db.example.test ready\n");
+    expect(redactor.chunk("stdout", "postgres://db.example.test/app"))
+      .toBe("postgres://");
+    expect(redactor.finish("stdout")).toBe("db.example.test/app");
+    expect(redactor.chunk("stdout", "postgres://worker:pa'"))
+      .toBe("postgres://");
+    expect(redactor.chunk("stdout", "ss@db/app\n"))
+      .toBe("***REDACTED***@db/app\n");
     expect(redactor.chunk("stdout", "postgres://interrupted:secret")).toBe("postgres://");
     expect(redactor.finish("stdout")).toBe(REDACTED_COMMAND_TEXT_VALUE);
 

@@ -7110,10 +7110,12 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
-    res.json(redactPostgresUrlsInValue(await runRedactions.redactForRuns(
-      companyId,
-      await Promise.all(runs.map(run => serializeRunListRow(req, run))),
-    )));
+    // Mask while capped fields still have their original length. Replacing a
+    // different registered secret first could hide that a URL was truncated.
+    const rows = redactPostgresUrlsInValue(await Promise.all(
+      runs.map(run => serializeRunListRow(req, run)),
+    ));
+    res.json(await runRedactions.redactForRuns(companyId, rows));
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
@@ -7249,13 +7251,14 @@ export function agentRoutes(
     }
 
     const projections = await executionProjectionsForRuns(db, companyId, rows.map(run => run.id));
-    res.json(redactPostgresUrlsInValue(await runRedactions.redactForRuns(companyId, await Promise.all(rows.map(async (run) => !(await actorCanReadRun(req, run)) ? redactHeartbeatRunListRow(run) : ({
+    const responseRows = redactPostgresUrlsInValue(await Promise.all(rows.map(async (run) => !(await actorCanReadRun(req, run)) ? redactHeartbeatRunListRow(run) : ({
       ...heartbeat.decorateActiveRunStatus(run),
       agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
       avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
       execution: projections.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence(run),
-    }))))));
+    }))));
+    res.json(await runRedactions.redactForRuns(companyId, responseRows));
   });
 
   function readHeartbeatRunId(req: Request): string {
@@ -7275,14 +7278,21 @@ export function agentRoutes(
     if (!(await assertRunReadAllowed(req, res, run))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
-    res.json(redactPostgresUrlsInValue(await runRedactions.redactForRun(
+    const responseRun = redactPostgresUrlsInValue({
+      ...decoratedRun,
+      execution: await executionProjectionForRun(db, run.companyId, run.id),
+      identityHistory: await listRunIdentityContexts(db, run.companyId, run.id),
+      retryExhaustedReason,
+      outputSilence: await heartbeat.buildRunOutputSilence(run),
+    });
+    res.json(await runRedactions.redactForRun(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        responseRun,
         await getCurrentUserRedactionOptions(),
       ),
-    )));
+    ));
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {

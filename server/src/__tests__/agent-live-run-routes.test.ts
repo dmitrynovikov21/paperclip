@@ -21,6 +21,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  list: vi.fn(),
   listEvents: vi.fn(),
   getRetryExhaustedReason: vi.fn(),
 }));
@@ -705,6 +706,69 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.stdoutExcerpt).toBe("***REDACTED***@db.example.test/app finished");
     expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
+  }, 45_000);
+
+  it("masks a shortened run-list URL before registered-secret replacement changes its length", async () => {
+    const registered = "r".repeat(300);
+    const partialUrl = "postgres://worker:fragment";
+    const summary = `${registered}${"x".repeat(500 - registered.length - partialUrl.length)}${partialUrl}`;
+    mockHeartbeatService.list.mockResolvedValueOnce([{
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+      resultJson: { summary },
+    }]);
+    mockRunSecretRedactionRegistry.redactForRuns.mockImplementationOnce(async (_companyId, rows) =>
+      rows.map((row: { resultJson: { summary: string } }) => ({
+        ...row,
+        resultJson: { summary: row.resultJson.summary.replace(registered, "***REDACTED***") },
+      })),
+    );
+
+    const res = await requestApp(await createApp(), (url) => request(url).get(
+      "/api/companies/company-1/heartbeat-runs?summary=true",
+    ));
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].resultJson.summary).toContain("postgres://***REDACTED***");
+    expect(res.body[0].resultJson.summary).not.toContain("worker");
+    expect(res.body[0].resultJson.summary).not.toContain("fragment");
+  }, 45_000);
+
+  it("masks a capped excerpt before registered-secret replacement changes its byte length", async () => {
+    const registered = "r".repeat(300);
+    const password = "q".repeat(33_000);
+    const output = `postgres://worker:${password}@db.example.test/app ${registered}`;
+    const excerpt = Buffer.from(output).subarray(-32 * 1024).toString("utf8");
+    expect(excerpt.startsWith("q")).toBe(true);
+    mockHeartbeatService.getRun.mockResolvedValueOnce({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+      stdoutExcerpt: excerpt,
+    });
+    mockRunSecretRedactionRegistry.redactForRun.mockImplementationOnce(async (_companyId, _runId, value) => {
+      const run = value as { stdoutExcerpt: string };
+      return { ...run, stdoutExcerpt: run.stdoutExcerpt.replace(registered, "***REDACTED***") };
+    });
+    const identityQuery = {
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      orderBy: vi.fn(async () => []),
+    };
+
+    const res = await requestApp(await createApp({ select: vi.fn(() => identityQuery) }), (url) => request(url).get(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ));
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stdoutExcerpt).toMatch(/^\*\*\*REDACTED\*\*\*@db\.example\.test\/app /);
+    expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
+    expect(res.body.stdoutExcerpt).toContain("***REDACTED***");
   }, 45_000);
 
   it.each(["board", "agent"])("masks truncated historical event userinfo for a %s reader", async (actorType) => {

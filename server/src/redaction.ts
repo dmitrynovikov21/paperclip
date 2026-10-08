@@ -1005,13 +1005,13 @@ export function redactSensitiveText(input: string): string {
 }
 
 /** Recheck historical run metadata without changing its response shape. */
-export function redactPostgresUrlsInValue<T>(input: T): T {
+function redactPostgresUrlsInValueAtKey<T>(input: T, key?: string): T {
   if (typeof input === "string") {
     const completeUrlsRedacted = redactPostgresUrlUserinfo(input, REDACTED_EVENT_VALUE);
     // Run-list summaries can be shortened in SQL before reaching this reader.
     // A cut before `@` leaves no complete URL for the ordinary matcher, so
     // hide an undecidable authority at a text boundary as well.
-    return completeUrlsRedacted.replace(
+    const redacted = completeUrlsRedacted.replace(
       /(postgres(?:ql)?:\/\/)([^@\s"`<>\\/?#]+)/gi,
       (match, scheme: string, _authority: string, offset: number, source: string) => {
         const next = source[offset + match.length];
@@ -1019,13 +1019,24 @@ export function redactPostgresUrlsInValue<T>(input: T): T {
           ? match
           : `${scheme}${REDACTED_EVENT_VALUE}`;
       },
-    ) as T;
+    );
+    // The 32 KiB stdout/stderr excerpt cap keeps the right edge. Historical
+    // rows can therefore start inside userinfo with no scheme to recognize.
+    // Hide the undecidable first token; a visible scheme is handled above.
+    return (key === "stdoutExcerpt" || key === "stderrExcerpt") &&
+      !/^postgres(?:ql)?:\/\//i.test(redacted)
+      ? redacted.replace(/^[^\s@]+/, REDACTED_EVENT_VALUE) as T
+      : redacted as T;
   }
   if (Array.isArray(input)) {
-    return input.map((value) => redactPostgresUrlsInValue(value)) as T;
+    return input.map((value) => redactPostgresUrlsInValueAtKey(value)) as T;
   }
   if (input instanceof Date || !isPlainObject(input)) return input;
   return Object.fromEntries(
-    Object.entries(input).map(([key, value]) => [key, redactPostgresUrlsInValue(value)]),
+    Object.entries(input).map(([childKey, value]) => [childKey, redactPostgresUrlsInValueAtKey(value, childKey)]),
   ) as T;
+}
+
+export function redactPostgresUrlsInValue<T>(input: T): T {
+  return redactPostgresUrlsInValueAtKey(input);
 }

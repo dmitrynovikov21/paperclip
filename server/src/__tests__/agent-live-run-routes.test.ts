@@ -21,6 +21,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  getRetryExhaustedReason: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -333,6 +334,7 @@ describe("agent live run routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.getRetryExhaustedReason.mockResolvedValue(null);
     mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
       ...run,
       currentStatusMessage: null,
@@ -664,6 +666,35 @@ describe("agent live run routes", () => {
     } finally {
       await fs.rm(basePath, { recursive: true, force: true });
     }
+  }, 45_000);
+
+  it.each(["board", "agent"])("masks truncated historical run excerpts for a %s reader", async (actorType) => {
+    const password = "q".repeat(33_000);
+    const output = `postgres://worker:${password}@db.example.test/app finished`;
+    const excerpt = Buffer.from(output).subarray(-32 * 1024).toString("utf8");
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+      stdoutExcerpt: excerpt,
+    });
+    const actor = actorType === "board"
+      ? { type: "board", userId: "test-user", companyIds: ["company-1"], source: "session" }
+      : { type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key" };
+    const identityQuery = {
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      orderBy: vi.fn(async () => []),
+    };
+    const res = await requestApp(await createApp({ select: vi.fn(() => identityQuery) }, actor), (url) => request(url).get(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ));
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.stdoutExcerpt).toBe("***REDACTED***@db.example.test/app finished");
+    expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
   }, 45_000);
 
   it.each(["skill_test", "task_bridge"])(

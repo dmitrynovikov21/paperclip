@@ -8,6 +8,8 @@ event needs no operator endpoint.
 The stdout/stderr writer holds split PostgreSQL URL userinfo until it can
 redact the complete credential. The run-log reader also masks userinfo in
 historical local or object-storage logs before it returns byte-range pages.
+If a bounded read cuts through an oversized historical NDJSON record, the
+reader masks that record's page bytes because it cannot classify the fragment.
 The original log file stays intact for authorized incident forensics; the API
 cursor still uses offsets in that original file.
 

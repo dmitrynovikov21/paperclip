@@ -77,28 +77,6 @@ function maskPostgresCredentialsInRange(
     const maskEnd = Math.min(pageEnd, end);
     if (maskStart < maskEnd) bytes.fill(0x2a, maskStart, maskEnd);
   };
-  const maskPartialLine = (line: string, lineStart: number, lineEnd: number) => {
-    POSTGRES_URI_SCHEME_RE.lastIndex = 0;
-    const matches = [...line.matchAll(POSTGRES_URI_SCHEME_RE)];
-    if (matches.length === 0) {
-      maskUnclassifiedLine(lineStart, lineEnd);
-      return;
-    }
-    // A partial first record might carry the tail of an earlier URL. Its
-    // prefix is undecidable, but an explicit scheme inside the page is safe
-    // to retain for diagnostics.
-    if (sourceOffset > 0 || lineStart > 0) {
-      maskUnclassifiedLine(lineStart, lineStart + matches[0]!.index);
-    }
-    for (const match of matches) {
-      const userinfoStart = match.index + match[0].length;
-      let end = userinfoStart;
-      while (end < line.length && !/[@\s"`<>\\/?#]/.test(line[end]!)) end += 1;
-      if (line[end] === "@" || end === line.length) {
-        bytes.fill(0x2a, lineStart + userinfoStart, lineStart + end);
-      }
-    }
-  };
   for (let lineStart = 0; lineStart < source.length;) {
     const newline = source.indexOf("\n", lineStart);
     const lineEnd = newline < 0 ? source.length : newline;
@@ -125,13 +103,10 @@ function maskPostgresCredentialsInRange(
           }
         }
       } catch {
-        // A bounded range may start or end mid-record. Never serve its
-        // unclassified bytes when the requested page intersects it.
-        if ((lineStart === 0 && sourceOffset > 0) || newline < 0) {
-          maskPartialLine(line, lineStart, lineEnd);
-        } else {
-          maskUnclassifiedLine(lineStart, lineEnd);
-        }
+        // A bounded range can start or end inside a historical oversized
+        // record. Its chunk may contain escaped bytes or a URL completed in
+        // another record, so no substring of the partial line is provably safe.
+        maskUnclassifiedLine(lineStart, lineEnd);
       }
     }
     if (newline < 0) break;

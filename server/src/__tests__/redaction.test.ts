@@ -52,6 +52,18 @@ describe("redaction", () => {
       .toBe("postgres://db.example.test/app");
   });
 
+  it("masks a historical 32 KiB excerpt starting inside URL userinfo", () => {
+    const password = "q".repeat(33_000);
+    const output = `postgres://worker:${password}@db.example.test/app finished`;
+    const excerpt = Buffer.from(output).subarray(-32 * 1024).toString("utf8");
+    expect(excerpt.startsWith("q")).toBe(true);
+    const result = redactPostgresUrlsInValue({ stdoutExcerpt: excerpt, stderrExcerpt: excerpt });
+    for (const redacted of [result.stdoutExcerpt, result.stderrExcerpt]) {
+      expect(redacted).toMatch(/^\*\*\*REDACTED\*\*\*@db\.example\.test\/app finished$/);
+      expect(redacted).not.toContain(password.slice(0, 32));
+    }
+  });
+
   it("preserves credential-related prose, metadata, and dotted filenames", () => {
     const input = {
       body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",

@@ -442,9 +442,46 @@ describe("createDurableRunLogStore", () => {
       limitBytes: 32,
       redactPostgresCredentials: true,
     });
-    expect(start.content).toMatch(/^postgres:\/\/\*+$/);
+    // The oversized record cannot be classified within the bounded read, so
+    // even its otherwise diagnostic scheme is hidden on this page.
+    expect(start.content).toBe("*".repeat(32));
     expect(middle.content).toBe("*".repeat(32));
     expect(middle.nextOffset).toBe(middleOffset + 32);
+  });
+
+  it.each([false, true])("fails closed inside an oversized historical record (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    // 50,000 control characters expand beyond the 256 KiB lookbehind when
+    // encoded in NDJSON. The URL authority finishes in the following record.
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: `${"\u0001".repeat(50_000)}postgres://worker:partial`,
+      ts: "t1",
+    });
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: "secret@db.example.test/app done",
+      ts: "t2",
+    });
+    const raw = await store.read(handle, { limitBytes: 400_000 });
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    for (const fragment of ["partial", "secret"]) {
+      const offset = raw.content.indexOf(fragment) + 2;
+      expect(offset).toBeGreaterThan(2);
+      const page = await store.read(handle, {
+        offset,
+        limitBytes: 4,
+        redactPostgresCredentials: true,
+      });
+      expect(page.content).toBe("****");
+      expect(page.nextOffset).toBe(offset + 4);
+    }
+    expect((await store.read(handle, { limitBytes: 400_000 })).content).toBe(raw.content);
   });
 
   it("throws notFound when neither local nor S3 has the log (pre-S3 run after a roll)", async () => {

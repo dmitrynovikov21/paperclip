@@ -16,7 +16,7 @@ export function appendExcerpt(prev: string, chunk: string) {
 function truncateRunEventString(value: string) {
   // A URL's closing @ can fall outside the stored prefix. Redact the full
   // string before bounding it so the persisted event never keeps userinfo.
-  const sanitized = redactPostgresUrlsInValue(redactSensitiveText(value));
+  const sanitized = redactPostgresUrlsInValue(redactSensitiveText(value), { possiblyPartial: true });
   if (sanitized.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return sanitized;
   const omittedChars = sanitized.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
   return `${sanitized.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
@@ -120,4 +120,3 @@ export function compactRunLogChunk(
   const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
 }
-

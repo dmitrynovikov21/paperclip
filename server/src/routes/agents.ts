@@ -7761,11 +7761,11 @@ export function agentRoutes(
       redactCurrentUserValue({
         ...event,
         message: typeof event.message === "string"
-          ? redactPostgresUrlsInValue(redactSensitiveText(event.message))
+          ? redactPostgresUrlsInValue(redactSensitiveText(event.message), { possiblyPartial: true })
           : event.message,
         // Older events may have been bounded inside URL userinfo before write
         // redaction. Hide that undecidable authority on the read path too.
-        payload: redactPostgresUrlsInValue(redactEventPayload(event.payload)),
+        payload: redactPostgresUrlsInValue(redactEventPayload(event.payload), { possiblyPartial: true }),
       }, currentUserRedactionOptions),
     );
     res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));

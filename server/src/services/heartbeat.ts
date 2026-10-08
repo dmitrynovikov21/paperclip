@@ -10173,7 +10173,7 @@ export function heartbeatService(
     const sanitizedMessage = event.message
       ? redactPostgresUrlsInValue(redactSensitiveText(
           redactCurrentUserText(event.message, currentUserRedactionOptions),
-        ))
+        ), { possiblyPartial: true })
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)

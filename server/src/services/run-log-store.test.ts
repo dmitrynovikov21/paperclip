@@ -420,6 +420,34 @@ describe("createDurableRunLogStore", () => {
       .toEqual({ content: "*****", nextOffset: pageOffset + 5 });
   });
 
+  it.each([false, true])("masks historical userinfo cut by a run-log truncation marker (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const marker = "\n[paperclip truncated run log chunk: omitted 100 chars]\n";
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: `ps --dbname=postgresql://worker:p%40ss${marker}diagnostic tail`,
+      ts: "t1",
+    });
+    const raw = await store.read(handle);
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    let content = "";
+    for (let offset = 0; offset < Buffer.byteLength(raw.content); offset += 9) {
+      const page = await store.read(handle, { offset, limitBytes: 9, redactPostgresCredentials: true });
+      content += page.content;
+      expect(page.nextOffset).toBe(offset + 9 < Buffer.byteLength(raw.content) ? offset + 9 : undefined);
+    }
+    expect(content).toMatch(/postgresql:\/\/\*+\\n\[paperclip truncated run log chunk:/);
+    expect(content).toContain("diagnostic tail");
+    expect(content).not.toContain("worker");
+    expect(content).not.toContain("p%40ss");
+    expect((await store.read(handle)).content).toBe(raw.content);
+  });
+
   it("masks credentials longer than the bounded read context", async () => {
     const store = createDurableRunLogStore({ basePath: baseDir });
     const handle = await store.begin(begin);

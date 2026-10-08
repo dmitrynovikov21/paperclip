@@ -52,6 +52,17 @@ describe("redaction", () => {
       .toBe("postgres://db.example.test/app");
   });
 
+  it("preserves complete run diagnostics while hiding explicitly truncated userinfo", () => {
+    const complete = {
+      summary: "Connection to postgres://db.example.test refused",
+      stdoutExcerpt: "Connection refused",
+      stderrExcerpt: "postgres://db.example.test",
+    };
+    expect(redactPostgresUrlsInValue(complete)).toEqual(complete);
+    expect(redactPostgresUrlsInValue({ message: "postgres://worker:partial\n[truncated 20 chars]" }))
+      .toEqual({ message: "postgres://***REDACTED***\n[truncated 20 chars]" });
+  });
+
   it("masks a historical 32 KiB excerpt starting inside URL userinfo", () => {
     const password = "q".repeat(33_000);
     const output = `postgres://worker:${password}@db.example.test/app finished`;

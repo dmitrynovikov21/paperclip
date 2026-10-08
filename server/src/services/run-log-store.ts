@@ -32,6 +32,7 @@ export interface RunLogReadResult {
 type RawRunLogReadResult = { bytes: Buffer; nextOffset?: number };
 const POSTGRES_URI_READ_CONTEXT_BYTES = 256 * 1024;
 const POSTGRES_URI_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
+const RUN_LOG_TRUNCATION_MARKER_RE = /^\n\[paperclip truncated run log chunk: omitted \d+ chars\]\n/;
 
 type MappedChunk = { text: string; starts: number[]; ends: number[] };
 
@@ -135,7 +136,10 @@ function maskPostgresCredentialsInRange(
       const userinfoStart = match.index + match[0].length;
       let end = userinfoStart;
       while (end < stream.text.length && !/[@\s"`<>\\/?#]/.test(stream.text[end]!)) end += 1;
-      if (stream.text[end] === "@" || (end === stream.text.length &&
+      // Older writers truncated a chunk after redaction, leaving a partial
+      // authority before this marker even when the following tail has no @.
+      const cutByMarker = RUN_LOG_TRUNCATION_MARKER_RE.test(stream.text.slice(end));
+      if (stream.text[end] === "@" || cutByMarker || (end === stream.text.length &&
         (rightTruncated || stream.text.slice(userinfoStart, end).includes(":")))) {
         maskCharacters(userinfoStart, end);
       }

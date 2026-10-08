@@ -637,6 +637,11 @@ describe("agent live run routes", () => {
         chunk: "ps --dbname=postgresql://etl_user:p%40ssword@db.example.test/app complete",
         ts: "test-time",
       });
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: "postgres://worker:p%40ss\n[paperclip truncated run log chunk: omitted 100 chars]\ndiagnostic tail",
+        ts: "test-time",
+      });
       mockHeartbeatService.readLog.mockImplementation(async (_run, options) => ({
         runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         store: handle.store,
@@ -655,6 +660,9 @@ describe("agent live run routes", () => {
       expect(full.body.content).toContain("complete");
       expect(full.body.content).not.toContain("etl_user");
       expect(full.body.content).not.toContain("p%40ssword");
+      expect(full.body.content).not.toContain("worker");
+      expect(full.body.content).not.toContain("p%40ss");
+      expect(full.body.content).toContain("diagnostic tail");
 
       const raw = await store.read(handle);
       const passwordOffset = raw.content.indexOf("p%40ssword");

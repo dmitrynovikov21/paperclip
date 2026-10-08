@@ -705,7 +705,7 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { redactEventPayload, redactPostgresUrlsInValue, redactSensitiveText } from "../redaction.js";
 import { createPostgresUrlStreamRedactor } from "@paperclipai/adapter-utils/command-redaction";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
@@ -10171,9 +10171,9 @@ export function heartbeatService(
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactSensitiveText(
+      ? redactPostgresUrlsInValue(redactSensitiveText(
           redactCurrentUserText(event.message, currentUserRedactionOptions),
-        )
+        ))
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)

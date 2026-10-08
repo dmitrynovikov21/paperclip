@@ -12,6 +12,9 @@ If a bounded read cuts through an oversized historical NDJSON record, the
 reader masks that record's page bytes because it cannot classify the fragment.
 The original log file stays intact for authorized incident forensics; the API
 cursor still uses offsets in that original file.
+Event payload strings are redacted before their 16 KiB storage cap. The writer
+and event HTTP reader also mask incomplete PostgreSQL authorities in messages
+and payloads, including older payloads that were capped before redaction.
 
 ## Native PRP Run-Log Events
 

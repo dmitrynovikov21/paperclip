@@ -21,6 +21,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  listEvents: vi.fn(),
   getRetryExhaustedReason: vi.fn(),
 }));
 
@@ -386,6 +387,7 @@ describe("agent live run routes", () => {
       agentId: "agent-1",
       status: "succeeded",
     });
+    mockHeartbeatService.listEvents.mockResolvedValue([]);
     mockWorkspaceOperationService.getById.mockResolvedValue({
       id: "operation-1",
       companyId: "company-1",
@@ -695,6 +697,38 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.stdoutExcerpt).toBe("***REDACTED***@db.example.test/app finished");
     expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
+  }, 45_000);
+
+  it.each(["board", "agent"])("masks truncated historical event userinfo for a %s reader", async (actorType) => {
+    const marker = "synthetic-event-credential";
+    const historicalOutput = `started postgres://worker:${marker}${"q".repeat(16 * 1024)}\n[truncated 40 chars]`;
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+    });
+    mockHeartbeatService.listEvents.mockResolvedValue([
+      { seq: 1, eventType: "adapter", message: "historical postgres://worker:synthetic-partial", payload: { output: historicalOutput } },
+      { seq: 2, eventType: "adapter", message: "complete event", payload: { output: "postgresql://worker:synthetic-full@db.example.test/app ready" } },
+      { seq: 3, eventType: "adapter", message: "host only", payload: { output: "postgres://db.example.test/app" } },
+    ]);
+    const actor = actorType === "board"
+      ? { type: "board", userId: "test-user", companyIds: ["company-1"], source: "session" }
+      : { type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key" };
+    const res = await requestApp(await createApp({}, actor), (url) => request(url).get(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events",
+    ));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].message).toBe("historical postgres://***REDACTED***");
+    expect(res.body[0].payload.output).toContain("started postgres://***REDACTED***");
+    expect(res.body[0].payload.output).not.toContain(marker);
+    expect(res.body[0].payload.output).not.toContain("worker");
+    expect(res.body[1].payload.output).toBe("postgresql://***REDACTED***@db.example.test/app ready");
+    expect(res.body[2].payload.output).toBe("postgres://db.example.test/app");
   }, 45_000);
 
   it.each(["skill_test", "task_bridge"])(

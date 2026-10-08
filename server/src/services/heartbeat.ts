@@ -706,6 +706,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createPostgresUrlStreamRedactor } from "@paperclipai/adapter-utils/command-redaction";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -19813,8 +19814,16 @@ export function heartbeatService(
             },
           });
         };
-        const onLog = (stream: "stdout" | "stderr", chunk: string) =>
-          appendIdentityRedactedLog(stream, identityRedactor.chunk(stream, chunk));
+        const postgresUrlRedactor = createPostgresUrlStreamRedactor();
+        const onLog = (stream: "stdout" | "stderr", chunk: string) => {
+          const redactedChunk = postgresUrlRedactor.chunk(
+            stream,
+            identityRedactor.chunk(stream, chunk),
+          );
+          return redactedChunk
+            ? appendIdentityRedactedLog(stream, redactedChunk)
+            : Promise.resolve();
+        };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
             "stdout",
@@ -21507,7 +21516,12 @@ export function heartbeatService(
           }
           for (const stream of ["stdout", "stderr"] as const) {
             const tail = identityRedactor.finish(stream);
-            if (tail) await appendIdentityRedactedLog(stream, tail);
+            if (tail) {
+              const redactedTail = postgresUrlRedactor.chunk(stream, tail);
+              if (redactedTail) await appendIdentityRedactedLog(stream, redactedTail);
+            }
+            const uriTail = postgresUrlRedactor.finish(stream);
+            if (uriTail) await appendIdentityRedactedLog(stream, uriTail);
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
 
@@ -26799,7 +26813,7 @@ export function heartbeatService(
           store: run.logStore as "local_file",
           logRef: run.logRef,
         },
-        opts,
+        { ...opts, redactPostgresCredentials: true },
       );
 
       return {
@@ -26807,8 +26821,7 @@ export function heartbeatService(
         store: run.logStore,
         logRef: run.logRef,
         ...result,
-        // Run-log chunks are already redacted before they are appended to the store.
-        // Rewriting the full chunk again on every poll creates avoidable string copies.
+        // The store rechecks historical ranges with stable byte offsets.
         content: result.content,
       };
     },

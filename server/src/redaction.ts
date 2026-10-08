@@ -1,5 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
-import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
+import { isPublicExecutorToolSelector, looksLikeCredentialJwt, redactPostgresUrlUserinfo } from "@paperclipai/adapter-utils/command-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
 
@@ -384,6 +384,8 @@ function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
   return (
     SECRET_TEXT_HINTS.some((hint) => lower.includes(hint)) ||
+    lower.includes("postgres://") ||
+    lower.includes("postgresql://") ||
     input.includes(".")
   );
 }
@@ -1000,4 +1002,18 @@ export function redactSensitiveText(input: string): string {
       ),
     REDACTED_EVENT_VALUE,
   );
+}
+
+/** Recheck historical run metadata without changing its response shape. */
+export function redactPostgresUrlsInValue<T>(input: T): T {
+  if (typeof input === "string") {
+    return redactPostgresUrlUserinfo(input, REDACTED_EVENT_VALUE) as T;
+  }
+  if (Array.isArray(input)) {
+    return input.map((value) => redactPostgresUrlsInValue(value)) as T;
+  }
+  if (input instanceof Date || !isPlainObject(input)) return input;
+  return Object.fromEntries(
+    Object.entries(input).map(([key, value]) => [key, redactPostgresUrlsInValue(value)]),
+  ) as T;
 }

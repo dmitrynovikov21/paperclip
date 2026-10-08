@@ -20,11 +20,38 @@ export interface RunLogReadOptions {
   offset?: number;
   limitBytes?: number;
   signal?: AbortSignal;
+  /** Recheck historical run logs before serving company-readable byte ranges. */
+  redactPostgresCredentials?: boolean;
 }
 
 export interface RunLogReadResult {
   content: string;
   nextOffset?: number;
+}
+
+type RawRunLogReadResult = { bytes: Buffer; nextOffset?: number };
+const POSTGRES_URI_READ_CONTEXT_BYTES = 256 * 1024;
+const POSTGRES_URI_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
+
+/** Mask in place so API byte offsets still refer to the original log file. */
+function maskPostgresCredentialsInRange(bytes: Buffer, pageStart: number, pageEnd: number, sourceOffset: number) {
+  const source = bytes.toString("latin1");
+  for (const match of source.matchAll(POSTGRES_URI_SCHEME_RE)) {
+    const userinfoStart = match.index + match[0].length;
+    let end = userinfoStart;
+    while (end < bytes.length && !/[\s"'`<>\\/?#]/.test(source[end]) && source[end] !== "@") end += 1;
+    // A complete URL without @ has no userinfo. An unfinished right edge is
+    // ambiguous, so hide it until the next range can see the full authority.
+    if (source[end] !== "@" && end < bytes.length) continue;
+    bytes.fill(0x2a, userinfoStart, end);
+  }
+
+  // If a caller starts inside an exceptionally long NDJSON line, the scheme
+  // may lie beyond the bounded lookbehind. Do not expose an unclassified tail.
+  if (sourceOffset > 0 && bytes.lastIndexOf(0x0a, pageStart - 1) < 0) {
+    const lineEnd = bytes.indexOf(0x0a, pageStart);
+    bytes.fill(0x2a, pageStart, lineEnd < 0 ? pageEnd : Math.min(pageEnd, lineEnd));
+  }
 }
 
 export interface RunLogFinalizeSummary {
@@ -220,7 +247,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     offset: number,
     limitBytes: number,
     signal?: AbortSignal,
-  ): Promise<RunLogReadResult | null> {
+  ): Promise<RawRunLogReadResult | null> {
     signal?.throwIfAborted();
     const start = Math.max(0, offset);
     // Read one extra byte to discover whether another page exists. A single
@@ -239,9 +266,9 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     }
     signal?.throwIfAborted();
     const bytes = Buffer.concat(chunks);
-    const content = bytes.subarray(0, limitBytes).toString("utf8");
+    const content = bytes.subarray(0, limitBytes);
     const nextOffset = bytes.length > limitBytes ? start + limitBytes : undefined;
-    return { content, nextOffset };
+    return { bytes: content, nextOffset };
   }
 
   async function readS3Range(
@@ -249,7 +276,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     offset: number,
     limitBytes: number,
     signal?: AbortSignal,
-  ): Promise<RunLogReadResult> {
+  ): Promise<RawRunLogReadResult> {
     signal?.throwIfAborted();
     if (!s3) throw notFound("Run log not found");
     const key = s3Key(logRef);
@@ -263,7 +290,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     // must short-circuit to an empty read instead of clamping end up to
     // start and requesting `bytes=total-total`.
     const end = Math.min(start + limitBytes - 1, total - 1);
-    if (total === 0 || start > end) return { content: "", nextOffset: start < total ? start : undefined };
+    if (total === 0 || start > end) return { bytes: Buffer.alloc(0), nextOffset: start < total ? start : undefined };
 
     const result = await s3.provider.getObject({ objectKey: key, range: { start, end }, signal });
     // Destroy a body that stalls after headers arrive, including a body
@@ -274,9 +301,9 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     signal?.throwIfAborted();
-    const content = Buffer.concat(chunks).toString("utf8");
+    const content = Buffer.concat(chunks);
     const nextOffset = end + 1 < total ? end + 1 : undefined;
-    return { content, nextOffset };
+    return { bytes: content, nextOffset };
   }
 
   async function sha256File(filePath: string): Promise<string> {
@@ -424,12 +451,32 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       opts?.signal?.throwIfAborted();
       if (handle.store !== "local_file") throw notFound("Run log not found");
       const absPath = resolveWithin(basePath, handle.logRef);
-      const offset = opts?.offset ?? 0;
+      const offset = Math.max(0, opts?.offset ?? 0);
       const limitBytes = opts?.limitBytes ?? 256_000;
-      const local = await readLocalRange(absPath, offset, limitBytes, opts?.signal);
-      if (local) return local;
+      const contextStart = opts?.redactPostgresCredentials
+        ? Math.max(0, offset - POSTGRES_URI_READ_CONTEXT_BYTES)
+        : offset;
+      const prefixBytes = offset - contextStart;
+      const readBytes = opts?.redactPostgresCredentials
+        ? prefixBytes + limitBytes + POSTGRES_URI_READ_CONTEXT_BYTES
+        : limitBytes;
+      const local = await readLocalRange(absPath, contextStart, readBytes, opts?.signal);
       // Local file gone (pod rolled) -> serve from the S3 mirror if configured.
-      return readS3Range(handle.logRef, offset, limitBytes, opts?.signal);
+      const result = local ?? await readS3Range(handle.logRef, contextStart, readBytes, opts?.signal);
+      if (!opts?.redactPostgresCredentials) {
+        return { content: result.bytes.toString("utf8"), nextOffset: result.nextOffset };
+      }
+      if (prefixBytes >= result.bytes.length) {
+        return { content: "", nextOffset: undefined };
+      }
+      const pageEnd = Math.min(result.bytes.length, prefixBytes + limitBytes);
+      maskPostgresCredentialsInRange(result.bytes, prefixBytes, pageEnd, contextStart);
+      return {
+        content: result.bytes.subarray(prefixBytes, pageEnd).toString("utf8"),
+        nextOffset: result.bytes.length > prefixBytes + limitBytes || result.nextOffset !== undefined
+          ? offset + limitBytes
+          : undefined,
+      };
     },
 
     async flushInflightMirrors() {

@@ -19,11 +19,26 @@ import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
   redactEventPayload,
+  redactPostgresUrlsInValue,
   redactSensitiveText,
   sanitizeRecord,
 } from "../redaction.js";
 
 describe("redaction", () => {
+  it("masks PostgreSQL credentials in historical run metadata without changing dates", () => {
+    const startedAt = new Date("2026-10-08T00:00:00.000Z");
+    const redacted = redactPostgresUrlsInValue({
+      startedAt,
+      stdoutExcerpt: "ps postgres://worker:encoded%40value@db.example.test/app done",
+    });
+    expect(redacted.startedAt).toBe(startedAt);
+    expect(redacted.stdoutExcerpt).toContain("postgres://***REDACTED***@db.example.test/app done");
+    expect(redacted.stdoutExcerpt).not.toContain("worker");
+    expect(redacted.stdoutExcerpt).not.toContain("encoded%40value");
+    expect(redactSensitiveText("postgresql://u:s@db"))
+      .toBe("postgresql://***REDACTED***@db");
+  });
+
   it("preserves credential-related prose, metadata, and dotted filenames", () => {
     const input = {
       body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",

@@ -364,6 +364,63 @@ describe("createDurableRunLogStore", () => {
     }
   });
 
+  it.each([false, true])("masks a historical PostgreSQL URL across byte-range pages (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const url = "postgresql://etl_user:p%40ss%3Aword@db.example.test/app";
+    await store.append(handle, { stream: "stdout", chunk: `ps --dbname=${url} complete`, ts: "t" });
+    const raw = await store.read(handle);
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    let content = "";
+    for (let offset = 0; offset < Buffer.byteLength(raw.content); offset += 7) {
+      const page = await store.read(handle, { offset, limitBytes: 7, redactPostgresCredentials: true });
+      content += page.content;
+      expect(page.nextOffset).toBe(offset + 7 < Buffer.byteLength(raw.content) ? offset + 7 : undefined);
+      expect(page.content).not.toContain("etl_user");
+    }
+    expect(content).toMatch(/postgresql:\/\/\*+@db\.example\.test\/app/);
+    expect(content).toContain("complete");
+    expect(content).not.toContain("etl_user");
+    expect(content).not.toContain("p%40ss%3Aword");
+    expect(await store.read(handle, {
+      offset: 300_000,
+      limitBytes: 7,
+      redactPostgresCredentials: true,
+    })).toEqual({ content: "", nextOffset: undefined });
+    expect((await store.read(handle)).content).toBe(raw.content);
+  });
+
+  it("masks credentials longer than the bounded read context", async () => {
+    const store = createDurableRunLogStore({ basePath: baseDir });
+    const handle = await store.begin(begin);
+    const password = "x".repeat(300_000);
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: `postgres://user:${password}@db.example.test/app`,
+      ts: "t",
+    });
+    const raw = await store.read(handle);
+    const schemeOffset = raw.content.indexOf("postgres://");
+    const middleOffset = raw.content.indexOf(password) + 280_000;
+    const start = await store.read(handle, {
+      offset: schemeOffset,
+      limitBytes: 32,
+      redactPostgresCredentials: true,
+    });
+    const middle = await store.read(handle, {
+      offset: middleOffset,
+      limitBytes: 32,
+      redactPostgresCredentials: true,
+    });
+    expect(start.content).toMatch(/^postgres:\/\/\*+$/);
+    expect(middle.content).toBe("*".repeat(32));
+    expect(middle.nextOffset).toBe(middleOffset + 32);
+  });
+
   it("throws notFound when neither local nor S3 has the log (pre-S3 run after a roll)", async () => {
     const { provider } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

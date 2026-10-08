@@ -1,8 +1,12 @@
 import express from "express";
 import request from "supertest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDurableRunLogStore } from "../services/run-log-store.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -618,6 +622,49 @@ describe("agent live run routes", () => {
       nextOffset: 5,
     });
   });
+
+  it.each(["board", "agent"])("does not return a historical DB URL to a %s reader", async (actorType) => {
+    const basePath = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-redacted-api-log-"));
+    try {
+      const store = createDurableRunLogStore({ basePath });
+      const handle = await store.begin({ companyId: "company-1", agentId: routeAgentId, runId: "run-1" });
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: "ps --dbname=postgresql://etl_user:p%40ssword@db.example.test/app complete",
+        ts: "test-time",
+      });
+      mockHeartbeatService.readLog.mockImplementation(async (_run, options) => ({
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        store: handle.store,
+        logRef: handle.logRef,
+        ...await store.read(handle, { ...options, redactPostgresCredentials: true }),
+      }));
+      const actor = actorType === "board"
+        ? { type: "board", userId: "test-user", companyIds: ["company-1"], source: "session" }
+        : { type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key" };
+      const app = await createApp({}, actor);
+      const full = await requestApp(app, (url) => request(url).get(
+        "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/log?offset=0&limitBytes=1024",
+      ));
+      expect(full.status).toBe(200);
+      expect(full.body.content).toMatch(/postgresql:\/\/\*+@db\.example\.test\/app/);
+      expect(full.body.content).toContain("complete");
+      expect(full.body.content).not.toContain("etl_user");
+      expect(full.body.content).not.toContain("p%40ssword");
+
+      const raw = await store.read(handle);
+      const passwordOffset = raw.content.indexOf("p%40ssword");
+      expect(passwordOffset).toBeGreaterThan(0);
+      const page = await requestApp(app, (url) => request(url).get(
+        `/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/log?offset=${passwordOffset + 2}&limitBytes=5`,
+      ));
+      expect(page.status).toBe(200);
+      expect(page.body.content).toBe("*****");
+      expect(page.body.nextOffset).toBe(passwordOffset + 7);
+    } finally {
+      await fs.rm(basePath, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   it.each(["skill_test", "task_bridge"])(
     "denies %s keys from company-wide run and workspace logs",

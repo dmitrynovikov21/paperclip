@@ -342,6 +342,34 @@ describeEmbeddedPostgres("provider quota release", () => {
     expect(result).toMatchObject({ released: 0, canaries: 0, held: 1 });
   });
 
+  it("expires a relative reset at the source failure and probes on a later tick", async () => {
+    const failedAt = new Date("2026-10-08T05:00:00.000Z");
+    const earlyTick = new Date("2026-10-08T06:00:00.000Z");
+    const lateTick = new Date("2026-10-08T08:00:00.000Z");
+    const { companyId, prefix } = await seedCompany();
+    const worker = await seedAgent({ companyId, adapterType: "claude_local" });
+    const { issueId } = await seedBlockedQuotaIssue({
+      companyId,
+      prefix,
+      workerAgentId: worker,
+      failedAt,
+    });
+    await seedFamilyRuns({
+      companyId,
+      agentId: worker,
+      quotaFailedAt: [failedAt],
+      quotaError: "You've hit your session limit · resets 6:10am (UTC)",
+    });
+
+    const { recovery } = makeRecovery();
+    const early = await recovery.promoteQuotaBlockedIssues(earlyTick);
+    expect(early).toMatchObject({ released: 0, canaries: 0 });
+    const late = await recovery.promoteQuotaBlockedIssues(lateTick);
+    expect(late).toMatchObject({ released: 1, canaries: 1 });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("todo");
+  });
+
   it("releases exactly one canary when a silent family can produce no evidence", async () => {
     const now = new Date();
     const { companyId, prefix } = await seedCompany();

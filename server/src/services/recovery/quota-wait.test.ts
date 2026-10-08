@@ -106,6 +106,13 @@ describe("parseProviderQuotaResetHint", () => {
     ).toEqual(new Date("2026-09-17T06:10:00.000Z"));
   });
 
+  it("pins a relative reset to the failure across later routine ticks", () => {
+    const failedAt = new Date("2026-10-01T08:00:00.000Z");
+    const resetAt = parseProviderQuotaResetHint("resets 6:10am (UTC)", failedAt);
+    expect(resetAt).toEqual(new Date("2026-10-02T06:10:00.000Z"));
+    expect(resetAt!.getTime()).toBeLessThan(new Date("2026-10-08T08:00:00.000Z").getTime());
+  });
+
   it("keeps a wall clock reset later today on the same day", () => {
     expect(
       parseProviderQuotaResetHint("resets 6pm (UTC)", NOW),

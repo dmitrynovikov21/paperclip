@@ -145,13 +145,15 @@ function toTwentyFourHour(rawHour: number, meridiem: string) {
 
 /**
  * The absolute UTC moment the provider claims the quota returns, or null.
+ * Resolve a wall-clock hint against the run's failure time so later routine
+ * ticks cannot keep moving that hint into tomorrow.
  *
  * Only ever used to *hold* a canary back. Releases require positive evidence,
  * because these hints are routinely far-future or simply wrong.
  */
 export function parseProviderQuotaResetHint(
   text: string | null | undefined,
-  now: Date,
+  failedAt: Date,
 ): Date | null {
   if (!text) return null;
 
@@ -182,11 +184,11 @@ export function parseProviderQuotaResetHint(
       wallClock[3] ?? "",
     );
     const minute = Number.parseInt(wallClock[2] ?? "0", 10);
-    const parsed = new Date(now.getTime());
+    const parsed = new Date(failedAt.getTime());
     parsed.setUTCHours(hour, minute, 0, 0);
-    // A wall clock time carries no date. Anything at or before now refers to
-    // the next occurrence of that time.
-    if (parsed.getTime() <= now.getTime()) {
+    // A wall clock time carries no date. Anything at or before the failed
+    // run refers to the next occurrence of that time.
+    if (parsed.getTime() <= failedAt.getTime()) {
       parsed.setUTCDate(parsed.getUTCDate() + 1);
     }
     return parsed;

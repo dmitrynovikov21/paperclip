@@ -6045,9 +6045,12 @@ export function recoveryService(
             )
         ) as successes_after_quota_failure,
         (
-          select string_agg(newest.error, E'\n')
+          select json_agg(json_build_object(
+            'error', newest.error,
+            'finishedAt', newest.finished_at
+          ))::text
           from (
-            select r.error
+            select r.error, r.finished_at
             from window_runs r
             where r.company_id = m.company_id
               and r.family = m.family
@@ -6057,7 +6060,7 @@ export function recoveryService(
             order by r.finished_at desc
             limit 10
           ) as newest
-        ) as quota_failure_errors
+        ) as quota_failure_hints
       from family_marks m
     `)) as unknown as Iterable<{
       company_id: string;
@@ -6066,13 +6069,19 @@ export function recoveryService(
       last_quota_failure_at: string | null;
       last_terminal_at: string | null;
       successes_after_quota_failure: string | number;
-      quota_failure_errors: string | null;
+      quota_failure_hints: string | null;
     }>;
 
     for (const row of rows) {
-      const resetHints = (row.quota_failure_errors ?? "")
-        .split("\n")
-        .map((line) => parseProviderQuotaResetHint(line, now))
+      const quotaHints = JSON.parse(row.quota_failure_hints ?? "[]") as Array<{
+        error: string | null;
+        finishedAt: string | null;
+      }>;
+      const resetHints = quotaHints
+        .map((hint) => {
+          const failedAt = toDateOrNull(hint.finishedAt);
+          return failedAt ? parseProviderQuotaResetHint(hint.error, failedAt) : null;
+        })
         .filter((hint): hint is Date => hint !== null && hint > now);
       const verdict = classifyAdapterFamilyQuotaState(
         {

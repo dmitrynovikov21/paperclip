@@ -1028,13 +1028,24 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       scheduledRetryAt?: Date;
       scheduledRetryReason?: string;
       pinSetAt?: Date;
+      adapterType?: string;
     }) {
       const runId = randomUUID();
+      const predecessorId = randomUUID();
       const pinSetAt = input.pinSetAt ?? new Date(NOW.getTime() - 6 * 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: predecessorId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: "failed",
+        runnerProfileJson: { adapterDispatch: { adapterType: input.adapterType ?? "codex_local" } },
+        createdAt: new Date(pinSetAt.getTime() - 60_000),
+      });
       await db.insert(heartbeatRuns).values({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
+        retryOfRunId: predecessorId,
         invocationSource: "retry",
         status: "scheduled_retry",
         scheduledRetryAttempt: 1,
@@ -1047,7 +1058,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       return runId;
     }
 
-    async function seedSucceededRun(input: { companyId: string; agentId: string; finishedAt: Date }) {
+    async function seedSucceededRun(input: { companyId: string; agentId: string; finishedAt: Date; adapterType?: string }) {
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({
         id: runId,
@@ -1056,6 +1067,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         invocationSource: "assignment",
         status: "succeeded",
         finishedAt: input.finishedAt,
+        runnerProfileJson: { adapterDispatch: { adapterType: input.adapterType ?? "codex_local" } },
         contextSnapshot: {},
         createdAt: input.finishedAt,
         updatedAt: input.finishedAt,
@@ -1094,20 +1106,28 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         {
           runId: pinnedRunId,
           companyId,
+          agentId,
+          adapterType: "codex_local",
           retryReason: "transient_failure",
           scheduledRetryAt: FAR_FUTURE_PIN,
           pinSetAt: new Date(NOW.getTime() - 6 * 60_000),
+          createdAt: new Date(NOW.getTime() - 6 * 60_000),
         },
       ]);
     });
 
-    it("reads the company's latest success inside the lookback window as evidence", async () => {
+    it("reads only the same agent and adapter's latest success inside the lookback window", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const other = await seedCompanyAndAgent();
+      const otherAgentId = randomUUID();
+      await seedAgent({ id: otherAgentId, companyId, name: "Other" });
       const adapter = createPostgresRunDispatchAdapter(db);
+      const scope = { companyId, agentId, adapterType: "codex_local", now: NOW };
 
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 45 * 60_000) });
-      expect(await adapter.findUpstreamRecoveryEvidence({ companyId, now: NOW })).toBeNull();
+      await seedSucceededRun({ companyId, agentId: otherAgentId, finishedAt: new Date(NOW.getTime() - 30_000) });
+      await seedSucceededRun({ companyId, agentId, adapterType: "claude_local", finishedAt: new Date(NOW.getTime() - 30_000) });
+      expect(await adapter.findUpstreamRecoveryEvidence(scope)).toBeNull();
 
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 10 * 60_000) });
       const latestRunId = await seedSucceededRun({
@@ -1115,14 +1135,53 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         agentId,
         finishedAt: new Date(NOW.getTime() - 60_000),
       });
-      expect(await adapter.findUpstreamRecoveryEvidence({ companyId, now: NOW })).toEqual({
+      expect(await adapter.findUpstreamRecoveryEvidence(scope)).toEqual({
         runId: latestRunId,
         finishedAt: new Date(NOW.getTime() - 60_000),
       });
       // Another company's green run says nothing about this account's upstream.
       expect(
-        await adapter.findUpstreamRecoveryEvidence({ companyId: other.companyId, now: NOW }),
+        await adapter.findUpstreamRecoveryEvidence({ ...scope, companyId: other.companyId }),
       ).toBeNull();
+    });
+
+    it("uses the retry row's creation time when unrelated updates move updatedAt", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+      await db.update(heartbeatRuns)
+        .set({ updatedAt: NOW })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const [candidate] = await createPostgresRunDispatchAdapter(db)
+        .listEarlyUpstreamReprobeCandidates({ now: NOW, cutoff: null, limit: 50 });
+
+      expect(candidate?.pinSetAt).toEqual(new Date(NOW.getTime() - 6 * 60_000));
+    });
+
+    it("paginates tied retry pins without repeating the first page", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runIds = await Promise.all(Array.from({ length: 51 }, () =>
+        seedPinnedTransientRetry({ companyId, agentId, issueId }),
+      ));
+      const adapter = createPostgresRunDispatchAdapter(db);
+
+      const first = await adapter.listEarlyUpstreamReprobeCandidates({ now: NOW, cutoff: null, limit: 50 });
+      const last = first[first.length - 1]!;
+      const second = await adapter.listEarlyUpstreamReprobeCandidates({
+        now: NOW,
+        cutoff: null,
+        limit: 50,
+        after: { scheduledRetryAt: last.scheduledRetryAt!, createdAt: last.createdAt, runId: last.runId },
+      });
+
+      expect(first).toHaveLength(50);
+      expect(second).toHaveLength(1);
+      expect(new Set([...first, ...second].map((candidate) => candidate.runId)))
+        .toEqual(new Set(runIds));
     });
 
     it("advances a still-future pin once and records why", async () => {
@@ -1159,6 +1218,28 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
 
       // The pin is no longer in the future, so a second sweep is a no-op.
       expect(await adapter.advanceScheduledRetryPin(advanceInput)).toEqual({ advanced: false });
+    });
+
+    it("does not release a pin changed after candidate selection", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+      const changedPin = new Date(FAR_FUTURE_PIN.getTime() + 60_000);
+      await db.update(heartbeatRuns)
+        .set({ scheduledRetryAt: changedPin })
+        .where(eq(heartbeatRuns.id, runId));
+
+      expect(await createPostgresRunDispatchAdapter(db).advanceScheduledRetryPin({
+        runId,
+        companyId,
+        now: NOW,
+        originalScheduledRetryAt: FAR_FUTURE_PIN,
+        evidenceRunId: "green-run",
+      })).toEqual({ advanced: false });
+      const [row] = await db.select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(row?.scheduledRetryAt).toEqual(changedPin);
     });
 
     it("promotes a far-future pin on recovery and holds it while the upstream is down", async () => {

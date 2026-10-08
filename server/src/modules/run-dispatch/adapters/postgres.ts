@@ -2,6 +2,7 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -527,22 +528,41 @@ export function createPostgresRunDispatchAdapter(
     const reprobeThreshold = new Date(
       input.now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS,
     );
+    const predecessor = alias(heartbeatRuns, "early_reprobe_predecessor");
     const rows = await db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        adapterType: sql<string | null>`${predecessor.runnerProfileJson} #>> '{adapterDispatch,adapterType}'`,
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
         scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
         createdAt: heartbeatRuns.createdAt,
-        updatedAt: heartbeatRuns.updatedAt,
       })
       .from(heartbeatRuns)
+      .leftJoin(predecessor, and(
+        eq(predecessor.id, heartbeatRuns.retryOfRunId),
+        eq(predecessor.companyId, heartbeatRuns.companyId),
+        eq(predecessor.agentId, heartbeatRuns.agentId),
+      ))
       .where(
         and(
           eq(heartbeatRuns.status, "scheduled_retry"),
           eq(heartbeatRuns.scheduledRetryReason, TRANSIENT_FAILURE_RETRY_REASON),
           gt(heartbeatRuns.scheduledRetryAt, reprobeThreshold),
           input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
+          input.after ? or(
+            gt(heartbeatRuns.scheduledRetryAt, input.after.scheduledRetryAt),
+            and(
+              eq(heartbeatRuns.scheduledRetryAt, input.after.scheduledRetryAt),
+              gt(heartbeatRuns.createdAt, input.after.createdAt),
+            ),
+            and(
+              eq(heartbeatRuns.scheduledRetryAt, input.after.scheduledRetryAt),
+              eq(heartbeatRuns.createdAt, input.after.createdAt),
+              gt(heartbeatRuns.id, input.after.runId),
+            ),
+          ) : undefined,
         ),
       )
       .orderBy(
@@ -555,13 +575,14 @@ export function createPostgresRunDispatchAdapter(
     return rows.map((row) => ({
       runId: row.id,
       companyId: row.companyId,
+      agentId: row.agentId,
+      adapterType: row.adapterType,
       retryReason: row.scheduledRetryReason,
       scheduledRetryAt: row.scheduledRetryAt ? new Date(row.scheduledRetryAt) : null,
-      pinSetAt: row.updatedAt
-        ? new Date(row.updatedAt)
-        : row.createdAt
-          ? new Date(row.createdAt)
-          : null,
+      // Transient retry rows are inserted with their pin, so createdAt is the
+      // pin-write time. updatedAt can move after unrelated row mutations.
+      pinSetAt: new Date(row.createdAt),
+      createdAt: new Date(row.createdAt),
     }));
   }
 
@@ -577,7 +598,9 @@ export function createPostgresRunDispatchAdapter(
       .where(
         and(
           eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
           eq(heartbeatRuns.status, "succeeded"),
+          sql`${heartbeatRuns.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
           gt(heartbeatRuns.finishedAt, lookbackFloor),
         ),
       )
@@ -602,6 +625,9 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.status, "scheduled_retry"),
           eq(heartbeatRuns.scheduledRetryReason, TRANSIENT_FAILURE_RETRY_REASON),
+          input.originalScheduledRetryAt
+            ? eq(heartbeatRuns.scheduledRetryAt, input.originalScheduledRetryAt)
+            : sql`false`,
           gt(heartbeatRuns.scheduledRetryAt, input.now),
         ),
       )

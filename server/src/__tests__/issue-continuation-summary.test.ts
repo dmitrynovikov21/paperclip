@@ -86,6 +86,27 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("does not carry a review wait into an in_progress continuation after changes are requested", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1579",
+        title: "Finish requested changes",
+        description: null,
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: { id: "run-3", status: "succeeded", error: null, resultJson: null },
+      agent: { id: "agent-1", name: "CodexCoder", adapterType: "codex_local" },
+      previousSummaryBody: "## Next Action\n\n- Wait for reviewer feedback or approval before continuing executor work.",
+    });
+
+    expect(extractContinuationSummaryNextAction(body)).toBe(
+      "Resume implementation from the acceptance criteria, latest comments, and this summary.",
+    );
+    expect(continuationSummaryParksExecutor(body)).toBe(false);
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",

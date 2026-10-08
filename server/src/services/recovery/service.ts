@@ -2645,18 +2645,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       );
-    // Exclude any candidate that issue itself blocks — adding it would create a cycle.
-    const issueBlocksIds = await db
-      .select({ id: issueRelations.relatedIssueId })
-      .from(issueRelations)
-      .where(
-        and(
-          eq(issueRelations.companyId, issue.companyId),
-          eq(issueRelations.issueId, issue.id),
-          eq(issueRelations.type, "blocks"),
-        ),
+    // A child may be blocked by this issue through more than one `blocks` edge.
+    // Adding any reachable issue as a blocker would create a cycle.
+    const reachableRows = await db.execute(sql<{ id: string }>`
+      WITH RECURSIVE reachable(id) AS (
+        SELECT ${issueRelations.relatedIssueId}
+        FROM ${issueRelations}
+        WHERE ${issueRelations.companyId} = ${issue.companyId}
+          AND ${issueRelations.issueId} = ${issue.id}
+          AND ${issueRelations.type} = 'blocks'
+        UNION
+        SELECT ${issueRelations.relatedIssueId}
+        FROM ${issueRelations}
+        JOIN reachable ON ${issueRelations.issueId} = reachable.id
+        WHERE ${issueRelations.companyId} = ${issue.companyId}
+          AND ${issueRelations.type} = 'blocks'
       )
-      .then((rows) => new Set(rows.map((r) => r.id)));
+      SELECT id FROM reachable
+    `);
+    const issueBlocksIds = new Set(Array.from(reachableRows, (row) => row.id));
     const safeBlockers = existingBlockers.filter((r) => !issueBlocksIds.has(r.id));
     const safeChildren = openChildren.filter((r) => !issueBlocksIds.has(r.id));
     const blockedByIssueIds = [...new Set([...safeBlockers.map((row) => row.id), ...safeChildren.map((row) => row.id)])];
@@ -3318,6 +3325,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       } catch (err) {
         result.failed += 1;
         logger.warn({ issueId: issue.id, identifier: issue.identifier, err }, "reconcileStrandedAssignedIssues: skipping candidate after error");
+        continue;
       }
     }
 

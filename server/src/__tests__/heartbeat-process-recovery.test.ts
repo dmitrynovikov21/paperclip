@@ -4742,9 +4742,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(1);
   });
 
-  // HELA-14285: a child blocked by its own parent must not be added to blockedByIssueIds,
-  // otherwise assertNoBlockingCycles fires a 422 and crashes the whole periodic recovery pass.
-  it("does not add a child that the parent blocks to blockedByIssueIds, and does not crash the recovery pass", async () => {
+  // A child reachable from its parent through `blocks` must not be added as a blocker.
+  it("excludes direct and transitive cyclic children while recovering the next candidate", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "cancelled",
@@ -4773,19 +4772,49 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       relatedIssueId: childBlockedByParentId,
       type: "blocks",
     });
+    const intermediateId = randomUUID();
+    const transitiveChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: intermediateId,
+        companyId,
+        title: "Intermediate dependency",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 31,
+        identifier: `${issuePrefix}-31`,
+      },
+      {
+        id: transitiveChildId,
+        companyId,
+        parentId: issueId,
+        title: "Child reached through another dependency",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 32,
+        identifier: `${issuePrefix}-32`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId, relatedIssueId: intermediateId, type: "blocks" },
+      { companyId, issueId: intermediateId, relatedIssueId: transitiveChildId, type: "blocks" },
+    ]);
+    const nextCandidate = await seedStrandedIssueFixture({ status: "todo", runStatus: "failed" });
 
     const heartbeat = heartbeatService(db);
     // Must not throw — previously threw 422 "Blocking relations cannot contain cycles".
     const result = await heartbeat.reconcileStrandedAssignedIssues();
 
-    // The cyclic child is excluded → no open dependency remains → null path → escalated (not waitingOnReviewResolved).
     expect(result.failed).toBe(0);
+    expect(result.dispatchRequeued).toBe(1);
+    expect(result.issueIds).toContain(nextCandidate.issueId);
     // Issue must not be left as in_progress with no action.
     const updated = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(["blocked", "todo", "in_review"]).toContain(updated?.status);
 
-    // The cyclic child must NOT appear as a blocker of the parent.
+    // Neither cyclic child may be recorded as a blocker of the parent.
     const blockers = await sourceBlockerIssueIds(companyId, issueId);
     expect(blockers).not.toContain(childBlockedByParentId);
+    expect(blockers).not.toContain(transitiveChildId);
   });
 });

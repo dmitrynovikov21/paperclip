@@ -106,9 +106,9 @@ function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previou
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }
   if (run.status === "cancelled") return "Confirm the cancellation reason before starting another run.";
-  // Don't carry over a reviewer-wait action that was written while the card was in_review — it's stale after changes_requested moves the card back to in_progress.
-  const isStaleReviewWait = previousNextAction?.startsWith("Wait for reviewer");
-  return (!isStaleReviewWait && previousNextAction) ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
+  // A review wait from the previous stage must not park an executor after changes_requested.
+  const isStaleReviewWait = previousNextAction ? WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(previousNextAction) : false;
+  return (isStaleReviewWait ? null : previousNextAction) ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
 }
 
 function bulletList(items: string[], empty: string) {

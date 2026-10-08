@@ -1,0 +1,95 @@
+import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createLocalFileWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
+import {
+  createWorkspaceOperationUrlStreamRedactor,
+  redactWorkspaceOperationExcerpt,
+  redactWorkspaceOperationUrlUserInfo,
+} from "./workspace-operation-url-redaction.js";
+
+describe("workspace operation URL redaction", () => {
+  it("masks userinfo even when the scheme and credential arrive in separate chunks", () => {
+    const redactor = createWorkspaceOperationUrlStreamRedactor();
+    const output = [
+      redactor.push("connected to post"),
+      redactor.push("gresql://synthetic-user:sy"),
+      redactor.push("nthetic-password@db.example.test:5432/app and done"),
+      redactor.flush(),
+    ].join("");
+    expect(output).toContain("postgresql://[REDACTED]@db.example.test:5432/app");
+    expect(output).not.toContain("synthetic-user");
+    expect(output).not.toContain("synthetic-password");
+    expect(redactWorkspaceOperationUrlUserInfo("postgres://reader:one@db.test/app"))
+      .toBe("postgres://[REDACTED]@db.test/app");
+    expect(redactWorkspaceOperationExcerpt("the tail synthetic-password@db.test/app"))
+      .toBe("the tail [REDACTED]@db.test/app");
+  });
+
+  describe("historical byte-range pages", () => {
+    let logRoot: string;
+    beforeAll(async () => {
+      logRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-operation-url-redaction-"));
+    });
+    afterAll(async () => {
+      await fs.rm(logRoot, { recursive: true, force: true });
+    });
+
+    it("masks every page across a credential and leaves the forensic file unchanged", async () => {
+      const store = createLocalFileWorkspaceOperationLogStore(logRoot);
+      const handle = await store.begin({ companyId: randomUUID(), operationId: randomUUID() });
+      const credential = "synthetic-reader:synthetic-password";
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: `before postgres://${credential}@db.example.test/app after`,
+        ts: new Date().toISOString(),
+      });
+      const filePath = path.join(logRoot, handle.logRef);
+      const original = await fs.readFile(filePath);
+      const userinfoStart = original.indexOf(credential);
+      expect(userinfoStart).toBeGreaterThan(0);
+      const expected = Buffer.from(original);
+      expected.fill(0x2a, userinfoStart, userinfoStart + credential.length);
+
+      let offset = 0;
+      while (offset < original.length) {
+        const page = await store.read(handle, { offset, limitBytes: 7 });
+        const nextOffset = page.nextOffset ?? original.length;
+        expect(page.content).toBe(expected.subarray(offset, nextOffset).toString("utf8"));
+        offset = nextOffset;
+      }
+      expect(await fs.readFile(filePath)).toEqual(original);
+    });
+
+    it("masks a historical URL whose userinfo spans two NDJSON events", async () => {
+      const store = createLocalFileWorkspaceOperationLogStore(logRoot);
+      const handle = await store.begin({ companyId: randomUUID(), operationId: randomUUID() });
+      const first = "synthetic-reader:synthetic-";
+      const second = "password";
+      const ts = new Date().toISOString();
+      await store.append(handle, { stream: "stdout", chunk: `postgres://${first}`, ts });
+      await store.append(handle, { stream: "stderr", chunk: "unrelated output", ts });
+      await store.append(handle, { stream: "stdout", chunk: `${second}@db.example.test/app`, ts });
+      const filePath = path.join(logRoot, handle.logRef);
+      const original = await fs.readFile(filePath);
+      const expected = Buffer.from(original);
+      const firstAt = original.indexOf(first);
+      const secondAt = original.indexOf(second);
+      expect(firstAt).toBeGreaterThan(0);
+      expect(secondAt).toBeGreaterThan(firstAt);
+      expected.fill(0x2a, firstAt, firstAt + first.length);
+      expected.fill(0x2a, secondAt, secondAt + second.length);
+
+      let offset = 0;
+      while (offset < original.length) {
+        const page = await store.read(handle, { offset, limitBytes: 9 });
+        const nextOffset = page.nextOffset ?? original.length;
+        expect(page.content).toBe(expected.subarray(offset, nextOffset).toString("utf8"));
+        offset = nextOffset;
+      }
+      expect(await fs.readFile(filePath)).toEqual(original);
+    });
+  });
+});

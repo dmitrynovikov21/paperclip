@@ -286,21 +286,68 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     ]);
   });
 
-  it("checks a recovered candidate beyond an unchanged first page", async () => {
-    const candidates = Array.from({ length: 50 }, (_, index) =>
-      reprobeCandidate({ runId: `unrecovered-${index}` }),
+  it("checks one page per sweep and reaches every candidate across sweeps", async () => {
+    // One agent per candidate defeats the per-scope cache: every candidate costs one evidence read.
+    const candidates = Array.from({ length: 120 }, (_, index) =>
+      reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
     );
-    candidates.push(reprobeCandidate({ runId: "recovered", agentId: "agent-2" }));
     const reader = fakeReader([], {
       candidates,
-      evidenceFor: ({ agentId }) => agentId === "agent-2" ? RECOVERY_EVIDENCE : null,
+      evidenceFor: ({ agentId }) => agentId === "agent-119" ? RECOVERY_EVIDENCE : null,
     });
     const writer = fakeWriter();
+    const promote = buildEarlyPromoter(reader, writer);
 
-    const result = await buildEarlyPromoter(reader, writer)({ now: REPROBE_NOW, cutoff: null });
+    const evidenceReadsPerSweep: number[] = [];
+    const promotedPerSweep: string[][] = [];
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      const readsBefore = reader.evidenceCalls.length;
+      const result = await promote({ now: REPROBE_NOW, cutoff: null });
+      evidenceReadsPerSweep.push(reader.evidenceCalls.length - readsBefore);
+      promotedPerSweep.push(result.runIds);
+    }
 
-    expect(result.runIds).toEqual(["recovered"]);
+    expect(evidenceReadsPerSweep).toEqual([50, 50, 20]);
+    expect(promotedPerSweep).toEqual([[], [], ["pinned-119"]]);
     expect(writer.advanceCalls).toHaveLength(1);
+  });
+
+  it("wraps back to the first page after a short page", async () => {
+    const candidates = Array.from({ length: 60 }, (_, index) =>
+      reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
+    );
+    const reader = fakeReader([], { candidates, evidence: null });
+    const listCandidates = vi.spyOn(reader, "listEarlyUpstreamReprobeCandidates");
+    const promote = buildEarlyPromoter(reader, fakeWriter());
+
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      await promote({ now: REPROBE_NOW, cutoff: null });
+    }
+
+    expect(listCandidates.mock.calls.map(([input]) => input.after?.runId ?? null)).toEqual([
+      null,
+      "pinned-49",
+      null,
+    ]);
+  });
+
+  it("moves past a page whose processing throws", async () => {
+    const candidates = Array.from({ length: 51 }, (_, index) =>
+      reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
+    );
+    const reader = fakeReader([], {
+      candidates,
+      evidenceFor: ({ agentId }) => {
+        if (agentId === "agent-0") throw new Error("evidence read failed");
+        return agentId === "agent-50" ? RECOVERY_EVIDENCE : null;
+      },
+    });
+    const promote = buildEarlyPromoter(reader, fakeWriter());
+
+    await expect(promote({ now: REPROBE_NOW, cutoff: null })).rejects.toThrow("evidence read failed");
+    const result = await promote({ now: REPROBE_NOW, cutoff: null });
+
+    expect(result.runIds).toEqual(["pinned-50"]);
   });
 
   it("keeps a retry pinned when the predecessor's adapter is unknown", async () => {

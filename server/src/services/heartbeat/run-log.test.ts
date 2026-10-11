@@ -106,6 +106,16 @@ describe("heartbeat run-log payload formatting", () => {
     });
   });
 
+  it("redacts URI credentials in depth-limit key name summaries", () => {
+    const secretKey = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
+    const payload = { one: { two: { three: { four: { five: { six: { [secretKey]: "hidden" } } } } } } };
+    const bounded = boundHeartbeatRunEventPayloadForStorage(payload);
+    const summary = JSON.stringify(bounded);
+
+    expect(summary).toContain("postgres://***REDACTED***@db.example.test/app?***REDACTED***");
+    expect(summary).not.toMatch(/worker|synthetic-password|synthetic-query-secret/);
+  });
+
   it("replaces arrays at the depth limit with their original length", () => {
     const payload = { one: { two: { three: { four: { five: { six: [1, 2, 3] } } } } } };
     expect(boundHeartbeatRunEventPayloadForStorage(payload)).toEqual({

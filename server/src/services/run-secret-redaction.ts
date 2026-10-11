@@ -53,7 +53,7 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
   return Object.fromEntries(
     Object.entries(record)
       .filter(([key]) => key !== REGISTRY_KEY)
-      .map(([key, value]) => [key, key === "credentialAccess"
+      .map(([key, value]) => [redactText(key, values), key === "credentialAccess"
         ? (credentialConnectionName ? { connectionName: redactText(credentialConnectionName, values) } : {})
         : redactRegisteredSecretValues(value, values, credentialConnectionName)]),
   ) as T;

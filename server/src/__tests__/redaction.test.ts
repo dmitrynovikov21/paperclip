@@ -67,6 +67,23 @@ describe("redaction", () => {
       .toBe("postgres://***REDACTED***@db.example.test/app?***REDACTED***");
   });
 
+  it("masks PostgreSQL credentials in new and historical event payload keys", () => {
+    const urlKey = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
+    const partialKey = "postgresql://worker:synthetic-partial";
+    const payload = { normal: "ready", nested: { [urlKey]: "value", [partialKey]: "partial" } };
+    const expected = {
+      normal: "ready",
+      nested: {
+        "postgres://***REDACTED***@db.example.test/app?***REDACTED***": "value",
+        "postgresql://***REDACTED***": "partial",
+      },
+    };
+
+    expect(redactEventPayload(payload)).toEqual(expected);
+    expect(redactPostgresUrlsInValue(payload, { possiblyPartial: true })).toEqual(expected);
+    expect(JSON.stringify(redactEventPayload(payload))).not.toMatch(/synthetic-password|synthetic-query-secret|synthetic-partial|worker/);
+  });
+
   it("masks userinfo cut off by the 500-character run-list summary limit", () => {
     const url = "postgres://worker:fragment@db.example.test/app";
     const prefix = "x".repeat(500 - "postgres://worker:fragment".length);

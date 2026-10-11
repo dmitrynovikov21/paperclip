@@ -86,6 +86,10 @@ cursor still uses offsets in that original file.
 Event payload strings are redacted before their 16 KiB storage cap. The writer
 and event HTTP reader also mask incomplete PostgreSQL authorities in messages
 and payloads, including older payloads that were capped before redaction.
+Payload field names are treated as untrusted text. URL credentials in new or
+historical event keys are masked before persistence, live publication, or API
+response. On reads, registered secrets are matched before PostgreSQL URL
+redaction.
 
 ## Native PRP Run-Log Events
 

@@ -884,6 +884,32 @@ describe("agent live run routes", () => {
     expect(res.body[2].payload.output).toBe("postgres://db.example.test/app");
   }, 45_000);
 
+  it.each(["board", "agent"])("masks historical event payload keys for a %s reader", async (actorType) => {
+    const urlKey = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
+    mockHeartbeatService.getRun.mockResolvedValueOnce({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+    });
+    mockHeartbeatService.listEvents.mockResolvedValueOnce([
+      { seq: 1, eventType: "adapter", payload: { normal: "ready", [urlKey]: "diagnostic" } },
+    ]);
+    const actor = actorType === "board"
+      ? { type: "board", userId: "test-user", companyIds: ["company-1"], source: "session" }
+      : { type: "agent", agentId: routeAgentId, companyId: "company-1", source: "agent_key" };
+    const res = await requestApp(await createApp({}, actor), (url) => request(url).get(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events",
+    ));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].payload).toMatchObject({ normal: "ready" });
+    expect(res.body[0].payload).toHaveProperty("postgres://***REDACTED***@db.example.test/app?***REDACTED***", "diagnostic");
+    expect(JSON.stringify(res.body)).not.toMatch(/worker|synthetic-password|synthetic-query-secret/);
+  }, 45_000);
+
   it("replaces a registered full URL before sanitizing historical events", async () => {
     const registered = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
     mockHeartbeatService.getRun.mockResolvedValueOnce({
@@ -895,13 +921,16 @@ describe("agent live run routes", () => {
       status: "succeeded",
     });
     mockHeartbeatService.listEvents.mockResolvedValueOnce([
-      { seq: 1, eventType: "adapter", message: registered, payload: { output: registered } },
+      { seq: 1, eventType: "adapter", message: registered, payload: { output: registered, [registered]: "diagnostic" } },
     ]);
     mockRunSecretRedactionRegistry.redactForRun.mockImplementationOnce(async (_companyId, _runId, value) =>
-      (value as Array<{ message: string; payload: { output: string } }>).map((event) => ({
+      (value as Array<{ message: string; payload: Record<string, string> }>).map((event) => ({
         ...event,
         message: event.message.replace(registered, "***REDACTED***"),
-        payload: { output: event.payload.output.replace(registered, "***REDACTED***") },
+        payload: Object.fromEntries(Object.entries(event.payload).map(([key, entry]) => [
+          key.replace(registered, "***REDACTED***"),
+          entry.replace(registered, "***REDACTED***"),
+        ])),
       })),
     );
 
@@ -911,6 +940,7 @@ describe("agent live run routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body[0].message).toBe("***REDACTED***");
     expect(res.body[0].payload.output).toBe("***REDACTED***");
+    expect(res.body[0].payload["***REDACTED***"]).toBe("diagnostic");
   }, 45_000);
 
   it.each(["skill_test", "task_bridge"])(

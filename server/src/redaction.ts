@@ -908,12 +908,15 @@ export function sanitizeRecord(
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    // Adapter payload field names are untrusted text too. A URI used as a key
+    // must not bypass the value redactors on persisted and live run events.
+    const safeKey = redactPostgresUrlsInValueAtKey(redactSensitiveText(key), undefined, true);
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
-      redacted[key] = sanitizeCommandArgs(value);
+      redacted[safeKey] = sanitizeCommandArgs(value);
       continue;
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[key] = redactSensitiveText(value);
+      redacted[safeKey] = redactSensitiveText(value);
       continue;
     }
     if (
@@ -922,31 +925,31 @@ export function sanitizeRecord(
       !isAuditCountField(key, value)
     ) {
       if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[safeKey] = sanitizeValue(value);
         continue;
       }
       if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[safeKey] = sanitizeValue(value);
         continue;
       }
       if (isPlainBinding(value)) {
-        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
+        redacted[safeKey] = { type: "plain", value: REDACTED_EVENT_VALUE };
         continue;
       }
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[safeKey] = REDACTED_EVENT_VALUE;
       continue;
     }
     // Preserve public protocol identities before scanning diagnostic values.
     if (isKnownPrpEventDiscriminator(record, key, value)) {
-      redacted[key] = value;
+      redacted[safeKey] = value;
       continue;
     }
     if (isPaperclipSchemaDiscriminator(key, value)) {
-      redacted[key] = value;
+      redacted[safeKey] = value;
       continue;
     }
     if (AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[key] = redactSensitiveText(value);
+      redacted[safeKey] = redactSensitiveText(value);
       continue;
     }
     if (
@@ -955,10 +958,10 @@ export function sanitizeRecord(
       !isPublicExecutorToolSelector(value) &&
       !isPaperclipSchemaDiscriminator(key, value)
     ) {
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[safeKey] = REDACTED_EVENT_VALUE;
       continue;
     }
-    redacted[key] = sanitizeValue(value);
+    redacted[safeKey] = sanitizeValue(value);
   }
   return redacted;
 }
@@ -1074,7 +1077,10 @@ function redactPostgresUrlsInValueAtKey<T>(input: T, key?: string, possiblyParti
   }
   if (input instanceof Date || !isPlainObject(input)) return input;
   return Object.fromEntries(
-    Object.entries(input).map(([childKey, value]) => [childKey, redactPostgresUrlsInValueAtKey(value, childKey, possiblyPartial, onlyPartial)]),
+    Object.entries(input).map(([childKey, value]) => [
+      redactPostgresUrlsInValueAtKey(childKey, undefined, possiblyPartial, onlyPartial),
+      redactPostgresUrlsInValueAtKey(value, childKey, possiblyPartial, onlyPartial),
+    ]),
   ) as T;
 }
 

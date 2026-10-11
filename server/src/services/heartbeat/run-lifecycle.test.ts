@@ -257,4 +257,21 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
       expect(published.find(event => event.payload?.seq === row.seq)?.payload).toMatchObject({ message: row.message, payload: row.payload });
     }
   });
+
+  it("never persists or publishes a DB URL credential in an event payload key", async () => {
+    const { run } = await fixture();
+    const key = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
+    await createHeartbeatLifecycle(db, callbacks(db)).appendRunEvent(run, {
+      eventType: "adapter",
+      payload: { normal: "ready", [key]: "diagnostic" },
+    });
+
+    const [row] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
+    const live = vi.mocked(publishLiveEvent).mock.calls.map(([event]) => event).find(event => event.type === "heartbeat.run.event");
+    for (const payload of [row?.payload, live?.payload?.payload]) {
+      expect(payload).toMatchObject({ normal: "ready" });
+      expect(payload).toHaveProperty("postgres://***REDACTED***@db.example.test/app?***REDACTED***", "diagnostic");
+      expect(JSON.stringify(payload)).not.toMatch(/worker|synthetic-password|synthetic-query-secret/);
+    }
+  });
 });

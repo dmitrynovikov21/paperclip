@@ -12,8 +12,10 @@ describe("explicit diagnostic credential forms", () => {
 import {
   REDACTED_COMMAND_TEXT_VALUE,
   looksLikeCredentialJwt,
+  createPostgresUrlStreamRedactor,
   redactDiagnosticText,
   redactCommandText,
+  redactPostgresUrlUserinfo,
 } from "./command-redaction.js";
 
 describe("looksLikeCredentialJwt", () => {
@@ -43,6 +45,69 @@ describe("looksLikeCredentialJwt", () => {
     "paperclip.native-model-envelope.v3",
   ])("rejects public dotted identifiers: %s", (input) => {
     expect(looksLikeCredentialJwt(input)).toBe(false);
+  });
+});
+
+describe("PostgreSQL URL credentials", () => {
+  it("hides userinfo in free text and --dbname while keeping the host and database", () => {
+    const input = "psql --dbname=postgresql://etl_user:p%40ss%3Aword@db.example.test/app -c SELECT";
+    const result = redactCommandText(input);
+    expect(result).toContain("--dbname=postgresql://***REDACTED***@db.example.test/app");
+    expect(result).toContain("-c SELECT");
+    expect(result).not.toContain("etl_user");
+    expect(result).not.toContain("p%40ss%3Aword");
+    expect(redactCommandText("postgres://u:s@db"))
+      .toBe("postgres://***REDACTED***@db");
+    expect(redactCommandText("postgres://worker:pa'ss@db/app"))
+      .toBe("postgres://***REDACTED***@db/app");
+    expect(redactCommandText("postgres://worker:synthetic@db/app?sslpassword=synthetic-query-secret"))
+      .toBe("postgres://***REDACTED***@db/app?***REDACTED***");
+    expect(redactPostgresUrlUserinfo("postgres://localhost/app")).toBe("postgres://localhost/app");
+  });
+
+  it("hides a PostgreSQL query split between log chunks", () => {
+    const redactor = createPostgresUrlStreamRedactor();
+    const output = [
+      redactor.chunk("stdout", "postgres://worker:synthetic@db.example.test/app?sslpassword=synthetic-"),
+      redactor.chunk("stdout", "query-secret&application_name=worker done\n"),
+      redactor.finish("stdout"),
+    ].join("");
+    expect(output).toBe("postgres://***REDACTED***@db.example.test/app?***REDACTED*** done\n");
+    expect(output).not.toContain("synthetic-query-secret");
+  });
+
+  it("holds a split scheme and userinfo until the final @ on each stream", () => {
+    const redactor = createPostgresUrlStreamRedactor();
+    const stdout = [
+      redactor.chunk("stdout", "ps --dbname=post"),
+      redactor.chunk("stdout", "gresql://etl_user:p%40"),
+      redactor.chunk("stdout", "ss%3Aword@db.example.test/app done\n"),
+      redactor.finish("stdout"),
+    ].join("");
+    const stderr = redactor.chunk("stderr", "stderr is separate\n") + redactor.finish("stderr");
+    expect(stdout).toContain("postgresql://***REDACTED***@db.example.test/app done");
+    expect(stderr).toBe("stderr is separate\n");
+    expect(stdout).not.toContain("etl_user");
+    expect(stdout).not.toContain("p%40ss%3Aword");
+    expect(redactor.chunk("stdout", "connect postgres://db.example.test/app ready\n"))
+      .toBe("connect postgres://db.example.test/app ready\n");
+    expect(redactor.chunk("stdout", "connect postgres://db.example.test ready\n"))
+      .toBe("connect postgres://db.example.test ready\n");
+    expect(redactor.chunk("stdout", "postgres://db.example.test/app"))
+      .toBe("postgres://");
+    expect(redactor.finish("stdout")).toBe("db.example.test/app");
+    expect(redactor.chunk("stdout", "postgres://worker:pa'"))
+      .toBe("postgres://");
+    expect(redactor.chunk("stdout", "ss@db/app\n"))
+      .toBe("***REDACTED***@db/app\n");
+    expect(redactor.chunk("stdout", "postgres://interrupted:secret")).toBe("postgres://");
+    expect(redactor.finish("stdout")).toBe(REDACTED_COMMAND_TEXT_VALUE);
+
+    const oversized = createPostgresUrlStreamRedactor();
+    expect(oversized.chunk("stdout", `postgres://user:${"x".repeat(9000)}`))
+      .toBe("postgres://");
+    expect(oversized.chunk("stdout", "@db/app\n"))
+      .toBe("***REDACTED***@db/app\n");
   });
 });
 

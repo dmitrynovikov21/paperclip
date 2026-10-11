@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { createPostgresUrlStreamRedactor } from "@paperclipai/adapter-utils/command-redaction";
 import type { AdapterInvocationMeta, AdapterRuntimeEvent } from "../../adapters/index.js";
 import { redactCurrentUserText, type CurrentUserRedactionOptions } from "../../log-redaction.js";
 import type { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -20,7 +21,7 @@ export interface HeartbeatRunOutputInput {
   runId: string;
   issueId: string | null;
   runLogStore: Pick<RunLogStore, "begin" | "append">;
-  identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "chunk" | "redact">;
+  identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "chunk" | "finish" | "redact">;
   secretKeys: Set<string>;
   appendRunEvent: ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
@@ -44,6 +45,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     } | null;
   } = { pending: null };
   let persistedLogBytes = Number(run.logBytes ?? 0);
+  let flushRunLogRedactors: () => Promise<void> = async () => {};
   const flushOutputProgress = async (opts?: { force?: boolean }) => {
     const pendingOutputProgress = outputProgressState.pending;
     if (!pendingOutputProgress) return;
@@ -162,8 +164,22 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         },
       });
     };
-    const onLog = (stream: "stdout" | "stderr", chunk: string) =>
-      appendIdentityRedactedLog(stream, identityRedactor.chunk(stream, chunk));
+    const postgresUrlRedactor = createPostgresUrlStreamRedactor();
+    const onLog = (stream: "stdout" | "stderr", chunk: string) => {
+      const redactedChunk = postgresUrlRedactor.chunk(stream, identityRedactor.chunk(stream, chunk));
+      return redactedChunk ? appendIdentityRedactedLog(stream, redactedChunk) : Promise.resolve();
+    };
+    flushRunLogRedactors = async () => {
+      for (const stream of ["stdout", "stderr"] as const) {
+        const tail = identityRedactor.finish(stream);
+        if (tail) {
+          const redactedTail = postgresUrlRedactor.chunk(stream, tail);
+          if (redactedTail) await appendIdentityRedactedLog(stream, redactedTail);
+        }
+        const uriTail = postgresUrlRedactor.finish(stream);
+        if (uriTail) await appendIdentityRedactedLog(stream, uriTail);
+      }
+    };
     const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
       meta = identityRedactor.redact(meta);
       if (meta.env && secretKeys.size > 0) {
@@ -201,6 +217,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
 
   return {
     begin,
+    flushRunLogRedactors: () => flushRunLogRedactors(),
     get handle() { return handle; },
     outputProgressState,
     flushOutputProgress,

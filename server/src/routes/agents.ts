@@ -164,6 +164,8 @@ import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
   redactEventPayload,
+  redactPostgresUrlsInValue,
+  redactSensitiveText,
 } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import {
@@ -6870,9 +6872,12 @@ export function agentRoutes(
     const summary = req.query.summary === "true" || req.query.summary === "1";
     const runs = await heartbeat.list(companyId, agentId, limit, { summary });
     const readDecisions = await getHeartbeatRunReadDecisions(db, access, req.actor, runs);
-    res.json(await runRedactions.redactForRuns(companyId, runs.map((run, index) =>
-      readDecisions[index] ? run : redactHeartbeatRunListRow(run)),
-      req.actor.type === "board" ? getActorInfo(req).actorId : null));
+    // Mask incomplete URLs while capped fields still have their original
+    // length, then replace registered full URLs before changing their text.
+    const rows = redactPostgresUrlsInValue(runs.map((run, index) =>
+      readDecisions[index] ? run : redactHeartbeatRunListRow(run)), { onlyPartial: true });
+    res.json(redactPostgresUrlsInValue(await runRedactions.redactForRuns(companyId, rows,
+      req.actor.type === "board" ? getActorInfo(req).actorId : null)));
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
@@ -7008,13 +7013,15 @@ export function agentRoutes(
     }
 
     const projections = await executionProjectionsForRuns(db, companyId, rows.map(run => run.id));
-    res.json(await runRedactions.redactForRuns(companyId, await Promise.all(rows.map(async (run) => !(await actorCanReadRun(req, run)) ? redactHeartbeatRunListRow(run) : ({
+    const responseRows = redactPostgresUrlsInValue(await Promise.all(rows.map(async (run) => !(await actorCanReadRun(req, run)) ? redactHeartbeatRunListRow(run) : ({
       ...heartbeat.decorateActiveRunStatus(run),
       agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
       avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
       execution: projections.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence(run),
-    }))), req.actor.type === "board" ? getActorInfo(req).actorId : null));
+    }))), { onlyPartial: true });
+    res.json(redactPostgresUrlsInValue(await runRedactions.redactForRuns(companyId, responseRows,
+      req.actor.type === "board" ? getActorInfo(req).actorId : null)));
   });
 
   function readHeartbeatRunId(req: Request): string {
@@ -7034,15 +7041,19 @@ export function agentRoutes(
     if (!(await assertRunReadAllowed(req, res, run))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
-    res.json(await runRedactions.redactForRun(
+    const responseRun = redactPostgresUrlsInValue({
+      ...decoratedRun,
+      execution: await executionProjectionForRun(db, run.companyId, run.id),
+      identityHistory: await listRunIdentityContexts(db, run.companyId, run.id),
+      retryExhaustedReason,
+      outputSilence: await heartbeat.buildRunOutputSilence(run),
+    }, { onlyPartial: true });
+    res.json(redactCurrentUserValue(redactPostgresUrlsInValue(await runRedactions.redactForRun(
       run.companyId,
       run.id,
-      redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
-        await getCurrentUserRedactionOptions(),
-      ),
+      responseRun,
       req.actor.type === "board" ? getActorInfo(req).actorId : null,
-    ));
+    )), await getCurrentUserRedactionOptions()));
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
@@ -7518,13 +7529,21 @@ export function agentRoutes(
     const limit = Number(req.query.limit ?? 200);
     const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
+    // Match registered full values before any URI or payload redactor changes
+    // their text; incomplete historical authorities are still hidden below.
+    const registeredRedactedEvents = await runRedactions.redactForRun(run.companyId, run.id, events);
+    const redactedEvents = registeredRedactedEvents.map((event) =>
       redactCurrentUserValue({
         ...event,
-        payload: redactEventPayload(event.payload),
+        message: typeof event.message === "string"
+          ? redactPostgresUrlsInValue(redactSensitiveText(event.message), { possiblyPartial: true })
+          : event.message,
+        // Older events may have been bounded inside URL userinfo before write
+        // redaction. Hide that undecidable authority on the read path too.
+        payload: redactPostgresUrlsInValue(redactEventPayload(event.payload), { possiblyPartial: true }),
       }, currentUserRedactionOptions),
     );
-    res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
+    res.json(redactedEvents);
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {

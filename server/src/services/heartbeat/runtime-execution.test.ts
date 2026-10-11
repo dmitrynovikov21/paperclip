@@ -102,7 +102,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       control: { executionControl, executionPhaseContext: { onExecutionPhase: executionControl.phases.enter },
         dispatchResolvedInteractionContinuationWithAtomicGate: async dispatch => ({ dispatched: true, resultPromise: dispatch(vi.fn()) }),
       },
-      output: { identityRedactor: createAgentIdentityRedactor(), appendIdentityRedactedLog: vi.fn(async () => {}), onLog: vi.fn(async () => {}), onAdapterEvent: vi.fn(async () => {}), onAdapterMeta: vi.fn(async () => {}) },
+      output: { identityRedactor: createAgentIdentityRedactor(), flushRunLogRedactors: vi.fn(async () => {}), onLog: vi.fn(async () => {}), onAdapterEvent: vi.fn(async () => {}), onAdapterMeta: vi.fn(async () => {}) },
       services: { ...state, executionWorkspacesSvc: executionWorkspaceService(db), instanceSettings: instanceSettingsService(db),
         envOrchestrator: { releaseForRun: vi.fn() }, cancelRunInternal: vi.fn(), enqueueWakeup: vi.fn(),
         persistRunProcessMetadata: vi.fn(), recordCurrentHeartbeatRunRuntimeProgress: vi.fn(), dispatchPendingNativeStatusWakeups: vi.fn(),

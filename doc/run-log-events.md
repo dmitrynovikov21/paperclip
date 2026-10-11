@@ -75,6 +75,17 @@ Harness startup also records `harness_state.inspect`, `harness_state.path_check`
 and `harness_state.launch_material` for remote state inspection and fresh launch
 material. These events retain the existing schema and carry no paths or exception strings.
 They also become native Observability spans only with an operator OTLP endpoint.
+The stdout/stderr writer holds split PostgreSQL URL userinfo and query text
+until it can redact the complete credential. The run-log reader also masks
+userinfo and query text in historical local or object-storage logs before it
+returns byte-range pages.
+If a bounded read cuts through an oversized historical NDJSON record, the
+reader masks that record's page bytes because it cannot classify the fragment.
+The original log file stays intact for authorized incident forensics; the API
+cursor still uses offsets in that original file.
+Event payload strings are redacted before their 16 KiB storage cap. The writer
+and event HTTP reader also mask incomplete PostgreSQL authorities in messages
+and payloads, including older payloads that were capped before redaction.
 
 ## Native PRP Run-Log Events
 

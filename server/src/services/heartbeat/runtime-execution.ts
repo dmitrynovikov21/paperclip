@@ -175,7 +175,7 @@ export interface HeartbeatRuntimeExecutionInput {
     onAdapterEvent: NonNullable<AdapterExecutionContext["onEvent"]>;
     onAdapterMeta: AdapterExecutionContext["onMeta"];
     identityRedactor: ReturnType<typeof createAgentIdentityRedactor>;
-    appendIdentityRedactedLog: AdapterExecutionContext["onLog"];
+    flushRunLogRedactors: () => Promise<void>;
   };
   services: Pick<RunState, "upsertTaskSession" | "getRun"> &
     Pick<Lifecycle, "persistRunProcessMetadata" | "recordCurrentHeartbeatRunRuntimeProgress"> &
@@ -240,7 +240,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     const providerDispatch = AsyncLocalStorage.bind(dispatch);
     return measureRunPhase("execution.dispatch_admission", () => dispatchResolvedInteractionContinuationWithAtomicGate(providerDispatch));
   };
-  const { identityRedactor, appendIdentityRedactedLog, onLog, onAdapterEvent, onAdapterMeta } = input.output;
+  const { identityRedactor, flushRunLogRedactors, onLog, onAdapterEvent, onAdapterMeta } = input.output;
   const { executionWorkspacesSvc, instanceSettings, envOrchestrator, upsertTaskSession, getRun, cancelRunInternal, enqueueWakeup, persistRunProcessMetadata, recordCurrentHeartbeatRunRuntimeProgress, dispatchPendingNativeStatusWakeups } = input.services;
   const localAgentJwtScope =
     issueRef?.workMode === "skill_test"
@@ -904,10 +904,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       input.effects.onProviderResourceDisposition("stop_and_retain");
       await recordLegacyWorkspaceRestoreFailure(db, run, requiredWorkspaceRestoreEvidence, workspaceRestoreSource);
     }
-    for (const stream of ["stdout", "stderr"] as const) {
-      const tail = identityRedactor.finish(stream);
-      if (tail) await appendIdentityRedactedLog(stream, tail);
-    }
+    await flushRunLogRedactors();
     const instructionSave = input.instructions.getInstructionSave();
     if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
 

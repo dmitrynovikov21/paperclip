@@ -19,6 +19,7 @@ import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
   redactEventPayload,
+  redactPostgresUrlsInValue,
   redactSensitiveText,
   sanitizeRecord,
 } from "../redaction.js";
@@ -48,6 +49,58 @@ describe("redaction", () => {
     expect(redactEventPayload({ prpEvent: event })).toEqual({ prpEvent: event });
     expect(redactEventPayload({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: "secret-sentinel" } } }))
       .toEqual({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: REDACTED_EVENT_VALUE } } });
+  });
+
+  it("masks PostgreSQL credentials in historical run metadata without changing dates", () => {
+    const startedAt = new Date("2026-10-08T00:00:00.000Z");
+    const redacted = redactPostgresUrlsInValue({
+      startedAt,
+      stdoutExcerpt: "ps postgres://worker:encoded%40value@db.example.test/app done",
+    });
+    expect(redacted.startedAt).toBe(startedAt);
+    expect(redacted.stdoutExcerpt).toContain("postgres://***REDACTED***@db.example.test/app done");
+    expect(redacted.stdoutExcerpt).not.toContain("worker");
+    expect(redacted.stdoutExcerpt).not.toContain("encoded%40value");
+    expect(redactSensitiveText("postgresql://u:s@db"))
+      .toBe("postgresql://***REDACTED***@db");
+    expect(redactPostgresUrlsInValue("postgres://worker:synthetic@db.example.test/app?sslpassword=synthetic-query-secret"))
+      .toBe("postgres://***REDACTED***@db.example.test/app?***REDACTED***");
+  });
+
+  it("masks userinfo cut off by the 500-character run-list summary limit", () => {
+    const url = "postgres://worker:fragment@db.example.test/app";
+    const prefix = "x".repeat(500 - "postgres://worker:fragment".length);
+    const storedSummary = `${prefix}${url}`;
+    const shortened = storedSummary.slice(0, 500);
+    const result = redactPostgresUrlsInValue({ resultJson: { summary: shortened } });
+    expect(result.resultJson.summary).toBe(`${prefix}postgres://${REDACTED_EVENT_VALUE}`);
+    expect(result.resultJson.summary).not.toContain("worker");
+    expect(result.resultJson.summary).not.toContain("fragment");
+    expect(redactPostgresUrlsInValue("postgres://db.example.test/app"))
+      .toBe("postgres://db.example.test/app");
+  });
+
+  it("preserves complete run diagnostics while hiding explicitly truncated userinfo", () => {
+    const complete = {
+      summary: "Connection to postgres://db.example.test refused",
+      stdoutExcerpt: "Connection refused",
+      stderrExcerpt: "postgres://db.example.test",
+    };
+    expect(redactPostgresUrlsInValue(complete)).toEqual(complete);
+    expect(redactPostgresUrlsInValue({ message: "postgres://worker:partial\n[truncated 20 chars]" }))
+      .toEqual({ message: "postgres://***REDACTED***\n[truncated 20 chars]" });
+  });
+
+  it("masks a historical 32 KiB excerpt starting inside URL userinfo", () => {
+    const password = "q".repeat(33_000);
+    const output = `postgres://worker:${password}@db.example.test/app finished`;
+    const excerpt = Buffer.from(output).subarray(-32 * 1024).toString("utf8");
+    expect(excerpt.startsWith("q")).toBe(true);
+    const result = redactPostgresUrlsInValue({ stdoutExcerpt: excerpt, stderrExcerpt: excerpt });
+    for (const redacted of [result.stdoutExcerpt, result.stderrExcerpt]) {
+      expect(redacted).toMatch(/^\*\*\*REDACTED\*\*\*@db\.example\.test\/app finished$/);
+      expect(redacted).not.toContain(password.slice(0, 32));
+    }
   });
 
   it("preserves the actual Copilot receipt producer discriminator through nested durable redaction", () => {

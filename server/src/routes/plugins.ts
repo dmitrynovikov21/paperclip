@@ -2653,7 +2653,12 @@ export function pluginRoutes(
     }
 
     try {
-      const result = await jobDeps.scheduler.triggerJob(jobId, "manual");
+      const requestedCompanyId = req.body?.companyId;
+      if (requestedCompanyId !== undefined && typeof requestedCompanyId !== "string") {
+        res.status(400).json({ error: "companyId must be a string" });
+        return;
+      }
+      const result = await jobDeps.scheduler.triggerJob(jobId, "manual", requestedCompanyId);
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

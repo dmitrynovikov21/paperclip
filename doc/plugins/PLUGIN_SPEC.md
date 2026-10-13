@@ -593,6 +593,12 @@ The host provides:
 - trigger source
 - run id
 - schedule metadata
+- company id for a job that declares `scope: "company"` (also the invocation scope)
+
+Jobs default to `scope: "instance"`. A company job runs once per configured,
+enabled, active company. The host records the company id on each scoped run.
+A manual trigger must name the company when more than one enabled company
+has configuration.
 
 ### 13.7 `handleWebhook`
 
@@ -980,6 +986,8 @@ Job rules:
 2. The host is the scheduler of record.
 3. The host prevents overlapping execution of the same plugin/job combination unless explicitly allowed later.
 4. Every job run is recorded in Postgres.
+   Jobs that declare `scope: "company"` receive separate company run records.
+   One company cannot read another company's config from a job invocation.
 5. Failed jobs are retryable.
 6. For recurring business workflows that should create visible Paperclip work, prefer managed routines and managed resources over jobs. Jobs remain useful for private plugin-runtime maintenance tasks.
 

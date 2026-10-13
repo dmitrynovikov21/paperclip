@@ -4,6 +4,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   companies,
   createDb,
+  pluginConfig,
+  pluginCompanySettings,
   pluginEntities,
   pluginJobs,
   pluginJobRuns,
@@ -13,6 +15,8 @@ import {
 } from "@paperclipai/db";
 import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host-services.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { pluginJobStore } from "../services/plugin-job-store.js";
+import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -113,6 +117,72 @@ describeEmbeddedPostgres("plugin tenant isolation (company_id FK)", () => {
     const rows = await db.select().from(pluginLogs).where(eq(pluginLogs.pluginId, pluginId));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.companyId).toBeNull();
+  });
+
+  it("dispatches configured jobs once per enabled company with an exact host scope", async () => {
+    const pluginId = await seedPlugin();
+    const companyA = await seedCompany();
+    const companyB = await seedCompany();
+    const disabledCompany = await seedCompany();
+    const jobId = randomUUID();
+    await db.insert(pluginJobs).values({
+      id: jobId, pluginId, jobKey: "sync", schedule: "* * * * *", scope: "company",
+      nextRunAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(pluginConfig).values([companyA, companyB, disabledCompany].map((companyId) => ({
+      pluginId, companyId, configJson: { companyId },
+    })));
+    await db.insert(pluginCompanySettings).values({
+      pluginId, companyId: disabledCompany, enabled: false,
+    });
+    const call = vi.fn(async (_pluginId: string, _method: string, _params: any) => undefined);
+    const scheduler = createPluginJobScheduler({
+      db,
+      jobStore: pluginJobStore(db),
+      workerManager: { isRunning: () => true, call } as any,
+    });
+
+    await scheduler.tick();
+    const runs = await db.select().from(pluginJobRuns).where(eq(pluginJobRuns.jobId, jobId));
+    expect(runs).toHaveLength(2);
+    expect(runs.map((run) => run.companyId).sort()).toEqual([companyA, companyB].sort());
+    expect(runs.every((run) => run.status === "succeeded")).toBe(true);
+    expect(call).toHaveBeenCalledTimes(2);
+    for (const [, method, params] of call.mock.calls) {
+      expect(method).toBe("runJob");
+      expect(params.companyId).toBe(params.job.companyId);
+      expect([companyA, companyB]).toContain(params.companyId);
+      expect(runs.some((run) => run.id === params.job.runId && run.companyId === params.companyId)).toBe(true);
+    }
+    await expect(scheduler.triggerJob(jobId)).rejects.toThrow("Pass companyId");
+    await expect(scheduler.triggerJob(jobId, "manual", disabledCompany)).rejects.toThrow("not configured and enabled");
+  });
+
+  it("keeps a job instance scoped when its declaration does not opt in", async () => {
+    const pluginId = await seedPlugin();
+    const companyId = await seedCompany();
+    const jobId = randomUUID();
+    await db.insert(pluginJobs).values({
+      id: jobId, pluginId, jobKey: "maintenance", schedule: "* * * * *",
+      nextRunAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(pluginConfig).values({ pluginId, companyId, configJson: {} });
+    const call = vi.fn(async (_pluginId: string, _method: string, _params: any) => undefined);
+    const scheduler = createPluginJobScheduler({
+      db,
+      jobStore: pluginJobStore(db),
+      workerManager: { isRunning: () => true, call } as any,
+    });
+
+    await scheduler.tick();
+    const runs = await db.select().from(pluginJobRuns).where(eq(pluginJobRuns.jobId, jobId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.companyId).toBeNull();
+    expect(call).toHaveBeenCalledWith(pluginId, "runJob", expect.objectContaining({
+      companyId: undefined,
+      job: expect.objectContaining({ companyId: undefined }),
+    }), expect.any(Number));
+    await expect(scheduler.triggerJob(jobId, "manual", companyId)).rejects.toThrow("not configured and enabled");
   });
 
   it("cascades plugin_logs / plugin_entities / plugin_job_runs / plugin_webhook_deliveries when the owning company is deleted", async () => {

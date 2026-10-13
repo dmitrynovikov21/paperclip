@@ -36,7 +36,7 @@
 
 import { and, eq, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { companies, pluginConfig, pluginCompanySettings, pluginJobs, pluginJobRuns } from "@paperclipai/db";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -157,7 +157,7 @@ export interface PluginJobScheduler {
    * @returns The created run info
    * @throws {Error} if the job is not found, not active, or already running
    */
-  triggerJob(jobId: string, trigger?: "manual" | "retry"): Promise<TriggerJobResult>;
+  triggerJob(jobId: string, trigger?: "manual" | "retry", companyId?: string): Promise<TriggerJobResult>;
 
   /**
    * Run a single scheduler tick immediately (for testing).
@@ -336,6 +336,25 @@ export function createPluginJobScheduler(
   // Core: dispatch a single job
   // -----------------------------------------------------------------------
 
+  /** Only an explicit company job fans out; older jobs keep instance scope. */
+  async function runScopes(job: typeof pluginJobs.$inferSelect): Promise<Array<string | null>> {
+    if (job.scope === "instance") return [null];
+    const rows = await db
+      .select({ companyId: pluginConfig.companyId, enabled: pluginCompanySettings.enabled })
+      .from(pluginConfig)
+      .innerJoin(companies, and(eq(companies.id, pluginConfig.companyId), eq(companies.status, "active")))
+      .leftJoin(
+        pluginCompanySettings,
+        and(
+          eq(pluginCompanySettings.pluginId, pluginConfig.pluginId),
+          eq(pluginCompanySettings.companyId, pluginConfig.companyId),
+        ),
+      )
+      .where(eq(pluginConfig.pluginId, job.pluginId))
+      .orderBy(pluginConfig.companyId);
+    return rows.filter((row) => row.enabled !== false).map((row) => row.companyId);
+  }
+
   /**
    * Dispatch a single job run — create the run record, call the worker,
    * record the result, and advance the schedule pointer.
@@ -349,14 +368,38 @@ export function createPluginJobScheduler(
     // Mark as active (overlap prevention)
     activeJobs.add(jobId);
 
+    try {
+      // A configured plugin gets one bounded, isolated run per enabled company.
+      // A failure in one company must not prevent the next company's run.
+      for (const companyId of await runScopes(job)) {
+        await dispatchScheduledRun(job, companyId);
+      }
+    } catch (err) {
+      jobLog.error({ err: err instanceof Error ? err.message : String(err) }, "job scope lookup failed");
+    } finally {
+      activeJobs.delete(jobId);
+      try {
+        await advanceSchedulePointer(job);
+      } catch (err) {
+        jobLog.error(
+          { err: err instanceof Error ? err.message : String(err) },
+          "failed to advance schedule pointer",
+        );
+      }
+    }
+  }
+
+  async function dispatchScheduledRun(job: typeof pluginJobs.$inferSelect, companyId: string | null): Promise<void> {
+    const { id: jobId, pluginId, jobKey } = job;
+    const jobLog = log.child({ jobId, pluginId, jobKey, companyId });
     let runId: string | undefined;
     const startedAt = Date.now();
-
     try {
       // 1. Create run record
       const run = await jobStore.createRun({
         jobId,
         pluginId,
+        companyId,
         trigger: "schedule",
       });
       runId = run.id;
@@ -371,7 +414,9 @@ export function createPluginJobScheduler(
         pluginId,
         "runJob",
         {
+          companyId: companyId ?? undefined,
           job: {
+            companyId: companyId ?? undefined,
             jobKey,
             runId,
             trigger: "schedule" as const,
@@ -416,19 +461,6 @@ export function createPluginJobScheduler(
           );
         }
       }
-    } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
-      try {
-        await advanceSchedulePointer(job);
-      } catch (err) {
-        jobLog.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          "failed to advance schedule pointer",
-        );
-      }
     }
   }
 
@@ -439,6 +471,7 @@ export function createPluginJobScheduler(
   async function triggerJob(
     jobId: string,
     trigger: "manual" | "retry" = "manual",
+    requestedCompanyId?: string,
   ): Promise<TriggerJobResult> {
     const job = await jobStore.getJobById(jobId);
     if (!job) {
@@ -482,15 +515,26 @@ export function createPluginJobScheduler(
       );
     }
 
+    const scopes = await runScopes(job);
+    const companyId = requestedCompanyId === undefined
+      ? scopes.length === 1 ? scopes[0]! : undefined
+      : scopes.find((scope) => scope === requestedCompanyId);
+    if (companyId === undefined) {
+      throw new Error(requestedCompanyId
+        ? "Company is not configured and enabled for this plugin"
+        : "Pass companyId to trigger a job configured for multiple companies");
+    }
+
     // Create the run and dispatch (non-blocking)
     const run = await jobStore.createRun({
       jobId,
       pluginId: job.pluginId,
+      companyId,
       trigger,
     });
 
     // Dispatch in background — don't block the caller
-    void dispatchManualRun(job, run.id, trigger);
+    void dispatchManualRun(job, run.id, trigger, companyId);
 
     return { runId: run.id, jobId };
   }
@@ -502,6 +546,7 @@ export function createPluginJobScheduler(
     job: typeof pluginJobs.$inferSelect,
     runId: string,
     trigger: "manual" | "retry",
+    companyId: string | null,
   ): Promise<void> {
     const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey, runId, trigger });
@@ -516,7 +561,9 @@ export function createPluginJobScheduler(
         pluginId,
         "runJob",
         {
+          companyId: companyId ?? undefined,
           job: {
+            companyId: companyId ?? undefined,
             jobKey,
             runId,
             trigger,

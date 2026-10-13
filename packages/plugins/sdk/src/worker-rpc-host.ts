@@ -1759,6 +1759,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
   }
 
   async function handleRunJob(params: RunJobParams): Promise<void> {
+    if (params.companyId !== params.job.companyId) {
+      throw new Error("runJob company scope does not match job context");
+    }
     const handler = jobHandlers.get(params.job.jobKey);
     if (!handler) {
       throw new Error(`No handler registered for job "${params.job.jobKey}"`);

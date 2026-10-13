@@ -1623,6 +1623,7 @@ Log storage rules:
 - Plugin logs are stored in a `plugin_logs` table or appended to a log file under the plugin's data directory.
 - Each log entry includes: plugin ID, timestamp, level, message, and optional structured metadata.
 - Logs are queryable from the plugin settings page in the UI.
+- Instance-wide log and job diagnostics are available only to instance admins. Company members cannot read another company's run or log text through the plugin settings API.
 - Logs have a configurable retention period (default: 7 days).
 - The host captures `stdout` and `stderr` from the worker process as fallback logs even if the worker does not use `ctx.logger`.
 

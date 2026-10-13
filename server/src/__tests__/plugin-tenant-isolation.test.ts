@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
 import { eq } from "drizzle-orm";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   companies,
@@ -17,6 +19,8 @@ import { buildHostServices, flushPluginLogBuffer } from "../services/plugin-host
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginJobStore } from "../services/plugin-job-store.js";
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
+import { pluginRoutes } from "../routes/plugins.js";
+import { errorHandler } from "../middleware/error-handler.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -105,6 +109,93 @@ describeEmbeddedPostgres("plugin tenant isolation (company_id FK)", () => {
     });
     return companyId;
   }
+
+  it("keeps global job, log, and health diagnostics private to instance admins", async () => {
+    const pluginId = await seedPlugin();
+    const companyA = await seedCompany();
+    const companyB = await seedCompany();
+    const scopedJobId = randomUUID();
+    const instanceJobId = randomUUID();
+    await db.insert(pluginJobs).values([
+      { id: scopedJobId, pluginId, jobKey: "scoped", schedule: "* * * * *", scope: "company" },
+      { id: instanceJobId, pluginId, jobKey: "instance", schedule: "* * * * *" },
+    ]);
+    await db.insert(pluginJobRuns).values([
+      { jobId: scopedJobId, pluginId, companyId: companyA, trigger: "scheduled", status: "failed", error: "A private error", logs: ["A private run log"] },
+      { jobId: scopedJobId, pluginId, companyId: companyB, trigger: "scheduled", status: "failed", error: "B private error", logs: ["B private run log"] },
+      { jobId: instanceJobId, pluginId, trigger: "scheduled", status: "failed", error: "instance private error", logs: ["instance private run log"] },
+    ]);
+    await db.insert(pluginLogs).values([
+      { pluginId, companyId: companyA, message: "A private plugin log" },
+      { pluginId, companyId: companyB, message: "B private plugin log" },
+      { pluginId, message: "instance private plugin log" },
+    ]);
+    await db.update(plugins).set({ lastError: "global private error" }).where(eq(plugins.id, pluginId));
+
+    const app = express();
+    app.use((req, _res, next) => {
+      const isAdmin = req.header("x-test-admin") === "true";
+      req.actor = {
+        type: "board",
+        source: "session",
+        userId: isAdmin ? "admin" : "member-a",
+        isInstanceAdmin: isAdmin,
+        companyIds: isAdmin ? [] : [companyA],
+      } as typeof req.actor;
+      next();
+    });
+    app.use("/api", pluginRoutes(db, {} as never, {
+      jobStore: pluginJobStore(db),
+      scheduler: {} as never,
+    }));
+    app.use(errorHandler);
+
+    const base = `/api/plugins/${pluginId}`;
+    const diagnosticPaths = [
+      `${base}/health`,
+      `${base}/logs`,
+      `${base}/jobs`,
+      `${base}/jobs/${scopedJobId}/runs`,
+      `${base}/jobs/${instanceJobId}/runs`,
+      `${base}/dashboard`,
+    ];
+    for (const path of diagnosticPaths) {
+      const response = await request(app).get(path);
+      expect(response.status, path).toBe(403);
+      expect(JSON.stringify(response.body), path).not.toContain("private");
+    }
+
+    const memberList = await request(app).get("/api/plugins");
+    const memberDetail = await request(app).get(base);
+    expect(memberList.status).toBe(200);
+    expect(memberList.body[0].lastError).toBeNull();
+    expect(memberDetail.status).toBe(200);
+    expect(memberDetail.body.lastError).toBeNull();
+
+    const admin = (path: string) => request(app).get(path).set("x-test-admin", "true");
+    const [runs, instanceRuns, logs, dashboard, health] = await Promise.all([
+      admin(`${base}/jobs/${scopedJobId}/runs`),
+      admin(`${base}/jobs/${instanceJobId}/runs`),
+      admin(`${base}/logs`),
+      admin(`${base}/dashboard`),
+      admin(`${base}/health`),
+    ]);
+    expect(runs.status).toBe(200);
+    expect(runs.body.map((row: { companyId: string }) => row.companyId).sort()).toEqual([companyA, companyB].sort());
+    expect(runs.body.map((row: { error: string }) => row.error).sort()).toEqual(["A private error", "B private error"]);
+    expect(instanceRuns.status).toBe(200);
+    expect(instanceRuns.body).toMatchObject([{ companyId: null, error: "instance private error" }]);
+    expect(logs.status).toBe(200);
+    expect(logs.body.map((row: { message: string }) => row.message).sort()).toEqual([
+      "A private plugin log", "B private plugin log", "instance private plugin log",
+    ].sort());
+    expect(dashboard.status).toBe(200);
+    expect(dashboard.body.recentJobRuns.map((row: { error: string }) => row.error).sort()).toEqual([
+      "A private error", "B private error", "instance private error",
+    ]);
+    expect(health.status).toBe(200);
+    expect(health.body.lastError).toBe("global private error");
+  });
 
   it("allows NULL company_id on plugin_logs (instance-scope rows behave as before)", async () => {
     const pluginId = await seedPlugin();

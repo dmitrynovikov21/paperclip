@@ -1275,6 +1275,20 @@
       "when": 1784653200000,
       "tag": "0183_connection_user_authorization_state",
       "breakpoints": true
+    },
+    {
+      "idx": 184,
+      "version": "7",
+      "when": 1786639200000,
+      "tag": "0184_heartbeat_runs_status_agent_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 185,
+      "version": "7",
+      "when": 1791913296091,
+      "tag": "0185_company_scoped_plugin_jobs",
+      "breakpoints": true
     }
   ]
 }

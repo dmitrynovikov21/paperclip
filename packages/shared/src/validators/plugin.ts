@@ -81,6 +81,7 @@ export const pluginJobDeclarationSchema = z.object({
   jobKey: z.string().min(1),
   displayName: z.string().min(1),
   description: z.string().optional(),
+  scope: z.enum(["instance", "company"]).optional(),
   schedule: z.string().refine(
     (val) => isValidCronExpression(val),
     { message: "schedule must be a valid 5-field cron expression (e.g. '*/15 * * * *')" },

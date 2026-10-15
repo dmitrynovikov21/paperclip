@@ -79,7 +79,7 @@ rl.on("line", (line) => {
       id: message.id,
       result: {
         ok: true,
-        supportedMethods: ["getData", "performAction"],
+        supportedMethods: ["getData", "performAction", "runJob"],
       },
     });
     return;
@@ -87,6 +87,20 @@ rl.on("line", (line) => {
 
   if (method === "getData" || method === "performAction") {
     sendNestedHostRequest(message, message.paperclipInvocation?.id);
+    return;
+  }
+
+  if (method === "runJob") {
+    sendNestedHostRequest({
+      ...message,
+      params: {
+        params: {
+          mode: "echo",
+          hostMethod: "config.get",
+          requestedCompanyId: message.params?.job?.requestedCompanyId,
+        },
+      },
+    }, message.paperclipInvocation?.id);
     return;
   }
 

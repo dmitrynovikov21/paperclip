@@ -845,7 +845,11 @@ export function pluginRoutes(
     const plugins = status
       ? await registry.listByStatus(status)
       : await registry.listInstalled();
-    res.json(plugins);
+    // Lifecycle errors may contain company-specific worker details. The plugin
+    // catalog remains visible to board members, but global errors do not.
+    res.json(req.actor.source === "local_implicit" || req.actor.isInstanceAdmin
+      ? plugins
+      : plugins.map((plugin) => ({ ...plugin, lastError: null })));
   });
 
   /**
@@ -1908,7 +1912,13 @@ export function pluginRoutes(
       ? worker.supportedMethods.includes("validateConfig")
       : false;
 
-    res.json({ ...plugin, supportsConfigTest });
+    res.json({
+      ...plugin,
+      lastError: req.actor.source === "local_implicit" || req.actor.isInstanceAdmin
+        ? plugin.lastError
+        : null,
+      supportsConfigTest,
+    });
   });
 
   /**
@@ -2039,7 +2049,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/health", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
 
     const plugin = await resolvePlugin(registry, pluginId);
@@ -2107,7 +2117,7 @@ export function pluginRoutes(
    * Response: Array of log entries, newest first.
    */
   router.get("/plugins/:pluginId/logs", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
 
     const plugin = await resolvePlugin(registry, pluginId);
@@ -2460,7 +2470,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/jobs", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     if (!jobDeps) {
       res.status(501).json({ error: "Job scheduling is not enabled" });
       return;
@@ -2506,7 +2516,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/jobs/:jobId/runs", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     if (!jobDeps) {
       res.status(501).json({ error: "Job scheduling is not enabled" });
       return;
@@ -2574,7 +2584,12 @@ export function pluginRoutes(
     }
 
     try {
-      const result = await jobDeps.scheduler.triggerJob(jobId, "manual");
+      const requestedCompanyId = req.body?.companyId;
+      if (requestedCompanyId !== undefined && typeof requestedCompanyId !== "string") {
+        res.status(400).json({ error: "companyId must be a string" });
+        return;
+      }
+      const result = await jobDeps.scheduler.triggerJob(jobId, "manual", requestedCompanyId);
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2906,7 +2921,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found
    */
   router.get("/plugins/:pluginId/dashboard", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
 
     const plugin = await resolvePlugin(registry, pluginId);

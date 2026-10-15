@@ -473,6 +473,45 @@ describe("plugin-worker-manager stderr failure context", () => {
 
 
 describe("plugin host company context guards", () => {
+  it("reads only the scheduled job's host-issued company config", async () => {
+    const configGet = vi.fn(async (params: { companyId: string }) => ({ companyId: params.companyId }));
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: [],
+      services: { config: { get: configGet } } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers,
+    });
+    const job = {
+      companyId: "company-a",
+      jobKey: "sync",
+      runId: "run-1",
+      trigger: "schedule" as const,
+      scheduledAt: new Date().toISOString(),
+    };
+    try {
+      await handle.start();
+      await expect(handle.call("runJob", { companyId: "company-a", job })).resolves.toEqual({
+        companyId: "company-a",
+      });
+      await expect(handle.call("runJob", {
+        companyId: "company-a",
+        job: { ...job, requestedCompanyId: "company-b" } as typeof job,
+      })).rejects.toMatchObject({
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+      });
+      expect(configGet).toHaveBeenCalledTimes(1);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects config and secret calls without host-issued company context before host services run", async () => {
     const configGet = vi.fn(async () => ({ apiKey: "unreachable" }));
     const secretsResolve = vi.fn(async () => "unreachable");

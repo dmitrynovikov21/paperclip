@@ -340,9 +340,11 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 // HELA-1643: a transient retry can inherit a far-future usage-limit reset hint
 // (retryNotBefore, e.g. a quota reset hours away) as its scheduledRetryAt. Only
-// pins beyond the bounded backoff ceiling qualify for an early re-probe, so a
-// normally scheduled transient backoff is never disturbed.
-const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.max(...BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS);
+// such a hint pin reaching past the longest jittered backoff qualifies for an
+// early re-probe, so a normally scheduled transient backoff is never disturbed.
+const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.round(
+  Math.max(...BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS) * (1 + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO),
+);
 // How recent a successful run must be to still count as proof the upstream is serving.
 const EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS = 30 * 60 * 1000;
 const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
@@ -1056,7 +1058,10 @@ export type EarlyUpstreamReprobeDecision =
       reprobe: false;
       reason:
         | "retry_reason_not_transient"
+        | "pin_not_reset_hint"
         | "pin_not_far_future"
+        | "retry_adapter_unknown"
+        | "adapter_changed"
         | "no_recovery_evidence"
         | "recovery_evidence_stale"
         | "recovery_predates_pin";
@@ -1069,17 +1074,24 @@ export type EarlyUpstreamReprobeDecision =
  * stays parked for hours after the outage that produced it already ended.
  *
  * Releasing a pin needs positive proof, never a guess: a successful run of the
- * same agent, recent enough to describe the upstream's state and later than the
- * pin itself. Without that proof the pin is preserved exactly.
+ * same agent on the adapter that hit the limit, recent enough to describe that
+ * upstream's state and later than the pin itself, while the released retry would
+ * still run on that adapter. Without that proof the pin is preserved exactly.
  */
 export function decideEarlyUpstreamReprobe(
   facts: {
     retryReason: string | null;
     scheduledRetryAt: Date | null;
+    /** The usage-limit reset hint the retry was scheduled with, if any. */
+    resetHintAt: Date | null;
     /** When the transient retry row and its pin were inserted. */
     pinSetAt: Date | null;
-    /** The agent's most recent successful run, if any. */
-    recoveryEvidence: { runId: string; finishedAt: Date } | null;
+    /** The adapter the failed run behind this retry invoked. */
+    retryAdapterType: string | null;
+    /** The adapter the released retry would run on now. */
+    currentAdapterType: string | null;
+    /** The agent's most recent successful run on the retry's adapter, if any. */
+    recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null;
   },
   now: Date,
 ): EarlyUpstreamReprobeDecision {
@@ -1087,13 +1099,27 @@ export function decideEarlyUpstreamReprobe(
     return { reprobe: false, reason: "retry_reason_not_transient" };
   }
 
+  // The scheduler adopts the hint only when it lands after the jittered backoff,
+  // so a pin equal to the hint is the hint. Any other pin is ordinary backoff.
   const pinnedAt = facts.scheduledRetryAt?.getTime() ?? null;
-  if (pinnedAt === null || pinnedAt <= now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS) {
+  if (pinnedAt === null || facts.resetHintAt?.getTime() !== pinnedAt) {
+    return { reprobe: false, reason: "pin_not_reset_hint" };
+  }
+  if (pinnedAt <= now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS) {
     return { reprobe: false, reason: "pin_not_far_future" };
   }
 
+  // A success proves only the adapter it ran on, and only helps a retry that
+  // would run on that adapter again.
+  if (!facts.retryAdapterType) return { reprobe: false, reason: "retry_adapter_unknown" };
+  if (facts.currentAdapterType !== facts.retryAdapterType) {
+    return { reprobe: false, reason: "adapter_changed" };
+  }
+
   const evidence = facts.recoveryEvidence;
-  if (!evidence) return { reprobe: false, reason: "no_recovery_evidence" };
+  if (!evidence || evidence.adapterType !== facts.retryAdapterType) {
+    return { reprobe: false, reason: "no_recovery_evidence" };
+  }
 
   const recoveredAt = evidence.finishedAt.getTime();
   if (recoveredAt <= now.getTime() - EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS) {
@@ -10310,9 +10336,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // next sweep. It wraps to the start after a short page.
   let earlyUpstreamReprobeCursor: { scheduledRetryAt: Date; createdAt: Date; runId: string } | null = null;
 
-  async function findUpstreamRecoveryEvidence(companyId: string, agentId: string, now: Date) {
-    // Runs on this line do not record their adapter. The agent's own success is
-    // the proof: the released retry runs through that same agent's adapter.
+  // HELA-1643: runs on this line keep no adapter column. The adapter a run
+  // actually invoked is recorded by its first adapter.invoke event.
+  function invokedAdapterTypeOf(runId: typeof heartbeatRuns.id | typeof heartbeatRuns.retryOfRunId) {
+    return sql<string | null>`(
+      select ${heartbeatRunEvents.payload} ->> 'adapterType'
+      from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.runId} = ${runId}
+        and ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
+        and ${heartbeatRunEvents.agentId} = ${heartbeatRuns.agentId}
+        and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
+      order by ${heartbeatRunEvents.seq} asc
+      limit 1
+    )`;
+  }
+
+  async function findUpstreamRecoveryEvidence(companyId: string, agentId: string, adapterType: string, now: Date) {
     const lookbackFloor = new Date(now.getTime() - EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS);
     const row = await db
       .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
@@ -10323,17 +10362,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.agentId, agentId),
           eq(heartbeatRuns.status, "succeeded"),
           gt(heartbeatRuns.finishedAt, lookbackFloor),
+          sql`${invokedAdapterTypeOf(heartbeatRuns.id)} = ${adapterType}`,
         ),
       )
       .orderBy(desc(heartbeatRuns.finishedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!row?.finishedAt) return null;
-    return { runId: row.id, finishedAt: new Date(row.finishedAt) };
+    return { runId: row.id, finishedAt: new Date(row.finishedAt), adapterType };
   }
 
-  // HELA-1643: release transient retries whose far-future pin (typically a
-  // quota-reset hint) is stale because the upstream recovered early. A cleared
+  // HELA-1643: release transient retries whose far-future pin (a usage-limit
+  // reset hint) is stale because the upstream recovered early. A cleared
   // candidate has its pin pulled forward to `now`, then goes through
   // promoteScheduledRetryRun and all of its gates, like a retry that came due.
   // Each sweep reads one bounded page; the cursor carries the walk across
@@ -10347,8 +10387,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reprobeThreshold = new Date(now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS);
     const after = earlyUpstreamReprobeCursor;
     const candidates = await db
-      .select()
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        createdAt: heartbeatRuns.createdAt,
+        resetHint: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore'`,
+        retryAdapterType: invokedAdapterTypeOf(heartbeatRuns.retryOfRunId),
+        currentAdapterType: agents.adapterType,
+      })
       .from(heartbeatRuns)
+      .leftJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId)))
       .where(
         and(
           eq(heartbeatRuns.status, "scheduled_retry"),
@@ -10388,12 +10439,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
 
     const promotedRunIds: string[] = [];
-    const evidenceByAgent = new Map<string, { runId: string; finishedAt: Date } | null>();
+    const evidenceByScope = new Map<string, { runId: string; finishedAt: Date; adapterType: string } | null>();
     for (const candidate of candidates) {
       if (skipRunIds.has(candidate.id)) continue;
-      const scope = `${candidate.companyId}:${candidate.agentId}`;
-      if (!evidenceByAgent.has(scope)) {
-        evidenceByAgent.set(scope, await findUpstreamRecoveryEvidence(candidate.companyId, candidate.agentId, now));
+      const retryAdapterType = candidate.retryAdapterType;
+      let recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null = null;
+      if (retryAdapterType) {
+        const scope = `${candidate.companyId}:${candidate.agentId}:${retryAdapterType}`;
+        if (!evidenceByScope.has(scope)) {
+          evidenceByScope.set(
+            scope,
+            await findUpstreamRecoveryEvidence(candidate.companyId, candidate.agentId, retryAdapterType, now),
+          );
+        }
+        recoveryEvidence = evidenceByScope.get(scope) ?? null;
       }
 
       const originalScheduledRetryAt = candidate.scheduledRetryAt ? new Date(candidate.scheduledRetryAt) : null;
@@ -10401,10 +10460,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         {
           retryReason: candidate.scheduledRetryReason,
           scheduledRetryAt: originalScheduledRetryAt,
+          resetHintAt: candidate.resetHint ? new Date(candidate.resetHint) : null,
           // Transient retry rows are inserted with their pin, so createdAt is the
           // pin-write time. updatedAt can move after unrelated row mutations.
           pinSetAt: new Date(candidate.createdAt),
-          recoveryEvidence: evidenceByAgent.get(scope) ?? null,
+          retryAdapterType,
+          currentAdapterType: candidate.currentAdapterType,
+          recoveryEvidence,
         },
         now,
       );
@@ -10439,6 +10501,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           scheduledRetryReason: advanced.scheduledRetryReason,
           originalScheduledRetryAt: originalScheduledRetryAt.toISOString(),
           upstreamRecoveryEvidenceRunId: decision.evidenceRunId,
+          upstreamAdapterType: retryAdapterType,
         },
       });
 

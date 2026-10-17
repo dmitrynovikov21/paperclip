@@ -1064,7 +1064,8 @@ export type EarlyUpstreamReprobeDecision =
         | "adapter_changed"
         | "no_recovery_evidence"
         | "recovery_evidence_stale"
-        | "recovery_predates_pin";
+        | "recovery_predates_pin"
+        | "upstream_failed_after_recovery";
     };
 
 /**
@@ -1075,8 +1076,9 @@ export type EarlyUpstreamReprobeDecision =
  *
  * Releasing a pin needs positive proof, never a guess: a successful run of the
  * same agent on the adapter that hit the limit, recent enough to describe that
- * upstream's state and later than the pin itself, while the released retry would
- * still run on that adapter. Without that proof the pin is preserved exactly.
+ * upstream's state, later than the pin itself and not followed by another
+ * upstream failure there, while the released retry would still run on that
+ * adapter. Without that proof the pin is preserved exactly.
  */
 export function decideEarlyUpstreamReprobe(
   facts: {
@@ -1092,6 +1094,8 @@ export function decideEarlyUpstreamReprobe(
     currentAdapterType: string | null;
     /** The agent's most recent successful run on the retry's adapter, if any. */
     recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null;
+    /** The agent's most recent provider_quota / transient_upstream failure on that adapter, if any. */
+    latestUpstreamFailure: { runId: string; finishedAt: Date } | null;
   },
   now: Date,
 ): EarlyUpstreamReprobeDecision {
@@ -1130,6 +1134,13 @@ export function decideEarlyUpstreamReprobe(
   // already failed against, not its recovery.
   if (facts.pinSetAt && recoveredAt <= facts.pinSetAt.getTime()) {
     return { reprobe: false, reason: "recovery_predates_pin" };
+  }
+
+  // The latest word on the upstream wins: hitting the limit there again after
+  // the success means the outage is back and the pin still holds.
+  const failure = facts.latestUpstreamFailure;
+  if (failure && failure.finishedAt.getTime() >= recoveredAt) {
+    return { reprobe: false, reason: "upstream_failed_after_recovery" };
   }
 
   return { reprobe: true, evidenceRunId: evidence.runId };
@@ -10372,6 +10383,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { runId: row.id, finishedAt: new Date(row.finishedAt), adapterType };
   }
 
+  // HELA-1643: the agent's latest failed run on the adapter since `since` that
+  // the scheduler would count as an upstream failure
+  // (readTransientRecoveryContractFromRun): a persisted errorFamily wins over the
+  // error code.
+  async function findLatestUpstreamFailure(companyId: string, agentId: string, adapterType: string, since: Date) {
+    const row = await db
+      .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "failed"),
+          gte(heartbeatRuns.finishedAt, since),
+          sql`(case
+            when btrim(coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '')) <> ''
+              then ${heartbeatRuns.resultJson} ->> 'errorFamily'
+            when ${heartbeatRuns.errorCode} = 'provider_quota' then 'provider_quota'
+            when ${heartbeatRuns.errorCode} in ('codex_transient_upstream', 'claude_transient_upstream')
+              then 'transient_upstream'
+          end) in ('provider_quota', 'transient_upstream')`,
+          sql`${invokedAdapterTypeOf(heartbeatRuns.id)} = ${adapterType}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.finishedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row?.finishedAt) return null;
+    return { runId: row.id, finishedAt: new Date(row.finishedAt) };
+  }
+
   // HELA-1643: release transient retries whose far-future pin (a usage-limit
   // reset hint) is stale because the upstream recovered early. A cleared
   // candidate has its pin pulled forward to `now`, then goes through
@@ -10438,21 +10480,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null;
 
+    type UpstreamState = {
+      recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null;
+      latestUpstreamFailure: { runId: string; finishedAt: Date } | null;
+    };
     const promotedRunIds: string[] = [];
-    const evidenceByScope = new Map<string, { runId: string; finishedAt: Date; adapterType: string } | null>();
+    const upstreamStateByScope = new Map<string, UpstreamState>();
     for (const candidate of candidates) {
       if (skipRunIds.has(candidate.id)) continue;
       const retryAdapterType = candidate.retryAdapterType;
-      let recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null = null;
+      let upstreamState: UpstreamState = { recoveryEvidence: null, latestUpstreamFailure: null };
       if (retryAdapterType) {
         const scope = `${candidate.companyId}:${candidate.agentId}:${retryAdapterType}`;
-        if (!evidenceByScope.has(scope)) {
-          evidenceByScope.set(
-            scope,
-            await findUpstreamRecoveryEvidence(candidate.companyId, candidate.agentId, retryAdapterType, now),
+        let scopeState = upstreamStateByScope.get(scope);
+        if (!scopeState) {
+          const recoveryEvidence = await findUpstreamRecoveryEvidence(
+            candidate.companyId,
+            candidate.agentId,
+            retryAdapterType,
+            now,
           );
+          // Only a failure at or after the success can outweigh it.
+          const latestUpstreamFailure = recoveryEvidence
+            ? await findLatestUpstreamFailure(
+                candidate.companyId,
+                candidate.agentId,
+                retryAdapterType,
+                recoveryEvidence.finishedAt,
+              )
+            : null;
+          scopeState = { recoveryEvidence, latestUpstreamFailure };
+          upstreamStateByScope.set(scope, scopeState);
         }
-        recoveryEvidence = evidenceByScope.get(scope) ?? null;
+        upstreamState = scopeState;
       }
 
       const originalScheduledRetryAt = candidate.scheduledRetryAt ? new Date(candidate.scheduledRetryAt) : null;
@@ -10466,7 +10526,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pinSetAt: new Date(candidate.createdAt),
           retryAdapterType,
           currentAdapterType: candidate.currentAdapterType,
-          recoveryEvidence,
+          ...upstreamState,
         },
         now,
       );

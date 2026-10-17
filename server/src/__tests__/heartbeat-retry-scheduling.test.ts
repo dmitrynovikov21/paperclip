@@ -559,6 +559,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     finishedAt: Date;
     /** The adapter the run invoked; null when it left no adapter.invoke event. */
     adapterType?: string | null;
+    /** A failed run's error code; a usage-limit failure unless given. */
+    errorCode?: string;
+    resultJson?: Record<string, unknown>;
   }) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -567,7 +570,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       agentId: input.agentId,
       invocationSource: "assignment",
       status: input.status,
-      ...(input.status === "failed" ? { errorCode: "provider_quota" } : {}),
+      ...(input.status === "failed" ? { errorCode: input.errorCode ?? "provider_quota" } : {}),
+      ...(input.resultJson ? { resultJson: input.resultJson } : {}),
       finishedAt: input.finishedAt,
       contextSnapshot: { wakeReason: "issue_assigned" },
       updatedAt: input.finishedAt,
@@ -774,6 +778,112 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       runIds: [],
     });
     expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+  });
+
+  it("keeps a far-future pin when the same upstream fails again after the recovery evidence (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // Green after the pin, then the same agent hits the limit on the same adapter again.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+    await insertFinishedRun({ companyId, agentId, status: "failed", finishedAt: new Date(now.getTime() + 7 * 60_000) });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 8 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    const stillPinned = await readRetryPin(retryRunId);
+    expect(stillPinned?.status).toBe("scheduled_retry");
+    expect(stillPinned?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // A success after that failure is the latest word again.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 9 * 60_000) });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 10 * 60_000))).toEqual({
+      promoted: 1,
+      runIds: [retryRunId],
+    });
+  });
+
+  it("counts only upstream failures on the pinned adapter against the recovery evidence (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // The persisted error family decides, as it does for the retry scheduler.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 6 * 60_000),
+      errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
+    });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 7 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // A failure outside the upstream families, or an upstream failure on another
+    // adapter, says nothing about this pin's upstream.
+    const evidenceRunId = await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 8 * 60_000),
+    });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 9 * 60_000),
+      errorCode: "adapter_failed",
+    });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 10 * 60_000),
+      adapterType: "codex_local",
+      errorCode: "codex_transient_upstream",
+    });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 11 * 60_000))).toEqual({
+      promoted: 1,
+      runIds: [retryRunId],
+    });
+    const reprobeEvent = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, retryRunId))
+      .then((rows) => rows.find((row) => row.message?.includes("re-probed early")) ?? null);
+    expect(reprobeEvent?.payload).toMatchObject({ upstreamRecoveryEvidenceRunId: evidenceRunId });
   });
 
   it("keeps a far-future transient pin without proof that this agent's upstream recovered (HELA-1643)", async () => {
@@ -2654,6 +2764,7 @@ describe("decideEarlyUpstreamReprobe (HELA-1643)", () => {
     retryAdapterType: "claude_local",
     currentAdapterType: "claude_local",
     recoveryEvidence: freshEvidence,
+    latestUpstreamFailure: null,
   };
 
   it("re-probes a far-future reset-hint pin on a fresh success of the same adapter after the pin", () => {
@@ -2735,5 +2846,22 @@ describe("decideEarlyUpstreamReprobe (HELA-1643)", () => {
         now,
       ),
     ).toEqual({ reprobe: false, reason: "recovery_predates_pin" });
+  });
+
+  it("keeps pins whose upstream failed again at or after the recovery evidence", () => {
+    const failedAt = (offsetMs: number) => ({
+      ...facts,
+      latestUpstreamFailure: { runId: "failure-run", finishedAt: new Date(freshEvidence.finishedAt.getTime() + offsetMs) },
+    });
+    expect(decideEarlyUpstreamReprobe(failedAt(1), now)).toEqual({
+      reprobe: false,
+      reason: "upstream_failed_after_recovery",
+    });
+    expect(decideEarlyUpstreamReprobe(failedAt(0), now)).toEqual({
+      reprobe: false,
+      reason: "upstream_failed_after_recovery",
+    });
+    // A failure the success already outlived is the outage it recovered from.
+    expect(decideEarlyUpstreamReprobe(failedAt(-1), now)).toEqual({ reprobe: true, evidenceRunId: "evidence-run" });
   });
 });

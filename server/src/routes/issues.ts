@@ -170,6 +170,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWake,
+  getIssueBlockersResolvedReadyAt,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
@@ -9549,9 +9550,14 @@ export function issueRoutes(
           resolvedBlockerIssueId: input.resolvedBlockerIssueId,
         });
         try {
+          const readyAt = await getIssueBlockersResolvedReadyAt(db, {
+            companyId: issue.companyId,
+            blockerIssueIds: input.blockerIssueIds,
+          });
           const existingWake = await findExistingIssueBlockersResolvedWake(db, {
             companyId: issue.companyId,
             idempotencyKey,
+            readyAt,
           });
           if (existingWake) return;
         } catch (err) {
@@ -11430,9 +11436,14 @@ export function issueRoutes(
           resolvedBlockerIssueId: input.resolvedBlockerIssueId,
         });
         try {
+          const readyAt = await getIssueBlockersResolvedReadyAt(db, {
+            companyId: currentIssue.companyId,
+            blockerIssueIds: input.blockerIssueIds,
+          });
           const existingWake = await findExistingIssueBlockersResolvedWake(db, {
             companyId: currentIssue.companyId,
             idempotencyKey,
+            readyAt,
           });
           if (existingWake) return;
         } catch (err) {

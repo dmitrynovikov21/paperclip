@@ -610,6 +610,58 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(wakes.some((wake) => ["queued", "claimed", "completed"].includes(wake.status))).toBe(true);
   });
 
+  it("wakes again after a blocker completes twice while the dependent stays blocked", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
+    const firstDoneAt = new Date(Date.now() - 60_000);
+    await db.update(issues).set({ completedAt: firstDoneAt }).where(eq(issues.id, blockerIssueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerIssueId },
+      status: "completed",
+      requestedAt: new Date(firstDoneAt.getTime() + 10_000),
+      finishedAt: new Date(firstDoneAt.getTime() + 20_000),
+      idempotencyKey,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const firstPass = await heartbeat.reconcileIssueGraphLiveness();
+    expect(firstPass.dependencyWakesHealed).toBe(0);
+    expect(firstPass.dependencyWakeExistingSkipped).toBe(1);
+
+    await db.update(issues)
+      .set({ status: "in_review", completedAt: null })
+      .where(eq(issues.id, blockerIssueId));
+    const reopenedPass = await heartbeat.reconcileIssueGraphLiveness();
+    expect(reopenedPass.dependencyWakesHealed).toBe(0);
+    expect(reopenedPass.dependencyWakeNotReadySkipped).toBe(1);
+
+    await db.update(issues)
+      .set({ status: "done", completedAt: new Date(Date.now() - 1_000) })
+      .where(eq(issues.id, blockerIssueId));
+    const secondPass = await heartbeat.reconcileIssueGraphLiveness();
+    expect(secondPass.dependencyWakesHealed).toBe(1);
+    expect(secondPass.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+    await heartbeat.drainActiveRunExecutions();
+
+    const wakes = await db.select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey)));
+    expect(wakes).toHaveLength(2);
+
+    // The wake execution can advance the issue. Keep the same ready blocker
+    // state and verify a later reconciliation does not start a wake loop.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, blockedIssueId));
+    const stablePass = await heartbeat.reconcileIssueGraphLiveness();
+    expect(stablePass.dependencyWakesHealed).toBe(0);
+    expect(stablePass.dependencyWakeExistingSkipped).toBe(1);
+  });
+
   it("waits for workspace finalize before healing a resolved blocked dependent", async () => {
     await enableAutoRecovery();
     const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =

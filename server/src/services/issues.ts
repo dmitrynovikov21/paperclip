@@ -7645,7 +7645,7 @@ export function issueService(db: Db) {
         if (issueData.status === "done") {
           // Only a transition into done starts a new completion epoch. A
           // repeated done patch must not rearm dependency wakeups.
-          patch.completedAt = receiptExisting.status === "done" && receiptExisting.completedAt
+          patch.completedAt = receiptExisting.status === "done"
             ? receiptExisting.completedAt
             : new Date();
         }

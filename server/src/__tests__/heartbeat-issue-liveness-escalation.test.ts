@@ -610,12 +610,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(wakes.some((wake) => ["queued", "claimed", "completed"].includes(wake.status))).toBe(true);
   });
 
-  it("ignores a repeated done patch but wakes after blocker recompletion while the dependent stays blocked", async () => {
+  it.each([
+    { label: "timestamped", hasCompletionTimestamp: true },
+    { label: "legacy nullable", hasCompletionTimestamp: false },
+  ])("ignores a repeated done patch for a $label blocker but wakes after recompletion", async ({ hasCompletionTimestamp }) => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const idempotencyKey = `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`;
-    const firstDoneAt = new Date(Date.now() - 60_000);
+    const firstDoneAt = hasCompletionTimestamp ? new Date(Date.now() - 60_000) : null;
     await db.update(issues).set({ completedAt: firstDoneAt }).where(eq(issues.id, blockerIssueId));
+    const wakeRequestedAt = new Date(Date.now() - 50_000);
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId,
@@ -624,8 +628,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       reason: "issue_blockers_resolved",
       payload: { issueId: blockedIssueId, resolvedBlockerIssueId: blockerIssueId },
       status: "completed",
-      requestedAt: new Date(firstDoneAt.getTime() + 10_000),
-      finishedAt: new Date(firstDoneAt.getTime() + 20_000),
+      requestedAt: wakeRequestedAt,
+      finishedAt: new Date(wakeRequestedAt.getTime() + 10_000),
       idempotencyKey,
     });
 
@@ -647,7 +651,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(reopenedPass.dependencyWakeNotReadySkipped).toBe(1);
 
     const completedAgain = await issueService(db).update(blockerIssueId, { status: "done" });
-    expect(completedAgain?.completedAt?.getTime()).toBeGreaterThan(firstDoneAt.getTime());
+    expect(completedAgain?.completedAt?.getTime()).toBeGreaterThan(wakeRequestedAt.getTime());
     const secondPass = await heartbeat.reconcileIssueGraphLiveness();
     expect(secondPass.dependencyWakesHealed).toBe(1);
     expect(secondPass.dependencyWakeIssueIds).toEqual([blockedIssueId]);

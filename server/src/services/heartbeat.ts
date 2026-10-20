@@ -348,6 +348,10 @@ const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.round(
 // How recent a successful run must be to still count as proof the upstream is serving.
 const EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS = 30 * 60 * 1000;
 const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
+// Every character String.prototype.trim strips, so SQL can tell a blank string
+// apart exactly as readNonEmptyString does (btrim alone strips only spaces).
+export const JS_TRIM_WHITESPACE_CHARACTERS =
+  "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -10386,7 +10390,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // HELA-1643: the agent's latest failed run on the adapter since `since` that
   // the scheduler would count as an upstream failure
   // (readTransientRecoveryContractFromRun): a persisted errorFamily wins over the
-  // error code.
+  // error code, but only as a non-blank JSON string (readHeartbeatRunErrorFamily).
   async function findLatestUpstreamFailure(companyId: string, agentId: string, adapterType: string, since: Date) {
     const row = await db
       .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
@@ -10398,7 +10402,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(heartbeatRuns.status, "failed"),
           gte(heartbeatRuns.finishedAt, since),
           sql`(case
-            when btrim(coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '')) <> ''
+            when jsonb_typeof(${heartbeatRuns.resultJson} -> 'errorFamily') = 'string'
+              and btrim(${heartbeatRuns.resultJson} ->> 'errorFamily', ${JS_TRIM_WHITESPACE_CHARACTERS}) <> ''
               then ${heartbeatRuns.resultJson} ->> 'errorFamily'
             when ${heartbeatRuns.errorCode} = 'provider_quota' then 'provider_quota'
             when ${heartbeatRuns.errorCode} in ('codex_transient_upstream', 'claude_transient_upstream')

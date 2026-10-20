@@ -32,6 +32,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   decideEarlyUpstreamReprobe,
   heartbeatService,
+  JS_TRIM_WHITESPACE_CHARACTERS,
 } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -885,6 +886,56 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .then((rows) => rows.find((row) => row.message?.includes("re-probed early")) ?? null);
     expect(reprobeEvent?.payload).toMatchObject({ upstreamRecoveryEvidenceRunId: evidenceRunId });
   });
+
+  // A stored errorFamily decides only as a non-blank string; anything else falls
+  // back to the error code, as readHeartbeatRunErrorFamily does for the scheduler.
+  it.each([
+    { name: "a non-string error family", errorCode: "provider_quota", resultJson: { errorFamily: 42 }, upstream: true },
+    {
+      name: "a blank error family",
+      errorCode: "claude_transient_upstream",
+      resultJson: { errorFamily: "\u00a0\t" },
+      upstream: true,
+    },
+    { name: "a non-string error family", errorCode: "adapter_failed", resultJson: { errorFamily: true }, upstream: false },
+  ])(
+    "classifies a later $errorCode failure with $name like the retry scheduler does (HELA-1643)",
+    async ({ errorCode, resultJson, upstream }) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const retryRunId = randomUUID();
+      const now = new Date("2026-10-16T02:40:00.000Z");
+      const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+      const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+      await seedFarFutureTransientRetry({
+        runId: retryRunId,
+        companyId,
+        agentId,
+        issueId: randomUUID(),
+        issueNumber: 1,
+        issuePrefix,
+        createdAt: now,
+        scheduledRetryAt: stalePin,
+      });
+
+      await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+      await insertFinishedRun({
+        companyId,
+        agentId,
+        status: "failed",
+        finishedAt: new Date(now.getTime() + 6 * 60_000),
+        errorCode,
+        resultJson,
+      });
+      const promotion = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 7 * 60_000));
+      if (upstream) {
+        expect(promotion).toEqual({ promoted: 0, runIds: [] });
+        expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+      } else {
+        expect(promotion).toEqual({ promoted: 1, runIds: [retryRunId] });
+      }
+    },
+  );
 
   it("keeps a far-future transient pin without proof that this agent's upstream recovered (HELA-1643)", async () => {
     const companyId = randomUUID();
@@ -2863,5 +2914,16 @@ describe("decideEarlyUpstreamReprobe (HELA-1643)", () => {
     });
     // A failure the success already outlived is the outage it recovered from.
     expect(decideEarlyUpstreamReprobe(failedAt(-1), now)).toEqual({ reprobe: true, evidenceRunId: "evidence-run" });
+  });
+});
+
+describe("JS_TRIM_WHITESPACE_CHARACTERS (HELA-1643)", () => {
+  it("holds exactly the characters String.prototype.trim strips", () => {
+    const trimmed: string[] = [];
+    for (let codePoint = 0; codePoint <= 0x10ffff; codePoint += 1) {
+      const char = String.fromCodePoint(codePoint);
+      if (char.trim() === "") trimmed.push(char);
+    }
+    expect([...JS_TRIM_WHITESPACE_CHARACTERS].sort()).toEqual(trimmed.sort());
   });
 });

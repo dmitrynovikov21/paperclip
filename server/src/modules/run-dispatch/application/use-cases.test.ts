@@ -13,7 +13,7 @@ import type {
   RunDispatchWriter,
   ScheduledRetryReader,
 } from "./ports.js";
-import type { UpstreamRecoveryEvidence } from "../domain/policy.js";
+import type { UpstreamFailureEvidence, UpstreamRecoveryEvidence } from "../domain/policy.js";
 
 const REPROBE_NOW = new Date("2026-06-22T02:46:00.000Z");
 /** Pinned to a weekly-quota reset 15h out, written before this sweep's clock. */
@@ -44,13 +44,16 @@ function fakeReader(
     candidates?: EarlyUpstreamReprobeCandidate[];
     evidence?: UpstreamRecoveryEvidence | null;
     evidenceFor?: (input: { companyId: string; agentId: string; adapterType: string; now: Date }) => UpstreamRecoveryEvidence | null;
+    failure?: UpstreamFailureEvidence | null;
   } = {},
-): ScheduledRetryReader & { evaluateCalls: unknown[]; evidenceCalls: unknown[] } {
+): ScheduledRetryReader & { evaluateCalls: unknown[]; evidenceCalls: unknown[]; failureCalls: unknown[] } {
   const evaluateCalls: unknown[] = [];
   const evidenceCalls: unknown[] = [];
+  const failureCalls: unknown[] = [];
   return {
     evaluateCalls,
     evidenceCalls,
+    failureCalls,
     async evaluateScheduledRetryGate(input) {
       evaluateCalls.push(input);
       return { allowed: true };
@@ -68,6 +71,10 @@ function fakeReader(
     async findUpstreamRecoveryEvidence(input) {
       evidenceCalls.push(input);
       return reprobe.evidenceFor ? reprobe.evidenceFor(input) : (reprobe.evidence ?? null);
+    },
+    async findLatestUpstreamFailure(input) {
+      failureCalls.push(input);
+      return reprobe.failure ?? null;
     },
   };
 }
@@ -254,6 +261,29 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     expect(result).toMatchObject({ promoted: 0, runIds: [] });
     expect(writer.advanceCalls).toEqual([]);
     expect(writer.promoteCalls).toEqual([]);
+    // Without a success there is nothing for a later failure to outweigh.
+    expect(reader.failureCalls).toEqual([]);
+  });
+
+  it("holds the pin when the upstream failed again after the success", async () => {
+    const reader = fakeReader([], {
+      candidates: [reprobeCandidate()],
+      evidence: RECOVERY_EVIDENCE,
+      failure: { runId: "quota-run", finishedAt: new Date(REPROBE_NOW.getTime() - 30_000) },
+    });
+    const writer = fakeWriter();
+    const result = await buildEarlyPromoter(reader, writer)({ now: REPROBE_NOW, cutoff: null });
+
+    expect(result).toMatchObject({ promoted: 0, runIds: [] });
+    expect(writer.advanceCalls).toEqual([]);
+    expect(reader.failureCalls).toEqual([
+      {
+        companyId: "company-1",
+        agentId: "agent-1",
+        adapterType: "codex_local",
+        since: RECOVERY_EVIDENCE.finishedAt,
+      },
+    ]);
   });
 
   it("leaves a run alone when another writer released its pin first", async () => {
@@ -283,6 +313,10 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     expect(reader.evidenceCalls).toEqual([
       { companyId: "company-1", agentId: "agent-1", adapterType: "codex_local", now: REPROBE_NOW },
       { companyId: "company-2", agentId: "agent-1", adapterType: "codex_local", now: REPROBE_NOW },
+    ]);
+    expect(reader.failureCalls).toEqual([
+      { companyId: "company-1", agentId: "agent-1", adapterType: "codex_local", since: RECOVERY_EVIDENCE.finishedAt },
+      { companyId: "company-2", agentId: "agent-1", adapterType: "codex_local", since: RECOVERY_EVIDENCE.finishedAt },
     ]);
   });
 

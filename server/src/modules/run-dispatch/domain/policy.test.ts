@@ -549,6 +549,7 @@ describe("decideEarlyUpstreamReprobe", () => {
         runId: "green-run",
         finishedAt: new Date(NOW.getTime() - 60_000),
       },
+      latestUpstreamFailure: null,
     };
   }
 
@@ -557,6 +558,31 @@ describe("decideEarlyUpstreamReprobe", () => {
       reprobe: true,
       evidenceRunId: "green-run",
     });
+  });
+
+  it("holds the pin when the upstream failed again at or after the success", () => {
+    const recoveredAt = baseReprobeFacts().recoveryEvidence!.finishedAt;
+    for (const finishedAt of [recoveredAt, new Date(recoveredAt.getTime() + 1)]) {
+      expect(
+        decideEarlyUpstreamReprobe(
+          { ...baseReprobeFacts(), latestUpstreamFailure: { runId: "quota-run", finishedAt } },
+          NOW,
+        ),
+      ).toEqual({ reprobe: false, reason: "upstream_failed_after_recovery" });
+    }
+  });
+
+  it("re-probes when the latest upstream failure came before the success", () => {
+    const recoveredAt = baseReprobeFacts().recoveryEvidence!.finishedAt;
+    expect(
+      decideEarlyUpstreamReprobe(
+        {
+          ...baseReprobeFacts(),
+          latestUpstreamFailure: { runId: "quota-run", finishedAt: new Date(recoveredAt.getTime() - 1) },
+        },
+        NOW,
+      ),
+    ).toEqual({ reprobe: true, evidenceRunId: "green-run" });
   });
 
   it("holds the pin while the upstream is still down", () => {

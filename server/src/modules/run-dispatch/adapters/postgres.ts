@@ -55,11 +55,14 @@ import type {
   ReviewParticipantFacts,
   RetryReasonKind,
   ScheduledRetryFacts,
+  UpstreamFailureEvidence,
   UpstreamRecoveryEvidence,
 } from "../domain/policy.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
+  PROVIDER_QUOTA_ERROR_CODE,
   TRANSIENT_FAILURE_RETRY_REASON,
+  TRANSIENT_UPSTREAM_ERROR_CODES,
   allowsIssueInteractionWake,
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
@@ -74,6 +77,7 @@ import type {
   DueRetryRun,
   EarlyUpstreamReprobeCandidate,
   EvaluateScheduledRetryGateInput,
+  FindLatestUpstreamFailureInput,
   FindUpstreamRecoveryEvidenceInput,
   ListDueRetriesInput,
   ListEarlyUpstreamReprobeCandidatesInput,
@@ -143,6 +147,14 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
     currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
   } : null;
 }
+
+/**
+ * Every character String.prototype.trim strips. SQL `btrim` alone strips only
+ * spaces, so the early re-probe passes this set to tell a blank stored error
+ * family apart exactly as readNonEmptyString does.
+ */
+export const JS_TRIM_WHITESPACE_CHARACTERS =
+  "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -619,6 +631,39 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "succeeded"),
           sql`${heartbeatRuns.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
           gt(heartbeatRuns.finishedAt, lookbackFloor),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.finishedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row?.finishedAt) return null;
+    return { runId: row.id, finishedAt: new Date(row.finishedAt) };
+  }
+
+  async function findLatestUpstreamFailure(
+    input: FindLatestUpstreamFailureInput,
+  ): Promise<UpstreamFailureEvidence | null> {
+    // A failed run counts exactly when the retry scheduler would call it an
+    // upstream failure (readTransientRecoveryContractFromRun): a stored
+    // errorFamily wins over the error code, but only as a non-blank JSON string
+    // (readHeartbeatRunErrorFamily).
+    const row = await db
+      .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.status, "failed"),
+          sql`${heartbeatRuns.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
+          gte(heartbeatRuns.finishedAt, input.since),
+          sql`(case
+            when jsonb_typeof(${heartbeatRuns.resultJson} -> 'errorFamily') = 'string'
+              and btrim(${heartbeatRuns.resultJson} ->> 'errorFamily', ${JS_TRIM_WHITESPACE_CHARACTERS}) <> ''
+              then ${heartbeatRuns.resultJson} ->> 'errorFamily'
+            when ${heartbeatRuns.errorCode} = ${PROVIDER_QUOTA_ERROR_CODE} then 'provider_quota'
+            when ${inArray(heartbeatRuns.errorCode, [...TRANSIENT_UPSTREAM_ERROR_CODES])} then 'transient_upstream'
+          end) in ('provider_quota', 'transient_upstream')`,
         ),
       )
       .orderBy(desc(heartbeatRuns.finishedAt))
@@ -1458,6 +1503,7 @@ export function createPostgresRunDispatchAdapter(
     listDueRetries,
     listEarlyUpstreamReprobeCandidates,
     findUpstreamRecoveryEvidence,
+    findLatestUpstreamFailure,
     cancelStaleQueuedRun,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,

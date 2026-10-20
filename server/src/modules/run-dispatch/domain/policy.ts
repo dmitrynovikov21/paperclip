@@ -191,6 +191,12 @@ export type UpstreamRecoveryEvidence = {
   finishedAt: Date;
 };
 
+/** A failed run in the same scope that the retry scheduler counts as an upstream failure. */
+export type UpstreamFailureEvidence = {
+  runId: string;
+  finishedAt: Date;
+};
+
 export type EarlyUpstreamReprobeFacts = {
   runId: string;
   retryReason: string | null;
@@ -199,6 +205,8 @@ export type EarlyUpstreamReprobeFacts = {
   pinSetAt: Date | null;
   /** The most recent successful run in the same upstream scope, if found. */
   recoveryEvidence: UpstreamRecoveryEvidence | null;
+  /** The most recent upstream failure in that scope at or after the success, if any. */
+  latestUpstreamFailure: UpstreamFailureEvidence | null;
 };
 
 export type EarlyUpstreamReprobeHoldReason =
@@ -206,7 +214,8 @@ export type EarlyUpstreamReprobeHoldReason =
   | "pin_not_far_future"
   | "no_recovery_evidence"
   | "recovery_evidence_stale"
-  | "recovery_predates_pin";
+  | "recovery_predates_pin"
+  | "upstream_failed_after_recovery";
 
 export type EarlyUpstreamReprobeDecision =
   | { reprobe: true; evidenceRunId: string }
@@ -740,9 +749,10 @@ export function decideQueuedRunStaleness(
  * parked for hours after the outage that produced it already ended.
  *
  * Releasing such a pin needs positive proof, never a guess: a successful run in
- * the same agent and adapter, recent enough to describe that upstream's state and
- * later than the pin itself, shows the adapter is being served again. Without
- * that proof the pin is preserved exactly, so a genuine quota wait is untouched.
+ * the same agent and adapter, recent enough to describe that upstream's state,
+ * later than the pin itself and not followed by another upstream failure there,
+ * shows the adapter is being served again. Without that proof the pin is
+ * preserved exactly, so a genuine quota wait is untouched.
  */
 export function decideEarlyUpstreamReprobe(
   facts: EarlyUpstreamReprobeFacts,
@@ -772,6 +782,13 @@ export function decideEarlyUpstreamReprobe(
   // already failed against, not its recovery.
   if (facts.pinSetAt && recoveredAt <= facts.pinSetAt.getTime()) {
     return { reprobe: false, reason: "recovery_predates_pin" };
+  }
+
+  // The latest word on the upstream wins: hitting the limit there again after
+  // the success means the outage is back and the pin still holds.
+  const failure = facts.latestUpstreamFailure;
+  if (failure && failure.finishedAt.getTime() >= recoveredAt) {
+    return { reprobe: false, reason: "upstream_failed_after_recovery" };
   }
 
   return { reprobe: true, evidenceRunId: evidence.runId };

@@ -27,6 +27,18 @@ export const TRANSIENT_FAILURE_RETRY_REASON = "transient_failure";
  * drift apart.
  */
 export const BOUNDED_TRANSIENT_RETRY_DELAYS_MS = [30_000, 60_000] as const;
+/**
+ * The error codes the transient retry scheduler (`readHeartbeatRunErrorFamily`)
+ * maps to an upstream error family when a failed run stored none. The early
+ * re-probe's SQL classifies failed runs from the same constants, so a code
+ * added for one is added for both.
+ */
+export const PROVIDER_QUOTA_ERROR_CODE = "provider_quota";
+export const TRANSIENT_UPSTREAM_ERROR_CODES = [
+  "codex_transient_upstream",
+  "claude_transient_upstream",
+  "codex_harness_crash",
+] as const;
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";

@@ -1,5 +1,5 @@
 import { decideEarlyUpstreamReprobe } from "../domain/policy.js";
-import type { UpstreamRecoveryEvidence } from "../domain/policy.js";
+import type { UpstreamFailureEvidence, UpstreamRecoveryEvidence } from "../domain/policy.js";
 import type { EarlyUpstreamReprobeCandidate, EarlyUpstreamReprobeCursor, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
@@ -76,17 +76,32 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
 
     // Cache by the upstream scope, never by company alone: a green run from
     // another agent or adapter does not prove this agent's provider recovered.
-    const evidenceByScope = new Map<string, UpstreamRecoveryEvidence | null>();
+    const upstreamStateByScope = new Map<string, {
+      recoveryEvidence: UpstreamRecoveryEvidence | null;
+      latestUpstreamFailure: UpstreamFailureEvidence | null;
+    }>();
     for (const candidate of candidates) {
       if (input.skipRunIds?.has(candidate.runId) || !candidate.adapterType) continue;
       const scope = `${candidate.companyId}:${candidate.agentId}:${candidate.adapterType}`;
-      if (!evidenceByScope.has(scope)) {
-        evidenceByScope.set(scope, await deps.reader.findUpstreamRecoveryEvidence({
+      let upstreamState = upstreamStateByScope.get(scope);
+      if (!upstreamState) {
+        const recoveryEvidence = await deps.reader.findUpstreamRecoveryEvidence({
           companyId: candidate.companyId,
           agentId: candidate.agentId,
           adapterType: candidate.adapterType,
           now,
-        }));
+        });
+        // Only a failure at or after the success can outweigh it.
+        const latestUpstreamFailure = recoveryEvidence
+          ? await deps.reader.findLatestUpstreamFailure({
+            companyId: candidate.companyId,
+            agentId: candidate.agentId,
+            adapterType: candidate.adapterType,
+            since: recoveryEvidence.finishedAt,
+          })
+          : null;
+        upstreamState = { recoveryEvidence, latestUpstreamFailure };
+        upstreamStateByScope.set(scope, upstreamState);
       }
 
       const decision = decideEarlyUpstreamReprobe(
@@ -95,7 +110,7 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
           retryReason: candidate.retryReason,
           scheduledRetryAt: candidate.scheduledRetryAt,
           pinSetAt: candidate.pinSetAt,
-          recoveryEvidence: evidenceByScope.get(scope) ?? null,
+          ...upstreamState,
         },
         now,
       );

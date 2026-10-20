@@ -54,6 +54,8 @@ import {
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   TRANSIENT_FAILURE_RETRY_REASON,
   BOUNDED_TRANSIENT_RETRY_DELAYS_MS,
+  PROVIDER_QUOTA_ERROR_CODE,
+  TRANSIENT_UPSTREAM_ERROR_CODES,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   isNonAssigneeWorkspaceBusyRetry,
@@ -246,14 +248,12 @@ export function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
-  if (run.errorCode === "provider_quota") {
+  // The early upstream re-probe classifies failed runs in SQL from the same
+  // error-code constants, so the two classifications cannot drift apart.
+  if (run.errorCode === PROVIDER_QUOTA_ERROR_CODE) {
     return "provider_quota";
   }
-  if (
-    run.errorCode === "codex_transient_upstream" ||
-    run.errorCode === "claude_transient_upstream" ||
-    run.errorCode === "codex_harness_crash"
-  ) {
+  if (TRANSIENT_UPSTREAM_ERROR_CODES.some((code) => code === run.errorCode)) {
     return "transient_upstream";
   }
   return null;

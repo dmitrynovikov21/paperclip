@@ -17,6 +17,8 @@ export {
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   TRANSIENT_FAILURE_RETRY_REASON,
   BOUNDED_TRANSIENT_RETRY_DELAYS_MS,
+  PROVIDER_QUOTA_ERROR_CODE,
+  TRANSIENT_UPSTREAM_ERROR_CODES,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   WAKE_COMMENT_IDS_KEY,
@@ -44,6 +46,7 @@ export type {
   StalenessDecision,
   QueuedRunFacts,
   UpstreamRecoveryEvidence,
+  UpstreamFailureEvidence,
   EarlyUpstreamReprobeFacts,
   EarlyUpstreamReprobeDecision,
 } from "./domain/policy.js";

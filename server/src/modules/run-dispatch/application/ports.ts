@@ -1,4 +1,8 @@
-import type { GateDecision, UpstreamRecoveryEvidence } from "../domain/policy.js";
+import type {
+  GateDecision,
+  UpstreamFailureEvidence,
+  UpstreamRecoveryEvidence,
+} from "../domain/policy.js";
 import type {
   CancelStaleQueuedRunOutcome,
   PromoteScheduledRetryOutcome,
@@ -48,6 +52,14 @@ export type FindUpstreamRecoveryEvidenceInput = {
   now: Date;
 };
 
+export type FindLatestUpstreamFailureInput = {
+  companyId: string;
+  agentId: string;
+  adapterType: string;
+  /** Only failures that finished at or after this instant count. */
+  since: Date;
+};
+
 export type EvaluateScheduledRetryGateInput = {
   runId: string;
   companyId: string;
@@ -66,6 +78,10 @@ export interface ScheduledRetryReader {
   findUpstreamRecoveryEvidence(
     input: FindUpstreamRecoveryEvidenceInput,
   ): Promise<UpstreamRecoveryEvidence | null>;
+  /** The latest upstream failure by the same agent and adapter since `since`, if any. */
+  findLatestUpstreamFailure(
+    input: FindLatestUpstreamFailureInput,
+  ): Promise<UpstreamFailureEvidence | null>;
 }
 
 export type PromoteOrCancelDueRetryInput = {

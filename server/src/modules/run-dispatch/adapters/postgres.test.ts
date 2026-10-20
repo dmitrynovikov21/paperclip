@@ -30,13 +30,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
-import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import { createPostgresRunDispatchAdapter, JS_TRIM_WHITESPACE_CHARACTERS } from "./postgres.js";
 import { createRunDispatch } from "../index.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { reserveRunBudget } from "../../../services/budget-reservations.js";
 import { budgetService, recheckAdmittedRunBudgetReadOnly } from "../../../services/budgets.js";
 import { costService } from "../../../services/costs.js";
+import { readTransientRecoveryContractFromRun } from "../../../services/heartbeat/retries.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -1554,6 +1555,32 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       return runId;
     }
 
+    async function seedFailedRun(input: {
+      companyId: string;
+      agentId: string;
+      finishedAt: Date;
+      errorCode?: string | null;
+      resultJson?: Record<string, unknown> | null;
+      adapterType?: string;
+    }) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        finishedAt: input.finishedAt,
+        errorCode: input.errorCode === undefined ? "provider_quota" : input.errorCode,
+        resultJson: input.resultJson ?? null,
+        runnerProfileJson: { adapterDispatch: { adapterType: input.adapterType ?? "codex_local" } },
+        contextSnapshot: {},
+        createdAt: input.finishedAt,
+        updatedAt: input.finishedAt,
+      });
+      return runId;
+    }
+
     it("selects only far-future transient pins as candidates", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
@@ -1752,6 +1779,138 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         .where(eq(heartbeatRuns.id, runId));
       expect(promoted?.status).toBe("queued");
     });
+
+    it("reads only the same agent and adapter's latest upstream failure since the success", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const otherAgentId = randomUUID();
+      await seedAgent({ id: otherAgentId, companyId, name: "Other" });
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const since = new Date(NOW.getTime() - 5 * 60_000);
+      const scope = { companyId, agentId, adapterType: "codex_local", since };
+
+      await seedFailedRun({ companyId, agentId, finishedAt: new Date(since.getTime() - 1) });
+      await seedFailedRun({ companyId, agentId: otherAgentId, finishedAt: NOW });
+      await seedFailedRun({ companyId, agentId, adapterType: "claude_local", finishedAt: NOW });
+      await seedFailedRun({ companyId, agentId, errorCode: "adapter_failed", finishedAt: NOW });
+      await seedSucceededRun({ companyId, agentId, finishedAt: NOW });
+      expect(await adapter.findLatestUpstreamFailure(scope)).toBeNull();
+
+      // A failure in the same millisecond as the success already outweighs it.
+      const atSince = await seedFailedRun({ companyId, agentId, finishedAt: since });
+      expect(await adapter.findLatestUpstreamFailure(scope)).toEqual({ runId: atSince, finishedAt: since });
+
+      const latest = await seedFailedRun({
+        companyId,
+        agentId,
+        errorCode: "claude_transient_upstream",
+        finishedAt: new Date(NOW.getTime() - 60_000),
+      });
+      expect(await adapter.findLatestUpstreamFailure(scope)).toEqual({
+        runId: latest,
+        finishedAt: new Date(NOW.getTime() - 60_000),
+      });
+    });
+
+    // The retry scheduler reads a stored errorFamily only as a non-blank string
+    // and otherwise falls back to the error code (readHeartbeatRunErrorFamily).
+    it.each([
+      { name: "a quota error code", errorCode: "provider_quota", resultJson: null, upstream: true },
+      { name: "a transient upstream error code", errorCode: "codex_transient_upstream", resultJson: {}, upstream: true },
+      { name: "a harness crash", errorCode: "codex_harness_crash", resultJson: {}, upstream: true },
+      {
+        name: "a stored upstream family over a plain code",
+        errorCode: "adapter_failed",
+        resultJson: { errorFamily: "provider_quota" },
+        upstream: true,
+      },
+      {
+        name: "a stored plain family over a quota code",
+        errorCode: "provider_quota",
+        resultJson: { errorFamily: "adapter_failed" },
+        upstream: false,
+      },
+      { name: "a non-string stored family", errorCode: "provider_quota", resultJson: { errorFamily: 42 }, upstream: true },
+      {
+        name: "a blank stored family",
+        errorCode: "claude_transient_upstream",
+        resultJson: { errorFamily: String.fromCharCode(0x00a0, 0x0009, 0x3000, 0xfeff) },
+        upstream: true,
+      },
+      {
+        name: "a padded stored family",
+        errorCode: "provider_quota",
+        resultJson: { errorFamily: " provider_quota " },
+        upstream: false,
+      },
+      {
+        name: "a non-string family over a plain code",
+        errorCode: "adapter_failed",
+        resultJson: { errorFamily: true },
+        upstream: false,
+      },
+      { name: "a non-object result", errorCode: "provider_quota", resultJson: ["adapter_failed"], upstream: true },
+      { name: "no error code", errorCode: null, resultJson: null, upstream: false },
+    ])("classifies a failed run with $name like the retry scheduler", async ({ errorCode, resultJson, upstream }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const finishedAt = new Date(NOW.getTime() - 60_000);
+      const run = { errorCode, resultJson: resultJson as unknown as Record<string, unknown> | null };
+      const runId = await seedFailedRun({ companyId, agentId, finishedAt, ...run });
+
+      expect(readTransientRecoveryContractFromRun(run) !== null).toBe(upstream);
+      expect(await createPostgresRunDispatchAdapter(db).findLatestUpstreamFailure({
+        companyId,
+        agentId,
+        adapterType: "codex_local",
+        since: new Date(NOW.getTime() - 5 * 60_000),
+      })).toEqual(upstream ? { runId, finishedAt } : null);
+    });
+
+    it("holds a far-future pin when the upstream failed again after the success", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      const runDispatch = createRunDispatch(db);
+
+      // The success proved recovery for a moment. The quota failure after it,
+      // stored with a non-string family so its code decides, says the limit is back.
+      await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 2 * 60_000) });
+      await seedFailedRun({
+        companyId,
+        agentId,
+        finishedAt: new Date(NOW.getTime() - 60_000),
+        errorCode: "provider_quota",
+        resultJson: { errorFamily: 42 },
+      });
+      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+        promoted: 0,
+        runIds: [],
+      });
+      const [held] = await db
+        .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(held).toMatchObject({ status: "scheduled_retry", scheduledRetryAt: FAR_FUTURE_PIN });
+
+      // A success after that failure is the latest word again.
+      await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 30_000) });
+      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+        promoted: 1,
+        runIds: [runId],
+      });
+    });
   });
 
+});
+
+describe("JS_TRIM_WHITESPACE_CHARACTERS", () => {
+  it("holds exactly the characters String.prototype.trim strips", () => {
+    const trimmed: string[] = [];
+    for (let codePoint = 0; codePoint <= 0x10ffff; codePoint += 1) {
+      const char = String.fromCodePoint(codePoint);
+      if (char.trim() === "") trimmed.push(char);
+    }
+    expect([...JS_TRIM_WHITESPACE_CHARACTERS].sort()).toEqual(trimmed.sort());
+  });
 });

@@ -47,6 +47,7 @@ const { WebSocket, WebSocketServer } = require("ws") as {
 
 import { authorizationService, type AuthorizationActor } from "../services/authorization.js";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
+import { canActorReadCase } from "../services/case-access.js";
 
 interface UpgradeContext {
   actor: AuthorizationActor;
@@ -285,6 +286,8 @@ export function setupLiveEventsWebSocketServer(
 
     const access = authorizationService(db);
     async function visibleEvent(event: LiveEvent): Promise<LiveEvent | null> {
+      if (event.payload.entityType === "case" && (typeof event.payload.entityId !== "string"
+        || !(await canActorReadCase(db, context!.actor, { id: event.payload.entityId, companyId: event.companyId })))) return null;
       if (context!.actor.source === "local_implicit") {
         if (event.type === "activity.logged" && event.payload.entityType === "issue") {
           return { ...event, payload: { ...event.payload,
@@ -344,6 +347,8 @@ export function setupLiveEventsWebSocketServer(
           ? (details as Record<string, unknown>).commentId : null;
         return { ...event, payload: {
           action: payload.action, entityType: payload.entityType, entityId: payload.entityId,
+          // An authorized task viewer can refresh an empty cases panel after a handoff.
+          ...(payload.entityType === "case" && String(payload.action).startsWith("case.handoff_") && issueId ? { issueId } : {}),
           // The task read check above authorizes attribution, but not arbitrary details.
           ...(issueId ? await activityToastIdentity(db, event.companyId, payload) : {}),
           ...(typeof commentId === "string" && isUuidLike(commentId) ? { details: { commentId } } : {}),

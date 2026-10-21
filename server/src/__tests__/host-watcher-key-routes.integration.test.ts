@@ -658,6 +658,14 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
 
   it("fails closed on an invalid stored scope and keeps one active key per service identity", async () => {
     const diskAgentId = serviceAgents.disk!;
+    await db.update(agents).set({ lifecycleHolds: ["setup"] }).where(eq(agents.id, diskAgentId));
+    try {
+      await expect(agentService(db).createApiKey(diskAgentId, "setup-held host key", scopes.disk!, {
+        responsibleUserId,
+      })).rejects.toThrow("Finish agent setup before creating keys");
+    } finally {
+      await db.update(agents).set({ lifecycleHolds: [] }).where(eq(agents.id, diskAgentId));
+    }
     await expect(agentService(db).createApiKey(diskAgentId, "second host key", scopes.disk!, {
       responsibleUserId,
     })).rejects.toThrow("exactly one active API key");

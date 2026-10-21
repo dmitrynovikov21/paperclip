@@ -120,9 +120,12 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       const created = await db.transaction(async (tx) => {
         // Serialize issuance for an identity. A host service must have exactly
         // one active credential and cannot retain a broad agent key alongside it.
-        const existing = await tx.select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+        const existing = await tx.select({
+          id: agents.id, companyId: agents.companyId, status: agents.status, lifecycleHolds: agents.lifecycleHolds,
+        })
           .from(agents).where(eq(agents.id, id)).for("update").then((rows) => rows[0] ?? null);
         if (!existing) throw notFound("Agent not found");
+        if (existing.lifecycleHolds?.includes("setup")) throw conflict("Finish agent setup before creating keys");
         if (existing.status === "pending_approval") throw conflict("Cannot create keys for pending approval agents");
         if (existing.status === "terminated") throw conflict("Cannot create keys for terminated agents");
         const activeKeys = await tx.select({ scopeConfig: agentApiKeys.scopeConfig })

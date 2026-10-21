@@ -195,9 +195,6 @@ function applyStatusSideEffects(
   if (status === "in_progress" && !patch.startedAt) {
     patch.startedAt = new Date();
   }
-  if (status === "done") {
-    patch.completedAt = new Date();
-  }
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
   }
@@ -7645,6 +7642,13 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (issueData.status === "done") {
+          // Only a transition into done starts a new completion epoch. A
+          // repeated done patch must not rearm dependency wakeups.
+          patch.completedAt = receiptExisting.status === "done"
+            ? receiptExisting.completedAt
+            : new Date();
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])

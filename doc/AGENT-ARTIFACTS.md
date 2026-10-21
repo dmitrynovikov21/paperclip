@@ -115,25 +115,20 @@ skills/paperclip/scripts/paperclip-upload-artifact.sh render.bin \
 
 ## Direct API Pattern
 
-If the helper is unavailable, use the same API shape:
+To use the API client directly, use the same API shape:
 
 ```sh
-curl -sS -X POST \
-  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -F 'file=@"dist/demo.mp4";type=video/mp4'
+python3 skills/paperclip/scripts/paperclip-api.py POST \
+  "/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
+  --multipart-file dist/demo.mp4 --content-type video/mp4
 ```
 
 Then create a work product when the uploaded file is the deliverable:
 
 ```sh
-curl -sS -X POST \
-  "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -H "Content-Type: application/json" \
-  --data-binary @artifact-work-product.json
+python3 skills/paperclip/scripts/paperclip-api.py POST \
+  "/api/issues/$PAPERCLIP_TASK_ID/work-products" --body-stdin \
+  < artifact-work-product.json
 ```
 
 Use `type: "artifact"`, `provider: "paperclip"`, and metadata containing the

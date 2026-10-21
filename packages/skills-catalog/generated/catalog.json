@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-08-07T20:30:29.973Z",
+  "generatedAt": "2026-10-21T16:14:40.082Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -102,11 +102,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 12028,
-          "sha256": "083d5fa8dc43c3ce7747e89c1afb6f6f42d0603a31808bffc5f8e56735f2d865"
+          "sizeBytes": 12263,
+          "sha256": "f6dfcc1e57d7656503aa65d9e8c7295dc59b4ff09ae9f2870b456905f637aca9"
         }
       ],
-      "contentHash": "sha256:f2592d81f616628a3eba92636616424f2eed82ec22bb504240a58f6be115e407"
+      "contentHash": "sha256:bba353aa19775598b4fc11324d6cf8ee0c4fa2a13e71ae50528cbf28348bee1a"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:status-card-query",
@@ -137,11 +137,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 6368,
-          "sha256": "0c6140f51d503cbadc98723ce54c0def48e7e31ea159b0935b8ad6369291498a"
+          "sizeBytes": 6441,
+          "sha256": "3acd0211b40427f7d69792169234d82593b31ea294c020fa6d49c57f572fcc41"
         }
       ],
-      "contentHash": "sha256:2b6e53bf8491f027afdbd6961ad84f677cfd385a0a6a73616ea84111ca8886ed"
+      "contentHash": "sha256:6c867e1937067dd0f56735c6e5666482a5266f80058957cdbdac7e488ae193e0"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:summarize-status",
@@ -172,11 +172,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 8682,
-          "sha256": "c5f459ced4e97e6ae33c3ffbe7b3fb7d4c1fe7bfb0121187f0c2f9000a670b37"
+          "sizeBytes": 8897,
+          "sha256": "64bf03d835078d05da92c8a6607a6afc879ea8f5072434127dd5fdf1135e05f3"
         }
       ],
-      "contentHash": "sha256:32d2f231a35fc3a658b244f13dd726b2f2bc642db6d3512559fdf9a2b680838d"
+      "contentHash": "sha256:022be31727ad1471580441da34a3c63fffd6f69b35d59b6e9bf534a5c52cad48"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:task-planning",

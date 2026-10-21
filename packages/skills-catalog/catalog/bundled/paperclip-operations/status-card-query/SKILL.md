@@ -22,35 +22,28 @@ Use this skill in one of two modes:
 
 ## Agent-authored card recipe
 
+Set `PAPERCLIP_SKILL_DIR` to the absolute directory of the installed `paperclip` skill in the same shell as the API examples. From a Paperclip source checkout root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`; check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"`.
+
 Agent-authored cards require `tasks:assign`, remain company-scoped, and are available only when `enableStatusCards` is enabled. An agent may manage only cards it authored, may author at most 20 cards, and may send at most 4,000 characters in `interestPrompt`.
 
 Normalize the run-provided API base and create a manual card:
 
 ```bash
-PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
-PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
-
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"interestPrompt":"Blocked or in-review launch work updated this week"}' \
-  "$PAPERCLIP_API_BASE/api/companies/$PAPERCLIP_COMPANY_ID/status-cards"
+printf '%s' '{"interestPrompt":"Blocked or in-review launch work updated this week"}' |
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+    "/api/companies/$PAPERCLIP_COMPANY_ID/status-cards" --body-stdin
 ```
 
 Creation returns `201` and queues compilation automatically. Save the returned card id. To refine an owned card or request a refresh:
 
 ```bash
-curl -sS -X PATCH \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"interestPrompt":"Blocked or in-review launch work updated this week. Call out the single next decision."}' \
-  "$PAPERCLIP_API_BASE/api/status-cards/$STATUS_CARD_ID"
+printf '%s' '{"interestPrompt":"Blocked or in-review launch work updated this week. Call out the single next decision."}' |
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PATCH \
+    "/api/status-cards/$STATUS_CARD_ID" --body-stdin
 
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"full":false}' \
-  "$PAPERCLIP_API_BASE/api/status-cards/$STATUS_CARD_ID/refresh"
+printf '%s' '{"full":false}' |
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+    "/api/status-cards/$STATUS_CARD_ID/refresh" --body-stdin
 ```
 
 Do not call `/query` or `/summary` while authoring. Those write-back routes are reserved for the assigned Summarizer generation issue and run.

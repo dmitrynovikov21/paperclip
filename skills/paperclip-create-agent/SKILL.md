@@ -21,29 +21,27 @@ If you do not have this permission, escalate to your CEO or board.
 
 ## Workflow
 
+Set `PAPERCLIP_SKILL_DIR` to the absolute directory of the installed `paperclip` skill in each shell that runs an API example. From a Paperclip repository root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`; from the installed `paperclip` skill root, use `export PAPERCLIP_SKILL_DIR="$PWD"`. Check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"` before use.
+
 ### 1. Confirm identity and company context
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/agents/me" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/me"
 ```
 
 ### 2. Discover adapter configuration for this Paperclip instance
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/llms/agent-configuration.txt" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-configuration.txt"
 
 # Then the specific adapter you plan to use, e.g. claude_local:
-curl -sS "$PAPERCLIP_API_URL/llms/agent-configuration/claude_local.txt" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-configuration/claude_local.txt"
 ```
 
 ### 3. Compare existing agent configurations
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-configurations" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/agent-configurations"
 ```
 
 Note naming, icon, reporting-line, and adapter conventions the company already follows.
@@ -67,8 +65,7 @@ State which path you took in your hire-request comment so the board can see the 
 ### 5. Discover allowed agent icons
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-icons.txt"
 ```
 
 ### 6. Draft the new hire config
@@ -96,10 +93,8 @@ Before submitting, walk the draft-review checklist end-to-end and fix any item t
 ### 8. Submit hire request
 
 ```sh
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" --body-stdin <<'JSON'
+{
     "name": "CTO",
     "role": "cto",
     "title": "Chief Technology Officer",
@@ -112,7 +107,8 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     "instructionsBundle": {"files": {"AGENTS.md": "You are the CTO..."}},
     "runtimeConfig": {"heartbeat": {"enabled": false, "wakeOnDemand": true}},
     "sourceIssueId": "<issue-id>"
-  }'
+  }
+JSON
 ```
 
 ### 9. Handle governance state
@@ -122,32 +118,27 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
 - when the board approves, you will be woken with `PAPERCLIP_APPROVAL_ID`; read linked issues and close/comment follow-up
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/approvals/<approval-id>" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/approvals/<approval-id>"
 
-curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/<approval-id>/comments" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"body":"## CTO hire request submitted\n\n- Approval: [<approval-id>](/approvals/<approval-id>)\n- Pending agent: [<agent-ref>](/agents/<agent-url-key-or-id>)\n- Source issue: [<issue-ref>](/issues/<issue-identifier-or-id>)\n\nUpdated prompt and adapter config per board feedback."}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/approvals/<approval-id>/comments" --body-stdin <<'JSON'
+{"body":"## CTO hire request submitted\n\n- Approval: [<approval-id>](/approvals/<approval-id>)\n- Pending agent: [<agent-ref>](/agents/<agent-url-key-or-id>)\n- Source issue: [<issue-ref>](/issues/<issue-identifier-or-id>)\n\nUpdated prompt and adapter config per board feedback."}
+JSON
 ```
 
 If the approval already exists and needs manual linking to the issue:
 
 ```sh
-curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/<issue-id>/approvals" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"approvalId":"<approval-id>"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/issues/<issue-id>/approvals" --body-stdin <<'JSON'
+{"approvalId":"<approval-id>"}
+JSON
 ```
 
 After approval is granted, run this follow-up loop:
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/approvals/$PAPERCLIP_APPROVAL_ID" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/approvals/$PAPERCLIP_APPROVAL_ID"
 
-curl -sS "$PAPERCLIP_API_URL/api/approvals/$PAPERCLIP_APPROVAL_ID/issues" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/approvals/$PAPERCLIP_APPROVAL_ID/issues"
 ```
 
 For each linked issue, either:

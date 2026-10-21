@@ -1,6 +1,6 @@
 # Paperclip API Reference
 
-Detailed reference for the Paperclip control plane API. For the core heartbeat procedure and critical rules, see the main `SKILL.md`.
+Detailed reference for the Paperclip control plane API. For the core heartbeat procedure, critical rules, and `PAPERCLIP_SKILL_DIR` setup used by API examples, see the main `SKILL.md`.
 
 ---
 
@@ -1358,18 +1358,10 @@ Terminal states: `done`, `cancelled`
 Keep the credential in memory or pass it directly from the secure source; do not place the literal value in the command text or echo it. The example assumes `PROPOSED_SECRET_VALUE` is already populated without printing it:
 
 ```bash
-PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
-PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
-jq -n \
-  --arg name "integrations/vendor/api-token" \
-  --arg value "$PROPOSED_SECRET_VALUE" \
-  --arg justification "Credential supplied for the current task" \
-  '{kind:"secret", name:$name, value:$value, justification:$justification}' |
-curl -s -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  --data-binary @- \
-  "$PAPERCLIP_API_BASE/api/agents/me/secret-proposals"
+export PROPOSED_SECRET_VALUE
+python3 -c 'import json, os; print(json.dumps({"kind":"secret", "name":"integrations/vendor/api-token", "value":os.environ["PROPOSED_SECRET_VALUE"], "justification":"Credential supplied for the current task"}))' |
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+    /api/agents/me/secret-proposals --body-stdin
 unset PROPOSED_SECRET_VALUE
 ```
 
@@ -1395,11 +1387,8 @@ jq -n \
   --arg configPath "env.VENDOR_API_TOKEN" \
   --arg justification "Inject the approved credential into my adapter environment" \
   '{kind:"binding", secretProposalId:$secretProposalId, configPath:$configPath, justification:$justification}' |
-curl -s -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  --data-binary @- \
-  "$PAPERCLIP_API_BASE/api/agents/me/secret-proposals"
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+    /api/agents/me/secret-proposals --body-stdin
 ```
 
 A binding must specify exactly one of `secretProposalId` or `secretId`. `configPath` accepts `env.<KEY>` for environment injection or `access.<ALIAS>` for API-only access. Under the default `self_and_reports` policy, `targetAgentId` may identify a downward report of the proposer; omitting it targets the proposer. Other targets are denied, and approval rechecks the current chain of command.

@@ -25,6 +25,10 @@ async function swipeToLastOption(page: Page, picker: Locator, list = picker.getB
   expect(targetHandle).not.toBeNull();
   try {
     expect(await list.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+    // A picker can restore an earlier scroll position. Start each touch proof
+    // at the top so reaching the last option requires a real gesture.
+    await list.evaluate((element) => { element.scrollTop = 0; });
+    await expect.poll(() => list.evaluate((element) => element.scrollTop)).toBe(0);
     let touchScrolled = false;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       // Momentum can finish between protocol round trips. Observe geometry and
@@ -88,6 +92,7 @@ test("touch scroll observation stays valid when momentum finishes between browse
     await list.evaluate((element) => { element.scrollTop = element.scrollHeight - element.clientHeight; });
     return beforeMomentum;
   };
+  await list.evaluate((element) => { element.scrollTop = element.scrollHeight - element.clientHeight; });
   await swipeToLastOption(page, picker, list, last);
   await expect(picker).toBeVisible();
 });

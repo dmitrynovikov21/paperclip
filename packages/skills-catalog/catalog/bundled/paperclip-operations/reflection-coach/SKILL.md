@@ -58,11 +58,12 @@ Every proposal must satisfy all of these:
 
 ## Procedure
 
+For the API examples, set `PAPERCLIP_SKILL_DIR` to the absolute directory of the installed `paperclip` skill in the same shell. From a Paperclip source checkout root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`; check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"`.
+
 ### 1) Confirm target and scope
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/agents/<targetAgentId>" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/<targetAgentId>"
 ```
 
 Record `name`, `role`, `reportsTo`, `adapterType`, `adapterConfig.instructionsFilePath` (where `AGENTS.md` lives), and current assigned skills via `GET /api/agents/<targetAgentId>/skills`. Refuse and exit if `targetAgentId == $PAPERCLIP_AGENT_ID`.
@@ -70,15 +71,15 @@ Record `name`, `role`, `reportsTo`, `adapterType`, `adapterConfig.instructionsFi
 ### 2) Pull the recent record
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=<targetAgentId>&status=done,in_review,blocked&limit=25" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET \
+  "/api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=<targetAgentId>&status=done,in_review,blocked&limit=25"
 ```
 
 For each issue, pull the trajectory substrate — the issue body and its comments:
 
 ```sh
-curl -sS "$PAPERCLIP_API_URL/api/issues/<issueId>" -H "Authorization: Bearer $PAPERCLIP_API_KEY"
-curl -sS "$PAPERCLIP_API_URL/api/issues/<issueId>/comments" -H "Authorization: Bearer $PAPERCLIP_API_KEY"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/<issueId>"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/<issueId>/comments"
 ```
 
 Keep status transitions, blocker reasons, reviewer comments, approval outcomes, human corrections, and PR-link comments. Comments are the closest thing Paperclip has to an execution trace — treat them as first-class evidence.

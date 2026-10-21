@@ -384,11 +384,9 @@ export TWEET_WORK_ISSUE="$(
     --json | jq -r '.id'
 )"
 
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  --data "$(jq -cn --arg issueId "$TWEET_WORK_ISSUE" '{ issueId: $issueId, role: "work" }')" \
-  "$PAPERCLIP_API_URL/api/cases/$TWEET_CASE/issue-links" >/dev/null
+jq -cn --arg issueId "$TWEET_WORK_ISSUE" '{ issueId: $issueId, role: "work" }' |
+  python3 skills/paperclip/scripts/paperclip-api.py POST \
+    "/api/cases/$TWEET_CASE/issue-links" --body-stdin --discard-response
 
 paperclipai pipelines case edit \
   -C "$PAPERCLIP_COMPANY_ID" \

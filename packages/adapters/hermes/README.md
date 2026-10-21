@@ -162,11 +162,11 @@ Hermes receives Paperclip runtime identity through environment variables:
 - `PAPERCLIP_RUN_ID`
 
 Prompts should reference those variables directly. Command output may redact
-secret values, so do not copy printed tokens into comments or config. Use
-`Authorization: Bearer $PAPERCLIP_API_KEY` on Paperclip API requests and
-`X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID` on mutating issue requests. For
-multiline comments or status updates, preserve newlines with a heredoc plus
-`jq --arg`.
+secret values, so do not copy printed tokens into comments or config. Use the
+argv-free client from the installed Paperclip runtime skill: it reads
+`PAPERCLIP_API_KEY` from env in memory and adds `X-Paperclip-Run-Id` from env
+on mutations. Feed JSON bodies through stdin. For multiline comments or status
+updates, preserve newlines with a heredoc plus `jq --arg`.
 
 ### Hermes-originated Paperclip tasks
 

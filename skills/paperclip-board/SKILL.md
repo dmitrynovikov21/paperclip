@@ -16,9 +16,9 @@ You are a board-level assistant helping a human manage their AI-agent company th
 - `PAPERCLIP_API_URL` — base URL of the Paperclip server (e.g., `http://localhost:3100`)
 - `PAPERCLIP_COMPANY_ID` — the active company ID (may be empty if no company exists yet)
 
-**Auth mode:** In `local_trusted` mode (default for local dev), no auth headers are needed — the server auto-grants board access to all local requests. If `PAPERCLIP_API_KEY` is set, include `Authorization: Bearer $PAPERCLIP_API_KEY` on all requests.
+**Auth mode:** In `local_trusted` mode (default for local dev), no auth headers are needed. If `PAPERCLIP_API_KEY` is set, the API helper reads it from env in memory and sends the bearer header without putting its value in argv.
 
-**Making API calls:** Use `curl -sS` via bash. All endpoints are under `/api`. All request/response bodies are JSON. Always use `Content-Type: application/json` on POST/PATCH/PUT requests.
+**Making API calls:** Set `PAPERCLIP_SKILL_DIR` to the absolute directory of the installed `paperclip` skill (the sibling of this `paperclip-board` skill); from a source repository root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`. Set it in each shell that runs an example and check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"`. Use `python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"` via the shell. Its authenticated requests are argv-free; JSON request bodies come from stdin. All API endpoints are under `/api`. The helper supplies `Content-Type: application/json` for body requests.
 
 **Critical rules:**
 - Always re-read a document or config from the API before modifying it (write-path freshness)
@@ -39,7 +39,7 @@ Every time you begin a new conversation with the user:
 
 ```bash
 # Fetch dashboard
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/dashboard"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/dashboard"
 ```
 
 Present the dashboard as:
@@ -63,16 +63,16 @@ Guide the user through these steps when they're setting up for the first time.
 
 ```bash
 # List existing companies
-curl -sS "$PAPERCLIP_API_URL/api/companies"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies"
 
 # Create a new company
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies" --body-stdin <<'JSON'
+{
     "name": "Company Name",
     "description": "Company mission / description",
     "budgetMonthlyCents": 50000
-  }'
+  }
+JSON
 ```
 
 Ask the user for:
@@ -85,9 +85,9 @@ The response includes the company `id` and auto-generated `issuePrefix`. Tell th
 After creating, set `PAPERCLIP_COMPANY_ID` for subsequent calls. Also set `requireBoardApprovalForNewAgents: true` so all hires go through governance:
 
 ```bash
-curl -sS -X PATCH "$PAPERCLIP_API_URL/api/companies/{companyId}" \
-  -H "Content-Type: application/json" \
-  -d '{"requireBoardApprovalForNewAgents": true}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PATCH "/api/companies/{companyId}" --body-stdin <<'JSON'
+{"requireBoardApprovalForNewAgents": true}
+JSON
 ```
 
 ### Step 2: Create the CEO Agent
@@ -96,18 +96,17 @@ The CEO is the first agent. Use the agent-hire endpoint:
 
 ```bash
 # Discover available adapters
-curl -sS "$PAPERCLIP_API_URL/llms/agent-configuration.txt"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-configuration.txt"
 
 # Read adapter-specific docs (e.g., claude_local)
-curl -sS "$PAPERCLIP_API_URL/llms/agent-configuration/claude_local.txt"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-configuration/claude_local.txt"
 
 # Discover available icons
-curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/llms/agent-icons.txt"
 
 # Submit hire request
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" --body-stdin <<'JSON'
+{
     "name": "CEO Name",
     "role": "ceo",
     "title": "Chief Executive Officer",
@@ -123,7 +122,8 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     },
     "permissions": {"canCreateAgents": true},
     "budgetMonthlyCents": 10000
-  }'
+  }
+JSON
 ```
 
 Guide the user through:
@@ -138,12 +138,12 @@ If the company has `requireBoardApprovalForNewAgents: true`, the hire will need 
 
 ```bash
 # Check pending approvals
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/approvals?status=pending"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/approvals?status=pending"
 
 # Approve the CEO hire
-curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/{approvalId}/approve" \
-  -H "Content-Type: application/json" \
-  -d '{"decisionNote": "CEO hire approved by board during onboarding"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/approvals/{approvalId}/approve" --body-stdin <<'JSON'
+{"decisionNote": "CEO hire approved by board during onboarding"}
+JSON
 ```
 
 ### Step 3: Create the Board Operations Issue
@@ -151,26 +151,26 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/{approvalId}/approve" \
 Create a standing issue for decision logging and board operations:
 
 ```bash
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/issues" --body-stdin <<'JSON'
+{
     "title": "Board Operations",
     "description": "Standing issue for board decision log and operations tracking",
     "status": "in_progress",
     "priority": "medium"
-  }'
+  }
+JSON
 ```
 
 Then create the decision log document:
 
 ```bash
-curl -sS -X PUT "$PAPERCLIP_API_URL/api/issues/{boardIssueId}/documents/decision-log" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PUT "/api/issues/{boardIssueId}/documents/decision-log" --body-stdin <<'JSON'
+{
     "title": "Decision Log",
     "format": "markdown",
     "body": "# Decision Log — {Company Name}\n\n## {today date}\n- Created company {name} with mission: {description}\n- Hired CEO agent \"{ceo name}\"\n"
-  }'
+  }
+JSON
 ```
 
 Also write this to a local file at `./artifacts/decision-log.md` so the user can view it directly.
@@ -180,8 +180,7 @@ Also write this to a local file at `./artifacts/decision-log.md` so the user can
 Start the CEO's first heartbeat:
 
 ```bash
-curl -sS -X POST "$PAPERCLIP_API_URL/api/agents/{ceoId}/heartbeat/invoke" \
-  -H "Content-Type: application/json"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/agents/{ceoId}/heartbeat/invoke"
 ```
 
 ## Hiring Plan Loop
@@ -194,23 +193,23 @@ When the user wants to build a hiring plan:
 
 ```bash
 # Create the hiring plan issue
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/issues" --body-stdin <<'JSON'
+{
     "title": "Hiring Plan",
     "description": "Develop and execute the team hiring plan",
     "status": "in_progress",
     "priority": "high"
-  }'
+  }
+JSON
 
 # Attach the plan document
-curl -sS -X PUT "$PAPERCLIP_API_URL/api/issues/{issueId}/documents/hiring-plan" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PUT "/api/issues/{issueId}/documents/hiring-plan" --body-stdin <<'JSON'
+{
     "title": "Hiring Plan",
     "format": "markdown",
     "body": "# Hiring Plan\n\n## Roles\n\n### 1. Role Name\n- Focus: ...\n- Reports to: ...\n- Budget: ...\n"
-  }'
+  }
+JSON
 ```
 
 3. **Also write a local file** at `./artifacts/hiring-plan.md` so the user can open and edit it directly.
@@ -259,12 +258,11 @@ For each agent to hire:
 
 ```bash
 # Compare existing agent configurations
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-configurations"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/agent-configurations"
 
 # Submit hire request
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" --body-stdin <<'JSON'
+{
     "name": "Agent Name",
     "role": "general",
     "title": "Role Title",
@@ -281,7 +279,8 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
       "heartbeat": {"enabled": true, "intervalSec": 300, "wakeOnDemand": true}
     },
     "budgetMonthlyCents": 5000
-  }'
+  }
+JSON
 ```
 
 ### Cross-Agent Escalation Path Updates
@@ -315,14 +314,14 @@ Approve these updates? (approve all / review individually / edit)
 
 ```bash
 # Fetch current config first (write-path freshness)
-curl -sS "$PAPERCLIP_API_URL/api/agents/{agentId}"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/{agentId}"
 
 # Update the agent's config with new escalation paths
-curl -sS -X PATCH "$PAPERCLIP_API_URL/api/agents/{agentId}" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PATCH "/api/agents/{agentId}" --body-stdin <<'JSON'
+{
     "adapterConfig": { ... updated config with new Collaboration section ... }
-  }'
+  }
+JSON
 ```
 
 5. Log the changes and reasoning in the decision log.
@@ -331,22 +330,22 @@ curl -sS -X PATCH "$PAPERCLIP_API_URL/api/agents/{agentId}" \
 
 ```bash
 # List pending approvals
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/approvals?status=pending"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/approvals?status=pending"
 
 # Approve
-curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/{id}/approve" \
-  -H "Content-Type: application/json" \
-  -d '{"decisionNote": "Approved by board"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/approvals/{id}/approve" --body-stdin <<'JSON'
+{"decisionNote": "Approved by board"}
+JSON
 
 # Reject
-curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/{id}/reject" \
-  -H "Content-Type: application/json" \
-  -d '{"decisionNote": "Reason for rejection"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/approvals/{id}/reject" --body-stdin <<'JSON'
+{"decisionNote": "Reason for rejection"}
+JSON
 
 # Request revision
-curl -sS -X POST "$PAPERCLIP_API_URL/api/approvals/{id}/request-revision" \
-  -H "Content-Type: application/json" \
-  -d '{"decisionNote": "Please adjust X, Y, Z"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/approvals/{id}/request-revision" --body-stdin <<'JSON'
+{"decisionNote": "Please adjust X, Y, Z"}
+JSON
 ```
 
 Present approvals as:
@@ -367,18 +366,17 @@ For batch approval: list all pending, let the user approve all or review individ
 
 ```bash
 # List open tasks
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=todo,in_progress,blocked"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/issues?status=todo,in_progress,blocked"
 
 # Get task detail
-curl -sS "$PAPERCLIP_API_URL/api/issues/{issueId}"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{issueId}"
 
 # Get task comments
-curl -sS "$PAPERCLIP_API_URL/api/issues/{issueId}/comments"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{issueId}/comments"
 
 # Create a task
-curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/companies/$PAPERCLIP_COMPANY_ID/issues" --body-stdin <<'JSON'
+{
     "title": "Task title",
     "description": "What needs to be done",
     "status": "todo",
@@ -386,20 +384,21 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues"
     "assigneeAgentId": "{agent-id}",
     "projectId": "{project-id}",
     "parentId": "{parent-issue-id}"
-  }'
+  }
+JSON
 
 # Update a task
-curl -sS -X PATCH "$PAPERCLIP_API_URL/api/issues/{issueId}" \
-  -H "Content-Type: application/json" \
-  -d '{"status": "done", "comment": "Completed"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PATCH "/api/issues/{issueId}" --body-stdin <<'JSON'
+{"status": "done", "comment": "Completed"}
+JSON
 
 # Add a comment
-curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/{issueId}/comments" \
-  -H "Content-Type: application/json" \
-  -d '{"body": "Comment text in markdown"}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/issues/{issueId}/comments" --body-stdin <<'JSON'
+{"body": "Comment text in markdown"}
+JSON
 
 # Search issues
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?q=search+term"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/issues?q=search+term"
 ```
 
 Present tasks as:
@@ -414,13 +413,13 @@ Present tasks as:
 
 ```bash
 # List all agents
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/agents"
 
 # Get agent detail
-curl -sS "$PAPERCLIP_API_URL/api/agents/{id}"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/{id}"
 
 # Get agent config revisions (change history)
-curl -sS "$PAPERCLIP_API_URL/api/agents/{id}/config-revisions"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/{id}/config-revisions"
 ```
 
 Present agents as:
@@ -440,16 +439,16 @@ Team Overview
 
 ```bash
 # Overall summary
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary"
 
 # Breakdown by agent
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-agent"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-agent"
 
 # Breakdown by project
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-project"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/costs/by-project"
 
 # Optional date range
-curl -sS "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary?from=2026-03-01&to=2026-03-31"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/companies/$PAPERCLIP_COMPANY_ID/costs/summary?from=2026-03-01&to=2026-03-31"
 ```
 
 Present costs as:
@@ -468,13 +467,13 @@ By Agent:
 
 ```bash
 # List work products for an issue
-curl -sS "$PAPERCLIP_API_URL/api/issues/{issueId}/work-products"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{issueId}/work-products"
 
 # View a document
-curl -sS "$PAPERCLIP_API_URL/api/issues/{issueId}/documents/{key}"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{issueId}/documents/{key}"
 
 # View document revisions
-curl -sS "$PAPERCLIP_API_URL/api/issues/{issueId}/documents/{key}/revisions"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{issueId}/documents/{key}/revisions"
 ```
 
 Present work products with status and links:
@@ -495,12 +494,12 @@ Three ways the user can edit system prompts:
 **In chat:** User describes changes, you update via API:
 ```bash
 # Always re-fetch before modifying
-curl -sS "$PAPERCLIP_API_URL/api/agents/{id}"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/{id}"
 
 # Then update
-curl -sS -X PATCH "$PAPERCLIP_API_URL/api/agents/{id}" \
-  -H "Content-Type: application/json" \
-  -d '{"adapterConfig": { ... updated config ... }}'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PATCH "/api/agents/{id}" --body-stdin <<'JSON'
+{"adapterConfig": { ... updated config ... }}
+JSON
 ```
 
 **Direct file edit:** If the agent uses `instructionsFilePath`, the user can edit the file directly. When they tell you they're done, re-read the file and confirm changes.
@@ -509,7 +508,7 @@ curl -sS -X PATCH "$PAPERCLIP_API_URL/api/agents/{id}" \
 
 **Viewing change history:**
 ```bash
-curl -sS "$PAPERCLIP_API_URL/api/agents/{id}/config-revisions"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/agents/{id}/config-revisions"
 ```
 
 Present as a changelog:
@@ -544,17 +543,17 @@ Maintain a decision log for session continuity. Log major decisions — not ever
 1. Update the API document:
 ```bash
 # Fetch current log
-curl -sS "$PAPERCLIP_API_URL/api/issues/{boardIssueId}/documents/decision-log"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET "/api/issues/{boardIssueId}/documents/decision-log"
 
 # Update with new entries appended
-curl -sS -X PUT "$PAPERCLIP_API_URL/api/issues/{boardIssueId}/documents/decision-log" \
-  -H "Content-Type: application/json" \
-  -d '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PUT "/api/issues/{boardIssueId}/documents/decision-log" --body-stdin <<'JSON'
+{
     "title": "Decision Log",
     "format": "markdown",
     "body": "... existing content ... \n\n## {date}\n- New decision\n",
     "baseRevisionId": "{current revision id}"
-  }'
+  }
+JSON
 ```
 2. Also update the local file at `./artifacts/decision-log.md`.
 

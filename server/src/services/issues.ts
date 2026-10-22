@@ -64,6 +64,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  truncateUnicodeString,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -791,7 +792,9 @@ function chunkList<T>(values: T[], size: number): T[][] {
 function truncateInlineSummary(value: string | null | undefined, maxChars = CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS) {
   const normalized = value?.trim();
   if (!normalized) return null;
-  return normalized.length > maxChars ? `${normalized.slice(0, Math.max(0, maxChars - 15)).trimEnd()} [truncated]` : normalized;
+  return normalized.length > maxChars
+    ? `${truncateUnicodeString(normalized, Math.max(0, maxChars - 15)).trimEnd()} [truncated]`
+    : normalized;
 }
 
 function truncateByCodePoint(value: string, maxChars: number): string {

@@ -268,7 +268,7 @@ describe("server adapter registry", () => {
     await expect(listAdapterModelProfiles("codex_local")).resolves.toEqual([
       expect.objectContaining({
         key: "cheap",
-        adapterConfig: {},
+        adapterConfig: { model: "gpt-6-luna", modelReasoningEffort: "low" },
         source: "adapter_default",
       }),
     ]);

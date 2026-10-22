@@ -22,6 +22,16 @@ function issue(overrides: Partial<TaskWatchdogClassifierIssue> = {}): TaskWatchd
   };
 }
 
+function stoppedChild(overrides: Partial<TaskWatchdogClassifierIssue> = {}): TaskWatchdogClassifierIssue {
+  return issue({
+    id: childId,
+    parentId: sourceId,
+    status: "blocked",
+    assigneeAgentId: null,
+    ...overrides,
+  });
+}
+
 function classify(overrides: Partial<Parameters<typeof classifyTaskWatchdogSubtree>[0]> = {}) {
   return classifyTaskWatchdogSubtree({
     watchdog: {
@@ -220,19 +230,13 @@ describe("task watchdog subtree classifier", () => {
       pendingInteractions: [{ companyId, issueId: childId, id: "interaction-2", status: "pending" }],
     }],
     ["status", {
-      issues: [issue({ status: "in_progress" }), issue({ id: childId, parentId: sourceId, status: "todo" })],
+      issues: [issue({ status: "in_progress" }), stoppedChild({ status: "todo" })],
     }],
     ["assigneeAgentId", {
-      issues: [
-        issue({ status: "in_progress" }),
-        issue({ id: childId, parentId: sourceId, status: "blocked", assigneeAgentId: "agent-2" }),
-      ],
+      issues: [issue({ status: "in_progress" }), stoppedChild({ assigneeAgentId: "agent-2" })],
     }],
     ["assigneeUserId", {
-      issues: [
-        issue({ status: "in_progress" }),
-        issue({ id: childId, parentId: sourceId, status: "blocked", assigneeUserId: "user-2" }),
-      ],
+      issues: [issue({ status: "in_progress" }), stoppedChild({ assigneeUserId: "user-2" })],
     }],
     ["blockerIssueIds", {
       blockers: [{ companyId, blockedIssueId: childId, blockerIssueId: "blocker-2" }],
@@ -243,13 +247,13 @@ describe("task watchdog subtree classifier", () => {
     ["new stopped leaf", {
       issues: [
         issue({ status: "in_progress" }),
-        issue({ id: childId, parentId: sourceId, status: "blocked" }),
+        stoppedChild(),
         issue({ id: "child-2", parentId: sourceId, status: "blocked" }),
       ],
     }],
   ])("triggers a fresh stop when the %s changes", (_label, overrides) => {
     const baseInput = {
-      issues: [issue({ status: "in_progress" }), issue({ id: childId, parentId: sourceId, status: "blocked" })],
+      issues: [issue({ status: "in_progress" }), stoppedChild()],
       pendingInteractions: [{ companyId, issueId: childId, id: "interaction-1", status: "pending" }],
       blockers: [{ companyId, blockedIssueId: childId, blockerIssueId: "blocker-1" }],
     };

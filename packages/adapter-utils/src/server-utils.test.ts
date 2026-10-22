@@ -2089,6 +2089,37 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).toContain("No board-supplied watchdog instructions. Apply the mandate above.");
   });
 
+  it("renders the recovery owner handoff without advertising a blocked PATCH", () => {
+    const prompt = renderPaperclipWakePrompt({
+      ...baseWatchdogPayload,
+      taskWatchdog: {
+        watchedIssueId: "watched-issue-1",
+        watchedIssueIdentifier: "PAP-8000",
+        capabilities: {
+          operations: ["comment_on_watched_subtree_issues", "update_reusable_watchdog_issue"],
+          deniedOperations: [
+            "transition_watched_subtree_issue_status",
+            "reassign_watched_subtree_issues",
+          ],
+          recoveryHandoffs: [{
+            issueId: "watched-issue-1",
+            issueIdentifier: "PAP-8000",
+            recoveryActionId: "recovery-1",
+            recoveryOwnerType: "agent",
+            recoveryOwnerAgentId: "owner-agent-1",
+            recoveryOwnerUserId: null,
+          }],
+        },
+      },
+    });
+
+    expect(prompt).toContain("Allowed operations: comment_on_watched_subtree_issues, update_reusable_watchdog_issue.");
+    expect(prompt).toContain("Denied operations: transition_watched_subtree_issue_status, reassign_watched_subtree_issues.");
+    expect(prompt).toContain("action recovery-1 belongs to agent owner-agent-1");
+    expect(prompt).toContain("do not PATCH or comment on this watched issue");
+    expect(prompt).toContain("If the action already supplies a live path, record that finding on the reusable watchdog issue");
+  });
+
   it("appends board-supplied custom instructions after the default mandate with an explicit non-override reminder", () => {
     const prompt = renderPaperclipWakePrompt({
       ...baseWatchdogPayload,

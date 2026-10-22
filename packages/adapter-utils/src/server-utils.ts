@@ -215,6 +215,14 @@ type PaperclipWakeTaskWatchdogLeaf = {
 type PaperclipWakeTaskWatchdogCapabilities = {
   operations: string[];
   deniedOperations: string[];
+  recoveryHandoffs: Array<{
+    issueId: string;
+    issueIdentifier: string | null;
+    recoveryActionId: string;
+    recoveryOwnerType: string;
+    recoveryOwnerAgentId: string | null;
+    recoveryOwnerUserId: string | null;
+  }>;
   targetScope: {
     watchedIssueId: string | null;
     watchedIssueIdentifier: string | null;
@@ -1108,6 +1116,21 @@ const MAX_WATCHDOG_INSTRUCTIONS_CHARS = 4_000;
 const MAX_WATCHDOG_LEAF_SUMMARIES = 25;
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
+function normalizePaperclipWakeTaskWatchdogRecoveryHandoff(value: unknown) {
+  const handoff = parseObject(value);
+  const issueId = asString(handoff.issueId, "").trim();
+  const recoveryActionId = asString(handoff.recoveryActionId, "").trim();
+  if (!issueId || !recoveryActionId) return null;
+  return {
+    issueId,
+    issueIdentifier: asString(handoff.issueIdentifier, "").trim() || null,
+    recoveryActionId,
+    recoveryOwnerType: asString(handoff.recoveryOwnerType, "").trim() || "unknown",
+    recoveryOwnerAgentId: asString(handoff.recoveryOwnerAgentId, "").trim() || null,
+    recoveryOwnerUserId: asString(handoff.recoveryOwnerUserId, "").trim() || null,
+  };
+}
+
 function normalizePaperclipWakeTaskWatchdogLeaf(value: unknown): PaperclipWakeTaskWatchdogLeaf | null {
   const leaf = parseObject(value);
   const id = asString(leaf.id, "").trim() || null;
@@ -1133,6 +1156,12 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
   const capabilities = parseObject(value);
   const operations = normalizeStringList(capabilities.operations, MAX_WATCHDOG_CAPABILITY_ITEMS);
   const deniedOperations = normalizeStringList(capabilities.deniedOperations, MAX_WATCHDOG_CAPABILITY_ITEMS);
+  const recoveryHandoffs = Array.isArray(capabilities.recoveryHandoffs)
+    ? capabilities.recoveryHandoffs
+        .slice(0, MAX_WATCHDOG_CAPABILITY_ITEMS)
+        .map((entry) => normalizePaperclipWakeTaskWatchdogRecoveryHandoff(entry))
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+    : [];
   const targetScopeRaw = parseObject(capabilities.targetScope);
   const targetScope = {
     watchedIssueId: asString(targetScopeRaw.watchedIssueId, "").trim() || null,
@@ -1148,10 +1177,11 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
       targetScope.includeNonWatchdogDescendants ||
       targetScope.excludedOriginKinds.length > 0,
   );
-  if (operations.length === 0 && deniedOperations.length === 0 && !hasTargetScope) return null;
+  if (operations.length === 0 && deniedOperations.length === 0 && recoveryHandoffs.length === 0 && !hasTargetScope) return null;
   return {
     operations,
     deniedOperations,
+    recoveryHandoffs,
     targetScope: hasTargetScope ? targetScope : null,
   };
 }
@@ -1828,6 +1858,21 @@ export function renderPaperclipWakePrompt(
       }
       if (watchdog.capabilities.deniedOperations.length > 0) {
         lines.push(`- Denied operations: ${watchdog.capabilities.deniedOperations.join(", ")}.`);
+      }
+      if (watchdog.capabilities.recoveryHandoffs.length > 0) {
+        lines.push("- Recovery-owner handoffs (recheck each action before acting):");
+        for (const handoff of watchdog.capabilities.recoveryHandoffs) {
+          const owner = handoff.recoveryOwnerAgentId
+            ? `agent ${handoff.recoveryOwnerAgentId}`
+            : handoff.recoveryOwnerUserId
+              ? `user ${handoff.recoveryOwnerUserId}`
+              : handoff.recoveryOwnerType;
+          lines.push(
+            `  - ${handoff.issueIdentifier ?? handoff.issueId}: action ${handoff.recoveryActionId} belongs to ${owner}. ` +
+            "Handoff: that owner resolves the recovery action. While it is active, do not PATCH or comment on this watched issue. " +
+            "If the action already supplies a live path, record that finding on the reusable watchdog issue.",
+          );
+        }
       }
     }
     if (watchdog.terminalLeafSummaries.length > 0) {

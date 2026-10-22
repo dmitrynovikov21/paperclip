@@ -1679,6 +1679,35 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("keeps recovery-owned issue PATCH under the recovery owner", async () => {
+    const blockedIssue = makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" });
+    mockIssueService.getById.mockResolvedValue(blockedIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...blockedIssue,
+      ...patch,
+    }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId,
+    });
+
+    const outsider = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked", title: "Unauthorized recovery edit" });
+    expect(outsider.status, JSON.stringify(outsider.body)).toBe(403);
+    expect(outsider.body.error).toBe("Agent cannot resolve another owner's recovery action");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const owner = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "blocked", title: "Recovery owner edit" });
+    expect(owner.status, JSON.stringify(owner.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Recovery owner edit" }),
+    );
+  });
+
   it("rejects peer-agent recovery resolution on a board-owned source issue", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),

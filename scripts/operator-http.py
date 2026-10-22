@@ -5,7 +5,6 @@ import argparse
 import http.client
 import os
 from pathlib import Path
-import select
 import sys
 import time
 from urllib.error import HTTPError, URLError
@@ -80,15 +79,21 @@ def auth_headers(kind, url):
 def redact_error_body(body):
     # Expected policy denials have useful JSON bodies, but an upstream may echo
     # credentials on an error path. Keep those values out of stdout and files.
+    secrets = set()
     for name in ("BOARD_API_KEY", "PAPERCLIP_API_KEY", "PAPERCLIP_AUTH_HEADER",
                  "PAPERCLIP_COOKIE", "GATEWAY_TOKEN", "HERMES_GATEWAY_API_KEY"):
         value = os.environ.get(name, "")
         if value:
-            body = body.replace(value.encode(), b"[redacted]")
+            secrets.add(value)
             if value.startswith("Bearer "):
-                body = body.replace(value[7:].encode(), b"[redacted]")
-            if name == "PAPERCLIP_COOKIE" and "=" in value:
-                body = body.replace(value.split("=", 1)[1].encode(), b"[redacted]")
+                secrets.add(value[7:])
+            if name == "PAPERCLIP_COOKIE":
+                for cookie in value.split(";"):
+                    _, separator, cookie_value = cookie.strip().partition("=")
+                    if separator and cookie_value:
+                        secrets.add(cookie_value.strip('"'))
+    for secret in sorted(secrets - {""}, key=len, reverse=True):
+        body = body.replace(secret.encode(), b"[redacted]")
     return body
 
 
@@ -135,8 +140,11 @@ def main():
                             if response.isclosed():
                                 break
                             remaining = deadline - time.monotonic()
-                            if remaining <= 0 or not select.select([response], [], [], remaining)[0]:
+                            if remaining <= 0:
                                 raise TimeoutError("stream deadline exceeded")
+                            # read1 can return bytes already buffered by HTTPResponse
+                            # even when select() says the socket has no new bytes.
+                            response.fp.raw._sock.settimeout(remaining)
                             chunk = response.read1(4096)
                             if not chunk:
                                 break

@@ -2,12 +2,14 @@
 """Synthetic request and process regression for operator HTTP commands."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import os
 from pathlib import Path
 import re
 import secrets
 import subprocess
 import sys
+import tempfile
 from threading import Event, Thread
 import time
 import unittest
@@ -51,6 +53,9 @@ class MockHandler(BaseHTTPRequestHandler):
         self.release.wait(timeout=5)
         if self.path == "/api/error":
             status, body = 401, self.marker.encode()
+        elif self.path == "/api/cookie-error":
+            cookie_value = self.headers.get("Cookie", "").rsplit(";", 1)[-1].strip().partition("=")[2]
+            status, body = 401, json.dumps({"error": cookie_value}).encode()
         elif self.path == "/api/redirect":
             self.send_response(302)
             self.send_header("Location", "http://127.0.0.1:1/api/probe")
@@ -202,6 +207,27 @@ class OperatorHttpTest(unittest.TestCase):
         result = self.invoke("/api/redirect", "GET", "--auth", "board")
         self.assertEqual(result.returncode, 1)
         self.assertFalse(self.marker.encode() in result.stdout + result.stderr)
+
+    def test_second_cookie_value_is_redacted_from_error_output(self):
+        cookie_secret = secrets.token_urlsafe(24)
+        env = self.env("/api/cookie-error")
+        env["PAPERCLIP_API_KEY"] = ""
+        env["PAPERCLIP_COOKIE"] = "session=stub; auth=" + cookie_secret
+
+        result = self.invoke("/api/cookie-error", "GET", "--auth", "paperclip",
+                             "--allow-http-error", "--append-status", env=env)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"[redacted]", result.stdout)
+        self.assertTrue(result.stdout.endswith(b"401\n"))
+        self.assertNotIn(cookie_secret.encode(), result.stdout + result.stderr)
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR") or None) as tempdir:
+            output = Path(tempdir) / "response.json"
+            result = self.invoke("/api/cookie-error", "GET", "--auth", "paperclip",
+                                 "--allow-http-error", "--status-only", "--output", str(output), env=env)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"401\n")
+            self.assertNotIn(cookie_secret.encode(), output.read_bytes() + result.stderr)
 
     def test_smoke_request_functions_reach_mock_with_auth_outside_argv(self):
         for script in SMOKES:

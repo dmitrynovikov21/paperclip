@@ -60,6 +60,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),
   enableMemoryConnectors: z.boolean().default(false),
+  enablePaperclipNotebook: z.boolean().default(false),
   enableCases: z.boolean().default(false),
   enableAgentChat: z.boolean().default(false),
   enableCombinedInboxTasks: z.boolean().default(false),

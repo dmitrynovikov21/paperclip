@@ -1,5 +1,6 @@
 import { authorizationService } from "../authorization.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
+import { insertIssueComment } from "../issue-comment-writes.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { normalizeAgentNameKey } from "./retries.js";
@@ -147,7 +148,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { allowsIssueInteractionWake } from "../../modules/run-dispatch/index.js";
+import { allowsIssueInteractionWake, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -3774,7 +3775,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   updatedAt: now,
                 })
                 .where(eq(issues.id, issue.id));
-              await tx.insert(issueComments).values({
+              await insertIssueComment(tx, {
                 companyId: issue.companyId,
                 issueId: issue.id,
                 body: blockedComment,
@@ -4414,10 +4415,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ? null
             : (sameScopeRunningRun ?? null)));
 
-    const coalescedTargetRun = filterZombieCoalesceTarget(
-      rawCoalescedTarget,
-      liveRunExecutions,
-    );
+    // A reviewed chat run attests one conversation, so never fold another
+    // conversation's reply into it; that reply queues its own run instead.
+    const coalescedTargetRun = rawCoalescedTarget &&
+      wakeChatConversationsConflict(rawCoalescedTarget.contextSnapshot, enrichedContextSnapshot)
+      ? null
+      : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -4775,6 +4778,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       try {
         const wakeRun = await enqueueWakeup(candidate.agentId, {
+          allowRunCoalescing: false,
           source: candidate.source as WakeupOptions["source"],
           triggerDetail: (candidate.triggerDetail ??
             "system") as WakeupOptions["triggerDetail"],

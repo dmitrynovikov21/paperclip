@@ -79,6 +79,7 @@ import {
   NativeChatReviewPresentationContentionError,
 } from "../native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "../native-runtime/chat-attachment-reuse.js";
+import { CHAT_CONVERSATION_ID_KEY } from "../../modules/run-dispatch/index.js";
 import { projectSafeChatPublication } from "../chat-publication-projection.js";
 
 import {
@@ -1598,6 +1599,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           } : {}),
           taskKey: source.taskKey,
           source: `chat:${source.provider}`,
+          [CHAT_CONVERSATION_ID_KEY]: source.conversationId,
           wakeCommentId: source.commentIds.at(-1)!,
           wakeCommentIds: source.commentIds,
           retryOfRunId: source.failedRunId,

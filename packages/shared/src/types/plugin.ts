@@ -610,13 +610,16 @@ export interface PluginDatabaseDeclaration {
 export type PluginApiRouteCompanyResolution =
   | { from: "body"; key: string }
   | { from: "query"; key: string }
-  | { from: "issue"; param: string };
+  | { from: "issue"; param: string }
+  | { from: "agent"; param: string };
 
 export interface PluginApiRouteDeclaration {
   /** Stable plugin-defined route key passed to the worker. */
   routeKey: string;
   /** HTTP method accepted by this route. */
   method: PluginApiRouteMethod;
+  /** Browser WebSocket upgrade, authorized through the ordinary HTTP middleware. */
+  transport?: "websocket";
   /** Plugin-local path under `/api/plugins/:pluginId/api`, e.g. `/issues/:issueId/smoke`. */
   path: string;
   /** Actor class allowed to call the route. */

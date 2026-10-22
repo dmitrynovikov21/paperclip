@@ -1,6 +1,7 @@
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { createHeartbeatWorkspaceResolver, resolveExecutionWorkspaceReuseRequestForIssue } from "./heartbeat/workspaces.js";
 import { environmentService } from "./environments.js";
+import { classifyEnvironmentCapabilities, environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
@@ -111,7 +112,11 @@ describe("automatic retained workspace recovery", () => {
       fingerprint: runId, nextAction: "Manual repair required", evidence: { runId, workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: recovery } });
     const runtime = { resumeRunLease: vi.fn(async (_input: { lease: EnvironmentLease }) => ({ providerLeaseId, metadata: { remoteCwd: remote } })),
       retryPendingSandboxTeardown: vi.fn(async () => ({ providerLeaseId, state: "stopped" })) };
-    const input = { db, companyId, issueId, runId, actionId, environmentRuntime: runtime as never };
+    const environmentRuntime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox",
+      acquireRunLease: vi.fn(), releaseRunLease: vi.fn(), ...runtime,
+      resolveCapabilities: async () => classifyEnvironmentCapabilities({ verifiedMethods: [], declared: null, narrowing: null }),
+    }] });
+    const input = { db, companyId, issueId, runId, actionId, environmentRuntime };
     return { ...input, input, runtime, host, remote, lease, providerLeaseId };
   }
   const action = async (id: string) => (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, id)))[0]!;
@@ -282,6 +287,52 @@ describe("automatic retained workspace recovery", () => {
     expect(f.runtime.resumeRunLease).toHaveBeenCalledOnce();
     expect(await db.select().from(workspaceOperations).where(and(eq(workspaceOperations.companyId, f.companyId), eq(workspaceOperations.phase, "workspace_recovery")))).toHaveLength(1);
   }, 30_000);
+
+  it("recovers a protected retained source through the assembled environment runtime", async () => {
+    const f = await seed();
+    await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata,
+      workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", runId: f.runId },
+      remoteExecutionTermination: remoteTerminationReceipt(f.lease, { providerLeaseId: f.providerLeaseId, state: "stopped" }),
+    } }).where(eq(environmentLeases.id, f.lease.id));
+    const runtime = f.input.environmentRuntime;
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    const [environment] = await db.select().from(environments).where(eq(environments.id, lease.environmentId!));
+    expect(await runtime.resumeRunLease({ environment: environment as never, lease: lease as EnvironmentLease })).toBeNull();
+    expect(f.runtime.resumeRunLease).not.toHaveBeenCalled();
+    await recoverRetainedWorkspace({ ...f.input, environmentRuntime: runtime });
+    expect(readWorkspaceRecovery((await action(f.actionId)).evidence)?.status).toBe("recovered");
+    expect(await readFile(path.join(f.host, "saved.txt"), "utf8")).toBe("finished work\n");
+    expect(await readFile(path.join(f.host, "newer.txt"), "utf8")).toBe("newer local work\n");
+    expect(f.runtime.resumeRunLease).toHaveBeenCalledOnce();
+    await recoverRetainedWorkspace({ ...f.input, environmentRuntime: runtime });
+    expect(f.runtime.resumeRunLease).toHaveBeenCalledOnce();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+  }, 30_000);
+
+  it.each(["changed_claim", "missing_stop_intent", "wrong_lease", "wrong_environment"])(
+    "does not reopen a retained source without exact recovery authority: %s", async kind => {
+      const f = await seed();
+      const runtime = f.input.environmentRuntime;
+      const resume = runtime.resumeWorkspaceRecoveryLease.bind(runtime);
+      vi.spyOn(runtime, "resumeWorkspaceRecoveryLease").mockImplementationOnce(async input => {
+        if (kind === "changed_claim") await db.update(environmentLeases).set({ metadata: sql`
+          ${environmentLeases.metadata} || '{"pendingCleanupAttemptId":"other-owner"}'::jsonb`
+        }).where(eq(environmentLeases.id, f.lease.id));
+        if (kind === "missing_stop_intent") await db.update(environmentLeases).set({ metadata: sql`
+          ${environmentLeases.metadata} - 'sandboxStopAndRetain'`
+        }).where(eq(environmentLeases.id, f.lease.id));
+        return resume({ ...input,
+          ...(kind === "wrong_lease" ? { leaseId: randomUUID() } : {}),
+          ...(kind === "wrong_environment" ? { environmentId: randomUUID() } : {}),
+        });
+      });
+      await recoverRetainedWorkspace(f.input);
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.failure?.code).toBe("source_binding_invalid");
+      expect(f.runtime.resumeRunLease).not.toHaveBeenCalled();
+      expect(await readFile(path.join(f.remote, "saved.txt"), "utf8")).toBe("finished work\n");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+    }, 30_000);
 
   it("keeps verified copyback files in the preserved workspace on ordinary Retry", async () => {
     const f = await seed();

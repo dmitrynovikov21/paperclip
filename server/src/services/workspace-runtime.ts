@@ -1,3 +1,4 @@
+import { insertIssueComment } from "./issue-comment-writes.js";
 import { restoreGitWorkspaceContents } from "./git-workspace-contents.js";
 import { savedGitWorkspaceRestoration, ensureSavedGitCommit, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
 import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
@@ -1632,18 +1633,15 @@ async function writeDirtyQuarantineAuditComments(input: {
   let claimantAuditCommentId: string | null = null;
   const now = new Date();
   if (input.evidence.sourceIssueId) {
-    const [sourceComment] = await input.db
-      .insert(issueComments)
-      .values({
-        companyId: input.companyId,
-        issueId: input.evidence.sourceIssueId,
-        authorAgentId: null,
-        authorUserId: null,
-        authorType: "system",
-        createdByRunId: input.heartbeatRunId,
-        body,
-      })
-      .returning({ id: issueComments.id });
+    const [sourceComment] = await insertIssueComment(input.db, {
+      companyId: input.companyId,
+      issueId: input.evidence.sourceIssueId,
+      authorAgentId: null,
+      authorUserId: null,
+      authorType: "system",
+      createdByRunId: input.heartbeatRunId,
+      body,
+    });
     sourceAuditCommentId = sourceComment?.id ?? null;
     await input.db
       .update(issues)
@@ -1653,18 +1651,15 @@ async function writeDirtyQuarantineAuditComments(input: {
 
   const claimantIssueId = input.evidence.contention?.claimedByIssueId ?? null;
   if (claimantIssueId && claimantIssueId !== input.evidence.sourceIssueId) {
-    const [claimantComment] = await input.db
-      .insert(issueComments)
-      .values({
-        companyId: input.companyId,
-        issueId: claimantIssueId,
-        authorAgentId: null,
-        authorUserId: null,
-        authorType: "system",
-        createdByRunId: input.heartbeatRunId,
-        body,
-      })
-      .returning({ id: issueComments.id });
+    const [claimantComment] = await insertIssueComment(input.db, {
+      companyId: input.companyId,
+      issueId: claimantIssueId,
+      authorAgentId: null,
+      authorUserId: null,
+      authorType: "system",
+      createdByRunId: input.heartbeatRunId,
+      body,
+    });
     claimantAuditCommentId = claimantComment?.id ?? null;
     await input.db
       .update(issues)
@@ -3770,6 +3765,17 @@ export async function realizeExecutionWorkspace(input: {
   };
 }
 
+function isPersistedTaskDirectory(workspace: {
+  strategyType: string | null | undefined;
+  projectId: string | null | undefined;
+  projectWorkspaceId: string | null | undefined;
+  repoUrl: string | null | undefined;
+  metadata?: Record<string, unknown> | null;
+}): boolean {
+  return workspace.strategyType === "project_primary" && workspace.metadata?.source === "task_session"
+    && workspace.projectId === null && workspace.projectWorkspaceId === null && workspace.repoUrl === null;
+}
+
 export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   prepareRestoredLocalSource?: (sourceCwd: string) => Promise<() => Promise<void>>;
   persistContentsRestoredAt?: (at: string | null) => Promise<void>;
@@ -3807,13 +3813,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   if (!cwd) return null;
 
   const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
+  const taskDirectory = isPersistedTaskDirectory(input.workspace);
   const realized: RealizedExecutionWorkspace = {
     baseCwd: input.base.baseCwd,
-    source: input.workspace.mode === "shared_workspace" ? "project_primary" : "task_session",
+    source: input.workspace.mode === "shared_workspace" && !taskDirectory ? "project_primary" : "task_session",
     projectId: input.workspace.projectId === undefined ? input.base.projectId : input.workspace.projectId,
     workspaceId: input.workspace.projectWorkspaceId === undefined ? input.base.workspaceId : input.workspace.projectWorkspaceId,
-    repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,
-    repoRef: input.workspace.baseRef ?? input.base.repoRef,
+    repoUrl: taskDirectory ? null : input.workspace.repoUrl ?? input.base.repoUrl,
+    repoRef: taskDirectory ? null : input.workspace.baseRef ?? input.base.repoRef,
     additionalWorkspaces: input.base.additionalWorkspaces ?? [],
     strategy,
     cwd,
@@ -8898,7 +8905,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           : null,
         workspace: {
           baseCwd: row.cwd,
-          source: row.mode === "shared_workspace" ? "project_primary" : "task_session",
+          source: row.mode === "shared_workspace" && !isPersistedTaskDirectory(row) ? "project_primary" : "task_session",
           projectId: row.projectId,
           workspaceId: row.projectWorkspaceId ?? null,
           repoUrl: row.repoUrl ?? null,

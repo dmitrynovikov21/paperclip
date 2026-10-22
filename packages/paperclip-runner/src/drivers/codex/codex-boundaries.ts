@@ -259,6 +259,7 @@ export function codexToolAcceptsDisposition(
 export function codexToolAcceptsResult(
   tool: string,
   result: PrpStructuredRunResult,
+  serverResolvedContinuation = false,
 ): boolean {
   if (!codexToolAcceptsDisposition(tool, result.reportedWorkDisposition)) {
     return false;
@@ -266,7 +267,8 @@ export function codexToolAcceptsResult(
   return result.reportedWorkDisposition !== "yielded"
     || result.continuation?.kind === "response_wake"
     || result.continuation?.kind === "monitor"
-    || result.continuation?.kind === "case_handoff";
+    || result.continuation?.kind === "case_handoff"
+    || (serverResolvedContinuation && result.continuation?.kind === "same_agent");
 }
 
 export function redactCodexValue(value: unknown, depth = 0): unknown {

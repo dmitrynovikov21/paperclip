@@ -184,12 +184,14 @@ import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
 } from "../services/chat-run-publications.js";
 import {
+  extractWakeCommentIds,
   heartbeatService,
   resolveExternalChatWakeProvider,
 } from "../services/heartbeat.js";
 import { buildPaperclipWakePayload, resolveRunScopedMentionedSkillKeys } from "../services/heartbeat/run-preparation.js";
 import {
   registerServerAdapter,
+  runningProcesses,
   unregisterServerAdapter,
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
@@ -3157,6 +3159,103 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(new Set(tools.map(tool => tool.name)).size).toBe(7);
       expect(await githubBotToolsForSession(db, { ...f.session, issueId: randomUUID() })).toEqual([]);
       expect(await readChatConversationsByEndpointId(f.endpoint.id)).toHaveLength(2);
+    });
+    describe("replies in review finding threads behind an active run", () => {
+      const pr = "github:paperclipai/paperclip:17044";
+      async function findingThreadFixture() {
+        vi.stubEnv("PAPERCLIP_API_URL", "https://paperclip.example.test");
+        onTestFinished(() => vi.unstubAllEnvs());
+        const f = await subscribedGitHubFixture(pr);
+        const adapterType = `github-finding-thread-test-${randomUUID()}`;
+        const execute = vi.fn(async (_input: { runId: string; context: Record<string, unknown> }) => ({
+          exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Answered the finding thread",
+        }));
+        registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false, execute,
+          testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+        const heartbeat = heartbeatService(db);
+        const activeRunId = randomUUID();
+        onTestFinished(async () => {
+          runningProcesses.delete(activeRunId);
+          await heartbeat.drainActiveRunExecutions();
+          unregisterServerAdapter(adapterType);
+        });
+        const issueId = f.conversation.issueId!;
+        await db.update(companies).set({ defaultResponsibleUserId: "owner-user" }).where(eq(companies.id, f.companyId));
+        await db.update(agents).set({ adapterType, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+          .where(eq(agents.id, f.assignedAgentId));
+        // Published findings bind their inline threads to the PR review task.
+        const { id: _id, ...base } = f.conversation;
+        const threads = await Promise.all(["4332012267", "4332012626"].map(async (commentId) => {
+          const thread = makeThread({ channelId: "paperclipai/paperclip", id: `${pr}:rc:${commentId}` }).thread;
+          const [conversation] = await db.insert(chatConversations).values({ ...base, externalThreadId: thread.id,
+            providerUrl: `https://github.com/paperclipai/paperclip/pull/17044#discussion_r${commentId}` }).returning();
+          return { thread, conversation };
+        }));
+        // The review-request run still holds the task when the linked user replies.
+        await db.insert(heartbeatRuns).values({ id: activeRunId, companyId: f.companyId, agentId: f.assignedAgentId,
+          status: "running", startedAt: new Date(), contextSnapshot: { issueId, source: "chat:github" },
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+        runningProcesses.set(activeRunId, { child: {} as never, graceSec: 0, processGroupId: null });
+        await db.update(issues).set({ status: "in_review", executionRunId: activeRunId,
+          executionAgentNameKey: "maya", executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+        f.wakeup.mockImplementation(heartbeat.wakeup);
+        let messageId = 41950;
+        const reply = (thread: Thread, text: string) => deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id,
+          provider: "github", thread, trigger: "subscribed_message",
+          message: makeMessage({ id: String(messageId++), text, userId: "42", userName: "octocat" }) });
+        const commentFor = async (text: string) => (await readIssueCommentsByIssueId(issueId)).find((c) => c.body.includes(text))!.id;
+        const finishActiveRun = async () => {
+          runningProcesses.delete(activeRunId);
+          await heartbeat.cancelRun(activeRunId, "Review request finished", { suppressImmediateRecovery: true });
+          await heartbeat.drainActiveRunExecutions();
+        };
+        const followUpRuns = async () => (await readHeartbeatRunsByCompanyId(f.companyId))
+          .filter((run) => run.id !== activeRunId && run.wakeupRequestId)
+          .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        return { ...f, issueId, threads, execute, reply, commentFor, finishActiveRun, followUpRuns };
+      }
+
+      it("answers each finding thread in its own run instead of one unattestable batch", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First finding is intentional");
+        await f.reply(f.threads[1].thread, "Second finding is fixed in the next commit");
+        const first = await f.commentFor("First finding"), second = await f.commentFor("Second finding");
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs.map((run) => ({ status: run.status, errorCode: run.errorCode, error: run.error })))
+          .toEqual([{ status: "succeeded", errorCode: null, error: null }, { status: "succeeded", errorCode: null, error: null }]);
+        expect(runs.map((run) => extractWakeCommentIds(run.contextSnapshot))).toEqual([[first], [second]]);
+        expect(runs.map((run) => run.contextSnapshot?.chatConversationId))
+          .toEqual(f.threads.map(({ conversation }) => conversation.id));
+        expect(f.execute.mock.calls.map(([input]) => [input.context.paperclipExternalChatExecutionBound,
+          extractWakeCommentIds(input.context)])).toEqual([[true, [first]], [true, [second]]]);
+      });
+
+      it("still batches several replies in one finding thread into one attested run", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First note on this finding");
+        await f.reply(f.threads[0].thread, "Second note on this finding");
+        const ids = [await f.commentFor("First note"), await f.commentFor("Second note")];
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toMatchObject({ status: "succeeded", errorCode: null });
+        expect(extractWakeCommentIds(runs[0].contextSnapshot)).toEqual(ids);
+        expect(f.execute).toHaveBeenCalledTimes(1);
+      });
+
+      it("still denies each separated finding-thread run after the linked identity is revoked", async () => {
+        const f = await findingThreadFixture();
+        await f.reply(f.threads[0].thread, "First finding is intentional");
+        await f.reply(f.threads[1].thread, "Second finding is fixed in the next commit");
+        await db.update(chatIdentityLinks).set({ status: "revoked", revokedAt: new Date() })
+          .where(eq(chatIdentityLinks.principalId, f.principal.id));
+        await f.finishActiveRun();
+        const runs = await f.followUpRuns();
+        expect(runs.length).toBeGreaterThan(0);
+        for (const run of runs) expect(run).toMatchObject({ status: "failed", errorCode: "setup_failed" });
+        expect(f.execute).not.toHaveBeenCalled();
+      });
     });
     it.each([
       { label: "returns the confirmed GitHub assessment when publication takes longer than ten seconds", delayMs: 11_000, timeoutMs: undefined },

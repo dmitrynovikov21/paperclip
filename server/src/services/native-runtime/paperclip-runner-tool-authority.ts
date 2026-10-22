@@ -2,11 +2,12 @@ import { priorRecoveryApiReceipt } from "../recovery-effect-receipts.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { caseHandoffService } from "../case-handoffs.js";
 import { caseIdForApiCapture, createNativeCaseSchema, executeNativeCaseTool, NATIVE_CASE_OPERATIONS } from "./native-case-tools.js";
+import { executeNativeWorkflowTool } from "./native-workflow-tools.js";
 import { assertNoCaseHandoffMutation } from "../heartbeat/case-handoff-lifecycle.js";
 import { handoffCaseSchema } from "@paperclipai/shared";
 import { skillAccessService } from "../skill-access.js";
 import { withExternalExecutionAdmission, type ExternalAdmissionTransaction } from "../../modules/external-agents/index.js";
-import { callTaskWorkspaceTool } from "../task-workspace-tools.js";
+import { callTaskWorkspaceTool, pendingTaskRepositoryContinuation } from "../task-workspace-tools.js";
 import { TaskAttachmentReadCache, TASK_ATTACHMENT_DEFINITIONS, TASK_ATTACHMENT_SCHEMAS, listTaskAttachments, readTaskAttachment } from "./runner-task-attachments.js";
 import { RUNNER_BRIDGE_SCHEMAS, runnerBridgeDefinitions, readAssignedSkill, executeWorkspaceTool, readWorkspaceUploadFile, settleRunnerBridgeRead, assertRunnerWorkspacePathAllowed } from "./runner-bridge-tools.js";
 import type { NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
@@ -351,6 +352,7 @@ export class PaperclipRunnerToolAuthority {
         } },
         ...create.kickoff,
         workflow_document_text: create.workflow_document_text,
+        ...(create.workflowId !== undefined ? { workflowId: create.workflowId } : {}),
         ...(create.initialDocuments !== undefined ? { initialDocuments: create.initialDocuments } : {}),
       } : call.arguments;
       return caseHandoffService(this.db).handoff(this.binding.companyId, this.#privacyActor(run), handoffCaseSchema.parse(request), {
@@ -559,6 +561,12 @@ export class PaperclipRunnerToolAuthority {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
     switch (call.tool) {
+      case "list_workflows":
+      case "read_workflow":
+      case "create_workflow":
+      case "update_workflow":
+        return executeNativeWorkflowTool({ db: this.db, binding: this.binding, tool: call.tool, arguments: call.arguments,
+          callApi: (receiptKey, request) => this.#callApi(receiptKey, request, { dedicatedCaseTool: call.tool }) });
       case "read_case":
       case "update_case":
         if (context.issue.workMode !== "standard") throw forbidden("Case tools require standard work mode");
@@ -673,7 +681,10 @@ export class PaperclipRunnerToolAuthority {
             kind: "monitor",
             summary: "Wait for the saved task monitor.",
             idempotencyKey: `task-monitor:${context.issue.id}:${monitorCheckAt}`,
-          } : null,
+          } : !this.binding.nativeReview && context.issue.workMode === "standard" && context.issue.executionRunId === this.binding.runId
+            ? await pendingTaskRepositoryContinuation(this.db, { companyId: this.binding.companyId, issueId: this.binding.issueId,
+                runId: this.binding.runId, workspaceId: context.issue.executionWorkspaceId })
+            : null,
           childTasks: visibleChildTasks.slice(0, 100).map(redactedTask),
           childTasksTruncated: childTasks.length > 100,
           delegationGuidance: "Reuse existing child tasks for delegated work. Inspect a completed child's comments and documents before creating another task for the same deliverable. Use search_tasks if the child task list is truncated.",
@@ -846,9 +857,9 @@ export class PaperclipRunnerToolAuthority {
     const { input, operation } = validateRunnerApiCall(value, context);
     // Only the strict dedicated case adapter may use its exact mapped route when
     // generic API discovery/calls are disabled. All route/run guards still apply.
-    const dedicatedCaseRoute = options && ["read_case", "update_case"].includes(options.dedicatedCaseTool)
+    const dedicatedCaseRoute = options && NATIVE_CASE_OPERATIONS.has(options.dedicatedCaseTool)
       && operation.dedicatedTools.includes(options.dedicatedCaseTool)
-      && input.pathParams?.id === options.caseId
+      && (options.dedicatedCaseTool.endsWith("workflow") || options.dedicatedCaseTool === "list_workflows" || input.pathParams?.id === options.caseId)
       && this.binding.casesEnabled === true && bound.issue.workMode === "standard";
     const assertAvailable = (workMode: string) => {
       if (options && workMode !== "standard") throw forbidden("Case tools require standard work mode");

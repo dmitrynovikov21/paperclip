@@ -1,3 +1,4 @@
+import { PRP_COMPLETION_TOOL_NAME, PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA } from "../contracts/completion-result.js";
 import { RunnerLaunchPreparationStore } from "./runner-launch-preparation-store.js";
 import type { PreparedRunnerProviderLaunch, RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 import { validatePreparedRunnerLaunch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
@@ -849,11 +850,11 @@ async function awaitRunnerSuspensionBarrier(input: {
 }
 
 function runnerCloseGraceMs(options: Pick<CapabilityRunnerdCodexTransportOptions, "provider" | "acpxAgent" | "closeGraceMs">): number {
-  // Idle Pi retirement may consume its five-second RPC stop window. Keep a
-  // separate five-second drain round trip and the bounded suspension reserve.
+  // Native Pi retirement allows thirty seconds for snapshot cleanup and five
+  // for its lifetime fence. Keep a drain round trip and suspension reserve too.
   // Explicit caller deadlines remain authoritative; all settlement proofs stay
   // mandatory even when the provider already completed its task.
-  return options.closeGraceMs ?? (options.provider === "acpx" && options.acpxAgent === "pi" ? 15_000 : 10_000);
+  return options.closeGraceMs ?? (options.provider === "acpx" && options.acpxAgent === "pi" ? 45_000 : 10_000);
 }
 
 function runnerCloseDeadlines(
@@ -3022,7 +3023,7 @@ function acpxProviderPackageAuthority(
     const workspaceRoot = dirname(serverRoot);
     // Source/Docker builds share the workspace's pnpm store. Published npm
     // bundles and self-rooted pnpm deployments retain their server authority.
-    if (basename(serverRoot) === "server" &&
+    if (agent !== "pi" && basename(serverRoot) === "server" &&
         !existsSync(resolve(serverRoot, "node_modules/.pnpm")) &&
         existsSync(resolve(workspaceRoot, "node_modules/.pnpm")) &&
         existsSync(resolve(workspaceRoot, "pnpm-workspace.yaml")) &&
@@ -3045,10 +3046,10 @@ function acpxProviderPackageAuthority(
     );
   }
   const sidecarPackageRoot = resolve(cliDirectory, "../..");
-  // Copilot's native closure belongs to the runner package itself. Its asset
+  // Native Pi and Copilot closures belong to the runner package itself. Their asset
   // guard requires the bound manifest directly inside that same package root;
   // the workspace dependency root used by JS providers is a different owner.
-  if (agent === "copilot") {
+  if (agent === "copilot" || agent === "pi") {
     return {
       root: sidecarPackageRoot,
       manifest: resolve(sidecarPackageRoot, "package.json"),
@@ -3211,7 +3212,7 @@ function authorizedToolSet(
       operationId: String(tool.name ?? ""),
       version: 1,
       description: String(tool.description ?? ""),
-      inputSchema: record(tool.inputSchema),
+      inputSchema: tool.name === PRP_COMPLETION_TOOL_NAME ? PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA : record(tool.inputSchema),
       responseSchema: {},
     }))
     .sort((left, right) =>

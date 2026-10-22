@@ -647,6 +647,7 @@ export const pluginApiRouteDeclarationSchema = z.object({
     message: "routeKey must be lowercase letters, digits, dots, colons, underscores, or hyphens",
   }),
   method: z.enum(PLUGIN_API_ROUTE_METHODS),
+  transport: z.literal("websocket").optional(),
   path: z.string().min(1).regex(/^\/[a-zA-Z0-9:_./-]*$/, {
     message: "path must start with / and contain only path-safe literal or :param segments",
   }).refine(
@@ -666,8 +667,13 @@ export const pluginApiRouteDeclarationSchema = z.object({
     z.object({ from: z.literal("body"), key: z.string().min(1) }),
     z.object({ from: z.literal("query"), key: z.string().min(1) }),
     z.object({ from: z.literal("issue"), param: z.string().min(1) }),
+    z.object({ from: z.literal("agent"), param: z.string().min(1) }),
   ]).optional(),
-});
+}).refine(route => !route.transport || (route.method === "GET" && route.auth === "board"), { message: "WebSocket routes require GET and board authentication" })
+  .refine(route => !route.transport || route.companyResolution?.from !== "body", {
+    message: "WebSocket routes cannot resolve company from a request body",
+    path: ["companyResolution"],
+  });
 
 export type PluginApiRouteDeclarationInput = z.infer<typeof pluginApiRouteDeclarationSchema>;
 
@@ -950,6 +956,10 @@ export const pluginManifestV1Schema = z.object({
         path: ["capabilities"],
       });
     }
+  }
+
+  if (manifest.apiRoutes?.some(route => route.transport === "websocket") && !manifest.capabilities.includes("http.outbound")) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "WebSocket routes require http.outbound", path: ["capabilities"] });
   }
 
   if (manifest.apiRoutes && manifest.apiRoutes.length > 0) {

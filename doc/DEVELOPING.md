@@ -1933,19 +1933,40 @@ agent conversion are outside this playbook.
 
 ## Paperclip Runner Adapter Conversion
 
-Paperclip Runner offers native Codex, OpenCode, and **ACPX Claude**. New
+Paperclip Runner offers native Codex, OpenCode, **ACPX Claude**, and **ACPX Pi**. New
 Claude Code agents default to ACPX Claude on Apple Silicon, Intel Mac, Linux x64
-and Linux ARM64 with supported glibc. Unsupported or unqualified targets retain
-Legacy. Darwin SSH keeps an automatic Legacy default; explicit native execution
+and Linux ARM64 with supported glibc. New OpenCode and Pi agents default to their native
+runtimes on Apple Silicon, Intel Mac, and Linux x64 with supported glibc;
+Linux ARM64 remains Legacy until the pinned runtimes support it.
+Unsupported or unqualified targets retain Legacy. Claude over Darwin SSH keeps
+an automatic Legacy default; explicit native execution
 requires matching remote assets. The runner override is in Advanced. Ordinary Claude models default to `claude-opus-5-5`; explicit models
-and provider routing remain authoritative. Existing agents keep their saved runner. Converting an existing Claude, Codex, or OpenCode agent selects its
+and provider routing remain authoritative. Existing agents keep their saved runner. Converting an existing Claude, Codex, OpenCode, or Pi agent selects its
 corresponding provider, preserves compatible models, credentials, workspace,
 and instructions, and resets execution sessions while retaining run history.
 Other adapters require an explicit provider choice. Legacy ACPX Codex agent
 settings normalize to native Codex on configuration updates and before fresh
 runs; immutable run descriptors remain readable. The **Paperclip Runner**
-experimental setting applies to other native providers. Native Codex and ACPX
-Claude do not require it. Company access checks still apply.
+experimental setting applies to other native providers. Native Codex, OpenCode,
+ACPX Claude, and ACPX Pi do not require it. Company access checks still apply.
+
+OpenCode requires an explicit `provider/model` before testing or finishing setup.
+An inactive setup draft can be saved before choosing a model. Automatic native
+selection uses `allow` permissions and a `per_turn` lifecycle. Native `ask` and
+`deny` policies remain available in agent configuration. Legacy custom commands,
+extra arguments, model variants, and inherited permission rules require the
+Legacy runner; incompatible settings return remediation instead of being ignored.
+Saved OpenCode agents keep their runner and runtime policies.
+
+Pi also requires an explicit `provider/model` before testing or hiring; inactive
+setup drafts may precede model selection. Install its pinned runtime on the
+execution host with `paperclipai runtime setup pi` before testing the connection.
+The native default uses `approve-all` permissions, `per_turn` lifecycle, and
+`low` thinking. Exact native thinking levels are `off`, `low`, `high`, and `max`.
+Legacy `minimal`, `medium`, and `xhigh` thinking, custom commands/arguments, and
+raw stdout mode require Legacy. Switching back to Legacy rejects native `max`
+thinking, nondefault permission policy, or warm lifecycle instead of discarding
+them. Existing Pi agents retain their saved runner and native policies.
 
 Agent configuration uses the same section layout across adapters: model and
 provider belong to **Adapter**, environment variables have their own section,
@@ -3084,7 +3105,7 @@ current task binding. They do not inventory peer workspaces. Existing
 `isolatedRemoteSource` receipts remain restorable, but new local sources are not
 replaced with remote clones because of historical file ownership.
 
-The disposable performance harness is:
+The disposable workspace-preparation performance harness is:
 
 ```sh
 pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-workspace-preparation-history.ts --baseline-ref=df80616d98119cbf5abd40549794d9980a5fabf6
@@ -3092,6 +3113,46 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-workspace-prepar
 
 It compares actual preparation guards with synthetic history. Local timings are
 separate from Git materialization, environment acquisition, and provider startup.
+
+### Budget accounting performance
+
+Budget admission and settlement share the company accounting lock. They evaluate
+only the company, responsible agent, and applicable project. Running usage is an
+internal exposure projection, not a provisional ledger charge. Cancellation and
+lifecycle effects run through the delivery coordinator after accounting commits.
+
+The final provider gate commits a dispatch claim before entering provider code.
+The reservation and native recovery lease generation fence duplicate handoffs;
+neither provider startup nor termination holds the company accounting lock.
+After accounting commits, a short ownership transaction rechecks the current
+task/run fences and covers the synchronous adapter handoff. It commits without
+awaiting provider bootstrap, results, or finalization.
+Hosted browser operations retain their own hold and admitted project in existing
+run metadata. Unknown provider outcomes retain that capacity until accounting
+establishes the charge. Browser holds are separate from their parent run's usage.
+Unfinished uncapped browsers and legacy rows without a reliable exposure record
+remain unknown usage when a new budget is introduced. The existing unpriced-usage
+policy controls admission until their terminal charge is known.
+
+Use a disposable real PostgreSQL database to compare cost evaluation and complete admission:
+
+```sh
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-budget-enforcement.ts --baseline-ref=6c9b87d0922f1ebfc43e8b0c36889ac5ba7b9837 > /tmp/budget-forward.json
+pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-budget-enforcement.ts --baseline-ref=6c9b87d0922f1ebfc43e8b0c36889ac5ba7b9837 --reverse > /tmp/budget-reverse.json
+```
+
+The cost comparison keeps one company policy and no active runs while adding 0,
+17, and 1,000 unrelated idle agents. It records 20 warm samples, SQL statement counts,
+company accounting locks, agent reads, and an `EXPLAIN (ANALYZE, BUFFERS)` plan.
+It asserts unchanged agent state and no agent reads in the new evaluation path.
+The harness also measures reservation, the final ownership gate, and an immediate
+offline provider result with one responsible agent and one active operation. It
+records transaction counts and asserts no reads of unrelated agents. Baseline
+service, lifecycle, reservation, and dispatch modules come from the supplied Git
+revision.
+Provider inference, network latency, stop acknowledgement, and hosted database
+latency need separate measurements. Do not run this benchmark beside test suites
+or builds when reporting timing results.
 
 ### Skill-source background synchronization
 
@@ -3125,3 +3186,53 @@ unavailable. Use a separate, disposable database whose name ends in `_test` for 
 `PAPERCLIP_PROJECT_SKILLS_TEST_DATABASE_URL`, and
 `PAPERCLIP_SKILL_SOURCES_TEST_DATABASE_URL`. The suites apply migrations and create
 test data; the synchronization suite truncates company data between tests.
+
+### Public MCP and Dot event delivery
+
+Public MCP task events and Dot mailbox events use separate topics in the shared
+transaction-aware delivery coordinator. They no longer scan SQL every two seconds.
+An enabled subscription without new events or unfinished deliveries is quiet,
+including when delivery history remains in the database.
+
+| Obligation | Source and wake path |
+| --- | --- |
+| Task status, comments, documents, prototype work | Existing activity rows; issue activity writes in `persistActivity`, the activity service, and wake recovery notify before their transaction commits |
+| Dot task follow-up discovery | Existing comments and assignments; `insertIssueComment` centralizes committed comment notifications, and assignment acceptance wakes the scanner |
+| Dot mailbox delivery | Existing mailbox rows; native broker events, explicit challenges, fencing, follow-up publication/consumption, and subscription reconnection notify through their owning transactions |
+| Subscription creation, renewal, removal | The subscription transaction wakes its worker; renewal can recover unreceived Dot assignment references |
+| Feature disable/reenable | The experimental settings transaction wakes both workers; disabled workers remain quiet until another change |
+| Delivery retries and abandoned claims | Existing `mcp_event_deliveries.next_attempt_at` drives the next deadline, reconstructed on startup |
+| Admission and old subscription cleanup | Opportunistic on startup and subsequent enabled sweeps; expiry remains enforced on use |
+
+The scanner preserves durable delivery receipts instead of advancing a timestamp
+cursor that could skip a late commit. Subscription scans use pages of 20; full source/delivery batches schedule another
+sweep until caught up. Subscription creation, refresh, and removal target their
+subscription ID (or the shared Dot binding for reconnect mailbox entries). Issue
+activity targets its task; comment discovery targets its company; mailbox and
+assignment changes target their Dot binding. Delivery retries do not rescan
+unchanged subscriptions. Only startup and instance-wide settings changes request
+a full scan. Settings changes retain an explicit wildcard when a transaction also
+contains scoped hints. A fresh request or failed sweep survives warm standby and
+idle drain; skipped dispatch never marks it complete. Shutdown stops admission of
+new batches and waits for the current bounded webhook attempt to settle.
+
+Automatic Dot readiness challenges are issued once for a connected subscription.
+A pending or expired challenge does not imply periodic renewal; an explicit retest
+creates and signals another challenge. The worker keeps the existing challenge and
+authorization checks. No schema, OAuth, or webhook contract changes are required.
+
+Notifications require supported writers in the same live server/database scope.
+Independent SQL writers and separate live server replicas do not wake this process;
+startup reconstructs their durable records, but continuous multi-writer discovery
+would require an ingress or notification contract before removing its backstop.
+The host sleep-safety checks remain conservative for MCP/Dot state. These retry
+deadlines are not yet exported to Paperclip Cloud's scheduled-wake contract.
+
+`events-work.test.ts` exercises real PostgreSQL commits, rollback, startup/drain,
+retry restoration, producer reactivation, large batches, and SQL/network quiet.
+When embedded PostgreSQL is unavailable, use separate disposable databases ending
+in `_test` for `PAPERCLIP_MCP_SLEEP_TEST_DATABASE_URL`,
+`PAPERCLIP_PUBLIC_MCP_TEST_DATABASE_URL`, and
+`PAPERCLIP_DOT_RUNNER_TEST_DATABASE_URL`. The interaction-service regression suite
+also accepts `PAPERCLIP_INTERACTIONS_TEST_DATABASE_URL`. The suites migrate and write to those
+URLs; the sleep suite truncates company data between tests.

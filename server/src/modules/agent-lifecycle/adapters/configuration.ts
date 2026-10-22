@@ -16,6 +16,7 @@ export async function updateAgentConfiguration(tx: Db, effects: LifecycleEffects
   const changed = ["adapterType", "adapterConfig", "runtimeConfig", "defaultEnvironmentId"].some(key =>
     Object.prototype.hasOwnProperty.call(patch, key) && !jsonEqual(patch[key as keyof typeof patch], current[key as keyof typeof current]));
   const invalidate = changed && ["preparing", "verifying", "resuming"].includes(current.lifecycleState);
+  if (invalidate) await effects.notifyWork(tx);
   const [updated] = await tx.update(agents).set({ ...patch, updatedAt: new Date(), ...(invalidate ? {
     lifecycleVersion: current.lifecycleVersion + 1, lifecycleError: null,
     lifecycleOperation: { ...current.lifecycleOperation!, id: randomUUID(), hostComplete: false,

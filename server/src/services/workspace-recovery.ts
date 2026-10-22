@@ -169,8 +169,8 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         }).catch(() => undefined); }, 30_000);
         let stopSettled = false;
         try {
-          const opened = await input.environmentRuntime.resumeRunLease({ environment: environment as unknown as Environment,
-            lease: cleanupLease as EnvironmentLease });
+          const opened = await input.environmentRuntime.resumeWorkspaceRecoveryLease({ source: input,
+            leaseId: cleanupLease.id, environmentId: environment.id, ownership });
           if (opened?.providerLeaseId !== lease.providerLeaseId || opened.metadata?.remoteCwd !== remoteCwd)
             throw new SystemRecoveryFailure("source_binding_invalid", "service_required");
           await inspectWorkspaceRecoverySource(db, input);

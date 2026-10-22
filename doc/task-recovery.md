@@ -33,6 +33,12 @@ The source recovery action holds a validated `systemRecovery` record. Its
 revision and generation fence late bookkeeping writes. Physical exports still
 use the existing workspace ownership lock and controller stop receipts.
 
+The export owner can reopen its exact stopped sandbox through the environment
+runtime's recovery path. This path checks the current source action, run,
+environment, allocation, stop-only intent, and physical ownership claim before
+calling the provider. The retained-source fence still blocks ordinary resume
+and destruction. Recovery does not clear it to gain access to the saved files.
+
 Execution containment and file preservation are independent facts:
 
 - Another agent needs authoritative containment of the old executor.
@@ -113,6 +119,8 @@ Run the focused PostgreSQL/filesystem suites from `server/`:
 `server/scripts/workspace-recovery-provider.test.mjs` is an opt-in controlled
 Daytona probe. It requires `PAPERCLIP_RECOVERY_LIVE=1`, `DAYTONA_API_KEY`,
 `PAPERCLIP_DAYTONA_SDK_PATH` and an immutable `PAPERCLIP_RECOVERY_IMAGE`.
+An immutable provider snapshot UUID in `PAPERCLIP_RECOVERY_SNAPSHOT_ID` can
+replace the image digest. The probe checks its ID and active state first.
 It interrupts export,
 joins the first controller, starts a second controller and verifies files,
 preservation receipts, agent-start count and external-operation count before

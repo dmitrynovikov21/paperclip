@@ -14,6 +14,7 @@ import type {
   PlanReviewInteractionResultContext,
   PlanReviewInteractionTargetContext,
 } from "@paperclipai/shared";
+import { truncateUnicodeString } from "@paperclipai/shared";
 import { parseObject } from "../adapters/utils.js";
 
 export const PLAN_REVIEW_CONTEXT_LIMITS = {
@@ -40,7 +41,7 @@ function nonEmptyString(value: unknown) {
 
 function truncateText(value: string, maxChars: number) {
   if (value.length <= maxChars) return { text: value, truncated: false };
-  return { text: value.slice(0, maxChars), truncated: true };
+  return { text: truncateUnicodeString(value, maxChars), truncated: true };
 }
 
 function authorFrom(row: {

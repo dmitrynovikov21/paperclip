@@ -1,4 +1,5 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
+export { replaceUnpairedSurrogates, truncateUnicodeString } from "./unicode.js";
 export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,

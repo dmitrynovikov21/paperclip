@@ -6,6 +6,16 @@ Audience: CTO sign-off, QA repro, and the recorded walkthrough that goes with th
 
 Pair this script with [MCP-ACCESS-GOVERNANCE.md](./MCP-ACCESS-GOVERNANCE.md) for concepts and the full reference, and the [package README](../packages/kv-demo-mcp-server/README.md) for the server itself.
 
+## Safe API commands
+
+Run the examples from the repository root after sourcing the helper once in the same Bash shell:
+
+```sh
+source scripts/operator-http.sh
+```
+
+`board_api` reads `BOARD_API_KEY` from env; `gateway_api` reads `GATEWAY_TOKEN`. The helper sends the request body through stdin and keeps credentials and request URLs out of process arguments. It rejects redirects and never prints credentials on request errors. Keep shell tracing disabled while using credentials.
+
 ## Prerequisites
 
 Before you start the recording:
@@ -61,11 +71,7 @@ This is the user-facing path. Open **Apps → Connect an app → Connect with a 
 API equivalent for the recording (the wizard hits these two routes back-to-back):
 
 ```sh
-CONNECT=$(curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/connect" \
-  -d '{
+CONNECT=$(board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/connect" '{
     "link": "http://127.0.0.1:8848/mcp",
     "name": "KV demo"
   }')
@@ -88,11 +94,7 @@ Expected: four catalog entries (`kv_list`, `kv_get`, `kv_set`, `kv_delete`). On 
 Finish the wizard (allow reads, ask-first on `kv_set`, leave `kv_delete` quarantined):
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/$CONNECTION_ID/finish" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/apps/$CONNECTION_ID/finish" '{
     "enabledCatalogEntryIds": '"$READ_ENTRY_IDS"',
     "askFirstCatalogEntryIds": ["'"$WRITE_ENTRY_ID"'"],
     "access": "all_agents"
@@ -103,9 +105,7 @@ curl -fsS -X POST \
     askFirstPolicies: (.policies | length)
   }'
 
-export PROFILE_ID=$(curl -fsS \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
+export PROFILE_ID=$(board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
   | jq -r '.profileIds[0]')
 ```
 
@@ -114,9 +114,7 @@ Expected: `connectionStatus: "active"`, one profile bound to the company, one `r
 ## Step 3 — Confirm the effective profile
 
 ```sh
-curl -fsS \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
+board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
   | jq '{profileIds, allowedToolNames}'
 ```
 
@@ -129,9 +127,7 @@ Gateway sessions are scoped to an active heartbeat run. When a board key mints t
 Grab the most recent active run for the demo agent:
 
 ```sh
-export RUN_ID=$(curl -fsS \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/heartbeat-runs?agentId=$AGENT_ID&limit=20" \
+export RUN_ID=$(board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/heartbeat-runs?agentId=$AGENT_ID&limit=20" \
   | jq -r '[.[] | select(.status == "running")] | first | .id')
 
 test -n "$RUN_ID" || { echo "No active run for agent — start one before recording"; exit 1; }
@@ -140,11 +136,7 @@ test -n "$RUN_ID" || { echo "No active run for agent — start one before record
 Mint the session:
 
 ```sh
-SESSION=$(curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/sessions" \
-  -d '{
+SESSION=$(board_api POST "$PAPERCLIP_URL/api/tool-gateway/sessions" '{
     "companyId": "'"$COMPANY_ID"'",
     "agentId": "'"$AGENT_ID"'",
     "runId": "'"$RUN_ID"'"
@@ -160,11 +152,7 @@ In production, the agent obtains this token from its own run bootstrap (agent JW
 Gateway calls use the session token via `X-Paperclip-Tool-Gateway-Token`. The body uses `tool` (string) and `parameters` (object).
 
 ```sh
-curl -fsS -X POST \
-  -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{ "tool": "kv_list", "parameters": {} }' \
+gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{ "tool": "kv_list", "parameters": {} }' \
   | jq '{invocationId, status, tool, result}'
 ```
 
@@ -175,11 +163,7 @@ Switch to the **Audit** tab in the UI. Refresh. The newest row is `tool_gateway.
 ## Step 6 — The destructive tool (denied)
 
 ```sh
-curl -i -X POST \
-  -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{ "tool": "kv_delete", "parameters": { "key": "demo/launch" } }'
+gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{ "tool": "kv_delete", "parameters": { "key": "demo/launch" } }' --allow-http-error --append-status
 ```
 
 Expected: an HTTP `403` or `404` response with a JSON body shaped like:
@@ -203,14 +187,10 @@ Spoken note:
 
 ## Step 7 — The agent call that triggers approval
 
-`kv_set` is in the allow set but carries an ask-first `require_approval` policy from Step 2. The first call returns HTTP `409` with `reasonCode: "approval_required"` and an `actionRequestId` in the body. Use `-w` (or capture status separately) so the recording shows the 409 explicitly:
+`kv_set` is in the allow set but carries an ask-first `require_approval` policy from Step 2. The first call returns HTTP `409` with `reasonCode: "approval_required"` and an `actionRequestId` in the body. The helper appends the status so the recording shows the 409 explicitly:
 
 ```sh
-CALL=$(curl -sS -w '\n%{http_code}' -X POST \
-  -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{ "tool": "kv_set", "parameters": { "key": "demo/launch", "value": "shipped" } }')
+CALL=$(gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{ "tool": "kv_set", "parameters": { "key": "demo/launch", "value": "shipped" } }' --allow-http-error --append-status)
 
 STATUS=$(echo "$CALL" | tail -1)
 BODY=$(echo "$CALL" | sed '$d')
@@ -228,11 +208,7 @@ In the UI, switch to the **Audit** tab and find the approval card. Point at the 
 Approve via the API for the recording (the UI button does the same thing). The approval endpoint requires `companyId` (in the body or as a query parameter):
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/action-requests/$ACTION_REQUEST_ID/approve" \
-  -d '{ "companyId": "'"$COMPANY_ID"'" }' \
+board_api POST "$PAPERCLIP_URL/api/tool-gateway/action-requests/$ACTION_REQUEST_ID/approve" '{ "companyId": "'"$COMPANY_ID"'" }' \
   | jq '{id, status, resolvedAt, resolvedByUserId, canonicalArgumentsHash}'
 ```
 
@@ -243,11 +219,7 @@ Expected: `status: "approved"` and `resolvedAt` set. The agent call has not run 
 The agent retries the same call with `approvedActionRequestId` set to the action request it received in Step 7. The gateway re-validates that the canonical arguments hash matches what was approved, then executes the tool against the live KV server.
 
 ```sh
-curl -fsS -X POST \
-  -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{
+gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{
     "tool": "kv_set",
     "parameters": { "key": "demo/launch", "value": "shipped" },
     "approvedActionRequestId": "'"$ACTION_REQUEST_ID"'"
@@ -264,11 +236,7 @@ If you change the `parameters` between Step 7 and Step 9, the retry fails with `
 Replay the read to close the loop — the agent's view of the world now matches the operator's:
 
 ```sh
-curl -fsS -X POST \
-  -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{ "tool": "kv_get", "parameters": { "key": "demo/launch" } }' \
+gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{ "tool": "kv_get", "parameters": { "key": "demo/launch" } }' \
   | jq '{invocationId, status, tool, result}'
 ```
 
@@ -279,11 +247,7 @@ Expected: `status: "completed"`, `result` content shows `{ "found": true, "key":
 Skip this on a 5-minute recording. Include it for the 10-minute version because it shows the operator-side automation story.
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/action-requests/$ACTION_REQUEST_ID/trust-rule" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/action-requests/$ACTION_REQUEST_ID/trust-rule" '{
     "name": "Trust kv_set demo/launch from the demo agent",
     "approvalThreshold": 2,
     "scope": { "includeAgent": true, "includeTool": true },
@@ -304,9 +268,7 @@ Spoken note:
 Pull the audit timeline for the demo:
 
 ```sh
-curl -fsS \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=20" \
+board_api GET "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=20" \
   | jq '[.[] | {createdAt, action, tool: .details.tool, decision: .details.decision, reasonCode: .details.reasonCode}]'
 ```
 
@@ -349,19 +311,13 @@ Run these if you want the connection and application out of the way as well. Ski
 
 ```sh
 # Revoke the trust rule (if you created one in Step 11)
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/trust-rules/$TRUST_RULE_POLICY_ID/revoke" \
-  -d '{ "reason": "Demo cleanup." }' | jq '{id, enabled}'
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/trust-rules/$TRUST_RULE_POLICY_ID/revoke" '{ "reason": "Demo cleanup." }' | jq '{id, enabled}'
 
 # Disable the connection
-curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
-  -d '{ "enabled": false, "status": "disabled" }' | jq '{id, enabled, status}'
+board_api PATCH "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" '{ "enabled": false, "status": "disabled" }' | jq '{id, enabled, status}'
 
 # Archive the application
-curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-applications/$APPLICATION_ID" \
-  -d '{ "status": "archived" }' | jq '{id, status}'
+board_api PATCH "$PAPERCLIP_URL/api/tool-applications/$APPLICATION_ID" '{ "status": "archived" }' | jq '{id, status}'
 ```
 
 Audit history is retained; the connection and application stay archived for the record.

@@ -19,8 +19,9 @@ require_cmd() {
   command -v "$cmd" >/dev/null 2>&1 || fail "missing required command: ${cmd}"
 }
 
-require_cmd curl
+require_cmd python3
 require_cmd jq
+HTTP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/operator-http.py"
 
 PAPERCLIP_API_URL="${PAPERCLIP_API_URL:-http://localhost:3100}"
 API_BASE="${PAPERCLIP_API_URL%/}/api"
@@ -81,16 +82,6 @@ case "${1:-}" in
     ;;
 esac
 
-AUTH_HEADERS=()
-if [[ -n "${PAPERCLIP_AUTH_HEADER:-}" ]]; then
-  AUTH_HEADERS+=(-H "Authorization: ${PAPERCLIP_AUTH_HEADER}")
-elif [[ -n "${PAPERCLIP_API_KEY:-}" ]]; then
-  AUTH_HEADERS+=(-H "Authorization: Bearer ${PAPERCLIP_API_KEY}")
-fi
-if [[ -n "${PAPERCLIP_COOKIE:-}" ]]; then
-  AUTH_HEADERS+=(-H "Cookie: ${PAPERCLIP_COOKIE}")
-fi
-
 RESPONSE_CODE=""
 RESPONSE_BODY=""
 CLAIM_SECRET=""
@@ -140,9 +131,9 @@ api_request() {
   fi
 
   if [[ -n "$data" ]]; then
-    RESPONSE_CODE="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" "$url" --data "$data")"
+    RESPONSE_CODE="$(printf '%s' "$data" | OPERATOR_HTTP_URL="$url" PAPERCLIP_API_URL="$PAPERCLIP_API_URL" python3 "$HTTP_HELPER" "$method" --auth paperclip --body-stdin --output "$tmp" --status-only --allow-http-error)"
   else
-    RESPONSE_CODE="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "${AUTH_HEADERS[@]}" "$url")"
+    RESPONSE_CODE="$(OPERATOR_HTTP_URL="$url" PAPERCLIP_API_URL="$PAPERCLIP_API_URL" python3 "$HTTP_HELPER" "$method" --auth paperclip --output "$tmp" --status-only --allow-http-error)"
   fi
   RESPONSE_BODY="$(cat "$tmp")"
   rm -f "$tmp"
@@ -271,7 +262,7 @@ probe_hermes_gateway() {
     log "Paperclip will store Hermes gateway URL ${HERMES_GATEWAY_API_BASE_URL}"
   fi
   local code
-  code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time "$GATEWAY_PROBE_TIMEOUT_SEC" -H "Authorization: Bearer ${HERMES_GATEWAY_API_KEY}" "$health_url" || true)"
+  code="$(OPERATOR_HTTP_URL="$health_url" HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" python3 "$HTTP_HELPER" GET --auth hermes --status-only --allow-http-error --timeout "$GATEWAY_PROBE_TIMEOUT_SEC" || true)"
   if [[ "$code" != "200" ]]; then
     fail "Hermes gateway health probe failed before mutating Paperclip state: ${health_url} returned HTTP ${code}. Start Hermes with API_SERVER_ENABLED=true API_SERVER_KEY=<key> hermes gateway run --replace --accept-hooks, or set HERMES_GATEWAY_API_BASE_URL/HERMES_GATEWAY_API_KEY."
   fi
@@ -316,10 +307,9 @@ assert_onboarding_contains "$ONBOARDING_TEXT" "API_SERVER_KEY"
 assert_onboarding_contains "$ONBOARDING_TEXT" "hermes gateway run --replace --accept-hooks"
 assert_onboarding_contains "$ONBOARDING_TEXT" "agentDefaultsPayload.apiBaseUrl"
 
-JOIN_PAYLOAD="$(jq -nc \
+JOIN_PAYLOAD="$(HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" jq -nc \
   --arg name "$HERMES_AGENT_NAME" \
   --arg apiBaseUrl "$HERMES_GATEWAY_API_BASE_URL" \
-  --arg apiKey "$HERMES_GATEWAY_API_KEY" \
   --arg paperclipApiUrl "$PAPERCLIP_API_URL_FOR_HERMES" \
   --arg sessionKeyStrategy "$HERMES_GATEWAY_SESSION_KEY_STRATEGY" \
   --argjson timeoutSec "$HERMES_GATEWAY_TIMEOUT_SEC" \
@@ -331,7 +321,7 @@ JOIN_PAYLOAD="$(jq -nc \
     capabilities: "Hermes gateway Docker smoke harness",
     agentDefaultsPayload: {
       apiBaseUrl: $apiBaseUrl,
-      apiKey: $apiKey,
+      apiKey: env.HERMES_GATEWAY_API_KEY,
       sessionKeyStrategy: $sessionKeyStrategy,
       timeoutSec: $timeoutSec
     }
@@ -374,7 +364,7 @@ if [[ "$RESPONSE_CODE" == "201" ]]; then
 fi
 
 log "claiming API key with one-time claim secret"
-CLAIM_PAYLOAD="$(jq -nc --arg secret "$CLAIM_SECRET" '{claimSecret:$secret}')"
+CLAIM_PAYLOAD="$(CLAIM_SECRET="$CLAIM_SECRET" jq -nc '{claimSecret:env.CLAIM_SECRET}')"
 api_request "POST" "$CLAIM_API_PATH" "$CLAIM_PAYLOAD"
 assert_status "201"
 AGENT_API_KEY="$(assert_json_has_string '.token')"
@@ -399,7 +389,7 @@ if [[ "$(strip_trailing_slash "$STORED_API_BASE_URL")" != "$(strip_trailing_slas
   fail "stored apiBaseUrl mismatch: expected $(strip_trailing_slash "$HERMES_GATEWAY_API_BASE_URL"), got $(strip_trailing_slash "$STORED_API_BASE_URL")"
 fi
 
-if jq -e --arg raw "$HERMES_GATEWAY_API_KEY" '.adapterConfig.apiKey == $raw' <<<"$RESPONSE_BODY" >/dev/null; then
+if HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" jq -e '.adapterConfig.apiKey == env.HERMES_GATEWAY_API_KEY' <<<"$RESPONSE_BODY" >/dev/null; then
   fail "stored adapterConfig.apiKey leaked the raw Hermes API key"
 fi
 if ! jq -e '(.adapterConfig.apiKey.type // "") == "secret_ref"' <<<"$RESPONSE_BODY" >/dev/null; then
@@ -426,13 +416,12 @@ log "agentApiKeySha256=$(hash_prefix "$AGENT_API_KEY") len=${#AGENT_API_KEY}"
 
 if [[ -n "$HERMES_JOIN_OUTPUT_FILE" ]]; then
   mkdir -p "$(dirname "$HERMES_JOIN_OUTPUT_FILE")"
-  jq -nc \
+  AGENT_API_KEY="$AGENT_API_KEY" jq -nc \
     --arg companyId "$COMPANY_ID" \
     --arg inviteId "$INVITE_ID" \
     --arg joinRequestId "$JOIN_REQUEST_ID" \
     --arg agentId "$CREATED_AGENT_ID" \
     --arg keyId "$KEY_ID" \
-    --arg agentApiKey "$AGENT_API_KEY" \
     --arg hermesGatewayApiKeySha256 "$(hash_prefix "$HERMES_GATEWAY_API_KEY")" \
     --arg agentApiKeySha256 "$(hash_prefix "$AGENT_API_KEY")" \
     '{
@@ -441,7 +430,7 @@ if [[ -n "$HERMES_JOIN_OUTPUT_FILE" ]]; then
       joinRequestId: $joinRequestId,
       agentId: $agentId,
       keyId: $keyId,
-      agentApiKey: $agentApiKey,
+      agentApiKey: env.AGENT_API_KEY,
       hermesGatewayApiKeySha256: $hermesGatewayApiKeySha256,
       agentApiKeySha256: $agentApiKeySha256
     }' > "$HERMES_JOIN_OUTPUT_FILE"

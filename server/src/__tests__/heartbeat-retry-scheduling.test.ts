@@ -25,11 +25,14 @@ import {
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+  computeBoundedTransientHeartbeatRetrySchedule,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  decideEarlyUpstreamReprobe,
   heartbeatService,
+  JS_TRIM_WHITESPACE_CHARACTERS,
 } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -469,6 +472,561 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
     expect(promotedRun?.status).toBe("queued");
+  });
+
+  async function seedEarlyReprobeCompany(companyId: string, agentIds: string[]) {
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(agentIds.map((agentId, index) => ({
+      id: agentId,
+      companyId,
+      name: `ClaudeCoder${index + 1}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    })));
+    return issuePrefix;
+  }
+
+  async function seedFarFutureTransientRetry(input: {
+    runId: string;
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    issueNumber: number;
+    issuePrefix: string;
+    createdAt: Date;
+    scheduledRetryAt: Date;
+    scheduledRetryAttempt?: number;
+    /** The reset hint the scheduler adopted as the pin; null for an ordinary backoff pin. */
+    resetHintAt?: Date | null;
+    /** The adapter the failed run behind the retry invoked; null when it left no adapter.invoke event. */
+    retryAdapterType?: string | null;
+  }) {
+    const resetHintAt = input.resetHintAt === undefined ? input.scheduledRetryAt : input.resetHintAt;
+    await db.insert(issues).values({
+      id: input.issueId,
+      companyId: input.companyId,
+      title: "Resume after a quota pin",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: input.agentId,
+      issueNumber: input.issueNumber,
+      identifier: `${input.issuePrefix}-${input.issueNumber}`,
+    });
+    // The failed run whose usage-limit error scheduled the retry.
+    const failedRunId = await insertFinishedRun({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "failed",
+      finishedAt: input.createdAt,
+      adapterType: input.retryAdapterType === undefined ? "claude_local" : input.retryAdapterType,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: input.runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      retryOfRunId: failedRunId,
+      scheduledRetryAt: input.scheduledRetryAt,
+      scheduledRetryAttempt: input.scheduledRetryAttempt ?? 1,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: {
+        issueId: input.issueId,
+        wakeReason: "transient_failure_retry",
+        retryReason: "transient_failure",
+        errorFamily: "provider_quota",
+        ...(resetHintAt ? { transientRetryNotBefore: resetHintAt.toISOString() } : {}),
+      },
+      updatedAt: input.createdAt,
+      createdAt: input.createdAt,
+    });
+  }
+
+  async function insertFinishedRun(input: {
+    companyId: string;
+    agentId: string;
+    status: "succeeded" | "failed";
+    finishedAt: Date;
+    /** The adapter the run invoked; null when it left no adapter.invoke event. */
+    adapterType?: string | null;
+    /** A failed run's error code; a usage-limit failure unless given. */
+    errorCode?: string;
+    resultJson?: Record<string, unknown>;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      status: input.status,
+      ...(input.status === "failed" ? { errorCode: input.errorCode ?? "provider_quota" } : {}),
+      ...(input.resultJson ? { resultJson: input.resultJson } : {}),
+      finishedAt: input.finishedAt,
+      contextSnapshot: { wakeReason: "issue_assigned" },
+      updatedAt: input.finishedAt,
+      createdAt: input.finishedAt,
+    });
+    const adapterType = input.adapterType === undefined ? "claude_local" : input.adapterType;
+    if (adapterType) {
+      await db.insert(heartbeatRunEvents).values({
+        companyId: input.companyId,
+        runId,
+        agentId: input.agentId,
+        seq: 1,
+        eventType: "adapter.invoke",
+        stream: "system",
+        level: "info",
+        message: "adapter invocation",
+        payload: { adapterType, command: adapterType },
+        createdAt: input.finishedAt,
+      });
+    }
+    return runId;
+  }
+
+  async function readRetryPin(runId: string) {
+    return db
+      .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  it("re-probes a far-future transient retry early once the same agent and adapter succeed again (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    // The pin outlives the real outage: a quota-reset hint 15 hours out.
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // Without recovery evidence the far-future pin is respected.
+    const beforeRecovery = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 60_000));
+    expect(beforeRecovery).toEqual({ promoted: 0, runIds: [] });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    const evidenceRunId = await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 5 * 60_000),
+    });
+
+    const reprobeNow = new Date(now.getTime() + 6 * 60_000);
+    const promotion = await heartbeat.promoteDueScheduledRetries(reprobeNow);
+    expect(promotion).toEqual({ promoted: 1, runIds: [retryRunId] });
+
+    const promotedRun = await readRetryPin(retryRunId);
+    expect(promotedRun?.status).toBe("queued");
+    expect(promotedRun?.scheduledRetryAt?.toISOString()).toBe(reprobeNow.toISOString());
+
+    const reprobeEvent = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, retryRunId))
+      .then((rows) => rows.find((row) => row.message?.includes("re-probed early")) ?? null);
+    expect(reprobeEvent?.payload).toMatchObject({
+      originalScheduledRetryAt: stalePin.toISOString(),
+      upstreamRecoveryEvidenceRunId: evidenceRunId,
+      upstreamAdapterType: "claude_local",
+    });
+  });
+
+  it("keeps the longest ordinary transient backoff pinned despite a fresh success (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    // The scheduler's own longest pin: the last backoff step with jitter at its top.
+    const backoff = computeBoundedTransientHeartbeatRetrySchedule(
+      BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      now,
+      () => 1,
+    );
+    expect(backoff?.delayMs).toBe(150 * 60_000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: backoff!.dueAt,
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      resetHintAt: null,
+    });
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+
+    // 140 minutes still to go, more than the 120-minute base step: an ordinary
+    // backoff all the same, so the last automatic attempt keeps its slot.
+    const promotion = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 10 * 60_000));
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const stillPinned = await readRetryPin(retryRunId);
+    expect(stillPinned?.status).toBe("scheduled_retry");
+    expect(stillPinned?.scheduledRetryAt?.toISOString()).toBe(backoff!.dueAt.toISOString());
+  });
+
+  it("does not take another adapter's success as the pinned adapter's recovery (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    // claude_local hit its usage limit and the retry inherited the reset hint.
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+      retryAdapterType: "claude_local",
+    });
+    const setAdapter = (adapterType: string) =>
+      db.update(agents).set({ adapterType }).where(eq(agents.id, agentId));
+
+    // A -> B (success) -> A: codex_local serving says nothing about claude_local.
+    await setAdapter("codex_local");
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 5 * 60_000),
+      adapterType: "codex_local",
+    });
+    await setAdapter("claude_local");
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 6 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // claude_local recovers, but the agent now runs on codex_local, where the
+    // released retry would land: still no proof for that adapter's pin.
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 7 * 60_000),
+      adapterType: "claude_local",
+    });
+    await setAdapter("codex_local");
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 8 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // Back on claude_local, its own recent success releases the pin.
+    await setAdapter("claude_local");
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 9 * 60_000))).toEqual({
+      promoted: 1,
+      runIds: [retryRunId],
+    });
+  });
+
+  it("keeps a far-future pin whose failed run left no adapter record (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+      retryAdapterType: null,
+    });
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 6 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+  });
+
+  it("keeps a far-future pin when the same upstream fails again after the recovery evidence (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // Green after the pin, then the same agent hits the limit on the same adapter again.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+    await insertFinishedRun({ companyId, agentId, status: "failed", finishedAt: new Date(now.getTime() + 7 * 60_000) });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 8 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    const stillPinned = await readRetryPin(retryRunId);
+    expect(stillPinned?.status).toBe("scheduled_retry");
+    expect(stillPinned?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // A success after that failure is the latest word again.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 9 * 60_000) });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 10 * 60_000))).toEqual({
+      promoted: 1,
+      runIds: [retryRunId],
+    });
+  });
+
+  it("counts only upstream failures on the pinned adapter against the recovery evidence (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // The persisted error family decides, as it does for the retry scheduler.
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 6 * 60_000),
+      errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
+    });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 7 * 60_000))).toEqual({
+      promoted: 0,
+      runIds: [],
+    });
+    expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+
+    // A failure outside the upstream families, or an upstream failure on another
+    // adapter, says nothing about this pin's upstream.
+    const evidenceRunId = await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 8 * 60_000),
+    });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 9 * 60_000),
+      errorCode: "adapter_failed",
+    });
+    await insertFinishedRun({
+      companyId,
+      agentId,
+      status: "failed",
+      finishedAt: new Date(now.getTime() + 10 * 60_000),
+      adapterType: "codex_local",
+      errorCode: "codex_transient_upstream",
+    });
+    expect(await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 11 * 60_000))).toEqual({
+      promoted: 1,
+      runIds: [retryRunId],
+    });
+    const reprobeEvent = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, retryRunId))
+      .then((rows) => rows.find((row) => row.message?.includes("re-probed early")) ?? null);
+    expect(reprobeEvent?.payload).toMatchObject({ upstreamRecoveryEvidenceRunId: evidenceRunId });
+  });
+
+  // A stored errorFamily decides only as a non-blank string; anything else falls
+  // back to the error code, as readHeartbeatRunErrorFamily does for the scheduler.
+  it.each([
+    { name: "a non-string error family", errorCode: "provider_quota", resultJson: { errorFamily: 42 }, upstream: true },
+    {
+      name: "a blank error family",
+      errorCode: "claude_transient_upstream",
+      resultJson: { errorFamily: "\u00a0\t" },
+      upstream: true,
+    },
+    { name: "a non-string error family", errorCode: "adapter_failed", resultJson: { errorFamily: true }, upstream: false },
+  ])(
+    "classifies a later $errorCode failure with $name like the retry scheduler does (HELA-1643)",
+    async ({ errorCode, resultJson, upstream }) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const retryRunId = randomUUID();
+      const now = new Date("2026-10-16T02:40:00.000Z");
+      const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId]);
+      const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+      await seedFarFutureTransientRetry({
+        runId: retryRunId,
+        companyId,
+        agentId,
+        issueId: randomUUID(),
+        issueNumber: 1,
+        issuePrefix,
+        createdAt: now,
+        scheduledRetryAt: stalePin,
+      });
+
+      await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+      await insertFinishedRun({
+        companyId,
+        agentId,
+        status: "failed",
+        finishedAt: new Date(now.getTime() + 6 * 60_000),
+        errorCode,
+        resultJson,
+      });
+      const promotion = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 7 * 60_000));
+      if (upstream) {
+        expect(promotion).toEqual({ promoted: 0, runIds: [] });
+        expect((await readRetryPin(retryRunId))?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+      } else {
+        expect(promotion).toEqual({ promoted: 1, runIds: [retryRunId] });
+      }
+    },
+  );
+
+  it("keeps a far-future transient pin without proof that this agent's upstream recovered (HELA-1643)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const retryRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [agentId, otherAgentId]);
+    const stalePin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+    await seedFarFutureTransientRetry({
+      runId: retryRunId,
+      companyId,
+      agentId,
+      issueId: randomUUID(),
+      issueNumber: 1,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: stalePin,
+    });
+
+    // The agent still fails, its last success predates the pin, and only a
+    // different agent of the same company is green: none of it proves recovery.
+    await insertFinishedRun({ companyId, agentId, status: "failed", finishedAt: new Date(now.getTime() + 5 * 60_000) });
+    await insertFinishedRun({ companyId, agentId, status: "succeeded", finishedAt: new Date(now.getTime() - 60_000) });
+    await insertFinishedRun({
+      companyId,
+      agentId: otherAgentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 5 * 60_000),
+    });
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 6 * 60_000));
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const stillPinned = await readRetryPin(retryRunId);
+    expect(stillPinned?.status).toBe("scheduled_retry");
+    expect(stillPinned?.scheduledRetryAt?.toISOString()).toBe(stalePin.toISOString());
+  });
+
+  it("walks far-future transient pins one page per sweep so later candidates are not starved (HELA-1643)", async () => {
+    // A dedicated service instance keeps this walk's cursor away from the other tests.
+    const sweeper = heartbeatService(db);
+    const companyId = randomUUID();
+    const stuckAgentId = randomUUID();
+    const recoveredAgentId = randomUUID();
+    const recoveredRunId = randomUUID();
+    const now = new Date("2026-10-16T02:40:00.000Z");
+    const issuePrefix = await seedEarlyReprobeCompany(companyId, [stuckAgentId, recoveredAgentId]);
+
+    // A full page of pins whose agent has not recovered sorts ahead of the one that has.
+    const stuckRunIds = Array.from({ length: 50 }, () => randomUUID());
+    for (const [index, runId] of stuckRunIds.entries()) {
+      await seedFarFutureTransientRetry({
+        runId,
+        companyId,
+        agentId: stuckAgentId,
+        issueId: randomUUID(),
+        issueNumber: index + 1,
+        issuePrefix,
+        createdAt: now,
+        scheduledRetryAt: new Date(now.getTime() + 10 * 60 * 60 * 1000 + index * 1_000),
+      });
+    }
+    await seedFarFutureTransientRetry({
+      runId: recoveredRunId,
+      companyId,
+      agentId: recoveredAgentId,
+      issueId: randomUUID(),
+      issueNumber: 51,
+      issuePrefix,
+      createdAt: now,
+      scheduledRetryAt: new Date(now.getTime() + 20 * 60 * 60 * 1000),
+    });
+    await insertFinishedRun({
+      companyId,
+      agentId: recoveredAgentId,
+      status: "succeeded",
+      finishedAt: new Date(now.getTime() + 5 * 60_000),
+    });
+
+    const sweepAt = new Date(now.getTime() + 6 * 60_000);
+    expect(await sweeper.promoteDueScheduledRetries(sweepAt)).toEqual({ promoted: 0, runIds: [] });
+    expect(await sweeper.promoteDueScheduledRetries(sweepAt)).toEqual({ promoted: 1, runIds: [recoveredRunId] });
+    expect((await readRetryPin(recoveredRunId))?.status).toBe("queued");
+
+    const stuckRuns = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, stuckRunIds));
+    expect(stuckRuns).toHaveLength(50);
+    expect(stuckRuns.every((run) => run.status === "scheduled_retry")).toBe(true);
   });
 
   it("schedules max-turn continuations with distinct retry metadata", async () => {
@@ -2237,5 +2795,135 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+});
+
+describe("decideEarlyUpstreamReprobe (HELA-1643)", () => {
+  const now = new Date("2026-10-16T02:40:00.000Z");
+  const pinSetAt = new Date(now.getTime() - 10 * 60_000);
+  const farPin = new Date(now.getTime() + 15 * 60 * 60 * 1000);
+  const freshEvidence = {
+    runId: "evidence-run",
+    finishedAt: new Date(now.getTime() - 60_000),
+    adapterType: "claude_local",
+  };
+  const facts = {
+    retryReason: "transient_failure",
+    scheduledRetryAt: farPin,
+    resetHintAt: farPin,
+    pinSetAt,
+    retryAdapterType: "claude_local",
+    currentAdapterType: "claude_local",
+    recoveryEvidence: freshEvidence,
+    latestUpstreamFailure: null,
+  };
+
+  it("re-probes a far-future reset-hint pin on a fresh success of the same adapter after the pin", () => {
+    expect(decideEarlyUpstreamReprobe(facts, now)).toEqual({ reprobe: true, evidenceRunId: "evidence-run" });
+  });
+
+  it("keeps pins that are not transient retries", () => {
+    expect(decideEarlyUpstreamReprobe({ ...facts, retryReason: MAX_TURN_CONTINUATION_RETRY_REASON }, now)).toEqual({
+      reprobe: false,
+      reason: "retry_reason_not_transient",
+    });
+  });
+
+  it("keeps pins that are not the usage-limit reset hint", () => {
+    // An ordinary backoff: no hint at all, or a hint the jittered backoff outlasted.
+    expect(decideEarlyUpstreamReprobe({ ...facts, resetHintAt: null }, now)).toEqual({
+      reprobe: false,
+      reason: "pin_not_reset_hint",
+    });
+    expect(
+      decideEarlyUpstreamReprobe({ ...facts, resetHintAt: new Date(farPin.getTime() - 60_000) }, now),
+    ).toEqual({ reprobe: false, reason: "pin_not_reset_hint" });
+    expect(decideEarlyUpstreamReprobe({ ...facts, scheduledRetryAt: null }, now)).toEqual({
+      reprobe: false,
+      reason: "pin_not_reset_hint",
+    });
+  });
+
+  it("keeps pins inside the longest jittered backoff", () => {
+    const longestBackoff = computeBoundedTransientHeartbeatRetrySchedule(
+      BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      pinSetAt,
+      () => 1,
+    );
+    expect(longestBackoff?.delayMs).toBe(150 * 60_000);
+    // Set 10 minutes ago, the top-jitter last step still has 140 minutes to go.
+    const topJitterPin = longestBackoff!.dueAt;
+    expect(
+      decideEarlyUpstreamReprobe({ ...facts, scheduledRetryAt: topJitterPin, resetHintAt: topJitterPin }, now),
+    ).toEqual({ reprobe: false, reason: "pin_not_far_future" });
+    const ceilingPin = new Date(now.getTime() + longestBackoff!.delayMs);
+    expect(
+      decideEarlyUpstreamReprobe({ ...facts, scheduledRetryAt: ceilingPin, resetHintAt: ceilingPin }, now),
+    ).toEqual({ reprobe: false, reason: "pin_not_far_future" });
+  });
+
+  it("keeps pins whose adapter is unknown or no longer the agent's", () => {
+    expect(decideEarlyUpstreamReprobe({ ...facts, retryAdapterType: null }, now)).toEqual({
+      reprobe: false,
+      reason: "retry_adapter_unknown",
+    });
+    expect(decideEarlyUpstreamReprobe({ ...facts, currentAdapterType: "codex_local" }, now)).toEqual({
+      reprobe: false,
+      reason: "adapter_changed",
+    });
+    expect(decideEarlyUpstreamReprobe({ ...facts, currentAdapterType: null }, now)).toEqual({
+      reprobe: false,
+      reason: "adapter_changed",
+    });
+  });
+
+  it("keeps pins without fresh evidence from the same adapter that postdates the pin", () => {
+    expect(decideEarlyUpstreamReprobe({ ...facts, recoveryEvidence: null }, now)).toEqual({
+      reprobe: false,
+      reason: "no_recovery_evidence",
+    });
+    expect(
+      decideEarlyUpstreamReprobe({ ...facts, recoveryEvidence: { ...freshEvidence, adapterType: "codex_local" } }, now),
+    ).toEqual({ reprobe: false, reason: "no_recovery_evidence" });
+    expect(
+      decideEarlyUpstreamReprobe(
+        { ...facts, recoveryEvidence: { ...freshEvidence, finishedAt: new Date(now.getTime() - 30 * 60_000) } },
+        now,
+      ),
+    ).toEqual({ reprobe: false, reason: "recovery_evidence_stale" });
+    expect(
+      decideEarlyUpstreamReprobe(
+        { ...facts, recoveryEvidence: { ...freshEvidence, finishedAt: new Date(pinSetAt.getTime()) } },
+        now,
+      ),
+    ).toEqual({ reprobe: false, reason: "recovery_predates_pin" });
+  });
+
+  it("keeps pins whose upstream failed again at or after the recovery evidence", () => {
+    const failedAt = (offsetMs: number) => ({
+      ...facts,
+      latestUpstreamFailure: { runId: "failure-run", finishedAt: new Date(freshEvidence.finishedAt.getTime() + offsetMs) },
+    });
+    expect(decideEarlyUpstreamReprobe(failedAt(1), now)).toEqual({
+      reprobe: false,
+      reason: "upstream_failed_after_recovery",
+    });
+    expect(decideEarlyUpstreamReprobe(failedAt(0), now)).toEqual({
+      reprobe: false,
+      reason: "upstream_failed_after_recovery",
+    });
+    // A failure the success already outlived is the outage it recovered from.
+    expect(decideEarlyUpstreamReprobe(failedAt(-1), now)).toEqual({ reprobe: true, evidenceRunId: "evidence-run" });
+  });
+});
+
+describe("JS_TRIM_WHITESPACE_CHARACTERS (HELA-1643)", () => {
+  it("holds exactly the characters String.prototype.trim strips", () => {
+    const trimmed: string[] = [];
+    for (let codePoint = 0; codePoint <= 0x10ffff; codePoint += 1) {
+      const char = String.fromCodePoint(codePoint);
+      if (char.trim() === "") trimmed.push(char);
+    }
+    expect([...JS_TRIM_WHITESPACE_CHARACTERS].sort()).toEqual(trimmed.sort());
   });
 });

@@ -338,6 +338,20 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+// HELA-1643: a transient retry can inherit a far-future usage-limit reset hint
+// (retryNotBefore, e.g. a quota reset hours away) as its scheduledRetryAt. Only
+// such a hint pin reaching past the longest jittered backoff qualifies for an
+// early re-probe, so a normally scheduled transient backoff is never disturbed.
+const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.round(
+  Math.max(...BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS) * (1 + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO),
+);
+// How recent a successful run must be to still count as proof the upstream is serving.
+const EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS = 30 * 60 * 1000;
+const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
+// Every character String.prototype.trim strips, so SQL can tell a blank string
+// apart exactly as readNonEmptyString does (btrim alone strips only spaces).
+export const JS_TRIM_WHITESPACE_CHARACTERS =
+  "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 3;
@@ -1040,6 +1054,100 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   };
+}
+
+export type EarlyUpstreamReprobeDecision =
+  | { reprobe: true; evidenceRunId: string }
+  | {
+      reprobe: false;
+      reason:
+        | "retry_reason_not_transient"
+        | "pin_not_reset_hint"
+        | "pin_not_far_future"
+        | "retry_adapter_unknown"
+        | "adapter_changed"
+        | "no_recovery_evidence"
+        | "recovery_evidence_stale"
+        | "recovery_predates_pin"
+        | "upstream_failed_after_recovery";
+    };
+
+/**
+ * Decides whether a far-future-pinned transient retry may re-probe the upstream
+ * now instead of idling to its pin (HELA-1643). The promoter otherwise waits for
+ * exactly the pinned timestamp, so a retry that inherited a quota-reset hint
+ * stays parked for hours after the outage that produced it already ended.
+ *
+ * Releasing a pin needs positive proof, never a guess: a successful run of the
+ * same agent on the adapter that hit the limit, recent enough to describe that
+ * upstream's state, later than the pin itself and not followed by another
+ * upstream failure there, while the released retry would still run on that
+ * adapter. Without that proof the pin is preserved exactly.
+ */
+export function decideEarlyUpstreamReprobe(
+  facts: {
+    retryReason: string | null;
+    scheduledRetryAt: Date | null;
+    /** The usage-limit reset hint the retry was scheduled with, if any. */
+    resetHintAt: Date | null;
+    /** When the transient retry row and its pin were inserted. */
+    pinSetAt: Date | null;
+    /** The adapter the failed run behind this retry invoked. */
+    retryAdapterType: string | null;
+    /** The adapter the released retry would run on now. */
+    currentAdapterType: string | null;
+    /** The agent's most recent successful run on the retry's adapter, if any. */
+    recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null;
+    /** The agent's most recent provider_quota / transient_upstream failure on that adapter, if any. */
+    latestUpstreamFailure: { runId: string; finishedAt: Date } | null;
+  },
+  now: Date,
+): EarlyUpstreamReprobeDecision {
+  if (facts.retryReason !== BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON) {
+    return { reprobe: false, reason: "retry_reason_not_transient" };
+  }
+
+  // The scheduler adopts the hint only when it lands after the jittered backoff,
+  // so a pin equal to the hint is the hint. Any other pin is ordinary backoff.
+  const pinnedAt = facts.scheduledRetryAt?.getTime() ?? null;
+  if (pinnedAt === null || facts.resetHintAt?.getTime() !== pinnedAt) {
+    return { reprobe: false, reason: "pin_not_reset_hint" };
+  }
+  if (pinnedAt <= now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS) {
+    return { reprobe: false, reason: "pin_not_far_future" };
+  }
+
+  // A success proves only the adapter it ran on, and only helps a retry that
+  // would run on that adapter again.
+  if (!facts.retryAdapterType) return { reprobe: false, reason: "retry_adapter_unknown" };
+  if (facts.currentAdapterType !== facts.retryAdapterType) {
+    return { reprobe: false, reason: "adapter_changed" };
+  }
+
+  const evidence = facts.recoveryEvidence;
+  if (!evidence || evidence.adapterType !== facts.retryAdapterType) {
+    return { reprobe: false, reason: "no_recovery_evidence" };
+  }
+
+  const recoveredAt = evidence.finishedAt.getTime();
+  if (recoveredAt <= now.getTime() - EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS) {
+    return { reprobe: false, reason: "recovery_evidence_stale" };
+  }
+
+  // A success from before the pin was written describes the upstream the run
+  // already failed against, not its recovery.
+  if (facts.pinSetAt && recoveredAt <= facts.pinSetAt.getTime()) {
+    return { reprobe: false, reason: "recovery_predates_pin" };
+  }
+
+  // The latest word on the upstream wins: hitting the limit there again after
+  // the success means the outage is back and the pin still holds.
+  const failure = facts.latestUpstreamFailure;
+  if (failure && failure.finishedAt.getTime() >= recoveredAt) {
+    return { reprobe: false, reason: "upstream_failed_after_recovery" };
+  }
+
+  return { reprobe: true, evidenceRunId: evidence.runId };
 }
 
 async function resolveRunScopedMentionedSkillKeys(input: {
@@ -10227,10 +10335,248 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // HELA-1643: beyond the runs whose pin came due on its own, release the
+    // ones still pinned to an outage that has demonstrably ended.
+    promotedRunIds.push(
+      ...(await promoteEarlyUpstreamRecoveryRetries(now, cutoff, new Set(dueRuns.map((dueRun) => dueRun.id)))),
+    );
+
     return {
       promoted: promotedRunIds.length,
       runIds: promotedRunIds,
     };
+  }
+
+  // HELA-1643: where the walk over far-future transient pins resumes on the
+  // next sweep. It wraps to the start after a short page.
+  let earlyUpstreamReprobeCursor: { scheduledRetryAt: Date; createdAt: Date; runId: string } | null = null;
+
+  // HELA-1643: runs on this line keep no adapter column. The adapter a run
+  // actually invoked is recorded by its first adapter.invoke event.
+  function invokedAdapterTypeOf(runId: typeof heartbeatRuns.id | typeof heartbeatRuns.retryOfRunId) {
+    return sql<string | null>`(
+      select ${heartbeatRunEvents.payload} ->> 'adapterType'
+      from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.runId} = ${runId}
+        and ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
+        and ${heartbeatRunEvents.agentId} = ${heartbeatRuns.agentId}
+        and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
+      order by ${heartbeatRunEvents.seq} asc
+      limit 1
+    )`;
+  }
+
+  async function findUpstreamRecoveryEvidence(companyId: string, agentId: string, adapterType: string, now: Date) {
+    const lookbackFloor = new Date(now.getTime() - EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS);
+    const row = await db
+      .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "succeeded"),
+          gt(heartbeatRuns.finishedAt, lookbackFloor),
+          sql`${invokedAdapterTypeOf(heartbeatRuns.id)} = ${adapterType}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.finishedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row?.finishedAt) return null;
+    return { runId: row.id, finishedAt: new Date(row.finishedAt), adapterType };
+  }
+
+  // HELA-1643: the agent's latest failed run on the adapter since `since` that
+  // the scheduler would count as an upstream failure
+  // (readTransientRecoveryContractFromRun): a persisted errorFamily wins over the
+  // error code, but only as a non-blank JSON string (readHeartbeatRunErrorFamily).
+  async function findLatestUpstreamFailure(companyId: string, agentId: string, adapterType: string, since: Date) {
+    const row = await db
+      .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "failed"),
+          gte(heartbeatRuns.finishedAt, since),
+          sql`(case
+            when jsonb_typeof(${heartbeatRuns.resultJson} -> 'errorFamily') = 'string'
+              and btrim(${heartbeatRuns.resultJson} ->> 'errorFamily', ${JS_TRIM_WHITESPACE_CHARACTERS}) <> ''
+              then ${heartbeatRuns.resultJson} ->> 'errorFamily'
+            when ${heartbeatRuns.errorCode} = 'provider_quota' then 'provider_quota'
+            when ${heartbeatRuns.errorCode} in ('codex_transient_upstream', 'claude_transient_upstream')
+              then 'transient_upstream'
+          end) in ('provider_quota', 'transient_upstream')`,
+          sql`${invokedAdapterTypeOf(heartbeatRuns.id)} = ${adapterType}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.finishedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!row?.finishedAt) return null;
+    return { runId: row.id, finishedAt: new Date(row.finishedAt) };
+  }
+
+  // HELA-1643: release transient retries whose far-future pin (a usage-limit
+  // reset hint) is stale because the upstream recovered early. A cleared
+  // candidate has its pin pulled forward to `now`, then goes through
+  // promoteScheduledRetryRun and all of its gates, like a retry that came due.
+  // Each sweep reads one bounded page; the cursor carries the walk across
+  // sweeps, so every candidate is re-checked within ceil(candidates / page)
+  // sweeps.
+  async function promoteEarlyUpstreamRecoveryRetries(
+    now: Date,
+    cutoff: Date | null,
+    skipRunIds: ReadonlySet<string>,
+  ) {
+    const reprobeThreshold = new Date(now.getTime() + EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS);
+    const after = earlyUpstreamReprobeCursor;
+    const candidates = await db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        createdAt: heartbeatRuns.createdAt,
+        resetHint: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore'`,
+        retryAdapterType: invokedAdapterTypeOf(heartbeatRuns.retryOfRunId),
+        currentAdapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .leftJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId)))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON),
+          gt(heartbeatRuns.scheduledRetryAt, reprobeThreshold),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          after
+            ? or(
+                gt(heartbeatRuns.scheduledRetryAt, after.scheduledRetryAt),
+                and(
+                  eq(heartbeatRuns.scheduledRetryAt, after.scheduledRetryAt),
+                  gt(heartbeatRuns.createdAt, after.createdAt),
+                ),
+                and(
+                  eq(heartbeatRuns.scheduledRetryAt, after.scheduledRetryAt),
+                  eq(heartbeatRuns.createdAt, after.createdAt),
+                  gt(heartbeatRuns.id, after.runId),
+                ),
+              )
+            : undefined,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP);
+
+    // Move the cursor before any candidate is processed: an overlapping sweep
+    // reads the next page, and a candidate that throws cannot hold the walk on
+    // its page.
+    const last = candidates[candidates.length - 1];
+    earlyUpstreamReprobeCursor =
+      candidates.length === MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP && last?.scheduledRetryAt
+        ? {
+            scheduledRetryAt: new Date(last.scheduledRetryAt),
+            createdAt: new Date(last.createdAt),
+            runId: last.id,
+          }
+        : null;
+
+    type UpstreamState = {
+      recoveryEvidence: { runId: string; finishedAt: Date; adapterType: string } | null;
+      latestUpstreamFailure: { runId: string; finishedAt: Date } | null;
+    };
+    const promotedRunIds: string[] = [];
+    const upstreamStateByScope = new Map<string, UpstreamState>();
+    for (const candidate of candidates) {
+      if (skipRunIds.has(candidate.id)) continue;
+      const retryAdapterType = candidate.retryAdapterType;
+      let upstreamState: UpstreamState = { recoveryEvidence: null, latestUpstreamFailure: null };
+      if (retryAdapterType) {
+        const scope = `${candidate.companyId}:${candidate.agentId}:${retryAdapterType}`;
+        let scopeState = upstreamStateByScope.get(scope);
+        if (!scopeState) {
+          const recoveryEvidence = await findUpstreamRecoveryEvidence(
+            candidate.companyId,
+            candidate.agentId,
+            retryAdapterType,
+            now,
+          );
+          // Only a failure at or after the success can outweigh it.
+          const latestUpstreamFailure = recoveryEvidence
+            ? await findLatestUpstreamFailure(
+                candidate.companyId,
+                candidate.agentId,
+                retryAdapterType,
+                recoveryEvidence.finishedAt,
+              )
+            : null;
+          scopeState = { recoveryEvidence, latestUpstreamFailure };
+          upstreamStateByScope.set(scope, scopeState);
+        }
+        upstreamState = scopeState;
+      }
+
+      const originalScheduledRetryAt = candidate.scheduledRetryAt ? new Date(candidate.scheduledRetryAt) : null;
+      const decision = decideEarlyUpstreamReprobe(
+        {
+          retryReason: candidate.scheduledRetryReason,
+          scheduledRetryAt: originalScheduledRetryAt,
+          resetHintAt: candidate.resetHint ? new Date(candidate.resetHint) : null,
+          // Transient retry rows are inserted with their pin, so createdAt is the
+          // pin-write time. updatedAt can move after unrelated row mutations.
+          pinSetAt: new Date(candidate.createdAt),
+          retryAdapterType,
+          currentAdapterType: candidate.currentAdapterType,
+          ...upstreamState,
+        },
+        now,
+      );
+      if (!decision.reprobe || !originalScheduledRetryAt) continue;
+
+      // Guarded on the exact pin still being in the future, so a retry another
+      // writer already released or re-pinned is never touched by this sweep.
+      const advanced = await db
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(heartbeatRuns.id, candidate.id),
+            eq(heartbeatRuns.companyId, candidate.companyId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON),
+            eq(heartbeatRuns.scheduledRetryAt, originalScheduledRetryAt),
+            gt(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!advanced) continue;
+
+      await appendRunEvent(advanced, await nextRunEventSeq(advanced.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Scheduled retry re-probed early because the upstream recovered before the pinned retry window",
+        payload: {
+          scheduledRetryAttempt: advanced.scheduledRetryAttempt,
+          scheduledRetryReason: advanced.scheduledRetryReason,
+          originalScheduledRetryAt: originalScheduledRetryAt.toISOString(),
+          upstreamRecoveryEvidenceRunId: decision.evidenceRunId,
+          upstreamAdapterType: retryAdapterType,
+        },
+      });
+
+      const result = await promoteScheduledRetryRun(advanced, now);
+      if (result.outcome === "promoted") {
+        promotedRunIds.push(result.run.id);
+      }
+    }
+
+    return promotedRunIds;
   }
 
   async function getIssueRetryRun(

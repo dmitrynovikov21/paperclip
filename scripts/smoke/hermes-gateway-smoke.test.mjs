@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const joinScript = path.join(repoRoot, "scripts", "smoke", "hermes-gateway-join.sh");
@@ -152,4 +155,78 @@ test("join helper normalizes trailing slashes for URL comparisons", () => {
 `,
   );
   assertSuccess(result, "strip_trailing_slash");
+});
+
+test("E2E diagnostic scan keeps secrets out of process args and still detects leaks", { skip: process.platform !== "linux", timeout: 10000 }, async (t) => {
+  const tempRoot = fs.mkdtempSync(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR || os.tmpdir(), "hermes-secret-scan-"));
+  t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+  const diagDir = path.join(tempRoot, "diagnostics");
+  const binDir = path.join(tempRoot, "bin");
+  const fifo = path.join(tempRoot, "pending-diagnostic");
+  const script = path.join(tempRoot, "scan.sh");
+  fs.mkdirSync(diagDir);
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(path.join(binDir, "find"), "#!/bin/sh\nprintf '%s\\n' \"$SCAN_TEST_FIFO\"\n", { mode: 0o755 });
+  assertSuccess(run("mkfifo", [fifo]), "mkfifo");
+  const scanner = extractFunction(fs.readFileSync(e2eScript, "utf8"), "scan_diagnostics_for_secret_leaks");
+  fs.writeFileSync(script, `#!/usr/bin/env bash
+set -euo pipefail
+log() { :; }
+fail() { printf 'secret detected\\n' >&2; exit 9; }
+HERMES_PROVIDER_ENV_KEYS=()
+AGENT_API_KEY=''
+JOIN_OUTPUT_FILE=''
+${scanner}
+scan_diagnostics_for_secret_leaks
+`);
+
+  const marker = randomBytes(20).toString("hex");
+  const env = {
+    PATH: `${binDir}:${process.env.PATH}`,
+    HERMES_GATEWAY_API_KEY: marker,
+    HERMES_SMOKE_DIAG_DIR: diagDir,
+    SCAN_TEST_FIFO: fifo,
+  };
+  const child = spawn("bash", [script], { cwd: repoRoot, env, stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exit = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  let grepPid;
+  try {
+    for (let attempt = 0; attempt < 60 && !grepPid; attempt += 1) {
+      const processList = run("ps", ["-eo", "pid=,args="]).stdout;
+      const line = processList.split("\n").find((entry) => entry.includes("grep -Fq") && entry.includes(fifo));
+      if (line) grepPid = Number(line.trim().split(/\s+/)[0]);
+      else await delay(50);
+    }
+    assert.ok(grepPid, "scanner did not reach the waiting grep process");
+    const cmdline = fs.readFileSync(`/proc/${grepPid}/cmdline`, "utf8");
+    const processView = run("ps", ["-p", String(grepPid), "-o", "args="]).stdout;
+    assert.equal(cmdline.includes(marker), false, "synthetic secret appeared in /proc cmdline");
+    assert.equal(processView.includes(marker), false, "synthetic secret appeared in ps args");
+
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(fifo);
+      writer.once("error", reject);
+      writer.end("clean diagnostics\n", resolve);
+    });
+    const result = await exit;
+    assert.equal(result.code, 0, `clean diagnostic scan failed: ${stderr}`);
+    assert.equal(stderr.includes(marker), false, "scanner printed a secret");
+  } finally {
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      if (grepPid) {
+        try { process.kill(grepPid, "SIGTERM"); } catch { /* already exited */ }
+      }
+    }
+  }
+
+  fs.writeFileSync(path.join(diagDir, "leak.txt"), `prefix${marker}suffix\n`);
+  const leak = run("bash", [script], { env: { ...env, PATH: process.env.PATH } });
+  assert.equal(leak.status, 9, "scanner missed a leaked secret");
+  assert.equal((leak.stdout + leak.stderr).includes(marker), false, "scanner printed a secret");
 });

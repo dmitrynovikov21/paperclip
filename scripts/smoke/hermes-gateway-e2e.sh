@@ -939,7 +939,7 @@ scan_diagnostics_for_secret_leaks() {
     [[ "$file" == "$JOIN_OUTPUT_FILE" ]] && continue
     local secret
     for secret in "${secrets[@]}"; do
-      if grep -Fq "$secret" "$file"; then
+      if grep -Fq -f - -- "$file" <<<"$secret"; then
         fail "raw secret leaked in diagnostics file ${file}"
       fi
     done

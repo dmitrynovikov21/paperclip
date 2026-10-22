@@ -22,6 +22,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  normalizePaperclipWakePayload,
+  renderPaperclipWakePrompt,
+} from "@paperclipai/adapter-utils/server-utils";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -227,6 +231,73 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       waitsByIssueId: {},
     });
     expect(watchdog?.triggerCount).toBe(1);
+  });
+
+  it("passes real stopped leaves and board instructions from the watchdog wake through the prompt", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ROOT", status: "blocked" });
+    const firstLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-1",
+      title: "First stopped leaf",
+      status: "blocked",
+      parentId: sourceId,
+    });
+    const secondLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-2",
+      title: "Second stopped leaf",
+      status: "in_review",
+      parentId: sourceId,
+    });
+    const agentId = await seedAgent(companyId);
+    const watchdog = await seedWatchdog(companyId, sourceId, agentId);
+    const instructions = "Check each stopped leaf.\nEscalate unresolved blockers.";
+    await db.update(issueWatchdogs).set({ instructions }).where(eq(issueWatchdogs.id, watchdog!.id));
+    const { service, wakes } = createService();
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot;
+    expect(context).toMatchObject({
+      customInstructions: instructions,
+      stoppedLeaves: expect.arrayContaining([
+        expect.objectContaining({ issueId: firstLeafId }),
+        expect.objectContaining({ issueId: secondLeafId }),
+      ]),
+    });
+    const normalized = normalizePaperclipWakePayload(context);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toHaveLength(2);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: firstLeafId, identifier: "WDOG-LEAF-1", title: "First stopped leaf", status: "blocked" }),
+      expect.objectContaining({ id: secondLeafId, identifier: "WDOG-LEAF-2", title: "Second stopped leaf", status: "in_review" }),
+    ]));
+    expect(normalized?.taskWatchdog?.customInstructions).toBe(instructions);
+
+    const prompt = renderPaperclipWakePrompt(context);
+    expect(prompt).toContain("Terminal / stopped leaves to verify:");
+    expect(prompt).toContain("- WDOG-LEAF-1 First stopped leaf (blocked)");
+    expect(prompt).toContain("- WDOG-LEAF-2 Second stopped leaf (in_review)");
+    expect(prompt).toContain("Board-supplied watchdog instructions");
+    expect(prompt).toContain(instructions);
+    expect(prompt).not.toContain("No board-supplied watchdog instructions");
+  });
+
+  it("omits leaf and instruction blocks when the real watchdog wake has neither", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-EMPTY", status: "done" });
+    const agentId = await seedAgent(companyId);
+    const watchdog = await seedWatchdog(companyId, sourceId, agentId);
+    await db.update(issueWatchdogs).set({ instructions: "" }).where(eq(issueWatchdogs.id, watchdog!.id));
+    const { service, wakes } = createService();
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot;
+    const normalized = normalizePaperclipWakePayload(context);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toEqual([]);
+    expect(normalized?.taskWatchdog?.customInstructions).toBeNull();
+
+    const prompt = renderPaperclipWakePrompt(context);
+    expect(prompt).not.toContain("Terminal / stopped leaves to verify:");
+    expect(prompt).not.toContain("Board-supplied watchdog instructions (read after the mandate");
+    expect(prompt).toContain("No board-supplied watchdog instructions. Apply the mandate above.");
   });
 
   it("does not append duplicate review comments for an already-open same-fingerprint review", async () => {

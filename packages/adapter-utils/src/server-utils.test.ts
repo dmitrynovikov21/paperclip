@@ -2292,7 +2292,7 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).toContain("Be skeptical of QA done-claims.");
   });
 
-  it("truncates oversized custom instructions and caps terminal leaf summaries", () => {
+  it("preserves complete custom instructions and all terminal leaf summaries", () => {
     const longInstructions = "x".repeat(8_000);
     const manyLeaves = Array.from({ length: 50 }, (_, idx) => ({
       id: `leaf-${idx}`,
@@ -2316,8 +2316,12 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
       },
     });
     const parsed = JSON.parse(serialized ?? "{}");
-    expect(parsed.taskWatchdog.customInstructions.length).toBeLessThanOrEqual(4_000);
-    expect(parsed.taskWatchdog.terminalLeafSummaries.length).toBeLessThanOrEqual(25);
+    expect(parsed.taskWatchdog.customInstructions).toBe(longInstructions);
+    expect(parsed.taskWatchdog.terminalLeafSummaries).toHaveLength(50);
+    expect(parsed.taskWatchdog.terminalLeafSummaries[49]).toMatchObject({ id: "leaf-49", identifier: "PAP-9049" });
+    const prompt = renderPaperclipWakePrompt(parsed);
+    expect(prompt).toContain("- PAP-9049 Leaf 49 (done)");
+    expect(prompt).toContain(longInstructions);
   });
 });
 

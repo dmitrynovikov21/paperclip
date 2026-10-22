@@ -248,6 +248,22 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       status: "in_review",
       parentId: sourceId,
     });
+    const leafIds = [firstLeafId, secondLeafId];
+    for (let index = 3; index <= 25; index += 1) {
+      leafIds.push(await seedIssue(companyId, {
+        identifier: `WDOG-LEAF-${index}`,
+        title: `Stopped leaf ${index}`,
+        status: "blocked",
+        parentId: sourceId,
+      }));
+    }
+    const lastLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-26",
+      title: "Last stopped leaf",
+      status: "blocked",
+      parentId: sourceId,
+    });
+    leafIds.push(lastLeafId);
     const agentId = await seedAgent(companyId);
     const watchdog = await seedWatchdog(companyId, sourceId, agentId);
     const instructions = "Check each stopped leaf.\nEscalate unresolved blockers.";
@@ -264,10 +280,12 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       ]),
     });
     const normalized = normalizePaperclipWakePayload(context);
-    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toHaveLength(2);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toHaveLength(26);
+    expect(new Set(normalized?.taskWatchdog?.terminalLeafSummaries.map((leaf) => leaf.id))).toEqual(new Set(leafIds));
     expect(normalized?.taskWatchdog?.terminalLeafSummaries).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: firstLeafId, identifier: "WDOG-LEAF-1", title: "First stopped leaf", status: "blocked" }),
       expect.objectContaining({ id: secondLeafId, identifier: "WDOG-LEAF-2", title: "Second stopped leaf", status: "in_review" }),
+      expect.objectContaining({ id: lastLeafId, identifier: "WDOG-LEAF-26", title: "Last stopped leaf", status: "blocked" }),
     ]));
     expect(normalized?.taskWatchdog?.customInstructions).toBe(instructions);
 
@@ -275,6 +293,10 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(prompt).toContain("Terminal / stopped leaves to verify:");
     expect(prompt).toContain("- WDOG-LEAF-1 First stopped leaf (blocked)");
     expect(prompt).toContain("- WDOG-LEAF-2 Second stopped leaf (in_review)");
+    expect(prompt).toContain("- WDOG-LEAF-26 Last stopped leaf (blocked)");
+    for (const leaf of normalized?.taskWatchdog?.terminalLeafSummaries ?? []) {
+      expect(prompt).toContain(`- ${leaf.identifier} ${leaf.title} (${leaf.status})`);
+    }
     expect(prompt).toContain("Board-supplied watchdog instructions");
     expect(prompt).toContain(instructions);
     expect(prompt).not.toContain("No board-supplied watchdog instructions");

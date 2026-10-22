@@ -1104,8 +1104,6 @@ function normalizePaperclipWakeExecutionPrincipal(value: unknown): PaperclipWake
   };
 }
 
-const MAX_WATCHDOG_INSTRUCTIONS_CHARS = 4_000;
-const MAX_WATCHDOG_LEAF_SUMMARIES = 25;
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
 function normalizePaperclipWakeTaskWatchdogLeaf(value: unknown): PaperclipWakeTaskWatchdogLeaf | null {
@@ -1170,18 +1168,12 @@ function normalizePaperclipWakeTaskWatchdog(
     watchdog.customInstructions === undefined ? payload.customInstructions : watchdog.customInstructions,
     "",
   );
-  const customInstructionsTrimmed = customInstructionsRaw.trim();
-  const customInstructions = customInstructionsTrimmed
-    ? customInstructionsTrimmed.length > MAX_WATCHDOG_INSTRUCTIONS_CHARS
-      ? customInstructionsTrimmed.slice(0, MAX_WATCHDOG_INSTRUCTIONS_CHARS)
-      : customInstructionsTrimmed
-    : null;
+  const customInstructions = customInstructionsRaw.trim() || null;
   const leafSummariesRaw = watchdog.terminalLeafSummaries === undefined
     ? payload.stoppedLeaves
     : watchdog.terminalLeafSummaries;
   const terminalLeafSummaries = Array.isArray(leafSummariesRaw)
     ? leafSummariesRaw
-        .slice(0, MAX_WATCHDOG_LEAF_SUMMARIES)
         .map((entry) => normalizePaperclipWakeTaskWatchdogLeaf(entry))
         .filter((entry): entry is PaperclipWakeTaskWatchdogLeaf => Boolean(entry))
     : [];

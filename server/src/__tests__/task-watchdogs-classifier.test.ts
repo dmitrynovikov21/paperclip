@@ -86,30 +86,36 @@ describe("task watchdog subtree classifier", () => {
     });
   });
 
-  it("keeps the material fingerprint stable across metadata-only ticks", () => {
+  it.each([
+    ["title", { title: "Renamed source" }],
+    ["identifier", { identifier: "PAP-9" }],
+    ["updatedAt", { updatedAt: new Date("2026-06-18T20:00:00.000Z") }],
+    ["latestCommentAt", { latestCommentAt: "2026-06-18T20:01:00.000Z" }],
+    ["latestDocumentAt", { latestDocumentAt: "2026-06-18T20:02:00.000Z" }],
+    ["latestWorkProductAt", { latestWorkProductAt: "2026-06-18T20:03:00.000Z" }],
+  ] as Array<[string, Partial<TaskWatchdogClassifierIssue>]>)("keeps the fingerprint stable when only %s changes", (_field, change) => {
+    const metadata = {
+      latestCommentAt: "2026-06-17T20:01:00.000Z",
+      latestDocumentAt: "2026-06-17T20:02:00.000Z",
+      latestWorkProductAt: "2026-06-17T20:03:00.000Z",
+    };
     const initial = classify({
-      issues: [issue({
-        status: "blocked",
-        latestCommentAt: "2026-06-17T20:01:00.000Z",
-        latestDocumentAt: "2026-06-17T20:02:00.000Z",
-        latestWorkProductAt: "2026-06-17T20:03:00.000Z",
-      })],
+      issues: [issue({ status: "blocked", ...metadata })],
     });
     const ticked = classify({
-      issues: [issue({
-        status: "blocked",
-        updatedAt: "2026-06-18T20:00:00.000Z",
-        latestCommentAt: "2026-06-18T20:01:00.000Z",
-        latestDocumentAt: "2026-06-18T20:02:00.000Z",
-        latestWorkProductAt: "2026-06-18T20:03:00.000Z",
-      })],
+      issues: [issue({ status: "blocked", ...metadata, ...change })],
     });
 
     expect(initial.state).toBe("stopped");
     expect(ticked.state).toBe("stopped");
     if (initial.state !== "stopped" || ticked.state !== "stopped") return;
     expect(ticked.stopFingerprint).toBe(initial.stopFingerprint);
-    expect(ticked.stoppedLeaves[0]?.updatedAt).not.toBe(initial.stoppedLeaves[0]?.updatedAt);
+    expect(ticked.stoppedLeaves).not.toEqual(initial.stoppedLeaves);
+    expect(ticked.stoppedLeaves[0]).toMatchObject({
+      latestCommentAt: change.latestCommentAt ?? metadata.latestCommentAt,
+      latestDocumentAt: change.latestDocumentAt ?? metadata.latestDocumentAt,
+      latestWorkProductAt: change.latestWorkProductAt ?? metadata.latestWorkProductAt,
+    });
   });
 
   it("suppresses a shrink-only stopped state after a sibling completes", () => {
@@ -210,20 +216,29 @@ describe("task watchdog subtree classifier", () => {
   });
 
   it.each([
-    ["wait set", {
+    ["pendingInteractionIds", {
       pendingInteractions: [{ companyId, issueId: childId, id: "interaction-2", status: "pending" }],
     }],
-    ["leaf status", {
+    ["status", {
       issues: [issue({ status: "in_progress" }), issue({ id: childId, parentId: sourceId, status: "todo" })],
     }],
-    ["leaf assignee", {
+    ["assigneeAgentId", {
       issues: [
         issue({ status: "in_progress" }),
         issue({ id: childId, parentId: sourceId, status: "blocked", assigneeAgentId: "agent-2" }),
       ],
     }],
-    ["leaf blocker", {
+    ["assigneeUserId", {
+      issues: [
+        issue({ status: "in_progress" }),
+        issue({ id: childId, parentId: sourceId, status: "blocked", assigneeUserId: "user-2" }),
+      ],
+    }],
+    ["blockerIssueIds", {
       blockers: [{ companyId, blockedIssueId: childId, blockerIssueId: "blocker-2" }],
+    }],
+    ["pendingApprovalIds", {
+      pendingApprovals: [{ companyId, issueId: childId, id: "approval-1", status: "pending" }],
     }],
     ["new stopped leaf", {
       issues: [
@@ -254,6 +269,8 @@ describe("task watchdog subtree classifier", () => {
     });
 
     expect(changed.state).toBe("stopped");
+    if (changed.state !== "stopped") return;
+    expect(changed.stopFingerprint).not.toBe(initial.stopFingerprint);
   });
 
   it("suppresses an unchanged stopped fingerprint once the watchdog reviewed it", () => {

@@ -96,11 +96,13 @@ def emit_measured_alarm(source):
         comment = ("🚨 **Disk CRITICAL** — сервисный замер свободного места:\n"
                    f"{measurements}\n\n"
                    "Состояние уборки проверьте в локальном журнале дискового сторожа.")
-        result = service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}",
-                                 {"status": "todo", "comment": comment})
+        # The server may commit the PATCH even when its response is lost. Reserve
+        # the cooldown before I/O; continuous pressure can still get the timer's
+        # measured follow-up after ten minutes if this delivery did not commit.
         for label, _free_gb, _threshold_gb, persistent in fresh:
             (last_persistent if persistent else last_reported)[label] = now
-        return result
+        return service_request("PATCH", f"/api/issues/{SIGNAL_ISSUE}",
+                               {"status": "todo", "comment": comment})
 
 
 def monitor_pressure(stop):

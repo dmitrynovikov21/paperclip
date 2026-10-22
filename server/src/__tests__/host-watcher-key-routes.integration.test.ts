@@ -835,6 +835,50 @@ describeDb("seven host service keys on real issue routes and test DB", () => {
     }
   });
 
+  it("does not turn a watchdog alarm comment into a review decision", async () => {
+    const issueId = watchdogAlarmIssueId;
+    const [baseline] = await db.select({
+      status: issues.status, assigneeAgentId: issues.assigneeAgentId,
+      executionPolicy: issues.executionPolicy, executionState: issues.executionState,
+    }).from(issues).where(eq(issues.id, issueId));
+    expect(baseline).toBeDefined();
+    const stageId = randomUUID();
+    const reviewState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: serviceAgents.watchdog! },
+      returnAssignee: { type: "agent", agentId: targets.disk.assigneeAgentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+    } as const;
+    const decisionsBefore = await db.select({ id: issueExecutionDecisions.id })
+      .from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId));
+    await db.update(issues).set({
+      status: "in_review", assigneeAgentId: serviceAgents.watchdog!,
+      executionPolicy: { stages: [{ id: stageId, type: "review", participants: [reviewState.currentParticipant] }] },
+      executionState: reviewState,
+    }).where(eq(issues.id, issueId));
+    try {
+      const response = await request(app).post(`/api/issues/${issueId}/comments`)
+        .set("Authorization", auth("watchdog")).send({ body: "## Review: APPROVED" });
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      const [after] = await db.select({ status: issues.status, executionState: issues.executionState })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(after?.status).toBe("in_review");
+      expect(after?.executionState).toMatchObject({
+        status: "pending", currentStageId: stageId, lastDecisionId: null,
+      });
+      expect(await db.select({ id: issueExecutionDecisions.id })
+        .from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+        .toEqual(decisionsBefore);
+    } finally {
+      await db.update(issues).set(baseline!).where(eq(issues.id, issueId));
+    }
+  });
+
   it("caps PATCH comments and rolls back the signal status when quota is exhausted", async () => {
     const issueId = targets.disk.issueId;
     await seedCommentsToOneBelowLimit("disk", issueId);

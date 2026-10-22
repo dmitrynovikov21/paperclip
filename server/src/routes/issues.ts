@@ -18673,6 +18673,7 @@ export function issueRoutes(
       );
       const shouldAutoApproveReviewComment =
         !isHostWatcherKeyActor(req) &&
+        !(req.actor.type === "agent" && req.actor.keyScope?.kind === "cron_service") &&
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
         actorMatchesExecutionParticipant(

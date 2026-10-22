@@ -385,6 +385,34 @@ class HostPackageTest(unittest.TestCase):
                             for call in requests))
         self.assertIn("критично на каждом сервисном замере за 10 минут", requests[-1][2]["comment"])
 
+    def test_lost_disk_response_does_not_repeat_immediate_alarm(self):
+        requests = []
+        now = [1000.0]
+
+        def response_lost(*args):
+            requests.append(args)
+            raise OSError("response lost after PATCH")
+
+        with patch.object(disk_reporter, "last_reported", {}), \
+                patch.object(disk_reporter, "last_persistent", {}), \
+                patch.object(disk_reporter, "pressure_since", {}), \
+                patch.object(disk_reporter, "measured_pressure", return_value=[("root", 5, 10)]), \
+                patch.object(disk_reporter.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(disk_reporter, "service_request", side_effect=response_lost):
+            with self.assertRaises(OSError):
+                disk_reporter.emit_measured_alarm("monitor")
+            self.assertEqual(disk_reporter.last_reported["root"], now[0])
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {"local": True})
+            self.assertEqual(disk_reporter.report({"event": "critical"}, 1000), {"local": True})
+            self.assertEqual(len(requests), 1)
+
+            now[0] += disk_reporter.PERSISTENCE_GAP_S
+            with self.assertRaises(OSError):
+                disk_reporter.emit_measured_alarm("monitor")
+            self.assertEqual(disk_reporter.last_persistent["root"], now[0])
+            self.assertEqual(disk_reporter.emit_measured_alarm("monitor"), {"local": True})
+            self.assertEqual(len(requests), 2)
+
     def test_pressure_recovery_resets_persistence_observation(self):
         requests = []
         now = [1000.0]

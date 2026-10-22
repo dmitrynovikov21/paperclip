@@ -6,6 +6,16 @@ Do not print raw bearer tokens, gateway session tokens, credential headers, envi
 
 Tool action approvals require `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` to be set independently from auth/JWT secrets. Rotate it deliberately: changing it invalidates outstanding signed tool-action approvals, so drain or reject pending approvals before rotation.
 
+## Safe API commands
+
+Run the examples from the repository root after sourcing the helper once in the same Bash shell:
+
+```sh
+source scripts/operator-http.sh
+```
+
+`board_api` reads `BOARD_API_KEY` from env; `gateway_api` reads `GATEWAY_TOKEN`. The helper sends the request body through stdin and keeps credentials and request URLs out of process arguments. It rejects redirects and never prints credentials on request errors. Keep shell tracing disabled while using credentials.
+
 ## Support Matrix
 
 | Transport | Local trusted | Hosted cloud / public authenticated | Notes |
@@ -18,9 +28,7 @@ Tool action approvals require `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` to be set i
 The board runtime health API summarizes one-hour event windows plus current durable slot state:
 
 ```sh
-curl -fsS \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq .
+board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq .
 ```
 
 Metrics surfaced there include:
@@ -52,25 +60,19 @@ Metrics surfaced there include:
 1. Read the health summary and note firing alert names:
 
    ```sh
-   curl -fsS \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq '{status, metrics, alerts}'
+   board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq '{status, metrics, alerts}'
    ```
 
 2. List durable runtime slots:
 
    ```sh
-   curl -fsS \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots" | jq .
+   board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots" | jq .
    ```
 
 3. Inspect recent gateway audit events without printing secrets:
 
    ```sh
-   curl -fsS \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=100" \
+   board_api GET "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=100" \
      | jq '[.[] | {createdAt, action, entityType, entityId, reasonCode: .details.reasonCode, tool: .details.tool, durationMs: .details.durationMs}]'
    ```
 
@@ -81,31 +83,19 @@ Metrics surfaced there include:
 Stop the slot first when it is stale, idle, failed, or confirmed not to be serving a healthy active call:
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots/$SLOT_ID/stop" \
-  -d '{}' | jq .
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots/$SLOT_ID/stop" '{}' | jq .
 ```
 
 Restart once when the template/config is expected to recover:
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots/$SLOT_ID/restart" \
-  -d '{}' | jq .
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-slots/$SLOT_ID/restart" '{}' | jq .
 ```
 
 If restart suppression fires, do not keep retrying. Disable the connection:
 
 ```sh
-curl -fsS -X PATCH \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
-  -d '{"enabled":false,"status":"disabled"}' | jq '{id, name, enabled, status, healthStatus}'
+board_api PATCH "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" '{"enabled":false,"status":"disabled"}' | jq '{id, name, enabled, status, healthStatus}'
 ```
 
 ## Verify Recovery
@@ -113,29 +103,19 @@ curl -fsS -X PATCH \
 1. Run the connection health check:
 
    ```sh
-   curl -fsS -X POST \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     -H "Content-Type: application/json" \
-     "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/health-check" \
-     -d '{}' | jq '{connection: {id: .connection.id, healthStatus: .connection.healthStatus, healthMessage: .connection.healthMessage}, runtimeSlot}'
+   board_api POST "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/health-check" '{}' | jq '{connection: {id: .connection.id, healthStatus: .connection.healthStatus, healthMessage: .connection.healthMessage}, runtimeSlot}'
    ```
 
 2. Refresh the catalog after a remote endpoint or stdio template recovers:
 
    ```sh
-   curl -fsS -X POST \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     -H "Content-Type: application/json" \
-     "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/catalog/refresh" \
-     -d '{}' | jq '{discoveredCount, quarantinedCount}'
+   board_api POST "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/catalog/refresh" '{}' | jq '{discoveredCount, quarantinedCount}'
    ```
 
 3. Re-read runtime health:
 
    ```sh
-   curl -fsS \
-     -H "Authorization: Bearer $BOARD_API_KEY" \
-     "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq '{status, metrics, alerts}'
+   board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/runtime-health" | jq '{status, metrics, alerts}'
    ```
 
 Recovery is complete when stuck-slot alerts clear, timeout/error rates return below threshold, the connection is healthy or intentionally disabled, and audit events show no new restart suppression or capacity deferrals.

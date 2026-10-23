@@ -1088,3 +1088,10 @@ function redactPostgresUrlsInValueAtKey<T>(input: T, key?: string, possiblyParti
 export function redactPostgresUrlsInValue<T>(input: T, options: { possiblyPartial?: boolean; onlyPartial?: boolean } = {}): T {
   return redactPostgresUrlsInValueAtKey(input, undefined, options.possiblyPartial, options.onlyPartial);
 }
+
+/** A next action may be cut off at 500 chars before a URI's closing `@`. */
+export function redactRunNextAction(value: string | null): string | null {
+  return value === null
+    ? null
+    : redactPostgresUrlsInValue(redactSensitiveText(value), { possiblyPartial: true });
+}

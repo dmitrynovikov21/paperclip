@@ -34,6 +34,7 @@ import {
   hasAcknowledgedNativeStopIntent,
 } from "../acknowledged-native-stop.js";
 import { connectionIntentService } from "../connection-intents.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import {
   CONVERSATION_CONTINUATION_POLICY,
   isConversationAdapter,
@@ -162,6 +163,7 @@ import {
 import {
   redactEventPayload,
   redactPostgresUrlsInValue,
+  redactRunNextAction,
   redactSensitiveText,
 } from "../../redaction.js";
 import {
@@ -632,6 +634,7 @@ function readNonEmptyString(value: unknown): string | null {
 
 /** Run lifecycle binds status, progress, liveness, and completion operations. */
 export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycleDependencies) {
+  const runRedactions = createRunSecretRedactionRegistry(db);
   const {
     issuesSvc,
     recovery,
@@ -2965,6 +2968,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       ...await buildRunLivenessInput(run, resultJson),
       authenticationRepairRequested: Boolean(authRepair?.interactionId),
     });
+    const nextAction = classification.nextAction === null ? null : redactRunNextAction(
+      await runRedactions.redactForRun(run.companyId, run.id, classification.nextAction),
+    );
     return db
       .update(heartbeatRuns)
       .set({
@@ -2972,7 +2978,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         livenessReason: classification.livenessReason,
         continuationAttempt: classification.continuationAttempt,
         lastUsefulActionAt: classification.lastUsefulActionAt,
-        nextAction: classification.nextAction,
+        nextAction,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id))

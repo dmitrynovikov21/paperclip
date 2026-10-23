@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { activityService } from "../services/activity.ts";
+import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { issueReadSqlCondition } from "../services/authorization.ts";
 import { issueService } from "../services/issues.ts";
 import { documentService } from "../services/documents.ts";
@@ -55,8 +56,10 @@ async function waitForIssueRun(
 describeEmbeddedPostgres("activity service", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
 
   beforeAll(async () => {
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = randomBytes(32).toString("base64");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-activity-service-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
@@ -76,6 +79,8 @@ describeEmbeddedPostgres("activity service", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+    if (previousMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
   });
 
   it.each(["standard", "planning", "ask"] as const)("LCA-05 persists explicit %s mode across wording edits and uses it in ledger backfill", async (workMode) => {
@@ -274,8 +279,10 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run produced concrete action evidence: 1 issue comment(s)",
       continuationAttempt: 2,
       lastUsefulActionAt: new Date("2026-04-18T19:59:00.000Z"),
-      nextAction: "Review the completed output.",
+      nextAction: "Inspect postgres://worker:synthetic-historical-password@db.example.test/app and q2a-opaque-canary-value",
     });
+
+    await createRunSecretRedactionRegistry(db).register(companyId, runId, "q2a-opaque-canary-value");
 
     const runs = await activityService(db).runsForIssue(companyId, issueId);
 
@@ -320,7 +327,7 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run produced concrete action evidence: 1 issue comment(s)",
       continuationAttempt: 2,
       lastUsefulActionAt: new Date("2026-04-18T19:59:00.000Z"),
-      nextAction: "Review the completed output.",
+      nextAction: "Inspect postgres://***REDACTED***@db.example.test/app and ***REDACTED***",
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
   });

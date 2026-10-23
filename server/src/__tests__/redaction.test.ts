@@ -20,6 +20,7 @@ import {
   redactAgentAdapterConfig,
   redactEventPayload,
   redactPostgresUrlsInValue,
+  redactRunNextAction,
   redactSensitiveText,
   sanitizeRecord,
 } from "../redaction.js";
@@ -95,6 +96,11 @@ describe("redaction", () => {
     expect(result.resultJson.summary).not.toContain("fragment");
     expect(redactPostgresUrlsInValue("postgres://db.example.test/app"))
       .toBe("postgres://db.example.test/app");
+  });
+
+  it("masks an unfinished next-action URI authority", () => {
+    expect(redactRunNextAction("Inspect postgres://worker:synthetic-truncated"))
+      .toBe("Inspect postgres://***REDACTED***");
   });
 
   it("preserves complete run diagnostics while hiding explicitly truncated userinfo", () => {

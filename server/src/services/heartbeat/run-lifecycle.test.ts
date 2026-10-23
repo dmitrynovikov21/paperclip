@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
@@ -9,6 +10,7 @@ import { getHeartbeatRunRuntimeStatus } from "../heartbeat-run-runtime-status.js
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatLifecycle, persistHeartbeatRunProcessMetadata, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
+import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
@@ -234,6 +236,30 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
       expect(progressed?.lastUsefulActionAt).toBeInstanceOf(Date);
     },
   );
+
+  it("persists a sanitized next action derived from successful run output", async () => {
+    const credential = "synthetic-next-action-password";
+    const registeredSecret = "q2a-opaque-canary-value";
+    const { run } = await fixture({
+      status: "succeeded",
+      stdoutExcerpt: `Next action: inspect postgresql://worker:${credential}@db.example.test/app and ${registeredSecret}`,
+    });
+    const previousMasterKey = process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY = randomBytes(32).toString("base64");
+    try {
+      await createRunSecretRedactionRegistry(db).register(run.companyId, run.id, registeredSecret);
+      const result = await createHeartbeatLifecycle(db, callbacks(db)).classifyAndPersistRunLiveness(run);
+      expect(result?.nextAction).toBe("inspect postgresql://***REDACTED***@db.example.test/app and ***REDACTED***");
+      const [persisted] = await db.select({ nextAction: heartbeatRuns.nextAction })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(persisted.nextAction).toBe(result?.nextAction);
+      expect(persisted.nextAction).not.toContain(credential);
+      expect(persisted.nextAction).not.toContain(registeredSecret);
+    } finally {
+      if (previousMasterKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY = previousMasterKey;
+    }
+  });
 
   it("reads current redaction settings for each event and persists the published sanitized payload", async () => {
     const { run } = await fixture();

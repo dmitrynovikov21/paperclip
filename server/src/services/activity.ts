@@ -23,6 +23,8 @@ import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATIO
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
+import { redactRunNextAction } from "../redaction.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -43,6 +45,7 @@ export function normalizeActivityLimit(limit: number | undefined) {
 }
 
 export function activityService(db: Db) {
+  const runRedactions = createRunSecretRedactionRegistry(db);
   const scheduledLivenessBackfills = new Set<string>();
   const issueIdAsText = sql<string>`${issues.id}::text`;
   const summarizedUsageJson = sql<Record<string, unknown> | null>`
@@ -329,6 +332,10 @@ export function activityService(db: Db) {
         },
       });
 
+      const nextAction = classification.nextAction === null ? null : redactRunNextAction(
+        await runRedactions.redactForRun(companyId, run.id, classification.nextAction),
+      );
+
       await db
         .update(heartbeatRuns)
         .set({
@@ -336,7 +343,7 @@ export function activityService(db: Db) {
           livenessReason: classification.livenessReason,
           continuationAttempt: classification.continuationAttempt,
           lastUsefulActionAt: classification.lastUsefulActionAt,
-          nextAction: classification.nextAction,
+          nextAction,
           updatedAt: new Date(),
         })
         .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.livenessState)));
@@ -476,6 +483,10 @@ export function activityService(db: Db) {
         .orderBy(desc(heartbeatRuns.createdAt));
 
       if (runs.length === 0) return runs;
+      const redactedActions = await runRedactions.redactForRuns(companyId,
+        runs.filter((run) => run.nextAction !== null).map((run) => ({ id: run.runId, nextAction: run.nextAction })),
+        viewerUserId);
+      const safeNextActions = new Map(redactedActions.map((run) => [run.id, redactRunNextAction(run.nextAction)]));
       const runIds = runs.map((run) => run.runId);
       if (runIds.length === 0) return runs;
 
@@ -553,6 +564,7 @@ export function activityService(db: Db) {
               : null;
         return {
           ...run,
+          nextAction: safeNextActions.get(run.runId) ?? null,
           resultJson: run.resultJson ? {
             ...run.resultJson,
             ...(Object.hasOwn(run.resultJson, "workspaceRestorePath") ? {

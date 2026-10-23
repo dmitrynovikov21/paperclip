@@ -308,6 +308,25 @@ describe("activity routes", () => {
     expect(res.body).toEqual([{ runId: "run-1", adapterType: "codex_local" }]);
   });
 
+  it.each([
+    ["board", undefined, "user-1"],
+    ["agent", { type: "agent", companyId: "company-1", agentId: "agent-1" }, null],
+  ] as const)("hides historical next-action credentials from an authorized %s reader", async (_role, actor, viewerUserId) => {
+    const credential = "synthetic-historical-password";
+    mockIssueService.getByIdentifier.mockResolvedValue({
+      id: "issue-uuid-1", companyId: "company-1", assigneeAgentId: "agent-1", status: "in_progress",
+    });
+    mockActivityService.runsForIssue.mockResolvedValue([{
+      runId: "run-1", nextAction: `inspect postgres://worker:${credential}@db.example.test/app`,
+    }]);
+    const app = await createApp(actor);
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/issues/TEST-1/runs"));
+    expect(res.status).toBe(200);
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", viewerUserId);
+    expect(res.body[0].nextAction).toBe("inspect postgres://***REDACTED***@db.example.test/app");
+    expect(JSON.stringify(res.body)).not.toContain(credential);
+  });
+
   it("requires company access before creating activity events", async () => {
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) => request(baseUrl)

@@ -160,6 +160,8 @@ export async function startServer(): Promise<StartedServer> {
   }
   process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME =
     config.secretsRequireIsolatedAgentRuntime ? "true" : "false";
+  process.env.PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON =
+    JSON.stringify(config.secretsAllowedWorkspaceRoots);
   if (config.secretsRequireIsolatedAgentRuntime && config.secretsHostAgentUid !== null) {
     process.env.PAPERCLIP_SECRETS_HOST_AGENT_UID = String(config.secretsHostAgentUid);
   }

@@ -257,6 +257,52 @@ describe("sandbox managed runtime", () => {
     }
   });
 
+  it("refuses a persisted key-directory workspace before sync and uploads an approved workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-key-workspace-sync-"));
+    cleanupDirs.push(rootDir);
+    const secretDir = path.join(rootDir, "private", "secrets");
+    const approvedRoot = path.join(rootDir, "workspaces");
+    const approved = path.join(approvedRoot, "project");
+    const approvedAlias = path.join(rootDir, "approved-alias");
+    const remote = path.join(rootDir, "remote");
+    await mkdir(secretDir, { recursive: true });
+    await mkdir(approved, { recursive: true });
+    await symlink(approved, approvedAlias);
+    await writeFile(path.join(secretDir, "master.key"), "synthetic-key-never-upload");
+    await writeFile(path.join(approved, "safe.txt"), "approved workspace");
+    const client = makeFilesystemClient();
+    const syncIn = vi.fn(client.syncIn!);
+    client.syncIn = syncIn;
+    const input = {
+      spec: { transport: "sandbox" as const, provider: "test", sandboxId: "sandbox-key-test", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+      adapterKey: "test-adapter",
+      client,
+    };
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(secretDir, "master.key"));
+    vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([approvedRoot]));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(prepareSandboxManagedRuntime({ ...input, workspaceLocalDir: secretDir })).rejects.toThrow(/outside/);
+      expect(syncIn).not.toHaveBeenCalled();
+      const prepared = await prepareSandboxManagedRuntime({
+        ...input,
+        workspaceLocalDir: approvedAlias,
+        additionalSources: [{ localPath: secretDir, projectId: "saved-project" }],
+      });
+      expect(syncIn).toHaveBeenCalledTimes(1);
+      expect(prepared.workspaceLocalDir).toBe(approved);
+      await expect(readFile(path.join(remote, "safe.txt"), "utf8")).resolves.toBe("approved workspace");
+      await expect(readFile(path.join(remote, "master.key"), "utf8")).rejects.toThrow();
+      expect(prepared.additionalSourceDirs).toEqual({});
+      expect(prepared.additionalSourceFailures).toHaveLength(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("synthetic-key-never-upload");
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("preserves excluded local workspace artifacts during restore mirroring", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-restore-"));
     cleanupDirs.push(rootDir);

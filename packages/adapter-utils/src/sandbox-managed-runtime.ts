@@ -27,6 +27,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { assertIsolatedWorkspaceSyncAllowed } from "./isolated-workspace-guard.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 
 const execFile = promisify(execFileCallback);
@@ -714,7 +715,10 @@ export async function prepareSandboxManagedRuntime(input: {
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
   const syncWorkspace = input.syncWorkspace !== false;
-  const gitSnapshot = syncWorkspace ? await readGitWorkspaceSnapshot(input.workspaceLocalDir) : null;
+  const workspaceLocalDir = syncWorkspace
+    ? await assertIsolatedWorkspaceSyncAllowed(input.workspaceLocalDir)
+    : input.workspaceLocalDir;
+  const gitSnapshot = syncWorkspace ? await readGitWorkspaceSnapshot(workspaceLocalDir) : null;
   const gitIgnoredExcludes = gitSnapshot?.ignoredPaths;
   const workspaceArchiveExclude = mergeExcludes(
     SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
@@ -731,7 +735,7 @@ export async function prepareSandboxManagedRuntime(input: {
     gitIgnoredExcludes,
   );
   const baselineSnapshot = syncWorkspace
-    ? await captureDirectorySnapshot(input.workspaceLocalDir, { exclude: restoreExclude })
+    ? await captureDirectorySnapshot(workspaceLocalDir, { exclude: restoreExclude })
     : null;
 
   // Every inbound staging step delegates to the provider through `client.syncIn`:
@@ -861,7 +865,7 @@ export async function prepareSandboxManagedRuntime(input: {
           const gitTarPath = path.join(tempDir, "git-workspace.tar");
           const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
           await withShallowGitWorkspaceClone({
-            localDir: input.workspaceLocalDir,
+            localDir: workspaceLocalDir,
             snapshot: gitSnapshot,
           }, async (cloneDir) => {
             await createTarballFromDirectory({
@@ -886,10 +890,10 @@ export async function prepareSandboxManagedRuntime(input: {
         //    the preserved names first. The extract runs AFTER the git extract.
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
         const workspaceTarPath = path.join(tempDir, "workspace.tar");
-        const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : input.workspaceLocalDir;
+        const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : workspaceLocalDir;
         if (gitSnapshot) {
           await copySelectedWorkspaceEntries({
-            sourceDir: input.workspaceLocalDir,
+            sourceDir: workspaceLocalDir,
             targetDir: workspaceArchiveDir,
             relativePaths: gitSnapshot.overlayPaths,
             exclude: workspaceArchiveExclude,
@@ -1007,6 +1011,7 @@ export async function prepareSandboxManagedRuntime(input: {
       const { localPath, projectId } = source;
       const label = `project-${projectId}`;
       try {
+        const canonicalLocalPath = await assertIsolatedWorkspaceSyncAllowed(localPath);
         if (!path.posix.isAbsolute(localPath)) {
           throw new Error(`additional source localPath is not an absolute path: ${localPath}`);
         }
@@ -1022,13 +1027,13 @@ export async function prepareSandboxManagedRuntime(input: {
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to sandbox");
         await stageConfinedSyncIn({
           files: [{
-            sourcePath: localPath,
+            sourcePath: canonicalLocalPath,
             targetPath: remoteProjectDir,
             kind: "directory",
             exclude: additionalSourceExclude,
             access: "ro",
           }],
-          sourceRoots: [localPath],
+          sourceRoots: [canonicalLocalPath],
           targetRoots: [remoteProjectDir],
           progressLabel: label,
           statusPhase: "config_sync",
@@ -1053,7 +1058,7 @@ export async function prepareSandboxManagedRuntime(input: {
 
   return {
     spec: input.spec,
-    workspaceLocalDir: input.workspaceLocalDir,
+    workspaceLocalDir,
     workspaceRemoteDir,
     runtimeRootDir,
     assetDirs,
@@ -1122,7 +1127,7 @@ export async function prepareSandboxManagedRuntime(input: {
               }
               await fs.writeFile(localBundlePath, bundleBuffer);
               return fetchGitBundleIntoLocalRef({
-                localDir: input.workspaceLocalDir,
+                localDir: workspaceLocalDir,
                 bundlePath: localBundlePath,
                 exportRef,
                 importedRef: importedRef!,
@@ -1201,11 +1206,11 @@ export async function prepareSandboxManagedRuntime(input: {
           await mergeDirectoryWithBaseline({
             baseline: baselineSnapshot!,
             sourceDir: extractedDir,
-            targetDir: input.workspaceLocalDir,
+            targetDir: workspaceLocalDir,
             beforeApply: gitHeadToIntegrate
               ? async () => {
                   await integrateImportedGitHead({
-                    localDir: input.workspaceLocalDir,
+                    localDir: workspaceLocalDir,
                     importedHead: gitHeadToIntegrate,
                   });
                 }
@@ -1213,7 +1218,7 @@ export async function prepareSandboxManagedRuntime(input: {
             afterApply: gitSnapshot
               ? async () => {
                   await resetLocalGitIndexToHead({
-                    localDir: input.workspaceLocalDir,
+                    localDir: workspaceLocalDir,
                     checkWorkingTreeClean: remoteWorkspaceStatus === "clean",
                   });
                 }
@@ -1233,7 +1238,7 @@ export async function prepareSandboxManagedRuntime(input: {
         } finally {
           await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing sandbox workspace");
           if (importedRef) {
-            await deleteLocalGitRef({ localDir: input.workspaceLocalDir, ref: importedRef });
+            await deleteLocalGitRef({ localDir: workspaceLocalDir, ref: importedRef });
           }
         }
       });

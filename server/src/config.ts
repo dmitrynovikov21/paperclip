@@ -1,7 +1,7 @@
 import { readConfigFile } from "./config-file.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
@@ -76,6 +76,7 @@ export interface Config {
   secretsMasterKeyFilePath: string;
   secretsRequireIsolatedAgentRuntime: boolean;
   secretsHostAgentUid: number | null;
+  secretsAllowedWorkspaceRoots: string[];
   storageProvider: StorageProvider;
   storageLocalDiskBaseDir: string;
   storageS3Bucket: string;
@@ -179,6 +180,23 @@ export function loadConfig(): Config {
     ? fileSecrets?.localEncrypted.hostAgentUid
     : Number(hostAgentUidRaw);
   const secretsHostAgentUid = hostAgentUid === undefined ? null : hostAgentUid;
+  let allowedWorkspaceRoots = fileSecrets?.localEncrypted.allowedWorkspaceRoots ?? [];
+  const allowedWorkspaceRootsRaw = process.env.PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON;
+  if (allowedWorkspaceRootsRaw !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(allowedWorkspaceRootsRaw);
+    } catch {
+      throw new Error("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON must be a JSON array of absolute paths.");
+    }
+    if (!Array.isArray(parsed) || parsed.some((root) => typeof root !== "string" || !isAbsolute(root))) {
+      throw new Error("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON must be a JSON array of absolute paths.");
+    }
+    allowedWorkspaceRoots = parsed;
+  }
+  if (allowedWorkspaceRoots.some((root) => !isAbsolute(root))) {
+    throw new Error("Isolated workspace roots must be absolute paths.");
+  }
   const deploymentExposureFromEnvRaw = process.env.PAPERCLIP_DEPLOYMENT_EXPOSURE;
   const deploymentExposureFromEnv =
     deploymentExposureFromEnvRaw &&
@@ -327,6 +345,7 @@ export function loadConfig(): Config {
     secretsStrictMode,
     secretsRequireIsolatedAgentRuntime,
     secretsHostAgentUid,
+    secretsAllowedWorkspaceRoots: allowedWorkspaceRoots,
     secretsMasterKeyFilePath:
       resolveHomeAwarePath(
         process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE ??

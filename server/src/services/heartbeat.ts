@@ -278,6 +278,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -1499,6 +1500,10 @@ export async function ensureManagedProjectWorkspace(input: {
   /** Optional git credential source for cloning private repos; null/absent preserves ambient behavior. */
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+      input.repoUrl && !isRemoteGitRepositoryUrl(input.repoUrl)) {
+    throw new Error("Isolated local secrets forbid host-local Git clone sources.");
+  }
   const cwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
     projectId: input.projectId,
@@ -1557,7 +1562,7 @@ async function materializeManagedProjectWorkspace(
   const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
   const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
-    await execFile("git", [...(auth?.configArgs ?? []), "clone", input.repoUrl, cloneTmpDir], {
+    await execFile("git", [...(auth?.configArgs ?? []), "clone", "--", input.repoUrl, cloneTmpDir], {
       env: {
         // Spread order matters: the sanitizer strips PAPERCLIP_*, which would remove the
         // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a

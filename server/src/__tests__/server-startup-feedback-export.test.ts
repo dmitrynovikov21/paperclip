@@ -175,6 +175,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     secretsProvider: "local_encrypted",
     secretsStrictMode: false,
     secretsMasterKeyFilePath: "/tmp/paperclip-master.key",
+    secretsAllowedWorkspaceRoots: [],
     storageProvider: "local_disk",
     storageLocalDiskBaseDir: "/tmp/paperclip-storage",
     storageS3Bucket: "paperclip-test",

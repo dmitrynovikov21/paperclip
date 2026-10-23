@@ -11,6 +11,7 @@ import {
 import { assertGitWorktreeBaseWorkspaceReady } from "../services/heartbeat.js";
 import { buildGitAuthInvocation } from "../services/git-credentials.js";
 import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "../services/host-git-security.js";
+import { addNestedRepositoryWorktree, readLinkedNestedCheckout } from "../services/nested-repository-worktrees.js";
 import {
   ensurePersistedExecutionWorkspaceAvailable,
   realizeExecutionWorkspace,
@@ -66,6 +67,41 @@ const agent = { id: "agent-test", name: "Test", companyId: "company-test" };
 const config = { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}" } };
 
 describe.skipIf(process.platform !== "linux")("isolated host Git before sandbox sync", () => {
+  it("rejects agent-writable nested repository metadata before host Git runs", async () => {
+    const { root, repoRoot, keyFile } = await createFixture();
+    enableIsolation(repoRoot, keyFile);
+    await fs.chmod(path.join(repoRoot, ".git", "config"), 0o666);
+
+    await expect(addNestedRepositoryWorktree({
+      base: repoRoot,
+      cwd: path.join(root, "workspaces", "nested"),
+      repoUrl: "https://example.invalid/nested.git",
+      repoRef: "main",
+    })).rejects.toThrow(/agent-immutable Git metadata/);
+  });
+
+  it("rejects agent-writable Git metadata before inspecting an existing nested worktree", async () => {
+    const { root, repoRoot, keyFile, git } = await createFixture();
+    const nested = path.join(root, "workspaces", "nested");
+    await git(["worktree", "add", "--detach", nested]);
+    enableIsolation(repoRoot, keyFile);
+    await fs.chmod(path.join(repoRoot, ".git", "config"), 0o666);
+
+    await expect(readLinkedNestedCheckout(nested)).rejects.toThrow(/agent-immutable Git metadata/);
+  });
+
+  it("inspects an immutable existing nested worktree under isolation", async () => {
+    const { root, repoRoot, keyFile, git } = await createFixture();
+    const nested = path.join(root, "workspaces", "nested");
+    await git(["worktree", "add", "--detach", nested]);
+    enableIsolation(repoRoot, keyFile);
+
+    await expect(readLinkedNestedCheckout(nested)).resolves.toMatchObject({
+      checkout: nested,
+      base: repoRoot,
+    });
+  });
+
   it("retains trusted GitHub SSH rewrites after removing ambient Git configuration", async () => {
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
     const auth = buildGitAuthInvocation({ token: "synthetic-token", source: "managed_connection", secretName: null });

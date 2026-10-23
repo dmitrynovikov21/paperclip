@@ -70,6 +70,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext } from "../instrumentation.js";
+import { assertNoFileBackedIssueAuthSourceOverrides } from "../lib/adapter-auth-source.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -3960,9 +3961,12 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
   };
 }
 
-function parseIssueAssigneeAdapterOverrides(
+export function parseIssueAssigneeAdapterOverrides(
   raw: unknown,
 ): ParsedIssueAssigneeAdapterOverrides | null {
+  // Persisted overrides may predate the API write guard. Reject them before
+  // they can be merged into a run config or used for Codex home staging.
+  assertNoFileBackedIssueAuthSourceOverrides(raw);
   const parsed = parseObject(raw);
   const modelProfile = MODEL_PROFILE_KEYS.includes(parsed.modelProfile as ModelProfileKey)
     ? parsed.modelProfile as ModelProfileKey

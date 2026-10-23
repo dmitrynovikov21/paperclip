@@ -63,6 +63,7 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import { collectFileBackedAdapterAuthSourcePaths } from "../lib/adapter-auth-source.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
@@ -1568,12 +1569,7 @@ export function agentRoutes(
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     if (req.actor.type === "agent" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
-      const env = asRecord(adapterConfig.env);
-      const protectedPaths = [
-        ...(env && Object.hasOwn(env, "CODEX_HOME") ? [`${path}.env.CODEX_HOME`] : []),
-        ...(Object.hasOwn(adapterConfig, "paperclipConnectorSkillDigest") ? [`${path}.paperclipConnectorSkillDigest`] : []),
-        ...(Object.hasOwn(adapterConfig, "managedAiConnection") ? [`${path}.managedAiConnection`] : []),
-      ];
+      const protectedPaths = collectFileBackedAdapterAuthSourcePaths(adapterConfig, path);
       if (protectedPaths.length > 0) {
         throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${protectedPaths.join(", ")})`);
       }

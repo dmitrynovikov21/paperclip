@@ -95,6 +95,9 @@ describe("local process sandbox", () => {
     expect(target.args).toContain(workspace);
     expect(target.args).toContain(managedHome);
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
+    expect(target.args).toContain("--ro-bind-fd");
+    expect(target.args).toContain("--bind-fd");
+    await target.cleanup?.();
   });
 
   it.runIf(process.platform === "linux")("rejects mounts that contain a file-backed service credential", async () => {
@@ -117,12 +120,14 @@ describe("local process sandbox", () => {
           extraPaths: [{ path: root, access: "ro" }],
         },
       })).rejects.toThrow("mount would expose the service database credential");
-      await expect(buildLocalProcessSandboxSpawnTarget({
+      const allowed = await buildLocalProcessSandboxSpawnTarget({
         executable: process.execPath,
         args: [],
         cwd: workspace,
         options: { workspaceDir: workspace, filesystemScope: "workspace" },
-      })).resolves.toMatchObject({ command: "bwrap" });
+      });
+      expect(allowed.command).toBe("bwrap");
+      await allowed.cleanup?.();
     } finally {
       if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
       else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
@@ -146,8 +151,9 @@ describe("local process sandbox", () => {
       },
     });
 
-    expect(target.args).toEqual(expect.arrayContaining(["--bind-fd", "3", "/app"]));
-    expect(target.inheritedFds).toHaveLength(1);
+    const aliasArgIndex = target.args.indexOf("/app");
+    expect(target.args[aliasArgIndex - 2]).toBe("--bind-fd");
+    expect(Number(target.args[aliasArgIndex - 1])).toBeGreaterThan(3);
     await target.cleanup?.();
 
     const source = path.join(workspace, "source");
@@ -164,8 +170,9 @@ describe("local process sandbox", () => {
         pathAliases: [{ path: "/app", target: inWorkspaceLink }],
       },
     });
-    expect(linkedTarget.args).toEqual(expect.arrayContaining(["--bind-fd", "3", "/app"]));
-    expect(linkedTarget.inheritedFds).toHaveLength(1);
+    const linkedAliasArgIndex = linkedTarget.args.indexOf("/app");
+    expect(linkedTarget.args[linkedAliasArgIndex - 2]).toBe("--bind-fd");
+    expect(Number(linkedTarget.args[linkedAliasArgIndex - 1])).toBeGreaterThan(3);
     await linkedTarget.cleanup?.();
   });
 
@@ -221,9 +228,11 @@ print('alias pinned; credential denied')`;
       try {
         await fs.rename(source, preserved);
         await fs.symlink(serviceDir, source);
-        expect(target.args).toEqual(expect.arrayContaining(["--bind-fd", "3", "/app"]));
-        expect(await fs.readFile(`/proc/self/fd/${target.inheritedFds![0]}/allowed-marker`, "utf8")).toBe("safe");
-        await expect(fs.access(`/proc/self/fd/${target.inheritedFds![0]}/database-url`)).rejects.toThrow();
+        const aliasArgIndex = target.args.indexOf("/app");
+        expect(target.args[aliasArgIndex - 2]).toBe("--bind-fd");
+        const pinnedFd = target.inheritedFds![Number(target.args[aliasArgIndex - 1]) - 3];
+        expect(await fs.readFile(`/proc/self/fd/${pinnedFd}/allowed-marker`, "utf8")).toBe("safe");
+        await expect(fs.access(`/proc/self/fd/${pinnedFd}/database-url`)).rejects.toThrow();
         if (bwrapE2e) {
           const raced = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
             const child = spawn(target.command, target.args, {
@@ -240,6 +249,72 @@ print('alias pinned; credential denied')`;
           });
           expect(raced.code, raced.stderr).toBe(0);
           expect(raced.stdout).toContain("alias pinned; credential denied");
+        }
+      } finally {
+        await target.cleanup?.();
+      }
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("pins an extra mount source when its path is replaced before Bubblewrap starts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-extra-race-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const extraPath = path.join(root, "extra");
+    const preserved = path.join(root, "preserved");
+    const serviceDir = path.join(root, "service");
+    const credential = path.join(serviceDir, "database-url");
+    await Promise.all([fs.mkdir(workspace), fs.mkdir(extraPath), fs.mkdir(serviceDir)]);
+    await fs.writeFile(path.join(extraPath, "allowed-marker"), "safe");
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      const bwrapE2e = process.env.PAPERCLIP_BWRAP_E2E === "1";
+      const probe = `from pathlib import Path
+mount = Path(${JSON.stringify(extraPath)})
+if (mount / 'allowed-marker').read_text() != 'safe':
+    raise RuntimeError('extra path did not bind the checked directory')
+if (mount / 'database-url').exists():
+    raise RuntimeError('extra path exposed the service credential')
+print('extra mount pinned; credential denied')`;
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: bwrapE2e ? "/usr/bin/python3" : process.execPath,
+        args: bwrapE2e ? ["-c", probe] : [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: extraPath, access: "ro" }],
+        },
+      });
+      try {
+        await fs.rename(extraPath, preserved);
+        await fs.symlink(serviceDir, extraPath);
+        const mountArgIndex = target.args.indexOf(extraPath);
+        expect(target.args[mountArgIndex - 2]).toBe("--ro-bind-fd");
+        const pinnedFd = target.inheritedFds![Number(target.args[mountArgIndex - 1]) - 3];
+        expect(await fs.readFile(`/proc/self/fd/${pinnedFd}/allowed-marker`, "utf8")).toBe("safe");
+        await expect(fs.access(`/proc/self/fd/${pinnedFd}/database-url`)).rejects.toThrow();
+        if (bwrapE2e) {
+          const raced = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+            const child = spawn(target.command, target.args, {
+              cwd: target.cwd,
+              env: { PATH: "/usr/bin:/bin" },
+              stdio: ["ignore", "pipe", "pipe", ...(target.inheritedFds ?? [])],
+            });
+            let stdout = "";
+            let stderr = "";
+            child.stdout!.on("data", (chunk) => { stdout += chunk; });
+            child.stderr!.on("data", (chunk) => { stderr += chunk; });
+            child.on("error", reject);
+            child.on("close", (code) => resolve({ code, stdout, stderr }));
+          });
+          expect(raced.code, raced.stderr).toBe(0);
+          expect(raced.stdout).toContain("extra mount pinned; credential denied");
         }
       } finally {
         await target.cleanup?.();

@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   listAdapterModelProfiles,
   type AdapterModelProfileDefinition,
 } from "../adapters/index.js";
 import {
   mergeModelProfileAdapterConfig,
+  parseIssueAssigneeAdapterOverrides,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,
   isConfigurationIncompleteFailedRun,
@@ -21,6 +22,26 @@ const cheapProfile: AdapterModelProfileDefinition = {
 };
 
 describe("heartbeat model profile application", () => {
+  it("rejects persisted issue auth-source overrides before run configuration and staging", () => {
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/private/database-url");
+    try {
+      for (const adapterConfig of [
+        { env: { CODEX_HOME: "/private/other-agent" } },
+        { paperclipConnectorSkillDigest: "other-digest" },
+        { managedAiConnection: { id: "other-connection" } },
+      ]) {
+        expect(() => parseIssueAssigneeAdapterOverrides({ adapterConfig })).toThrow(
+          "Issue adapter overrides cannot select connector authentication sources",
+        );
+      }
+      expect(parseIssueAssigneeAdapterOverrides({ adapterConfig: { model: "safe" } })).toMatchObject({
+        adapterConfig: { model: "safe" },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("uses the supported Codex cheap default for a cheap request", async () => {
     const modelProfile = resolveModelProfileApplication({
       adapterModelProfiles: await listAdapterModelProfiles("codex_local"),

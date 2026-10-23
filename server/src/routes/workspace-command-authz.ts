@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import { forbidden } from "../errors.js";
+import { collectFileBackedIssueAuthSourcePaths } from "../lib/adapter-auth-source.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -108,6 +109,18 @@ export function collectIssueWorkspaceCommandPaths(input: {
     ));
   }
   return paths;
+}
+
+export function assertNoAgentIssueConfigMutation(req: Request, input: {
+  executionWorkspaceSettings?: unknown;
+  assigneeAdapterOverrides?: unknown;
+}) {
+  assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(input));
+  if (req.actor.type !== "agent" || !process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) return;
+  const paths = collectFileBackedIssueAuthSourcePaths(input.assigneeAdapterOverrides);
+  if (paths.length > 0) {
+    throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${paths.join(", ")})`);
+  }
 }
 
 export function collectExecutionWorkspaceCommandPaths(input: {

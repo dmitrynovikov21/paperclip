@@ -279,6 +279,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -1562,8 +1563,10 @@ async function materializeManagedProjectWorkspace(
   const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
   const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
-    await execFile("git", [...(auth?.configArgs ?? []), "clone", "--", input.repoUrl, cloneTmpDir], {
-      env: {
+    await assertHostGitWorkspaceAllowed(cloneTmpDir);
+    const git = prepareHostGitInvocation(
+      [...(auth?.configArgs ?? []), "clone", "--", input.repoUrl, cloneTmpDir],
+      {
         // Spread order matters: the sanitizer strips PAPERCLIP_*, which would remove the
         // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a
         // credential-less private clone immediately instead of hanging on a prompt until
@@ -1572,6 +1575,9 @@ async function materializeManagedProjectWorkspace(
         GIT_TERMINAL_PROMPT: "0",
         ...(auth?.env ?? {}),
       },
+    );
+    await execFile("git", git.args, {
+      env: git.env,
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });
   } catch (error) {
@@ -1830,7 +1836,9 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  await assertHostGitWorkspaceAllowed(normalized);
+  const git = prepareHostGitInvocation(["rev-parse", "--show-toplevel"]);
+  return execFile("git", git.args, { cwd: normalized, env: git.env })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -1845,7 +1853,9 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  await assertHostGitWorkspaceAllowed(normalized);
+  const remoteGit = prepareHostGitInvocation(["remote"]);
+  const remoteNames = await execFile("git", remoteGit.args, { cwd: normalized, env: remoteGit.env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -1855,7 +1865,8 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const git = prepareHostGitInvocation(["remote", "get-url", "--push", remoteName]);
+    const pushUrl = await execFile("git", git.args, { cwd: normalized, env: git.env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;

@@ -39,6 +39,7 @@ import { workspaceOperationService, type WorkspaceOperationRecorder } from "./wo
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -579,11 +580,13 @@ async function executeProcess(input: {
 }
 
 async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+  await assertHostGitWorkspaceAllowed(cwd);
+  const git = prepareHostGitInvocation(args, opts?.env);
   const proc = await executeProcess({
     command: "git",
-    args,
+    args: git.args,
     cwd,
-    env: opts?.env,
+    env: git.env,
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -2520,10 +2523,13 @@ async function recordGitOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
+      await assertHostGitWorkspaceAllowed(input.cwd);
+      const git = prepareHostGitInvocation(input.args);
       const result = await executeProcess({
         command: "git",
-        args: input.args,
+        args: git.args,
         cwd: input.cwd,
+        env: git.env,
       });
       stdout = result.stdout;
       stderr = result.stderr;

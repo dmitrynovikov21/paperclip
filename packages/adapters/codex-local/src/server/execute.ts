@@ -705,6 +705,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
+  if (ctx.managedAiCredentialHome && (
+    !config.managedAiConnection || configuredCodexHome !== ctx.managedAiCredentialHome
+  )) {
+    throw new Error("Managed Codex credential home does not match the server-provisioned CODEX_HOME.");
+  }
   const configuredOpenAiApiKey =
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
@@ -724,10 +729,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         .map(entry => [entry.key, entry.source]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     })).digest("hex")
     : connectorSkillDigest;
-  const runtimeCredentialHome = runtimeSkillDigest
+  // A managed AI connection already has a fresh, server-created home for this
+  // run. Keep skills there as well: a second skill home would symlink auth.json
+  // away from the home whose credential the server saves during cleanup.
+  const needsSkillHome = Boolean(runtimeSkillDigest) && !ctx.managedAiCredentialHome;
+  const runtimeCredentialHome = needsSkillHome
     ? skillSourceHome ?? await prepareManagedCodexHome(process.env, onLog, agent.companyId, { apiKey: configuredOpenAiApiKey })
     : null;
-  if (runtimeSkillDigest) {
+  if (needsSkillHome) {
     const credentialHome = runtimeCredentialHome!;
     const credentialBytes = await fs.readFile(path.join(credentialHome, "auth.json")).catch(() => null);
     const selectedConfig = await fs.readFile(path.join(credentialHome, "config.toml")).catch(() => null);

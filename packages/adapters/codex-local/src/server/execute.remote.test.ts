@@ -314,6 +314,100 @@ describe("codex remote execution", () => {
     expect(await readFile(path.join(providerHome, "auth.json"), "utf8")).toBe(credential);
   });
 
+  it.skipIf(process.platform !== "linux")("dispatches managed subscription with an empty skill inventory and copies refresh into the cleanup home", async () => {
+    const root = await mkdtemp(path.join(process.cwd(), ".codex-managed-subscription-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const providerHome = path.join(root, "provider");
+    const auth = (refresh: string, lastRefresh: string) => JSON.stringify({
+      tokens: {
+        account_id: "synthetic-account",
+        id_token: `id-${refresh}`,
+        access_token: `access-${refresh}`,
+        refresh_token: `refresh-${refresh}`,
+      },
+      last_refresh: lastRefresh,
+    });
+    const original = auth("original", "2026-01-01T00:00:00.000Z");
+    const refreshed = auth("refreshed", "2026-06-01T00:00:00.000Z");
+    await mkdir(workspace, { mode: 0o700 });
+    await mkdir(providerHome, { mode: 0o700 });
+    await writeFile(path.join(providerHome, "auth.json"), original, { mode: 0o600 });
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100000));
+    let stagedAuth: string | null = null;
+    syncDirectoryToSsh.mockImplementationOnce(async (...args: unknown[]) => {
+      const { localDir } = args[0] as { localDir: string };
+      stagedAuth = await readFile(path.join(localDir, "auth.json"), "utf8");
+    });
+    runSshCommand.mockImplementation(async (...args: unknown[]) => ({
+      stdout: Buffer.from(String(args[1]).startsWith("base64 <") ? refreshed : "{}").toString("base64"),
+      stderr: "",
+    }));
+
+    await execute({
+      runId: "managed-subscription-with-skills",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli",
+        command: "codex",
+        managedAiConnection: { grantId: "grant-1" },
+        paperclipRuntimeSkills: [],
+        env: { CODEX_HOME: providerHome },
+      },
+      managedAiCredentialHome: providerHome,
+      context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+        strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    } as never);
+
+    expect(stagedAuth).toBe(original);
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    // prepareManagedAiRuntime.cleanup reads this exact provider file, then
+    // persists its newer token to the selected managed secret before deleting it.
+    expect(await readFile(path.join(providerHome, "auth.json"), "utf8")).toBe(refreshed);
+  });
+
+  it.skipIf(process.platform !== "linux")("keeps the managed connection source guard with an empty skill inventory", async () => {
+    const root = await mkdtemp(path.join(process.cwd(), ".codex-managed-source-guard-"));
+    cleanupDirs.push(root);
+    const providerHome = path.join(root, "provider");
+    const key = path.join(root, "synthetic-master.key");
+    await mkdir(providerHome, { mode: 0o700 });
+    await writeFile(key, "SYNTHETIC_MASTER_KEY", { mode: 0o600 });
+    await symlink(key, path.join(providerHome, "auth.json"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100000));
+    const logs: string[] = [];
+
+    await expect(execute({
+      runId: "managed-source-guard",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      config: {
+        engine: "cli",
+        managedAiConnection: { grantId: "grant-1" },
+        paperclipRuntimeSkills: [],
+        env: { CODEX_HOME: providerHome },
+      },
+      managedAiCredentialHome: providerHome,
+      context: {},
+      executionTarget: { kind: "remote", transport: "sandbox" },
+      onLog: async (_stream: "stdout" | "stderr", chunk: string) => { logs.push(chunk); },
+    } as never)).rejects.toThrow();
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    expect(runChildProcess).not.toHaveBeenCalled();
+    expect(logs.join("")).not.toContain("SYNTHETIC_MASTER_KEY");
+  });
+
   it("rejects a caller-selected managed connection path without the server-owned context", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-managed-spoof-"));
     cleanupDirs.push(root);

@@ -48,6 +48,10 @@ class InvalidRunId(ValueError):
     pass
 
 
+class InvalidPath(ValueError):
+    pass
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -61,6 +65,8 @@ def api_base(env=None) -> str:
 
 def call(method: str, path: str, body=None, timeout: int = DEFAULT_TIMEOUT):
     """Return (status, text). The credential never leaves this process's memory."""
+    if not path.startswith("/"):
+        raise InvalidPath("API path must start with /")
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Authorization": "Bearer " + os.environ["PAPERCLIP_API_KEY"]}
     run_id = os.environ.get("PAPERCLIP_RUN_ID")
@@ -91,8 +97,8 @@ def main(argv) -> int:
         body = json.loads(open(raw[1:]).read() if raw.startswith("@") else raw)
     try:
         status, text = call(method, path, body)
-    except InvalidRunId:
-        print("PAPERCLIP_RUN_ID contains a control character", file=sys.stderr)
+    except (InvalidRunId, InvalidPath) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     print(status)
     print(text)

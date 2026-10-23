@@ -42,6 +42,11 @@ pc_api_base() {
 _pc_api_run() {
   local method="$1" path="$2" body_file="$3" form="$4"
   local url out curl_status=0
+  PC_API_STATUS=""
+  case "$path" in
+    /*) ;;
+    *) printf 'pc_api: API path must start with /\n' >&2; return 2 ;;
+  esac
   local -a options=(--disable --silent --show-error --globoff --request "$method"
     --max-time "${PC_API_MAX_TIME:-90}" --write-out '%{http_code}' --header @-)
   url="$(pc_api_base)$path"

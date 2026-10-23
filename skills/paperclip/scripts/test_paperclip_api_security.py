@@ -294,6 +294,18 @@ class ApiHelperSecurityTest(unittest.TestCase):
         self.assertEqual(self.victim.requests[0][2].get("X-Paperclip-Run-Id"), "synthetic-run-id")
         self.assertNotIn(self.token, redirected.stdout + redirected.stderr)
 
+    def test_python_helper_rejects_authority_like_path_before_network(self):
+        path = "@" + self.attacker.url.removeprefix("http://") + "/stolen"
+        result = subprocess.run(
+            [sys.executable, str(PYTHON_HELPER), "GET", path],
+            env=self.env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("API path must start with /", result.stderr)
+        self.assertNotIn(self.token, result.stdout + result.stderr)
+        self.assertEqual(self.victim.requests, [])
+        self.assertEqual(self.attacker.requests, [])
+
     @unittest.skipUnless(Path("/proc/self/cmdline").exists(), "Linux /proc required")
     def test_python_helper_keeps_bearer_out_of_proc_and_ps(self):
         token = self.token.encode()
@@ -332,6 +344,24 @@ class ApiHelperSecurityTest(unittest.TestCase):
         self.call('pc_api GET "$PC_TEST_PATH"', PC_TEST_PATH=injected)
         self.assertEqual(len(self.attacker.requests), 0)
         self.assertLessEqual(len(self.victim.requests), 1)
+
+    def test_shell_helpers_reject_authority_like_path_before_network(self):
+        path = "@" + self.attacker.url.removeprefix("http://") + "/stolen"
+        upload = Path(self.scratch.name) / "safe-upload.txt"
+        upload.write_text("safe-upload-payload")
+        for script in (
+            'pc_api GET "$PC_TEST_PATH"',
+            'pc_api_upload "$PC_TEST_PATH" "$PC_TEST_FILE" text/plain',
+        ):
+            with self.subTest(script=script):
+                result = self.call(
+                    script, PC_TEST_PATH=path, PC_TEST_FILE=str(upload),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("API path must start with /", result.stderr)
+                self.assertNotIn(self.token, result.stdout + result.stderr)
+                self.assertEqual(self.victim.requests, [])
+                self.assertEqual(self.attacker.requests, [])
 
     def test_api_url_cannot_add_an_attacker_url(self):
         injected = self.victim.url + '/api"\nurl = "' + self.attacker.url + "/stolen"

@@ -109,6 +109,24 @@ describe("PostgreSQL URL credentials", () => {
     expect(oversized.chunk("stdout", "@db/app\n"))
       .toBe("***REDACTED***@db/app\n");
   });
+
+  it.each([",", ";", "|"])("holds a second URL after %s until its split @ arrives", (separator) => {
+    const redactor = createPostgresUrlStreamRedactor();
+    const chunks = [
+      `postgres://first:marker-one@db1/app${separator}post`,
+      "gresql://second:marker-two",
+      "@db2/app done\n",
+    ];
+    const output: string[] = [];
+    for (const chunk of chunks) {
+      output.push(redactor.chunk("stdout", chunk));
+      expect(output.join("")).not.toContain("marker-one");
+      expect(output.join("")).not.toContain("marker-two");
+    }
+    output.push(redactor.finish("stdout"));
+    expect(output.join(""))
+      .toBe(`postgres://***REDACTED***@db1/app${separator}postgresql://***REDACTED***@db2/app done\n`);
+  });
 });
 
 describe("redactDiagnosticText", () => {

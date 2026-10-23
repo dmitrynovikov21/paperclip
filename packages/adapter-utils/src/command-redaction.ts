@@ -41,6 +41,18 @@ const POSTGRES_URL_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
 const POSTGRES_URL_SCHEMES = ["postgres://", "postgresql://"];
 const MAX_PENDING_POSTGRES_USERINFO_CHARS = 8192;
 
+function trailingPostgresSchemePrefixLength(text: string): number {
+  let prefixLength = 0;
+  for (const scheme of POSTGRES_URL_SCHEMES) {
+    for (let length = 1; length < Math.min(text.length + 1, scheme.length); length += 1) {
+      if (text.slice(-length).toLowerCase() === scheme.slice(0, length)) {
+        prefixLength = Math.max(prefixLength, length);
+      }
+    }
+  }
+  return prefixLength;
+}
+
 function isConfirmedPostgresHost(value: string): boolean {
   // A path ends the authority. A dotted hostname (or localhost) followed by
   // whitespace is also a complete credential-free URL. Keep ambiguous
@@ -104,6 +116,17 @@ export function createPostgresUrlStreamRedactor(
           let boundary = index;
           while (boundary < input.length && !/[\s"`<>\\]/.test(input[boundary])) boundary += 1;
           const queryStart = input.indexOf("?", index);
+          POSTGRES_URL_SCHEME_RE.lastIndex = index;
+          const nextUrl = POSTGRES_URL_SCHEME_RE.exec(input);
+          // A second URL can follow the first without whitespace. Resume the
+          // userinfo scanner before any part of its authority is emitted.
+          if (nextUrl && nextUrl.index < boundary &&
+            (queryStart < 0 || nextUrl.index < queryStart)) {
+            output += input.slice(index, nextUrl.index);
+            state.urlTail = false;
+            index = nextUrl.index;
+            continue;
+          }
           if (queryStart >= 0 && queryStart < boundary) {
             output += input.slice(index, queryStart) + "?" + redactedValue;
             state.urlTail = false;
@@ -111,8 +134,14 @@ export function createPostgresUrlStreamRedactor(
             index = queryStart + 1;
             continue;
           }
+          if (boundary === input.length) {
+            const tail = input.slice(index, boundary);
+            const prefixLength = trailingPostgresSchemePrefixLength(tail);
+            output += tail.slice(0, tail.length - prefixLength);
+            state.prefix = tail.slice(tail.length - prefixLength);
+            break;
+          }
           output += input.slice(index, boundary);
-          if (boundary === input.length) break;
           output += input[boundary];
           state.urlTail = false;
           index = boundary + 1;
@@ -156,14 +185,7 @@ export function createPostgresUrlStreamRedactor(
           continue;
         }
         const rest = input.slice(index);
-        let prefixLength = 0;
-        for (const scheme of POSTGRES_URL_SCHEMES) {
-          for (let length = 1; length < Math.min(rest.length + 1, scheme.length); length += 1) {
-            if (rest.slice(-length).toLowerCase() === scheme.slice(0, length)) {
-              prefixLength = Math.max(prefixLength, length);
-            }
-          }
-        }
+        const prefixLength = trailingPostgresSchemePrefixLength(rest);
         output += rest.slice(0, rest.length - prefixLength);
         state.prefix = rest.slice(rest.length - prefixLength);
         break;

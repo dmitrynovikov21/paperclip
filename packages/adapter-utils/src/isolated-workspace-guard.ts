@@ -21,31 +21,58 @@ async function lstatIfPresent(entryPath: string): Promise<import("node:fs").Stat
   }
 }
 
+const GIT_SCAN_RECHECK_MS = 5_000;
+const GIT_SCAN_CACHE_LIMIT = 128;
+const verifiedGitDirectories = new Map<string, { dev: number; ino: number; checkedAt: number }>();
+const pendingGitScans = new Map<string, Promise<void>>();
+
 async function assertImmutableGitDirectory(gitDirectory: string, hostAgentUid: number): Promise<void> {
   // A linked worktree can point outside the workspace. Protect every component
   // of that path as well as the contents of the Git directory itself.
+  let rootEntry: import("node:fs").Stats | null = null;
   for (let directory = gitDirectory; ; directory = path.dirname(directory)) {
     const entry = await fs.lstat(directory);
     assertAgentImmutable(entry, directory, hostAgentUid);
     if (!entry.isDirectory()) {
       throw new Error(`Isolated workspace sync requires a Git metadata directory: ${directory}`);
     }
+    if (directory === gitDirectory) rootEntry = entry;
     if (directory === path.dirname(directory)) break;
   }
 
-  const pending = [gitDirectory];
-  while (pending.length > 0) {
-    const directory = pending.pop()!;
-    for (const name of await fs.readdir(directory)) {
-      const entryPath = path.join(directory, name);
-      const entry = await fs.lstat(entryPath);
-      assertAgentImmutable(entry, entryPath, hostAgentUid);
-      if (entry.isDirectory()) pending.push(entryPath);
-      else if (!entry.isFile()) {
-        throw new Error(`Isolated workspace sync requires regular Git metadata: ${entryPath}`);
+  const cacheKey = `${hostAgentUid}:${gitDirectory}`;
+  const cached = verifiedGitDirectories.get(cacheKey);
+  if (cached && rootEntry && cached.dev === rootEntry.dev && cached.ino === rootEntry.ino &&
+      Date.now() - cached.checkedAt < GIT_SCAN_RECHECK_MS) return;
+
+  const pendingScan = pendingGitScans.get(cacheKey);
+  if (pendingScan) return await pendingScan;
+
+  const scan = (async () => {
+    const pending = [gitDirectory];
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      for (const name of await fs.readdir(directory)) {
+        const entryPath = path.join(directory, name);
+        const entry = await fs.lstat(entryPath);
+        assertAgentImmutable(entry, entryPath, hostAgentUid);
+        if (entry.isDirectory()) pending.push(entryPath);
+        else if (!entry.isFile()) {
+          throw new Error(`Isolated workspace sync requires regular Git metadata: ${entryPath}`);
+        }
       }
     }
-  }
+    // The agent cannot alter an accepted metadata tree: every ancestor and
+    // entry is agent-immutable. A short recheck window catches operator-side
+    // changes while avoiding a full object walk for each small Git command.
+    verifiedGitDirectories.delete(cacheKey);
+    verifiedGitDirectories.set(cacheKey, { dev: rootEntry!.dev, ino: rootEntry!.ino, checkedAt: Date.now() });
+    if (verifiedGitDirectories.size > GIT_SCAN_CACHE_LIMIT) {
+      verifiedGitDirectories.delete(verifiedGitDirectories.keys().next().value!);
+    }
+  })();
+  pendingGitScans.set(cacheKey, scan);
+  try { await scan; } finally { if (pendingGitScans.get(cacheKey) === scan) pendingGitScans.delete(cacheKey); }
 }
 
 async function readImmutableGitPointer(pointerPath: string, prefix: string): Promise<string> {
@@ -68,10 +95,13 @@ const SAFE_GIT_CONFIG_KEYS: Record<string, ReadonlySet<string>> = {
   user: new Set(["name", "email"]),
 };
 
-async function assertSafeGitConfig(gitDirectory: string): Promise<void> {
+async function assertSafeGitConfig(gitDirectory: string, hostAgentUid: number): Promise<void> {
   for (const name of ["config", "config.worktree"]) {
     const configPath = path.join(gitDirectory, name);
-    if (!(await lstatIfPresent(configPath))) continue;
+    const entry = await lstatIfPresent(configPath);
+    if (!entry) continue;
+    assertAgentImmutable(entry, configPath, hostAgentUid);
+    if (!entry.isFile()) throw new Error(`Isolated workspace sync requires regular Git metadata: ${configPath}`);
     // Even service-owned config can name a command in an agent-writable tree
     // (fsmonitor, hooksPath, filters, etc.). Accept only inert settings needed
     // to read the repository; reject includes and unknown syntax fail-closed.
@@ -95,6 +125,20 @@ async function assertSafeGitConfig(gitDirectory: string): Promise<void> {
   }
 }
 
+async function assertSafeGitHooks(gitDirectory: string, hostAgentUid: number): Promise<void> {
+  const hooksPath = path.join(gitDirectory, "hooks");
+  const hooks = await lstatIfPresent(hooksPath);
+  if (!hooks) return;
+  assertAgentImmutable(hooks, hooksPath, hostAgentUid);
+  if (!hooks.isDirectory()) throw new Error(`Isolated workspace sync requires regular Git metadata: ${hooksPath}`);
+  for (const name of await fs.readdir(hooksPath)) {
+    const hookPath = path.join(hooksPath, name);
+    const entry = await fs.lstat(hookPath);
+    assertAgentImmutable(entry, hookPath, hostAgentUid);
+    if (!entry.isFile()) throw new Error(`Isolated workspace sync requires regular Git metadata: ${hookPath}`);
+  }
+}
+
 async function assertIsolatedGitMetadataImmutable(source: string, hostAgentUid: number): Promise<void> {
   // Git searches upwards for .git. Inspect the repository it would discover
   // before any Git command can parse config or run core.fsmonitor/hooks.
@@ -112,12 +156,14 @@ async function assertIsolatedGitMetadataImmutable(source: string, hostAgentUid: 
         throw new Error(`Isolated workspace sync requires regular Git metadata: ${dotGit}`);
       }
       await assertImmutableGitDirectory(gitDirectory, hostAgentUid);
-      await assertSafeGitConfig(gitDirectory);
+      await assertSafeGitConfig(gitDirectory, hostAgentUid);
+      await assertSafeGitHooks(gitDirectory, hostAgentUid);
       const commonDirPath = path.join(gitDirectory, "commondir");
       if (await lstatIfPresent(commonDirPath)) {
         const commonDirectory = await readImmutableGitPointer(commonDirPath, "");
         await assertImmutableGitDirectory(commonDirectory, hostAgentUid);
-        await assertSafeGitConfig(commonDirectory);
+        await assertSafeGitConfig(commonDirectory, hostAgentUid);
+        await assertSafeGitHooks(commonDirectory, hostAgentUid);
       }
       return;
     }

@@ -4545,10 +4545,11 @@ export async function copyStrictSkillDirectory(source: string, target: string): 
         await fs.mkdir(destination, { recursive: true, mode: 0o700 });
         await fs.chmod(destination, 0o700);
       },
-      file: async (relativePath, _mode, contents) => {
+      file: async (relativePath, mode, contents) => {
         const destination = path.join(target, relativePath);
-        await fs.writeFile(destination, contents, { mode: 0o600 });
-        await fs.chmod(destination, 0o600);
+        const privateMode = mode & 0o100 ? 0o700 : 0o600;
+        await fs.writeFile(destination, contents, { mode: privateMode });
+        await fs.chmod(destination, privateMode);
       },
       other: () => {},
     });
@@ -4823,7 +4824,7 @@ export async function materializePaperclipSkillCopy(
 
 /** Stage selected skills as real files before an SSH or sandbox asset is archived. */
 export async function buildPaperclipRuntimeSkillsAssetDir(
-  entries: Array<{ key: string; runtimeName: string; source: string }>,
+  entries: Array<{ key: string; runtimeName: string; source: string; sourceStatus?: "available" | "missing" }>,
   prefix: string,
 ): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -4834,6 +4835,7 @@ export async function buildPaperclipRuntimeSkillsAssetDir(
     const strictSkillStaging = process.platform === "linux" ||
       process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
     for (const entry of entries) {
+      if (entry.sourceStatus === "missing") continue;
       const name = entry.runtimeName;
       if (!name || name === "." || name === ".." || /[\\/]/.test(name) || names.has(name)) {
         throw new Error(`Invalid or duplicate Paperclip skill runtime name: ${name}`);

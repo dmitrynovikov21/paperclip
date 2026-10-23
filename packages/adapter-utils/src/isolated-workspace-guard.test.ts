@@ -1,9 +1,10 @@
 import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { assertIsolatedWorkspaceSyncAllowed, isRemoteGitRepositoryUrl } from "./isolated-workspace-guard.js";
 
 const execFile = promisify(execFileCallback);
@@ -81,13 +82,28 @@ describe("isolated workspace source guard", () => {
     await git(["add", "README.md"]);
     await git(["-c", "user.name=Paperclip Test", "-c", "user.email=test@paperclip.dev", "commit", "-m", "base"]);
     await git(["worktree", "add", "-b", "isolated-test", workspace]);
+    const manyObjects = path.join(source, ".git", "objects", "scan-cost-fixture");
+    await mkdir(manyObjects);
+    for (let index = 0; index < 200; index += 1) {
+      await writeFile(path.join(manyObjects, `entry-${index}`), "fixture");
+    }
     const env = {
       PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME: "true",
       PAPERCLIP_SECRETS_HOST_AGENT_UID: String((process.getuid?.() ?? 0) + 1),
       PAPERCLIP_SECRETS_MASTER_KEY_FILE: path.join(secretDirectory, "master.key"),
       PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON: JSON.stringify([workspaceRoot]),
     };
-    await expect(assertIsolatedWorkspaceSyncAllowed(workspace, env)).resolves.toBe(workspace);
+    const lstatSpy = vi.spyOn(fs, "lstat");
+    try {
+      await expect(assertIsolatedWorkspaceSyncAllowed(workspace, env)).resolves.toBe(workspace);
+      const firstWalk = lstatSpy.mock.calls.filter(([candidate]) => String(candidate).startsWith(manyObjects)).length;
+      expect(firstWalk).toBeGreaterThanOrEqual(200);
+      await expect(assertIsolatedWorkspaceSyncAllowed(workspace, env)).resolves.toBe(workspace);
+      const secondWalk = lstatSpy.mock.calls.filter(([candidate]) => String(candidate).startsWith(manyObjects)).length;
+      expect(secondWalk).toBe(firstWalk);
+    } finally {
+      lstatSpy.mockRestore();
+    }
     const configPath = path.join(source, ".git", "config");
     await chmod(configPath, 0o666);
     await expect(assertIsolatedWorkspaceSyncAllowed(workspace, env)).rejects.toThrow(/agent-immutable Git metadata/);

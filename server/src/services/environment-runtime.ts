@@ -1916,7 +1916,7 @@ function createSandboxEnvironmentDriver(
         // Another installed plugin can declare the same "kubernetes" driver
         // key and win lookup. Only the trusted provider may build the pod.
         if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
-            !isTrustedBundledKubernetesProvider(pluginProvider.resolved.plugin)) {
+            !(await isTrustedBundledKubernetesProvider(pluginProvider.resolved.plugin))) {
           throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
         }
 

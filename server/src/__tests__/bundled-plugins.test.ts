@@ -13,6 +13,7 @@ import {
   type BundledPluginProvisionerDeps,
   type ResolvedBundledPlugin,
 } from "../services/bundled-plugins.js";
+import { isReleaseOwnedBundleTree, isReleaseOwnedBundleTreeAsync } from "../services/release-owned-bundle.js";
 
 const CATALOG_ROOT = "/app/packages/plugins";
 
@@ -222,6 +223,47 @@ describe("resolveBundledPluginInstalls", () => {
       expect(trustedBundledPluginPath(bundle, env)).toBeNull();
       chmodSync(dependency, 0o700);
       expect(trustedBundledPluginPath(bundle, env)?.packagePath).toBe(realpathSync(bundle));
+    },
+  );
+
+  it.skipIf(process.platform !== "linux" || !process.getuid || process.getuid() === 0)(
+    "rejects a trusted dependency reached through an agent-writable intermediate link",
+    async () => {
+      const root = makeServiceOwnedTempDir();
+      const bundle = path.join(root, "bundle");
+      const dependency = path.join(root, "trusted-dependency");
+      const intermediate = path.join(root, "agent-writable");
+      mkdirSync(bundle);
+      mkdirSync(dependency);
+      mkdirSync(intermediate);
+      writeFileSync(path.join(dependency, "index.js"), "export {};");
+      symlinkSync(dependency, path.join(intermediate, "bridge"));
+      symlinkSync(path.join(intermediate, "bridge"), path.join(bundle, "node_modules"));
+      chmodSync(intermediate, 0o777);
+
+      expect(isReleaseOwnedBundleTree(bundle)).toBe(false);
+      await expect(isReleaseOwnedBundleTreeAsync(bundle)).resolves.toBe(false);
+      chmodSync(intermediate, 0o700);
+      expect(isReleaseOwnedBundleTree(bundle)).toBe(true);
+      await expect(isReleaseOwnedBundleTreeAsync(bundle)).resolves.toBe(true);
+    },
+  );
+
+  it.skipIf(process.platform !== "linux" || !process.getuid || process.getuid() === 0)(
+    "shares concurrent large bundle checks without blocking the event loop",
+    async () => {
+      const root = makeServiceOwnedTempDir();
+      const bundle = path.join(root, "bundle");
+      mkdirSync(bundle);
+      for (let index = 0; index < 300; index += 1) {
+        writeFileSync(path.join(bundle, `file-${index}.js`), "export {};");
+      }
+      const first = isReleaseOwnedBundleTreeAsync(bundle);
+      expect(isReleaseOwnedBundleTreeAsync(bundle)).toBe(first);
+      let ticked = false;
+      await new Promise<void>((resolve) => setImmediate(() => { ticked = true; resolve(); }));
+      expect(ticked).toBe(true);
+      await expect(first).resolves.toBe(true);
     },
   );
 

@@ -15,6 +15,7 @@ import {
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   buildPaperclipRuntimeSkillsAssetDir,
+  copyStrictSkillDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipExternalChatContractTurn,
@@ -371,6 +372,44 @@ describe("materializePaperclipSkillCopy", () => {
       } finally {
         await fs.rm(path.dirname(staged), { recursive: true, force: true });
       }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("skips missing runtime skill sources while staging available skills", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-missing-skill-"));
+    try {
+      const source = path.join(root, "available");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# available\n");
+      const staged = await buildPaperclipRuntimeSkillsAssetDir([
+        { key: "missing", runtimeName: "missing", source: path.join(root, "deleted"), sourceStatus: "missing" },
+        { key: "available", runtimeName: "available", source, sourceStatus: "available" },
+      ], "paperclip-missing-skill-asset-");
+      try {
+        await expect(fs.readFile(path.join(staged, "available", "SKILL.md"), "utf8")).resolves.toBe("# available\n");
+        await expect(fs.lstat(path.join(staged, "missing"))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await fs.rm(path.dirname(staged), { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps only the owner execute bit when copying an isolated skill", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-executable-skill-"));
+    try {
+      const source = path.join(root, "source");
+      const target = path.join(root, "target");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "script.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await fs.chmod(path.join(source, "script.sh"), 0o755);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n", { mode: 0o644 });
+      await copyStrictSkillDirectory(source, target);
+      expect((await fs.stat(path.join(target, "script.sh"))).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(path.join(target, "SKILL.md"))).mode & 0o777).toBe(0o600);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

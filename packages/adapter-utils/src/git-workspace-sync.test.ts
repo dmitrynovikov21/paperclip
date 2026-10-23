@@ -738,6 +738,23 @@ describe("git workspace sync", () => {
       expect(await readFile(path.join(repo, "local.txt"), "utf8")).toBe("local work\n");
     });
 
+    it("does not run a reference-transaction hook during isolated sandbox restore", async () => {
+      const { repo, baseline, importedHead } = await rewrittenHistory();
+      const marker = path.join(repo, "hook-ran");
+      const script = path.join(repo, "agent-script.sh");
+      await writeFile(script, `#!/bin/sh\nprintf ran > '${marker}'\n`, { mode: 0o755 });
+      await writeFile(path.join(repo, ".git", "hooks", "reference-transaction"),
+        `#!/bin/sh\n'${script}'\n`, { mode: 0o755 });
+      await git(repo, ["update-ref", "refs/paperclip/hook-probe", baseline.headCommit]);
+      await expect(readFile(marker, "utf8")).resolves.toBe("ran");
+      await rm(marker);
+
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      await integrateImportedGitHead({ localDir: repo, importedHead, baseline });
+      expect(await git(repo, ["rev-parse", "HEAD"])).toBe(importedHead);
+      await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
     it("restores an intentional reset to an ancestor when the host has not changed", async () => {
       const { repo, ancestor, baseline } = await rewrittenHistory();
       await integrateImportedGitHead({ localDir: repo, importedHead: ancestor, baseline });

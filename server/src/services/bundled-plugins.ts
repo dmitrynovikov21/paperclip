@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { assertDistributionManifestCapabilities, readDistributionPluginCatalog, type DistributionPlugin } from "./distribution-plugin-catalog.js";
-import { isReleaseOwnedBundleTree } from "./release-owned-bundle.js";
+import { isReleaseOwnedBundleTree, isReleaseOwnedBundleTreeAsync } from "./release-owned-bundle.js";
 
 /**
  * Bundled plugin auto-provisioning.
@@ -137,7 +137,7 @@ export function trustedBundledPluginPath(
       for (const root of [repoRoot, resolveBundledCatalogRoot(env)]) {
         try {
           if (actual === fs.realpathSync(path.join(root, entry.relativePath)) &&
-              isReleaseOwnedBundleTree(actual)) {
+              isReleaseOwnedBundleTree(packagePath)) {
             return { packagePath: actual, pluginKey: entry.pluginKey };
           }
         } catch { /* This bundle is absent in the current deployment. */ }
@@ -159,13 +159,26 @@ export function trustedBundledKubernetesProviderPath(
 }
 
 /** Registry metadata is not proof that an npm artifact is the bundled provider. */
-export function isTrustedBundledKubernetesProvider(
+export async function isTrustedBundledKubernetesProvider(
   plugin: { pluginKey: string; packageName: string; packagePath: string | null },
   env: Record<string, string | undefined> = process.env,
-): boolean {
-  return plugin.pluginKey === "paperclip.kubernetes-sandbox-provider" &&
-    plugin.packageName === "@paperclipai/plugin-kubernetes" &&
-    !!plugin.packagePath && !!trustedBundledKubernetesProviderPath(plugin.packagePath, env);
+): Promise<boolean> {
+  if (plugin.pluginKey !== "paperclip.kubernetes-sandbox-provider" ||
+      plugin.packageName !== "@paperclipai/plugin-kubernetes" || !plugin.packagePath) return false;
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../packages/plugins");
+  const bundled = BUNDLED_PLUGIN_CATALOG.find((entry) => entry.key === "kubernetes");
+  if (!bundled) return false;
+  try {
+    const actual = await fs.promises.realpath(plugin.packagePath);
+    for (const root of [repoRoot, resolveBundledCatalogRoot(env)]) {
+      try {
+        if (actual === await fs.promises.realpath(path.join(root, bundled.relativePath))) {
+          return await isReleaseOwnedBundleTreeAsync(plugin.packagePath);
+        }
+      } catch { /* The candidate bundle is absent in this deployment. */ }
+    }
+  } catch { /* A removed path must never fall back to npm. */ }
+  return false;
 }
 
 export interface ResolvedBundledPlugin {

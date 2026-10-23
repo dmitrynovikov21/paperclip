@@ -230,6 +230,16 @@ const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
   writeTools: readonly string[];
 }>;
 describe("AppDefinition catalog", () => {
+  it("offers 1Password service-account setup with official instructions and a vaulted token", () => {
+    const app = getAppStoreDefinition("1password")!;
+    expect(app.name).toBe("1Password");
+    expect(app.methods).toHaveLength(1);
+    expect(app.methods[0]).toMatchObject({ key: "service-account", transport: "rest_api", auth: "api_key",
+      credentialFields: [{ key: "authorization", label: "Paste your 1Password Service Account token", type: "password", secret: true, required: true }],
+      keyPlacement: { location: "header", name: "Authorization", prefix: "Bearer " }, riskTier: "S4" });
+    expect(app.methods[0]!.guidanceMd).toContain("https://www.1password.dev/service-accounts/get-started#create-a-service-account");
+    expect(app.methods[0]!.tenantFields ?? []).toHaveLength(0);
+  });
   it("namespaces Browser Use's hosted service as browser-use-cloud", () => {
     expect(CONNECTABLE_APP_DEFINITIONS.find(app => app.slug === "browser-use-cloud"))
       .toMatchObject({ name: "Browser Use Cloud", methods: [{ key: "cloud-v4", transport: "rest_api" }] });
@@ -886,7 +896,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(87);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(88);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );

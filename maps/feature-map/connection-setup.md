@@ -18,6 +18,10 @@ Settings → Connections. It adds no Apps provider or transport. Credential owne
 and audience rules are the existing connection rules; saving a connection alone
 does not activate the service. See [service configuration](../../doc/prompt-injection-prevention.md).
 
+1Password is available from Apps with a service-account token and an official
+service-account creation link. Its vault access is chosen in 1Password; action
+policies use the ordinary Permissions screen. See [connector notes](../../doc/connections/1PASSWORD.md).
+
 ## Sub-features
 
 - `catalog`: `connection-setup/catalog` — find a provider, inspect its available methods, and open setup;

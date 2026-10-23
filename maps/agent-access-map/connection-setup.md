@@ -16,6 +16,12 @@ Settings → Connections. It adds no Apps provider or transport. Credential owne
 and audience rules are the existing connection rules; saving a connection alone
 does not activate the service. See [service configuration](../../doc/prompt-injection-prevention.md).
 
+1Password adds a service-account catalog method. Agents request access through
+the existing connection tools and invoke its reviewed item actions through the
+run-scoped gateway. The service-account token stays in the selected user/company
+vault; vault boundaries are enforced by 1Password. Setup remains board-owned.
+Evidence and limits: [1Password connector](../../doc/connections/1PASSWORD.md).
+
 ## `catalog`
 
 Capability ID: `connection-setup/catalog`.

@@ -502,6 +502,62 @@ does not open a new spending window, change limits, dispatch tests or rewrite
 previous records. Regenerate the campaign report from the same ledger afterward;
 an old report snapshot is not rewritten by an offline receipt import.
 
+### Compare retained Anthropic billing exports
+
+Use the read-only comparison command to repeat a provider-window comparison
+without dispatching a test or changing the cost journal:
+
+```sh
+node --import ./server/node_modules/tsx/dist/esm/index.mjs tests/runner-e2e/anthropic-billing-comparison.ts /private/path/comparison-config.json /private/path/new-comparison.json
+```
+
+The private configuration has this shape. `apiKeyLabel` is the label in the CSV,
+not an API credential. Copy `sourceDataAsOf` from the provider's reporting view.
+Use absolute input paths and retain the original exported CSV bytes.
+
+```json
+{
+  "version": 1,
+  "manifest": "/private/path/manifest.json",
+  "ledger": "/private/path/ledger.jsonl",
+  "usageExport": "/private/path/claude-usage.csv",
+  "costExport": "/private/path/claude-cost.csv",
+  "workspace": "Dedicated eval workspace",
+  "apiKeyLabel": "dedicated-eval-key",
+  "date": "2026-10-23",
+  "sourceDataAsOf": "2026-10-23T18:07:00Z"
+}
+```
+
+The first supported export shape is one Claude Sonnet 5 campaign, one workspace
+and key label, standard global inference, and context buckets at or below 200k.
+Usage rows are hourly; cost rows are daily. Both must cover the selected UTC
+date, and every selected journal request must have finished inside that day and
+before the source timestamp. The command rejects mixed scopes, duplicate rows,
+unsupported pricing dimensions, conflicting observations and damaged journals.
+A provider export may still be delayed after these checks pass. Matching scope
+labels do not establish exclusive use of a key or completeness of its export.
+
+The output records source hashes, the journal checkpoint, the reporting window,
+its provisional status, provider tokens priced with the retained manifest,
+rounded provider charges, and the retained request subtotal. Complete and
+partial token receipts remain distinct from dollar-cost completeness. Each known
+token category counts once per request even when the cost or other token fields
+are unknown. Missing-field counts remain explicit. Final token evidence takes
+precedence over partial evidence; equally strong contradictory values fail. Canceled requests without a
+returned model identity remain explicitly unconfirmed. The token and estimated
+USD differences can be positive or negative; neither is assigned to a request.
+Non-model charges are shown separately. The report does not add the provider
+total to the ledger subtotal or interpret rounded zero charges as free usage.
+
+The command creates a new mode-0600 output and refuses to replace an existing
+file. It makes no network or provider call, does not import receipts, and leaves
+all reservations and historical evidence intact. A comparison is supporting
+evidence for reconciliation, not a settled invoice or an admission override.
+Keep the config, raw exports and comparison private; they are not public report
+projections. Other providers and export shapes still require their own reviewed
+comparison path.
+
 The checked pricecard expires on November 19, 2026. Admission stops when the
 pricecard expires, the catalog model changes, the project is missing, or the
 preflight already exists. Review current official prices and context limits

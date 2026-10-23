@@ -255,6 +255,10 @@ select `CODEX_HOME` in this mode. Runs reject a saved external home before
 reading its files or syncing assets to a pod. The managed home may link only
 `auth.json` to the server's configured shared Codex credential; linked
 `config.json`, `config.toml`, `instructions.md`, or `skills` roots are refused.
+The shared `CODEX_HOME`, the per-agent home, their directory ancestors, and
+their regular config and credential files must be immutable to `hostAgentUid`.
+The shared config and `auth.json` sources must be regular files; a link in a
+shared source or an agent-writable source fails the run before sandbox upload.
 Links inside `skills/` must target a server-selected skill directory.
 Update existing Codex agent configurations before enabling isolation. A saved
 external `CODEX_HOME` makes the run fail until an operator clears it.

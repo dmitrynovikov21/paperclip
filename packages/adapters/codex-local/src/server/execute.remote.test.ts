@@ -119,6 +119,35 @@ describe("codex remote execution", () => {
     expect(logs.join("")).not.toContain("SYNTHETIC_MASTER_KEY");
   });
 
+  it.skipIf(process.platform !== "linux")("rejects a linked shared Codex config before sandbox upload", async () => {
+    const root = await mkdtemp(path.join(process.cwd(), ".codex-shared-config-guard-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const sharedHome = path.join(root, "shared-codex-home");
+    const key = path.join(root, "master.key");
+    await mkdir(workspace);
+    await mkdir(sharedHome);
+    await writeFile(key, "SYNTHETIC_MASTER_KEY");
+    await symlink(key, path.join(sharedHome, "config.json"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("CODEX_HOME", sharedHome);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
+    const logs: string[] = [];
+
+    await expect(execute({
+      runId: "codex-shared-config-guard",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      config: { engine: "cli", env: { OPENAI_API_KEY: "sk-synthetic" } },
+      context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+      executionTarget: { kind: "remote", transport: "sandbox" },
+      onLog: async (_stream: "stdout" | "stderr", chunk: string) => { logs.push(chunk); },
+    } as never)).rejects.toThrow();
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    expect(runChildProcess).not.toHaveBeenCalled();
+    expect(logs.join("")).not.toContain("SYNTHETIC_MASTER_KEY");
+  });
+
   it("refuses an agent-selected home with a linked synthetic key before sandbox sync", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-home-escape-"));
     cleanupDirs.push(root);
@@ -146,13 +175,14 @@ describe("codex remote execution", () => {
   });
 
   it("rejects a linked managed config before provider preparation reads it", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-config-escape-"));
+    const root = await mkdtemp(path.join(process.cwd(), ".paperclip-codex-config-escape-"));
     cleanupDirs.push(root);
     const key = path.join(root, "secrets", "master.key");
     await mkdir(path.dirname(key));
     await writeFile(key, "SYNTHETIC_MASTER_KEY");
     vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
     const managedHome = resolveIsolatedCodexAgentHomeDir(process.env, "company-1", "agent-1");
     await mkdir(managedHome, { recursive: true });
     await symlink(key, path.join(managedHome, "config.toml"));
@@ -171,7 +201,7 @@ describe("codex remote execution", () => {
   });
 
   it("rejects a raced-in skill key link before syncing the sandbox asset", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-skill-race-"));
+    const root = await mkdtemp(path.join(process.cwd(), ".paperclip-codex-skill-race-"));
     cleanupDirs.push(root);
     const workspace = path.join(root, "workspace");
     const skill = path.join(workspace, "skill");
@@ -186,6 +216,7 @@ describe("codex remote execution", () => {
     vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
     vi.stubEnv("CODEX_HOME", sharedHome);
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", key);
     const originalLstat = fs.lstat.bind(fs);
     let swapped = false;
@@ -230,7 +261,7 @@ describe("codex remote execution", () => {
   });
 
   it("runs with a service-selected home in isolated mode", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-isolated-ok-"));
+    const root = await mkdtemp(path.join(process.cwd(), ".paperclip-codex-isolated-ok-"));
     cleanupDirs.push(root);
     const workspace = path.join(root, "workspace");
     const sharedHome = path.join(root, "shared-home");
@@ -239,6 +270,7 @@ describe("codex remote execution", () => {
     vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
     vi.stubEnv("CODEX_HOME", sharedHome);
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
     const logs: string[] = [];
 
     await execute({

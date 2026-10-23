@@ -361,6 +361,61 @@ describe("codexHomeHasUsableAuth", () => {
 });
 
 describe("seedManagedCodexHome", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.skipIf(process.platform !== "linux")("rejects linked or agent-writable shared config before seeding and staging", async () => {
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-codex-shared-guard-"));
+    let staged: string | null = null;
+    try {
+      const shared = path.join(root, "shared");
+      const home = path.join(root, "agent-home");
+      const key = path.join(root, "master.key");
+      await fs.mkdir(shared);
+      await fs.writeFile(key, "SYNTHETIC_MASTER_KEY");
+      await fs.symlink(key, path.join(shared, "config.json"));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
+      vi.stubEnv("CODEX_HOME", shared);
+      const env = { ...process.env, CODEX_HOME: shared };
+
+      await expect(seedManagedCodexHome(home, env, async () => {})).rejects.toThrow();
+      await expect(fs.access(path.join(home, "config.json"))).rejects.toThrow();
+
+      await fs.rm(path.join(shared, "config.json"));
+      await fs.writeFile(path.join(shared, "config.json"), "{\"safe\":true}");
+      await fs.chmod(shared, 0o770);
+      await expect(seedManagedCodexHome(home, env, async () => {})).rejects.toThrow("agent-immutable");
+      await fs.chmod(shared, 0o700);
+
+      await seedManagedCodexHome(home, env, async () => {});
+      staged = await stageCodexHomeForSync(home);
+      expect(await fs.readFile(path.join(staged, "config.json"), "utf8")).toBe('{"safe":true}');
+      expect((await fs.readdir(staged)).includes("master.key")).toBe(false);
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects a linked shared auth source before staging", async () => {
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-codex-auth-source-"));
+    try {
+      const shared = path.join(root, "shared");
+      const home = path.join(root, "agent-home");
+      const key = path.join(root, "master.key");
+      await fs.mkdir(shared);
+      await fs.writeFile(key, "SYNTHETIC_MASTER_KEY");
+      await fs.symlink(key, path.join(shared, "auth.json"));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
+      vi.stubEnv("CODEX_HOME", shared);
+      await expect(seedManagedCodexHome(home, process.env, async () => {})).rejects.toThrow();
+      await expect(fs.access(path.join(home, "auth.json"))).rejects.toThrow();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("symlinks auth.json from the shared source into an explicit per-agent home", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-"));
     try {
@@ -1065,7 +1120,7 @@ describe("stageCodexHomeForSync", () => {
   });
 
   it("rejects a linked config before reading the synthetic key, while staging managed auth", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-home-"));
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-isolated-home-"));
     let staged: string | null = null;
     try {
       const home = path.join(root, "managed-home");
@@ -1079,6 +1134,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.symlink(key, path.join(home, "config.json"));
       await fs.symlink(path.join(shared, "auth.json"), path.join(home, "auth.json"));
       vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
       vi.stubEnv("CODEX_HOME", shared);
       const readSpy = vi.spyOn(fs, "readFile");
 
@@ -1095,8 +1151,30 @@ describe("stageCodexHomeForSync", () => {
     }
   });
 
+  it.skipIf(process.platform !== "linux")("rejects an agent-writable per-agent config before sandbox staging", async () => {
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-codex-agent-config-"));
+    let staged: string | null = null;
+    try {
+      const home = path.join(root, "agent-home");
+      const config = path.join(home, "config.json");
+      await fs.mkdir(home);
+      await fs.writeFile(config, "{\"safe\":true}");
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
+
+      await fs.chmod(config, 0o666);
+      await expect(stageCodexHomeForSync(home)).rejects.toThrow("agent-immutable");
+      await fs.chmod(config, 0o600);
+      staged = await stageCodexHomeForSync(home);
+      expect(await fs.readFile(path.join(staged, "config.json"), "utf8")).toBe('{"safe":true}');
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("follows only server-selected skill links in isolated mode", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-skills-"));
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-isolated-skills-"));
     let staged: string | null = null;
     try {
       const home = path.join(root, "home");
@@ -1110,6 +1188,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.symlink(trusted, path.join(home, "skills", "trusted"));
       await fs.symlink(secrets, path.join(home, "skills", "untrusted"));
       vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
       vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(secrets, "master.key"));
 
       await expect(stageCodexHomeForSync(home, {
@@ -1154,7 +1233,7 @@ describe("stageCodexHomeForSync", () => {
   });
 
   it("rejects a nested skill file swapped for a synthetic key link before staging", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-skill-file-race-"));
+    const root = await fs.mkdtemp(path.join(process.cwd(), ".paperclip-codex-skill-file-race-"));
     let stagedHome: string | null = null;
     try {
       const home = path.join(root, "home");
@@ -1169,6 +1248,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.writeFile(key, "SYNTHETIC_MASTER_KEY_RACE");
       await fs.symlink(trusted, path.join(home, "skills", "trusted"));
       vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100_000));
       vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", key);
 
       const originalMkdtemp = fs.mkdtemp.bind(fs);

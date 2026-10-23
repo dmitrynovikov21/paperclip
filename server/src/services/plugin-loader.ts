@@ -1219,16 +1219,17 @@ export function pluginLoader(
       const localPackagePath = requiresIsolatedLocalSecrets()
         ? realpathSync(absLocalPath)
         : absLocalPath;
+      trustedPackage = requiresIsolatedLocalSecrets()
+        ? requireTrustedIsolationPath(localPackagePath,
+          packageName === KUBERNETES_PACKAGE_NAME ? KUBERNETES_PLUGIN_KEY : undefined)
+        : undefined;
       const pkgJson = await readPackageJson(localPackagePath);
       resolvedPackageName =
         typeof pkgJson?.["name"] === "string"
           ? pkgJson["name"]
           : path.basename(localPackagePath);
-      trustedPackage = requiresIsolatedLocalSecrets()
-        ? requireTrustedIsolationPath(localPackagePath,
-          packageName === KUBERNETES_PACKAGE_NAME || resolvedPackageName === KUBERNETES_PACKAGE_NAME
-            ? KUBERNETES_PLUGIN_KEY : undefined)
-        : undefined;
+      if (trustedPackage && resolvedPackageName === KUBERNETES_PACKAGE_NAME &&
+          trustedPackage.pluginKey !== KUBERNETES_PLUGIN_KEY) throw new Error(ISOLATED_KUBERNETES_ERROR);
       resolvedPackagePath = trustedPackage?.packagePath ?? localPackagePath;
 
       log.info(
@@ -1283,6 +1284,9 @@ export function pluginLoader(
 
     if (localPath) {
       await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
+      // Auto-build may create dist files or dependency links. Recheck those
+      // before importing an executable manifest from the bundle.
+      if (trustedPackage) requireTrustedIsolationPath(resolvedPackagePath, trustedPackage.pluginKey);
     }
 
     const manifestPath = resolveManifestPath(resolvedPackagePath, pkgJson);

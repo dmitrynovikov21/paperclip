@@ -5,7 +5,10 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { createTarballFromDirectory } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
+import {
+  prepareSandboxManagedRuntime,
+  type SandboxManagedRuntimeClient,
+} from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 
 const execFile = promisify(execFileCallback);
@@ -505,20 +508,60 @@ describe("kimi_local execute", () => {
     await fs.writeFile(key, keyBytes);
     await fs.symlink(key, path.join(leakySkill, "leak"));
     const archive = path.join(root, "skills.tar");
+    const sandboxRoot = path.join(root, "sandbox");
+    let syncedSkillsDir = "";
+    let syncInArchiveCount = 0;
     prepareRuntimeMock.mockImplementationOnce(async (input) => {
       const asset = input.assets?.find((entry: { key: string }) => entry.key === "skills");
       if (!asset) throw new Error("Kimi skills asset was not staged");
       expect(asset.followSymlinks).toBe(false);
       expect((await fs.lstat(path.join(asset.localDir, "safe"))).isDirectory()).toBe(true);
-      await createTarballFromDirectory({
-        localDir: asset.localDir,
-        archivePath: archive,
-        followSymlinks: asset.followSymlinks,
+      const client: SandboxManagedRuntimeClient = {
+        makeDir: async (dir) => { await fs.mkdir(dir, { recursive: true }); },
+        writeFile: async (file, bytes) => {
+          await fs.mkdir(path.dirname(file), { recursive: true });
+          await fs.writeFile(file, Buffer.from(bytes));
+        },
+        readFile: async (file) => fs.readFile(file),
+        listFiles: async (dir) => (await fs.readdir(dir)).sort(),
+        remove: async (file) => { await fs.rm(file, { recursive: true, force: true }); },
+        run: async (command) => { await execFile("sh", ["-c", command]); },
+        syncIn: async (operations) => {
+          for (const operation of operations) {
+            for (const mapping of operation.files) {
+              if (mapping.kind !== "file") throw new Error("Unexpected directory sync in Kimi asset test");
+              const bytes = await fs.readFile(mapping.sourcePath);
+              if (mapping.targetPath.endsWith("skills-upload.tar")) {
+                syncInArchiveCount += 1;
+                await fs.writeFile(archive, bytes);
+              }
+              await fs.mkdir(path.dirname(mapping.targetPath), { recursive: true });
+              await fs.writeFile(mapping.targetPath, bytes);
+            }
+            for (const command of operation.postUploadCommands ?? []) {
+              await execFile("sh", ["-c", command.command]);
+            }
+          }
+          return { operations: operations.map((operation) => ({
+            operationId: operation.operationId,
+            filesTransferred: operation.files.length,
+            bytesTransferred: 0,
+          })) };
+        },
+      };
+      const staged = await prepareSandboxManagedRuntime({
+        spec: { transport: "sandbox", provider: "test", sandboxId: "s1", remoteCwd: sandboxRoot, timeoutMs: 30_000, apiKey: null },
+        adapterKey: "kimi",
+        client,
+        workspaceLocalDir: workspace,
+        syncWorkspace: false,
+        assets: [asset],
       });
+      syncedSkillsDir = staged.assetDirs.skills;
       return {
-        workspaceRemoteDir: "/sandbox/workspace",
-        runtimeRootDir: null,
-        assetDirs: { skills: "/sandbox/runtime/skills" },
+        workspaceRemoteDir: staged.workspaceRemoteDir,
+        runtimeRootDir: staged.runtimeRootDir,
+        assetDirs: staged.assetDirs,
         restoreWorkspace: async () => {},
       };
     });
@@ -541,7 +584,9 @@ describe("kimi_local execute", () => {
     }));
 
     expect(result.exitCode).toBe(0);
-    expect(seenArgs[seenArgs.indexOf("--skills-dir") + 1]).toBe("/sandbox/runtime/skills");
+    expect(syncInArchiveCount).toBe(1);
+    expect(seenArgs[seenArgs.indexOf("--skills-dir") + 1]).toBe(syncedSkillsDir);
+    expect(await fs.readFile(path.join(syncedSkillsDir, "safe", "SKILL.md"), "utf8")).toBe("# ordinary Kimi skill\n");
     const { stdout: files } = await execFile("tar", ["-tf", archive]);
     expect(files).toContain("safe/SKILL.md");
     expect(files).not.toContain("leaky/");

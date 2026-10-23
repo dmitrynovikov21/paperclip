@@ -1061,6 +1061,71 @@ describe("evaluateCodexCredentialReadiness", () => {
 describe("stageCodexHomeForSync", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it("rejects a linked config before reading the synthetic key, while staging managed auth", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-home-"));
+    let staged: string | null = null;
+    try {
+      const home = path.join(root, "managed-home");
+      const shared = path.join(root, "shared");
+      const key = path.join(root, "secrets", "master.key");
+      await fs.mkdir(home, { recursive: true });
+      await fs.mkdir(shared, { recursive: true });
+      await fs.mkdir(path.dirname(key), { recursive: true });
+      await fs.writeFile(key, "SYNTHETIC_MASTER_KEY");
+      await fs.writeFile(path.join(shared, "auth.json"), '{"OPENAI_API_KEY":"test"}');
+      await fs.symlink(key, path.join(home, "config.json"));
+      await fs.symlink(path.join(shared, "auth.json"), path.join(home, "auth.json"));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("CODEX_HOME", shared);
+      const readSpy = vi.spyOn(fs, "readFile");
+
+      await expect(stageCodexHomeForSync(home)).rejects.toThrow("untrusted symlink");
+      expect(readSpy).not.toHaveBeenCalledWith(path.join(home, "config.json"));
+      await fs.rm(path.join(home, "config.json"));
+      await fs.writeFile(path.join(home, "config.json"), "{}");
+      staged = await stageCodexHomeForSync(home);
+      expect(await fs.readFile(path.join(staged, "auth.json"), "utf8")).toContain("OPENAI_API_KEY");
+      expect(await fs.readFile(path.join(staged, "config.json"), "utf8")).toBe("{}");
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows only server-selected skill links in isolated mode", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-skills-"));
+    let staged: string | null = null;
+    try {
+      const home = path.join(root, "home");
+      const trusted = path.join(root, "trusted-skill");
+      const secrets = path.join(root, "secrets");
+      await fs.mkdir(path.join(home, "skills"), { recursive: true });
+      await fs.mkdir(trusted);
+      await fs.mkdir(secrets);
+      await fs.writeFile(path.join(trusted, "SKILL.md"), "# trusted");
+      await fs.writeFile(path.join(secrets, "master.key"), "SYNTHETIC_MASTER_KEY");
+      await fs.symlink(trusted, path.join(home, "skills", "trusted"));
+      await fs.symlink(secrets, path.join(home, "skills", "untrusted"));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(secrets, "master.key"));
+
+      await expect(stageCodexHomeForSync(home, {
+        trustedSkillSources: [trusted],
+      })).rejects.toThrow("untrusted skill source");
+      await expect(stageCodexHomeForSync(home, {
+        trustedSkillSources: [trusted, secrets],
+      })).rejects.toThrow("overlaps the local secrets key");
+      await fs.rm(path.join(home, "skills", "untrusted"));
+      staged = await stageCodexHomeForSync(home, { trustedSkillSources: [trusted] });
+      expect(await fs.readFile(path.join(staged, "skills", "trusted", "SKILL.md"), "utf8")).toBe("# trusted");
+      expect((await fs.readdir(path.join(staged, "skills"))).sort()).toEqual(["trusted"]);
+    } finally {
+      if (staged) await fs.rm(staged, { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("stages only the invocation-owned private observability profile", async () => {

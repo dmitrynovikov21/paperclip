@@ -180,6 +180,20 @@ export function resolveManagedCodexHomeDir(
     : path.resolve(instanceRoot, "codex-home");
 }
 
+/** Service-selected home for an agent when the local secrets key is isolated. */
+export function resolveIsolatedCodexAgentHomeDir(
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+  agentId: string,
+): string {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+    env,
+  });
+  return path.resolve(instanceRoot, "companies", companyId, "agents", agentId, "codex-home");
+}
+
 /**
  * True when `homePath` lives under the Paperclip-managed company tree
  * (`<instanceRoot>/companies/<companyId>/...`). This covers both the shared
@@ -405,6 +419,8 @@ export interface StageCodexHomeForSyncOptions {
   additionalFiles?: readonly string[];
   /** Run id, used only to make the staged temp-dir name traceable in logs. */
   runId?: string;
+  /** Server-selected skill roots whose top-level links may be followed. */
+  trustedSkillSources?: string[];
 }
 
 /**
@@ -418,6 +434,34 @@ function isResolvedPathInside(candidate: string, root: string): boolean {
   if (candidate === root) return true;
   const rel = path.relative(root, candidate);
   return rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/** Reject home links before provider/MCP preparation can read any home file. */
+export async function assertIsolatedCodexHomeEntries(home: string): Promise<void> {
+  const homeStat = await fs.lstat(home).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (homeStat?.isSymbolicLink()) {
+    throw new Error("Isolated Codex execution refuses a linked managed home.");
+  }
+  for (const entry of CODEX_SYNC_ALLOWLIST) {
+    const source = path.join(home, entry);
+    const sourceStat = await fs.lstat(source).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (!sourceStat?.isSymbolicLink()) continue;
+    const expectedAuthSource = path.join(resolveSharedCodexHomeDir(process.env), "auth.json");
+    const linkedPath = path.resolve(path.dirname(source), await fs.readlink(source));
+    if (entry !== "auth.json" || linkedPath !== expectedAuthSource) {
+      throw new Error("Isolated Codex home contains an untrusted symlink.");
+    }
+    const authSourceStat = await fs.lstat(expectedAuthSource);
+    if (!authSourceStat.isFile()) {
+      throw new Error("Isolated Codex auth source must be a regular file.");
+    }
+  }
 }
 
 /**
@@ -513,6 +557,7 @@ async function stageContainedSubtree(
 async function stageDirectorySecure(
   sourceDir: string,
   targetDir: string,
+  trustedSkillRoots: ReadonlySet<string>,
 ): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true, mode: 0o700 });
   const realSourceDir = await fs.realpath(sourceDir);
@@ -536,6 +581,11 @@ async function stageDirectorySecure(
       throw error;
     });
     if (!entryStat) continue;
+    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" && entry.isSymbolicLink()) {
+      if (!entryStat.isDirectory() || !trustedSkillRoots.has(resolved)) {
+        throw new Error("Isolated Codex home contains an untrusted skill source.");
+      }
+    }
     if (entryStat.isDirectory()) {
       // This child skill establishes its own containment root: nested links may
       // not escape it, and the root seeds the cycle-detection active path.
@@ -560,6 +610,7 @@ async function stageCodexHomeEntry(
   sourceHome: string,
   stagedHome: string,
   entry: string,
+  trustedSkillRoots: ReadonlySet<string>,
 ): Promise<void> {
   const source = path.join(sourceHome, entry);
   // `fs.stat` follows symlinks, so a dangling link (e.g. a removed auth source)
@@ -570,11 +621,17 @@ async function stageCodexHomeEntry(
   });
   if (!stat) return;
 
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    if (entry === "skills" ? !stat.isDirectory() : !stat.isFile()) {
+      throw new Error("Isolated Codex home contains an invalid entry type.");
+    }
+  }
+
   const target = path.join(stagedHome, entry);
   if (stat.isDirectory()) {
     // Recursively copy with mode normalization — nested regular files land
     // `0600` and dangling/circular symlinks are skipped.
-    await stageDirectorySecure(source, target);
+    await stageDirectorySecure(source, target, trustedSkillRoots);
     return;
   }
 
@@ -619,6 +676,21 @@ export async function stageCodexHomeForSync(
   effectiveCodexHome: string,
   options: StageCodexHomeForSyncOptions = {},
 ): Promise<string> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    await assertIsolatedCodexHomeEntries(effectiveCodexHome);
+  }
+  const trustedSkillRoots = new Set(
+    (await Promise.all((options.trustedSkillSources ?? []).map((source) =>
+      fs.realpath(source).catch(() => null),
+    ))).filter((source): source is string => source !== null),
+  );
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    const keyPath = nonEmpty(process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE);
+    const realKeyPath = keyPath ? await fs.realpath(keyPath).catch(() => null) : null;
+    if (realKeyPath && [...trustedSkillRoots].some((root) => isResolvedPathInside(realKeyPath, root))) {
+      throw new Error("Isolated Codex skill source overlaps the local secrets key.");
+    }
+  }
   const runIdPart = nonEmpty(options.runId ?? undefined);
   const stagedHome = await fs.mkdtemp(
     path.join(os.tmpdir(), `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`),
@@ -632,7 +704,7 @@ export async function stageCodexHomeForSync(
       await fs.writeFile(path.join(stagedHome, filename), await fs.readFile(source), { mode: 0o600, flag: "wx" });
     }
     for (const entry of CODEX_SYNC_ALLOWLIST) {
-      await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
+      await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry, trustedSkillRoots);
     }
     return stagedHome;
   } catch (error) {

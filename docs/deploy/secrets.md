@@ -231,8 +231,17 @@ this mode; an operator must select the host path. Keep the approved roots
 separate from the service's key, database, backups, and other private data.
 Host-local Git clone URLs (including `file://`) are also refused before
 materializing a managed checkout; use a remote Git URL instead.
-Inline
-`PAPERCLIP_SECRETS_MASTER_KEY` is refused. Startup refuses a missing, linked,
+Codex agents use a service-selected home under
+`companies/<companyId>/agents/<agentId>/codex-home`. Agent API keys cannot
+select `CODEX_HOME` in this mode. Runs reject a saved external home before
+reading its files or syncing assets to a pod. The managed home may link only
+`auth.json` to the server's configured shared Codex credential; linked
+`config.json`, `config.toml`, `instructions.md`, or `skills` roots are refused.
+Links inside `skills/` must target a server-selected skill directory.
+Update existing Codex agent configurations before enabling isolation. A saved
+external `CODEX_HOME` makes the run fail until an operator clears it.
+
+Inline `PAPERCLIP_SECRETS_MASTER_KEY` is refused. Startup refuses a missing, linked,
 group-readable, or agent-owned key and a writable/untrusted ancestor directory.
 The CLI and provider will not generate a replacement key in isolation mode.
 The Kubernetes agent pod must exclude the server's key/instance directories,

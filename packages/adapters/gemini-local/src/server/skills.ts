@@ -31,7 +31,6 @@ export function resolveGeminiSkillsHome(config: Record<string, unknown>) {
   return path.join(home, ".gemini", "skills");
 }
 
-/** Build a remote asset from selected sources, never from the mutable Gemini home. */
 export async function buildGeminiSkillsDir(config: Record<string, unknown>): Promise<string> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));

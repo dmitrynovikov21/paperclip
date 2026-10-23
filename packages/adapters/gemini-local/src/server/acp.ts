@@ -154,9 +154,6 @@ async function prepareGeminiRemoteManagedHome(
       startMessage: "[paperclip] Restoring workspace changes from the sandbox.\n",
       failurePrefix: "[paperclip] Gemini ACP teardown workspace restore failed",
     });
-  // HOME also contains user-installed entries. Never let the service follow
-  // their links while archiving sandbox assets: only selected, materialized
-  // Paperclip skill sources may cross this boundary.
   const localSkillsDir = await buildGeminiSkillsDir(input.config);
   let stagedRuntime: AcpxRemoteManagedHomeResult["stagedRuntime"];
   try {

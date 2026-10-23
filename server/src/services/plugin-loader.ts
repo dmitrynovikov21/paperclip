@@ -1189,7 +1189,7 @@ export function pluginLoader(
     if (!trusted) {
       let actual: string | null = null;
       try { actual = realpathSync(packagePath); }
-      catch { /* Missing source must not fall back to npm. */ }
+      catch { actual = null; }
       if (actual) {
         const distribution = trustedDistributionPlugins.find((entry) => entry.localPath === actual);
         if (distribution) {
@@ -2454,8 +2454,6 @@ export function pluginLoader(
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
       };
 
-      // Repo-local development plugins may need tsx. In isolation mode only
-      // prebuilt release code may run as the service UID.
       if (!isolated && activePlugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
         workerOptions.execArgv = ["--import", DEV_TSX_LOADER_PATH];
       }

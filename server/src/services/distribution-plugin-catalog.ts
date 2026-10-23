@@ -49,7 +49,6 @@ export function distributionPluginsRoot(catalogRoot: string): string {
   }
 }
 
-/** Recheck the catalog and executable bundle after catalog read and at activation. */
 export function assertReleaseOwnedDistributionBundle(packagePath: string): void {
   const catalogFile = path.join(path.dirname(packagePath), "catalog.json");
   try {

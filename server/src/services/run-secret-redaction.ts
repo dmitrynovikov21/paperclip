@@ -42,9 +42,14 @@ function redactText(input: string, values: string[]) {
   );
 }
 
-export function redactRegisteredSecretValues<T>(input: T, values: string[], credentialConnectionName: string | null = null): T {
+export function redactRegisteredSecretValues<T>(
+  input: T,
+  values: string[],
+  credentialConnectionName: string | null = null,
+  redactKeys = false,
+): T {
   if (typeof input === "string") return redactText(input, values) as T;
-  if (Array.isArray(input)) return input.map((value) => redactRegisteredSecretValues(value, values, credentialConnectionName)) as T;
+  if (Array.isArray(input)) return input.map((value) => redactRegisteredSecretValues(value, values, credentialConnectionName, redactKeys)) as T;
   // Dates carry no redactable text; rebuilding them via Object.entries would
   // collapse them to `{}` and break every timestamp in redacted responses.
   if (input instanceof Date) return input;
@@ -53,9 +58,9 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
   return Object.fromEntries(
     Object.entries(record)
       .filter(([key]) => key !== REGISTRY_KEY)
-      .map(([key, value]) => [redactText(key, values), key === "credentialAccess"
+      .map(([key, value]) => [redactKeys ? redactText(key, values) : key, key === "credentialAccess"
         ? (credentialConnectionName ? { connectionName: redactText(credentialConnectionName, values) } : {})
-        : redactRegisteredSecretValues(value, values, credentialConnectionName)]),
+        : redactRegisteredSecretValues(value, values, credentialConnectionName, redactKeys || key === "payload")]),
   ) as T;
 }
 

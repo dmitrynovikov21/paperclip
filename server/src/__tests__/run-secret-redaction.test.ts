@@ -67,11 +67,21 @@ describe("registered run secret redaction", () => {
 
   it("replaces registered secrets in event payload keys before URI masking", () => {
     const registered = "postgres://worker:synthetic-password@db.example.test/app?sslpassword=synthetic-query-secret";
-    const payload = { normal: "ready", [registered]: "diagnostic" };
+    const event = { id: "event-1", payload: { normal: "ready", [registered]: "diagnostic" } };
 
-    expect(redactRegisteredSecretValues(payload, [registered])).toEqual({
-      normal: "ready",
-      [REDACTED_EVENT_VALUE]: "diagnostic",
+    expect(redactRegisteredSecretValues(event, [registered])).toEqual({
+      id: "event-1",
+      payload: { normal: "ready", [REDACTED_EVENT_VALUE]: "diagnostic" },
+    });
+  });
+
+  it("preserves fixed response fields when a registered value matches their names", () => {
+    const run = { id: "run-1", status: "succeeded", events: [{ id: "event-1", payload: { id: "diagnostic" } }] };
+
+    expect(redactRegisteredSecretValues(run, ["id"])).toEqual({
+      id: "run-1",
+      status: "succeeded",
+      events: [{ id: "event-1", payload: { [REDACTED_EVENT_VALUE]: "diagnostic" } }],
     });
   });
 

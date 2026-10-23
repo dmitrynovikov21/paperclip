@@ -71,7 +71,7 @@ function boundRunEventValue(
     const bounded = {
       _truncated: true,
       type: "object",
-      keys: entries.map(([key]) => truncateRunEventString(key)).slice(0, 20),
+      keys: entries.slice(0, 20).map(([key]) => truncateRunEventString(key)),
     };
     seen.delete(value);
     return bounded;

@@ -370,6 +370,60 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(watchdog?.lastReviewedFingerprint).toBeNull();
   });
 
+  it("does not exhaust review retries when wake scheduling is temporarily suppressed", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-SUPPRESSED-WAKE", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    let wakeRequests = 0;
+    const service = taskWatchdogService(db, {
+      enqueueWakeup: async (wokenAgentId, opts) => {
+        wakeRequests += 1;
+        if (wakeRequests < 3) {
+          await db.insert(agentWakeupRequests).values({
+            companyId,
+            agentId: wokenAgentId,
+            status: "skipped",
+            source: "automation",
+            reason: "heartbeat.scheduling_suppressed",
+            payload: opts?.payload,
+          });
+          return null;
+        }
+        const [run] = await db.insert(heartbeatRuns).values({
+          companyId,
+          agentId: wokenAgentId,
+          status: "queued",
+          invocationSource: "automation",
+          contextSnapshot: opts?.contextSnapshot ?? {},
+        }).returning();
+        return { id: run!.id };
+      },
+    });
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    expect(wakeRequests).toBe(3);
+    const skippedWakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.status, "skipped"),
+    ));
+    expect(skippedWakes).toHaveLength(2);
+
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const [reviewIssue] = await db.select().from(issues).where(eq(issues.id, watchdog!.watchdogIssueId!));
+    expect(reviewIssue).toMatchObject({ status: "todo", unblockDescriptor: null });
+    expect(watchdog?.lastReviewedFingerprint).toBeNull();
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 0, live: 1 });
+    expect(wakeRequests).toBe(3);
+    const escalationActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceId),
+      eq(activityLog.action, "issue.task_watchdog_retry_exhausted"),
+    ));
+    expect(escalationActivity).toHaveLength(0);
+  });
+
   it("escalates a repeatedly cancelled review once without an unbounded wake loop", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-RETRY-CAP", status: "blocked" });

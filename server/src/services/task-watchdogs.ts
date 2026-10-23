@@ -1555,17 +1555,19 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
     // A cancelled or failed review must be retried, but a permanently failing
     // adapter must not create an unbounded wake loop for an unchanged stop.
+    // Count runs, not trigger activity: enqueueWakeup can reject a wake before
+    // it queues a run (for example while scheduling is suppressed).
     if (existingWatchdogIssue) {
       const [attempts] = await db
         .select({ count: sql<number>`count(*)::int` })
-        .from(activityLog)
+        .from(heartbeatRuns)
         .where(and(
-          eq(activityLog.companyId, watchdog.companyId),
-          eq(activityLog.entityType, "issue"),
-          eq(activityLog.entityId, watchdog.issueId),
-          eq(activityLog.action, "issue.task_watchdog_triggered"),
-          sql`${activityLog.details}->>'watchdogId' = ${watchdog.id}`,
-          sql`${activityLog.details}->>'stopFingerprint' = ${classification.stopFingerprint}`,
+          eq(heartbeatRuns.companyId, watchdog.companyId),
+          eq(heartbeatRuns.agentId, watchdog.watchdogAgentId),
+          sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${existingWatchdogIssue.id}
+            OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${existingWatchdogIssue.id})`,
+          sql`${heartbeatRuns.contextSnapshot}->>'watchdogId' = ${watchdog.id}`,
+          sql`${heartbeatRuns.contextSnapshot}->'taskWatchdog'->>'stopFingerprint' = ${classification.stopFingerprint}`,
         ));
       if ((attempts?.count ?? 0) >= TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT) {
         if (existingWatchdogIssue.status !== "blocked" || !existingWatchdogIssue.unblockDescriptor) {

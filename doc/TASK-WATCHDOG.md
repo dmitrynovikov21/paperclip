@@ -93,7 +93,7 @@ For each active watchdog the tick:
 
 When the subtree changes between scans (someone restarts work, adds a blocker, or accepts an interaction) the stop fingerprint changes too, and the watchdog will be woken again for the new state — even if the previous run already disposed of an earlier fingerprint.
 
-The scheduler records a fingerprint as reviewed only after a successful watchdog run for that review task and fingerprint, or an explicit human status decision on the review task. A cancelled or failed run does not count as review. If the review task has no live run, wake, or real blocked path, the scheduler retries the same fingerprint at most once. After two wake attempts, it blocks the review task with a board-owned action and writes an audit entry. A real blocker with an unblock owner remains in place.
+The scheduler records a fingerprint as reviewed only after a successful watchdog run for that review task and fingerprint, or an explicit human status decision on the review task. A cancelled or failed run does not count as review. If the review task has no live run, wake, or real blocked path, the scheduler retries the same fingerprint at most once. The retry limit counts queued or started runs for that review task and fingerprint; a wake rejected before a run is queued does not use an attempt. After two run attempts, it blocks the review task with a board-owned action and writes an audit entry. A real blocker with an unblock owner remains in place.
 
 ---
 

@@ -1324,6 +1324,7 @@ export async function prepareSandboxManagedRuntime(input: {
   // another repository. Staging also verifies the captured directory identity.
   const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(approvedWorkspaceLocalDir)) : null;
   if (workspaceRoot) input = { ...input, workspaceLocalDir: workspaceRoot.sourceDir };
+  const workspaceLocalDir = input.workspaceLocalDir;
 
   // The git enumeration (`git status --ignored`, the HEAD diffs, `ls-files`).
   // It reads git's own bookkeeping to decide what to include/exclude, so it is
@@ -1576,6 +1577,9 @@ export async function prepareSandboxManagedRuntime(input: {
             //    which sits under `.paperclip-runtime`, survives to run its own extract.
             if (gitSnapshot || repositories.length) {
               await reportWorkspaceStatus("git_sync", "Syncing git history to environment");
+              if (!replaySeed && await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+                throw new Error("Isolated workspace source changed before archive staging.");
+              }
               const gitTarPath = path.join(tempDir, "git-workspace.tar");
               const remoteGitTar = path.posix.join(
                 runtimeRootDir,
@@ -1627,6 +1631,9 @@ export async function prepareSandboxManagedRuntime(input: {
             //    extracted git tree (no wipe); a plain workspace wipes every child except
             //    the preserved names first. The extract runs AFTER the git extract.
             await reportWorkspaceStatus("config_sync", "Syncing workspace to environment");
+            if (!replaySeed && await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+              throw new Error("Isolated workspace source changed before archive staging.");
+            }
             const workspaceTarPath = path.join(tempDir, "workspace.tar");
             if (replaySeed) {
               await runStepSpan("workspace.seed_replay", () => copyDurableSeedArchive({
@@ -1852,6 +1859,9 @@ export async function prepareSandboxManagedRuntime(input: {
               referencedSourceIgnoreExcludeEntries(ignoreResolution),
             );
             await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to environment");
+            if (await assertIsolatedWorkspaceSyncAllowed(approvedLocalPath) !== approvedLocalPath) {
+              throw new Error("Isolated referenced project source changed before upload.");
+            }
             await stageConfinedSyncIn({
               files: [{
                 sourcePath: approvedLocalPath,

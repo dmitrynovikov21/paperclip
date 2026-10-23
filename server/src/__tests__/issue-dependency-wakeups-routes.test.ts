@@ -4,6 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
 const mockFindExistingIssueBlockersResolvedWake = vi.hoisted(() => vi.fn(async () => null));
+const mockGetIssueBlockersResolvedReadyAt = vi.hoisted(() =>
+  vi.fn(async () => new Date("2026-09-12T12:00:00.000Z")),
+);
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -98,6 +101,7 @@ vi.mock("../services/issue-dependency-wakeups.js", async () => {
   return {
     ...actual,
     findExistingIssueBlockersResolvedWake: mockFindExistingIssueBlockersResolvedWake,
+    getIssueBlockersResolvedReadyAt: mockGetIssueBlockersResolvedReadyAt,
   };
 });
 
@@ -144,6 +148,7 @@ describe("issue dependency wakeups in issue routes", () => {
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
     mockFindExistingIssueBlockersResolvedWake.mockResolvedValue(null);
+    mockGetIssueBlockersResolvedReadyAt.mockResolvedValue(new Date("2026-09-12T12:00:00.000Z"));
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.getCommentCursor.mockResolvedValue({
@@ -211,6 +216,10 @@ describe("issue dependency wakeups in issue routes", () => {
     const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
     expect(res.status).toBe(200);
     await vi.waitFor(() => {
+      expect(mockFindExistingIssueBlockersResolvedWake).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ readyAt: new Date("2026-09-12T12:00:00.000Z") }),
+      );
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",
         expect.objectContaining({

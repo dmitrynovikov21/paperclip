@@ -26,6 +26,7 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  truncateUnicodeString,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -3170,7 +3171,7 @@ function readNonEmptyString(value: unknown): string | null {
 function sanitizeAgentSessionMessageText(value: unknown): string | null {
   const text = readNonEmptyString(value);
   if (!text) return null;
-  const redacted = redactSensitiveText(text).slice(0, MAX_AGENT_SESSION_MESSAGE_CHARS);
+  const redacted = truncateUnicodeString(redactSensitiveText(text), MAX_AGENT_SESSION_MESSAGE_CHARS);
   return redacted.trim().length > 0 ? redacted : null;
 }
 
@@ -5517,7 +5518,7 @@ export async function buildPaperclipWakePayload(input: {
   const issueDescriptionTruncated =
     issueDescription !== null && issueDescription.length > MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS;
   const inlineIssueDescription = issueDescriptionTruncated
-    ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
+    ? truncateUnicodeString(issueDescription, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
   let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
@@ -5549,7 +5550,7 @@ export async function buildPaperclipWakePayload(input: {
       break;
     }
 
-    const body = fullBody.length > allowedBodyChars ? fullBody.slice(0, allowedBodyChars) : fullBody;
+    const body = fullBody.length > allowedBodyChars ? truncateUnicodeString(fullBody, allowedBodyChars) : fullBody;
     const bodyTruncated = body.length < fullBody.length;
     if (bodyTruncated) truncated = true;
     remainingBodyChars -= body.length;
@@ -5619,7 +5620,7 @@ export async function buildPaperclipWakePayload(input: {
         anchorState: row.anchorState,
         anchorConfidence: row.anchorConfidence,
         body: row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS
-          ? row.body.slice(0, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
+          ? truncateUnicodeString(row.body, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
           : row.body,
         bodyTruncated: row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
         createdAt: row.createdAt.toISOString(),
@@ -5745,7 +5746,7 @@ export async function buildPaperclipWakePayload(input: {
           title: safeContinuationSummary.title,
           body:
             safeContinuationSummary.body.length > 4_000
-              ? safeContinuationSummary.body.slice(0, 4_000)
+              ? truncateUnicodeString(safeContinuationSummary.body, 4_000)
               : safeContinuationSummary.body,
           bodyTruncated: safeContinuationSummary.body.length > 4_000,
           sourceTrust: safeContinuationSummary.sourceTrust ?? null,
@@ -5940,7 +5941,7 @@ function sanitizeLiveRunProgressText(value: string, maxChars: number): string | 
   if (!normalized) return null;
   const redacted = redactSensitiveText(normalized);
   if (redacted.length <= maxChars) return redacted;
-  return `${redacted.slice(0, maxChars - 3)}...`;
+  return `${truncateUnicodeString(redacted, maxChars - 3)}...`;
 }
 
 function readLiveRunProgressString(value: unknown, maxChars: number): string | null {
@@ -6253,7 +6254,7 @@ function mergeHotRestartAdoptionResultJson(
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
   if (!value) return null;
-  return value.length > max ? value.slice(0, max) : value;
+  return truncateUnicodeString(value, max);
 }
 
 function normalizeAgentNameKey(value: string | null | undefined) {
@@ -8285,7 +8286,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `- Rotation reason: ${reason}`,
       latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
       input.continuationSummaryBody
-        ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
+        ? `- Issue continuation summary: ${truncateUnicodeString(input.continuationSummaryBody, 1_500)}`
         : "",
       "Continue from the current task state. Rebuild only the minimum context you need.",
     ]

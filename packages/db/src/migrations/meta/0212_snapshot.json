@@ -1,5 +1,5 @@
 {
-  "id": "8e96f023-76fb-4721-8328-8c739b914ec5",
+  "id": "45b4994f-189f-45a0-978a-04e168eb66b9",
   "prevId": "c56d3441-2ed4-4249-a115-99d55d395899",
   "version": "7",
   "dialect": "postgresql",
@@ -766,12 +766,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "session_correlation_id": {
-          "name": "session_correlation_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
         "state_json": {
           "name": "state_json",
           "type": "jsonb",
@@ -962,12 +956,6 @@
         "session_display_id": {
           "name": "session_display_id",
           "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "session_correlation_id": {
-          "name": "session_correlation_id",
-          "type": "uuid",
           "primaryKey": false,
           "notNull": false
         },
@@ -16428,12 +16416,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "session_correlation_id": {
-          "name": "session_correlation_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
         "log_store": {
           "name": "log_store",
           "type": "text",
@@ -16653,33 +16635,6 @@
             },
             {
               "expression": "started_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "heartbeat_runs_agent_session_correlation_idx": {
-          "name": "heartbeat_runs_agent_session_correlation_idx",
-          "columns": [
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "session_correlation_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "created_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -26841,6 +26796,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'instance'"
         }
       },
       "indexes": {

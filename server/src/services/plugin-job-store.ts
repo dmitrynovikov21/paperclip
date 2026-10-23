@@ -60,6 +60,8 @@ export interface CreateJobRunInput {
   jobId: string;
   /** FK to the plugins row. */
   pluginId: string;
+  /** Company for a scoped run; null for an instance-level job. */
+  companyId?: string | null;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
 }
@@ -165,6 +167,7 @@ export function pluginJobStore(db: Db) {
 
         const existing = existingByKey.get(decl.jobKey);
         const schedule = decl.schedule ?? "";
+        const scope = decl.scope ?? "instance";
 
         if (existing) {
           // Update schedule if it changed; re-activate if it was paused
@@ -173,6 +176,9 @@ export function pluginJobStore(db: Db) {
           };
           if (existing.schedule !== schedule) {
             updates.schedule = schedule;
+          }
+          if (existing.scope !== scope) {
+            updates.scope = scope;
           }
           if (existing.status === "paused") {
             updates.status = "active";
@@ -188,6 +194,7 @@ export function pluginJobStore(db: Db) {
             pluginId,
             jobKey: decl.jobKey,
             schedule,
+            scope,
             status: "active",
           });
         }
@@ -356,6 +363,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })

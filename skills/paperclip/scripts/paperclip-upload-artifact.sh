@@ -85,71 +85,21 @@ detect_content_type() {
 
 request_json() {
   local method="$1"
-  local url="$2"
+  local path="$2"
   local body="${3:-}"
-  local response_file
-  local status_code
-
-  response_file="$(mktemp)"
   if [[ -n "$body" ]]; then
-    status_code="$(
-      curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
-        "$url" \
-        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-        -H 'Content-Type: application/json' \
-        --data-binary "$body"
-    )"
+    printf '%s' "$body" | python3 "$script_dir/paperclip-api.py" "$method" "$path" --body-stdin
   else
-    status_code="$(
-      curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
-        "$url" \
-        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"
-    )"
+    python3 "$script_dir/paperclip-api.py" "$method" "$path"
   fi
-
-  if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
-    printf 'Request failed (%s): %s\n' "$status_code" "$url" >&2
-    cat "$response_file" >&2
-    printf '\n' >&2
-    rm -f "$response_file"
-    exit 1
-  fi
-
-  cat "$response_file"
-  rm -f "$response_file"
 }
 
 upload_file() {
-  local url="$1"
+  local endpoint="$1"
   local path="$2"
   local content_type="$3"
-  local escaped_path
-  local response_file
-  local status_code
-
-  escaped_path="${path//\\/\\\\}"
-  escaped_path="${escaped_path//\"/\\\"}"
-  response_file="$(mktemp)"
-  status_code="$(
-    curl -sS -X POST -w '%{http_code}' -o "$response_file" \
-      "$url" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-      -F "file=@\"${escaped_path}\";type=${content_type}"
-  )"
-
-  if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
-    printf 'Upload failed (%s): %s\n' "$status_code" "$url" >&2
-    cat "$response_file" >&2
-    printf '\n' >&2
-    rm -f "$response_file"
-    exit 1
-  fi
-
-  cat "$response_file"
-  rm -f "$response_file"
+  python3 "$script_dir/paperclip-api.py" POST "$endpoint" \
+    --multipart-file "$path" --content-type "$content_type"
 }
 
 file_path=""
@@ -243,8 +193,9 @@ if [[ "$output_format" != "markdown" && "$output_format" != "json" ]]; then
   exit 1
 fi
 
-require_command curl
+require_command python3
 require_command jq
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -z "$title" ]]; then
   title="$(basename "$file_path")"
@@ -281,10 +232,9 @@ if [[ -z "$issue_id" || -z "$company_id" ]]; then
   exit 1
 fi
 
-api_base="${PAPERCLIP_API_URL%/}/api"
 attachment="$(
   upload_file \
-    "$api_base/companies/$company_id/issues/$issue_id/attachments" \
+    "/api/companies/$company_id/issues/$issue_id/attachments" \
     "$file_path" \
     "$content_type"
 )"
@@ -344,7 +294,7 @@ if [[ "$create_work_product" == "1" ]]; then
   work_product="$(
     request_json \
       POST \
-      "$api_base/issues/$issue_id/work-products" \
+      "/api/issues/$issue_id/work-products" \
       "$work_product_payload"
   )"
 fi

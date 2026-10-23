@@ -1,8 +1,31 @@
 import { sql } from "drizzle-orm";
-import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, customType, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { replaceUnpairedSurrogates } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
+
+function repairJsonStrings(_key: string, value: unknown): unknown {
+  if (typeof value === "string") return replaceUnpairedSurrogates(value);
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const entries = Object.entries(value);
+    if (entries.some(([key]) => replaceUnpairedSurrogates(key) !== key)) {
+      return Object.fromEntries(entries.map(([key, entry]) => [replaceUnpairedSurrogates(key), entry]));
+    }
+  }
+  return value;
+}
+
+// This column is written by heartbeat, recovery, and route handlers. Enforce the
+// jsonb Unicode requirement at the common write boundary rather than at each call.
+const contextSnapshotJsonb = customType<{
+  data: Record<string, unknown>;
+  driverData: string;
+}>({
+  dataType: () => "jsonb",
+  toDriver: (value) => JSON.stringify(value, repairJsonStrings),
+  fromDriver: (value) => (typeof value === "string" ? JSON.parse(value) : value) as Record<string, unknown>,
+});
 
 export const heartbeatRuns = pgTable(
   "heartbeat_runs",
@@ -56,7 +79,7 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
-    contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
+    contextSnapshot: contextSnapshotJsonb("context_snapshot"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

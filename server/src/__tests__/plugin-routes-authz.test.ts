@@ -960,7 +960,7 @@ describe.sequential("plugin tool and bridge authz", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ runId: "run-1", jobId: "job-1" });
-    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual");
+    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual", undefined);
   });
 
   // ─── Agent JWT tool execution (cherry-picked from #5549) ─────────────────────

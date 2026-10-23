@@ -29,6 +29,7 @@ import type {
   IssueQueuedCommentQueue,
 } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
+import { TaskChatComposerBar } from "./TaskChatComposerBar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -145,7 +146,7 @@ function SortableQueuedMessage({
         {label}
       </span>
 
-      {queue.protocol === "legacy" || entry.source?.requiresFreshSession ? (
+      {queue.targetRunId && (queue.protocol === "legacy" || entry.source?.requiresFreshSession ? (
         <button
           type="button"
           onClick={onInterrupt}
@@ -177,7 +178,7 @@ function SortableQueuedMessage({
           )}
           Steer
         </button>
-      )}
+      ))}
 
       <button
         type="button"
@@ -377,16 +378,10 @@ export function TaskChatQueuedMessages({
   if (entries.length === 0 && !visibleError) return null;
 
   return (
-    <div
-      className="relative z-0 mx-3 -mb-px overflow-hidden rounded-t-xl rounded-b-none border border-b-0 border-border/75 bg-card shadow-sm"
+    <TaskChatComposerBar
       data-testid="task-chat-queued-messages"
       aria-label="Queued messages"
     >
-      {queue.executionWait && (
-        <div role="status" aria-live="polite" className="px-3 py-1.5 text-xs text-muted-foreground">
-          {queue.executionWait.message}
-        </div>
-      )}
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -433,6 +428,6 @@ export function TaskChatQueuedMessages({
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {announcement}
       </div>
-    </div>
+    </TaskChatComposerBar>
   );
 }

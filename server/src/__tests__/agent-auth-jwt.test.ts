@@ -74,6 +74,10 @@ describe("agent local JWT", () => {
     const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
     expect(token).not.toBeNull();
     expect(verifyLocalAgentJwt(token!)?.run_id).toBe("run-1");
+  it("preserves an internal Muse authorizer without changing the named agent or responsible user", () => {
+    const token = createLocalAgentJwt("agent-1", "company-1", "paperclip_runner", "run-1", "responsible-1", undefined, "authorizer-2");
+    expect(verifyLocalAgentJwt(token!)).toMatchObject({ sub: "agent-1", run_id: "run-1", responsible_user_id: "responsible-1", authorizing_user_id: "authorizer-2" });
+    expect(verifyLocalAgentJwt(createLocalAgentJwt("agent-1", "company-1", "codex_local", "run-1")!)?.authorizing_user_id).toBeUndefined();
   });
 
   it("round-trips a skill_test run scope", () => {

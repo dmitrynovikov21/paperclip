@@ -2,7 +2,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import {
+  assertStrictSkillDirectory,
+  copyStrictSkillDirectory,
+  readStrictSkillFile,
+  resolvePaperclipInstanceRootForAdapter,
+} from "@paperclipai/adapter-utils/server-utils";
 
 const TRUTHY_ENV_RE = /^(1|true|yes|on)$/i;
 const COPIED_SHARED_FILES = ["config.json", "config.toml", "instructions.md"] as const;
@@ -478,9 +483,11 @@ async function stageContainedSubtree(
  * intentionally point into a shared skill store *outside* `CODEX_HOME/skills/`,
  * so each child is allowed to resolve anywhere — and when it resolves to a
  * directory it becomes the containment root for its own subtree. Everything
- * *below* that root is copied via {@link stageContainedSubtree}, which refuses to
- * follow a nested symlink out of the skill (finding 2) and detects directory
- * cycles (finding 1). A direct child that resolves to `sourceDir` itself or to
+ * *below* that root is copied via {@link stageContainedSubtree} in ordinary
+ * mode, which refuses to follow a nested symlink out of the skill (finding 2)
+ * and detects directory cycles (finding 1). Isolated mode instead rejects
+ * nested links and opens every source component without following links.
+ * A direct child that resolves to `sourceDir` itself or to
  * an ancestor of it (a degenerate `-> .` / `-> ..` link at the top level) is
  * skipped rather than used as a root, so it can never drag the wider home into
  * the staged skills asset. The `0700` staged directory and per-file `0600` mode
@@ -492,7 +499,14 @@ async function stageDirectorySecure(
   trustedSkillRoots: ReadonlySet<string>,
 ): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true, mode: 0o700 });
+  const isolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
   const realSourceDir = await fs.realpath(sourceDir);
+  if (isolated) {
+    if (realSourceDir !== path.resolve(sourceDir)) {
+      throw new Error("Isolated Codex skills directory has a symbolic-link ancestor.");
+    }
+    await assertStrictSkillDirectory(sourceDir);
+  }
   const entries = await fs.readdir(sourceDir, { withFileTypes: true });
   for (const entry of entries) {
     const entrySource = path.join(sourceDir, entry.name);
@@ -504,6 +518,12 @@ async function stageDirectorySecure(
       throw error;
     });
     if (!resolved) continue;
+    // In isolation mode, even a direct child must remain inside skills/ or be
+    // one of the server-selected roots. An agent can replace a direct child
+    // between readdir and realpath, so its earlier Dirent type is not trusted.
+    if (isolated && !isResolvedPathInside(resolved, realSourceDir) && !trustedSkillRoots.has(resolved)) {
+      throw new Error("Isolated Codex home contains an untrusted skill source.");
+    }
     // A top-level child that resolves to the skills dir itself or an ancestor
     // of it (`back -> .` / `back -> ..`) is degenerate: using it as a root would
     // re-stage the whole home under `skills/`. Skip it.
@@ -513,7 +533,7 @@ async function stageDirectorySecure(
       throw error;
     });
     if (!entryStat) continue;
-    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" && entry.isSymbolicLink()) {
+    if (isolated && entry.isSymbolicLink()) {
       if (!entryStat.isDirectory() || !trustedSkillRoots.has(resolved)) {
         throw new Error("Isolated Codex home contains an untrusted skill source.");
       }
@@ -521,9 +541,13 @@ async function stageDirectorySecure(
     if (entryStat.isDirectory()) {
       // This child skill establishes its own containment root: nested links may
       // not escape it, and the root seeds the cycle-detection active path.
-      await stageContainedSubtree(resolved, entryTarget, resolved, new Set([resolved]));
+      if (isolated) {
+        await copyStrictSkillDirectory(resolved, entryTarget);
+      } else {
+        await stageContainedSubtree(resolved, entryTarget, resolved, new Set([resolved]));
+      }
     } else if (entryStat.isFile()) {
-      const bytes = await fs.readFile(resolved);
+      const bytes = isolated ? await readStrictSkillFile(resolved) : await fs.readFile(resolved);
       await fs.writeFile(entryTarget, bytes, { mode: 0o600 });
       await fs.chmod(entryTarget, 0o600);
     }
@@ -607,15 +631,26 @@ export async function stageCodexHomeForSync(
   effectiveCodexHome: string,
   options: StageCodexHomeForSyncOptions = {},
 ): Promise<string> {
-  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+  const isolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
+  if (isolated) {
     await assertIsolatedCodexHomeEntries(effectiveCodexHome);
   }
   const trustedSkillRoots = new Set(
-    (await Promise.all((options.trustedSkillSources ?? []).map((source) =>
-      fs.realpath(source).catch(() => null),
-    ))).filter((source): source is string => source !== null),
+    (await Promise.all((options.trustedSkillSources ?? []).map(async (source) => {
+      const resolved = await fs.realpath(source).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      });
+      if (resolved && isolated) {
+        if (resolved !== path.resolve(source)) {
+          throw new Error("Isolated Codex skill source has a symbolic-link ancestor.");
+        }
+        await assertStrictSkillDirectory(source);
+      }
+      return resolved;
+    }))).filter((source): source is string => source !== null),
   );
-  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+  if (isolated) {
     const keyPath = nonEmpty(process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE);
     const realKeyPath = keyPath ? await fs.realpath(keyPath).catch(() => null) : null;
     if (realKeyPath && [...trustedSkillRoots].some((root) => isResolvedPathInside(realKeyPath, root))) {

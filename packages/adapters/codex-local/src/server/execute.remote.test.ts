@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -138,6 +139,65 @@ describe("codex remote execution", () => {
     expect(syncDirectoryToSsh).not.toHaveBeenCalled();
     expect(runChildProcess).not.toHaveBeenCalled();
     expect(await readFile(key, "utf8")).toBe("SYNTHETIC_MASTER_KEY");
+  });
+
+  it("rejects a raced-in skill key link before syncing the sandbox asset", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-skill-race-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const skill = path.join(workspace, "skill");
+    const skillFile = path.join(skill, "SKILL.md");
+    const key = path.join(root, "secrets", "master.key");
+    const sharedHome = path.join(root, "shared-home");
+    await mkdir(skill, { recursive: true });
+    await mkdir(path.dirname(key), { recursive: true });
+    await mkdir(sharedHome);
+    await writeFile(skillFile, "# safe skill\n");
+    await writeFile(key, "SYNTHETIC_MASTER_KEY_RACE");
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
+    vi.stubEnv("CODEX_HOME", sharedHome);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", key);
+    const originalLstat = fs.lstat.bind(fs);
+    let swapped = false;
+    const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (candidate) => {
+      const stat = await originalLstat(candidate);
+      if (!swapped && String(candidate).startsWith("/proc/self/fd/") && path.basename(String(candidate)) === "SKILL.md") {
+        await fs.rename(skillFile, path.join(skill, "held-SKILL.md"));
+        await fs.symlink(key, skillFile);
+        swapped = true;
+      }
+      return stat;
+    });
+    const logs: string[] = [];
+    try {
+      await expect(execute({
+        runId: "isolated-skill-race",
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: "codex",
+          env: { OPENAI_API_KEY: "sk-test-key" },
+          paperclipRuntimeSkills: [{ key: "fixture/skill", runtimeName: "skill", source: skill }],
+          paperclipSkillSync: { desiredSkills: ["fixture/skill"] },
+        },
+        context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+        executionTransport: { remoteExecution: {
+          host: "127.0.0.1", port: 2222, username: "fixture",
+          remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        } },
+        onLog: async (_stream: "stdout" | "stderr", chunk: string) => { logs.push(chunk); },
+      } as never)).rejects.toThrow();
+      expect(swapped).toBe(true);
+      expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+      expect(runChildProcess).not.toHaveBeenCalled();
+      expect(logs.join("")).not.toContain("SYNTHETIC_MASTER_KEY_RACE");
+    } finally {
+      lstatSpy.mockRestore();
+    }
   });
 
   it("runs with a service-selected home in isolated mode", async () => {

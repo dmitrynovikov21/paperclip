@@ -305,6 +305,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(context?.taskWatchdog?.capabilities?.operations).not.toContain("reassign_watched_subtree_issues");
 
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    await seedWatchdogReviewRun(watchdog!, "succeeded");
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, watchdog!.watchdogIssueId!));
     const second = await service.reconcileTaskWatchdogs({ companyId });
 

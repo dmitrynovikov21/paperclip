@@ -111,3 +111,18 @@ it("prefers provider TTL splits and never repairs malformed or partial provider 
     expect(estimateProviderCost(receipt, policyPrice)).toBeNull();
   }
 });
+
+it.each([
+  ["openai", { input_tokens: 1001, output_tokens: 1 }, 1001],
+  ["openai", { input_tokens_details: { cached_tokens: 1001 } }, 1001],
+  ["anthropic", { input_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 1000,
+    cache_creation: { ephemeral_5m_input_tokens: 999, ephemeral_1h_input_tokens: 0 } }, 1003],
+  ["anthropic", { input_tokens: 1, cache_creation: { ephemeral_5m_input_tokens: 900, ephemeral_1h_input_tokens: 100 } }, 1001],
+] as const)("retains %s input bounds independently of incomplete or contradictory price counters", (provider, usage, input) => {
+  const receipt = normalizeProviderUsage(provider, { usage });
+  expect(receipt).toMatchObject({ complete: false, tokenBounds: { input, valid: true } });
+  expect(estimateProviderCost(receipt, { ...price, provider })).toBeNull();
+});
+it.each([null, -1, 1.5, "1001", Number.MAX_SAFE_INTEGER + 1])("marks malformed input evidence %j ineligible for a bound", input_tokens => {
+  expect(normalizeProviderUsage("openai", { usage: { input_tokens } }).tokenBounds?.valid).toBe(false);
+});

@@ -173,6 +173,78 @@ Private request receipts retain transport IDs, response IDs, usage and cache TTL
 route/cache/failover evidence, and final accounting status without request bodies
 or credentials. Raw provider responses remain only in the normal private evidence.
 
+## Provisional completion and later reconciliation
+
+Recurring campaigns may finish with provisional accounting when every pending
+charge has an explicit reviewed bound, all requests have stopped, no receipts
+conflict, and known costs plus retained holds fit the campaign cap. Product,
+cleanup, feedback, trace and ingestion requirements still apply. Reports and
+Braintrust experiment metadata label accounting as `provisional`,
+`receipts_complete`, `blocked`, or `unavailable`. Receipt completeness is separate
+from invoice reconciliation. The original failed campaign remains failed; a
+later report or policy does not change its original result.
+
+The optional `provisionalBound` on a manifest model or operating component is:
+
+```json
+{
+  "version": 1,
+  "scope": "full_lifecycle",
+  "evidenceSha256": "SHA256_OF_RETAINED_REVIEWED_AUDIT",
+  "configurationSha256": "SHA256_OF_EXACT_REVIEWED_CONFIGURATION"
+}
+```
+
+These placeholders are invalid until replaced with actual lowercase SHA-256
+values. Use `costBoundConfigurationSha256` from `cost-bound-evidence.ts` for
+stable key-sorted JSON hashing. The model configuration contains `provider`,
+`mode` (the manifest route), `price`, `maximumInputTokens`,
+`maximumOutputTokens`, and `reservation` (the nine-decimal value from
+`evalRequestReservation`). An operating configuration contains allowance
+`reference`, `runner`, `verifiedAt`, `expiresAt`, and a `component` object with
+its `component`, `maxUsd`, and `reference`. Changing any of those values
+invalidates the approval hash. Evidence metadata itself is excluded from this
+configuration hash.
+
+An operator must retain and review the audit before configuring its hash.
+Hashes bind evidence and configuration; they do not prove the audit is true.
+A model audit must establish the provider's full context ceiling, all billable
+token prices and tiers, standard inference, and the route's billing behavior.
+The gateway enforces output limits and supported request shapes. An operating
+audit must cover setup, failed attempts, build time, publication, transfer,
+observability and the full retained-storage lifecycle, including uncertainty in
+resource deletion and invoice arrival. It must name the enforceable resource
+limits and rates that keep the whole component below `maxUsd`. A current-day
+usage estimate or an arbitrary contingency amount is insufficient. A zero bound
+also needs evidence. Keep raw audits private; public reports expose only counts
+and the existing journal checkpoint.
+
+The ledger retains bound evidence before model dispatch. Unexpected or missing
+Braintrust route confirmation, failover, a returned model mismatch, or observed
+usage above a declared limit disqualifies that request's bound. Provider usage
+normalization retains a separate input/output lower bound even when missing or
+contradictory cache counters prevent pricing. Malformed reported counts also
+disqualify a bound. In-flight
+requests, conflicts, pending charges above their bound, and campaign overruns
+still block completion. Gateway cancellation before route confirmation remains
+unqualified even if it retained an admission reservation. Later receipts remain
+the way to resolve it.
+
+Provisional completion never releases a reservation or manufactures a zero
+charge. A missing receipt stays unknown and holds its full bound, less any
+known partial amount, until a valid final receipt supersedes it. The existing
+receipt importer still requires complete billing/resource windows before it
+marks a receipt final. Later bills can reveal an overrun; this local journal
+cannot stop external billing. Reconcile the same retained journal after its
+billing windows close, regenerate its report, and inspect any overruns before
+admitting more work. Existing subscription costs remain separate from the
+incremental daily/weekly budgets.
+
+Old journals and reports remain readable. They gain no bound evidence by
+upgrade or by this policy; unresolved legacy charges still block. Existing
+configured allowances and price cards are not automatically qualified by the
+new optional field. Recurrence remains subject to its existing enable gates.
+
 ## Manifest
 
 A manifest contains no credentials. This structural example uses fixture prices;
@@ -420,8 +492,9 @@ lifecycles. They do not occupy model concurrency, but they count toward the
 finite charge-record limit. Resuming cannot change or drop them. Until matched
 cost observations arrive, the report shows them as unknown and keeps their
 allowance held; even a zero allowance does not claim a known zero charge.
-The existing finalizer reports incomplete accounting while these receipts are
-missing. Do not dismiss that finding to enable recurrence.
+The finalizer permits provisional completion only when each pending charge has
+explicit reviewed bound evidence as described below. Missing or unqualified
+bounds remain incomplete accounting; a reservation alone does not qualify.
 
 Reconcile a component through its existing request ID with provenance-bound
 `infrastructure` or `invoice` observations. Partial observations keep the
@@ -587,8 +660,8 @@ explicit, unbounded qualification path and does not inherit these allowances.
 
 After execution, deterministic review dismisses only exact synthetic feedback
 bodies corroborated by all feedback-persistence graders. Novel feedback remains
-`needs_investigation`; no extra model call is made. Missing accounting, unresolved
-receipts, feedback collection/submission failures, novel feedback, export failure
+`needs_investigation`; no extra model call is made. Missing accounting, unbounded
+pending charges, conflicts, spending overruns, feedback collection/submission failures, novel feedback, export failure
 and incomplete experiment import or indexing fail the job with bounded diagnostic codes.
 Successful unchanged runs produce artifacts without posting messages. GitHub's
 workflow failure notifications remain the operator's notification channel.

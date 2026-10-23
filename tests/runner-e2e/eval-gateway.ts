@@ -1,3 +1,4 @@
+import { reservationBound, validateCostBoundEvidence, type EvalCostBoundEvidence } from "./cost-bound-evidence.js";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
@@ -17,6 +18,7 @@ export interface EvalGatewayRoute {
   maximumInputTokens: number;
   maximumOutputTokens: number;
   timeoutMs: number;
+  provisionalBound?: EvalCostBoundEvidence;
 }
 export interface EvalGatewayReceipt {
   requestId: string; status?: number; route: "direct" | "braintrust";
@@ -32,6 +34,7 @@ const row = (value: unknown): Record<string, unknown> => value && typeof value =
 class EvalRequestError extends Error {}
 
 export function evalRequestReservation(route: EvalGatewayRoute): string {
+  if (route.provisionalBound !== undefined) validateCostBoundEvidence(route.provisionalBound);
   if (![route.maximumInputTokens, route.maximumOutputTokens, route.timeoutMs].every(n => Number.isSafeInteger(n) && n > 0)
       || route.timeoutMs > 300_000 || route.provider !== route.price.provider || !validEvalLedgerId(route.price.version) || !validEvalLedgerId(route.price.model)) throw new Error("Invalid eval gateway limits or price identity");
   const parse = (rate: string) => {
@@ -50,7 +53,16 @@ export function evalRequestReservation(route: EvalGatewayRoute): string {
     const output = parse(tier.outputUsdPerMillion); if (output > maximumOutputRate) maximumOutputRate = output;
   }
   const numerator = BigInt(route.maximumInputTokens) * maximumInputRate + BigInt(route.maximumOutputTokens) * maximumOutputRate;
-  return money((numerator + 999_999n) / 1_000_000n);
+  const reservation = money((numerator + 999_999n) / 1_000_000n);
+  modelReservationBound(route, reservation);
+  return reservation;
+}
+
+function modelReservationBound(route: EvalGatewayRoute, reservation: string) {
+  return route.provisionalBound ? reservationBound("model_limits", route.provisionalBound, {
+    provider: route.provider, mode: route.mode, price: route.price, maximumInputTokens: route.maximumInputTokens,
+    maximumOutputTokens: route.maximumOutputTokens, reservation,
+  }) : undefined;
 }
 
 function boundedPayload(value: unknown, route: EvalGatewayRoute) {
@@ -115,7 +127,8 @@ export async function forwardEvalRequest(input: {
   const receipt: EvalGatewayReceipt = { requestId, route: route.mode, outcome: "failed", usageComplete: false, final: false, costUsd: null,
     ...(route.mode === "braintrust" ? { braintrustParent: braintrustGatewayRequestParent(route.projectId!, requestId, ledger.snapshot().campaignId, input.identity) } : {}) };
   const usage = new ProviderUsageAccumulator(route.provider, body);
-  await ledger.reserve(requestId, input.identity, reservation);
+  const bound = modelReservationBound(route, reservation);
+  await ledger.reserve(requestId, input.identity, reservation, bound);
   const abort = new AbortController();
   const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(Math.max(1, Math.min(route.timeoutMs, input.deadlineAt - Date.now()))), ...(input.signal ? [input.signal] : [])]);
   let response: Response | undefined;
@@ -184,6 +197,12 @@ export async function forwardEvalRequest(input: {
       delete tokens.reasoning;
       receipt.errorCode ??= "invalid_usage";
     }
+    const observedInput = observed.tokenBounds?.input ?? 0;
+    if (bound && (observed.tokenBounds?.valid === false || receipt.errorCode === "invalid_usage" || observed.model !== undefined && observed.model !== route.price.model
+        || !Number.isSafeInteger(observedInput) || observedInput > route.maximumInputTokens
+        || (observed.tokenBounds?.output ?? 0) > route.maximumOutputTokens
+        || route.mode === "braintrust" && (!response || receipt.endpoint !== route.endpointName
+          || receipt.cache === "HIT" || receipt.failoverFrom || receipt.failoverTo))) await ledger.invalidateBound(requestId);
     await input.persist(receipt);
     await ledger.observe({ observationId: `${requestId}:usage`, requestId, source: route.mode === "braintrust" ? "gateway" : "provider",
       provider: route.provider,

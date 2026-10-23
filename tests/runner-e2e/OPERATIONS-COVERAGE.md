@@ -133,7 +133,10 @@ the existing $249/month fee while including new usage and capacity charges.
 Scheduled admission now reserves the declared CI, storage, observability and
 subscription allowances inside the same $20/$100 journal limit. Missing or stale
 allowances stop scheduling before the AWS test runner starts. Missing receipts
-keep their reservations held and accounting incomplete. This is a local admission
+keep their reservations held. Explicit reviewed full-lifecycle bounds may allow
+provisional completion while billing remains pending; missing bounds, conflicts
+and overspending still fail. Legacy reservations gain no qualification from the
+policy change. This is a local admission
 control, not a provider billing cap. Actual resource bounds, cost collection and
 reviewed allowances still need qualification before recurrence is enabled; see
 [the allowance contract](OPERATIONS.md#recurring-campaigns).

@@ -1,3 +1,5 @@
+import { usdToUnits } from "../../packages/shared/src/money.js";
+import { evalAccountingStatus } from "./operations-report.js";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,7 +46,10 @@ export function scheduledCampaignFindings(campaign: RunnerE2ECampaign): string[]
   if (campaign.accounting?.attempts.some(row => row.cleanup !== "passed")) findings.push("cleanup_failure");
   const operations = campaign.operations;
   if (!operations || operations.status === "unavailable") findings.push("accounting_unavailable");
-  else if (operations.unresolvedRequests || operations.conflictingRequests || operations.inflight) findings.push("accounting_incomplete");
+  else {
+    if (evalAccountingStatus(operations) === "blocked") findings.push("accounting_incomplete");
+    if (usdToUnits(operations.committedUsd) > usdToUnits(operations.limitUsd)) findings.push("accounting_over_budget");
+  }
   const feedback = summarizeCampaignFeedback(campaign.accounting?.attempts ?? campaign.results);
   if (feedback.incomplete || feedback.failedSubmissions || feedback.unknownSubmissions) findings.push("feedback_collection_incomplete");
   if (!campaign.feedbackReview || campaign.feedbackReview.decisions.some(row => ["actionable", "needs_investigation"].includes(row.disposition))) findings.push("feedback_needs_review");
@@ -107,6 +112,7 @@ export async function finalizeScheduledCampaign(env: NodeJS.ProcessEnv) {
   if (indexing !== "verified") findings.push("trace_or_experiment_indexing_incomplete");
   await writeFile(path.join(directory, "findings.json"), `${JSON.stringify({ version: 1, findings,
     nativeIndexVerification: indexing, invoiceReconciliation: "pending",
+    accountingStatus: campaign.operations ? evalAccountingStatus(campaign.operations) : "unavailable",
     feedbackReviewMethod: "Only exact synthetic fixture bodies with all corroborating graders are automatically dismissed; all other feedback requires review" }, null, 2)}\n`, { mode: 0o600 });
   for (const finding of findings) console.error(`::error title=Eval operations::${finding}`);
   return findings;

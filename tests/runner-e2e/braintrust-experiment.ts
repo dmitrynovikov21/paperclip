@@ -1,3 +1,4 @@
+import { evalAccountingStatus } from "./operations-report.js";
 import { createHash } from "node:crypto";
 import { buildCampaignAccounting } from "./attempt-accounting.js";
 import { exportBraintrustAttemptParent, type EvalBraintrustConfig } from "./braintrust.js";
@@ -98,6 +99,7 @@ export function buildBraintrustExperiment(projectId: string, campaign: RunnerE2E
     missing_attempts: accounting.missingAttempts,
     request_ledger: operations ? { journal_hash: operations.journalHash, known_usd: operations.knownUsd,
       additional_held_usd: operations.heldUsd, committed_usd: operations.committedUsd,
+      accounting_status: evalAccountingStatus(operations), bounded_unresolved_requests: operations.boundedUnresolvedRequests ?? 0,
       requests: operations.requests, unresolved_requests: operations.unresolvedRequests, breakdown: operations.breakdown } : null,
     feedback_review: campaign.feedbackReview ?? null,
     accounting_note: "Ledger amounts are separate observations, not additive trace metrics. Held reservations are not charges. Requests outside the gateway and infrastructure require separate accounting." };

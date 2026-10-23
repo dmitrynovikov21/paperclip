@@ -17,6 +17,7 @@ interface EvalOperationsAvailableReport {
   committedUsd: string;
   requests: number;
   unresolvedRequests: number;
+  boundedUnresolvedRequests?: number;
   conflictingRequests: number;
   inflight: number;
   breakdown: { reported: string; estimated: string; allocated: string; reconciled: string };
@@ -38,11 +39,15 @@ export function validateEvalOperationsReport(report: EvalOperationsReport): void
   }
   const dollars = (value: unknown): bigint => typeof value === "string" && /^(?:0|[1-9][0-9]*)\.[0-9]{9}$/.test(value) ? usdToUnits(value) : fail();
   const count = (value: unknown) => { if (!Number.isSafeInteger(value) || Number(value) < 0) fail(); };
-  fields(report, ["version", "scope", "ledgerCampaignId", "journalHash", "records", "deadlineAt", "limitUsd", "knownUsd", "heldUsd", "committedUsd", "requests", "unresolvedRequests", "conflictingRequests", "inflight", "breakdown", "attempts"]);
+  fields(report, ["version", "scope", "ledgerCampaignId", "journalHash", "records", "deadlineAt", "limitUsd", "knownUsd", "heldUsd", "committedUsd", "requests", "unresolvedRequests", "boundedUnresolvedRequests", "conflictingRequests", "inflight", "breakdown", "attempts"]);
   if (report.version !== 1 || report.scope !== "shared_gateway_ledger" || !validEvalLedgerId(report.ledgerCampaignId)
       || !/^[a-f0-9]{64}$/.test(report.journalHash) || !isPublicReportTimestamp(report.deadlineAt) || !Array.isArray(report.attempts)) fail();
   [report.records, report.requests, report.unresolvedRequests, report.conflictingRequests, report.inflight].forEach(count);
   if (report.records < 1 || report.unresolvedRequests > report.requests || report.conflictingRequests > report.unresolvedRequests || report.inflight > report.requests) fail();
+  if (report.boundedUnresolvedRequests !== undefined) {
+    count(report.boundedUnresolvedRequests);
+    if (report.boundedUnresolvedRequests > report.unresolvedRequests - report.conflictingRequests) fail();
+  }
   dollars(report.limitUsd);
   const known = dollars(report.knownUsd), held = dollars(report.heldUsd);
   if (known + held !== dollars(report.committedUsd)) fail();
@@ -84,10 +89,18 @@ async function readAvailableEvalOperationsReport(file: string): Promise<EvalOper
   const report: EvalOperationsAvailableReport = { version: 1, scope: "shared_gateway_ledger", ledgerCampaignId: snapshot.campaignId,
     journalHash: loaded.previous, records: loaded.sequence, deadlineAt: new Date(loaded.state.limits.deadlineAt).toISOString(),
     limitUsd: snapshot.limitUsd, knownUsd: snapshot.knownUsd, heldUsd: snapshot.heldUsd, committedUsd: snapshot.committedUsd,
-    requests: snapshot.requests.length, unresolvedRequests: snapshot.unknownRequests, conflictingRequests: snapshot.conflictingRequests,
+    requests: snapshot.requests.length, unresolvedRequests: snapshot.unknownRequests, boundedUnresolvedRequests: snapshot.boundedUnresolvedRequests, conflictingRequests: snapshot.conflictingRequests,
     inflight: snapshot.inflight, breakdown: snapshot.breakdown as EvalOperationsAvailableReport["breakdown"], attempts: [...groups.values()] };
   validateEvalOperationsReport(report);
   return report;
+}
+
+export function evalAccountingStatus(report: EvalOperationsReport): "unavailable" | "blocked" | "provisional" | "receipts_complete" {
+  validateEvalOperationsReport(report);
+  if (report.status === "unavailable") return "unavailable";
+  if (report.conflictingRequests || report.inflight || usdToUnits(report.committedUsd) > usdToUnits(report.limitUsd)
+      || report.unresolvedRequests !== (report.boundedUnresolvedRequests ?? 0)) return "blocked";
+  return report.unresolvedRequests ? "provisional" : "receipts_complete";
 }
 
 export function operationsReportText(report: EvalOperationsReport): string[] {
@@ -96,6 +109,7 @@ export function operationsReportText(report: EvalOperationsReport): string[] {
     "Retained test results are preserved. Recover and validate the original journal before resuming paid work; do not reset the allowance or treat missing amounts as zero.",
   ];
   return [
+    `Accounting status: ${evalAccountingStatus(report)}. ${report.boundedUnresolvedRequests ?? 0} pending charges have reviewed bounds; ${report.unresolvedRequests - (report.boundedUnresolvedRequests ?? 0)} do not. Provisional completion preserves holds and requires later reconciliation; it does not establish invoice completeness.`,
     `Shared request ledger ${report.ledgerCampaignId}: $${report.knownUsd} known subtotal; $${report.heldUsd} additional held reservations; $${report.committedUsd} committed against $${report.limitUsd}.`,
     `Charges: $${report.breakdown.reconciled} reconciled; $${report.breakdown.reported} reported; $${report.breakdown.estimated} estimated; $${report.breakdown.allocated} allocated.`,
     `${report.requests} recorded requests or overhead reservations; ${report.unresolvedRequests} unresolved; ${report.conflictingRequests} conflicting; ${report.inflight} in flight. Deadline ${report.deadlineAt}.`,

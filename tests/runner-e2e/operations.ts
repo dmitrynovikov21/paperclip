@@ -35,7 +35,7 @@ export function validateEvalOperationsManifest(value: EvalOperationsManifest, ex
   if (value.route === "braintrust" && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.projectId ?? "")) throw new Error("Braintrust gateway requires an explicit project UUID");
   const models = new Map<string, bigint>();
   for (const model of value.models) {
-    fields(model, ["provider", "price", "maximumInputTokens", "maximumOutputTokens", "timeoutMs"]);
+    fields(model, ["provider", "price", "maximumInputTokens", "maximumOutputTokens", "timeoutMs", "provisionalBound"]);
     const rateFields = ["inputUsdPerMillion", "cachedReadUsdPerMillion", "outputUsdPerMillion", "cacheWrite5mUsdPerMillion", "cacheWrite1hUsdPerMillion", "cacheWrite30mUsdPerMillion", "cacheWrite12hUsdPerMillion"];
     fields(model.price, ["provider", "model", "version", "sourceUrl", "longContext", ...rateFields]);
     if (model.price.longContext) { fields(model.price.longContext, ["aboveInputTokens", "rates"]); fields(model.price.longContext.rates, rateFields); }

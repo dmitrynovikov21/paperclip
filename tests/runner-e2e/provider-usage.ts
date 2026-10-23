@@ -9,6 +9,7 @@ export interface ProviderUsageReceipt {
   provider: "openai" | "anthropic";
   tokens: Tokens;
   complete: boolean;
+  tokenBounds?: { input: number; output: number; valid: boolean };
   providerResponseId?: string;
   model?: string;
   cacheWrite5m?: number;
@@ -38,6 +39,24 @@ function openAiRequestCachePolicy(payload: unknown): { model: string; ttl: "30m"
   return { model: body.model, ttl };
 }
 
+function tokenBounds(provider: "openai" | "anthropic", usage: Row) {
+  const input = row(usage.input_tokens_details), output = row(usage.output_tokens_details);
+  const writes = provider === "openai" ? row(input.cache_write_tokens_details) : row(usage.cache_creation);
+  const rawWrite = provider === "openai" ? input.cache_write_tokens : usage.cache_creation_input_tokens;
+  const rawRead = provider === "openai" ? input.cached_tokens : usage.cache_read_input_tokens;
+  const ttls = provider === "openai" ? [writes.ttl_30m_tokens, writes.ttl_12h_tokens]
+    : [writes.ephemeral_5m_input_tokens, writes.ephemeral_1h_input_tokens];
+  const inputs = [usage.input_tokens, rawRead, rawWrite, ...ttls];
+  const outputs = [usage.output_tokens, ...(provider === "openai" ? [output.reasoning_tokens] : [])];
+  const value = (raw: unknown) => count(raw) ?? 0;
+  const cached = value(rawRead) + Math.max(value(rawWrite), value(ttls[0]) + value(ttls[1]));
+  const inputBound = provider === "openai" ? Math.max(value(usage.input_tokens), cached) : value(usage.input_tokens) + cached;
+  const outputBound = Math.max(...outputs.map(value));
+  return { input: inputBound, output: outputBound,
+    valid: [...inputs, ...outputs].every(raw => raw === undefined || count(raw) !== undefined)
+      && Number.isSafeInteger(inputBound) && Number.isSafeInteger(outputBound) };
+}
+
 export function normalizeProviderUsage(provider: "openai" | "anthropic", payload: unknown): ProviderUsageReceipt {
   const body = row(payload), usage = row(body.usage);
   const output = count(usage.output_tokens);
@@ -65,7 +84,7 @@ export function normalizeProviderUsage(provider: "openai" | "anthropic", payload
   }
   const complete = tokens.input !== undefined && tokens.cachedRead !== undefined && tokens.cachedWrite !== undefined && output !== undefined
     && !(tokens.reasoning !== undefined && tokens.reasoning > output);
-  return { provider, tokens: Object.fromEntries(Object.entries(tokens).filter(([, value]) => value !== undefined)), complete,
+  return { provider, tokenBounds: tokenBounds(provider, usage), tokens: Object.fromEntries(Object.entries(tokens).filter(([, value]) => value !== undefined)), complete,
     ...(typeof body.id === "string" ? { providerResponseId: body.id } : {}),
     ...(typeof body.model === "string" ? { model: body.model } : {}),
     ...(cacheWrite5m !== undefined ? { cacheWrite5m } : {}), ...(cacheWrite1h !== undefined ? { cacheWrite1h } : {}),

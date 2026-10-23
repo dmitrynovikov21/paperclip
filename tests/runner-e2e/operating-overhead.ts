@@ -1,3 +1,4 @@
+import { reservationBound, type EvalCostBoundEvidence } from "./cost-bound-evidence.js";
 import { usdToUnits } from "../../packages/shared/src/money.js";
 
 export const EVAL_OVERHEAD_COMPONENTS = ["ci_compute", "artifact_storage", "observability", "shared_subscription"] as const;
@@ -7,7 +8,7 @@ export interface EvalOperatingOverhead {
   runner: "github-hosted" | "aws-fleet";
   verifiedAt: string;
   expiresAt: string;
-  components: Array<{ component: typeof EVAL_OVERHEAD_COMPONENTS[number]; maxUsd: string; reference: string }>;
+  components: Array<{ component: typeof EVAL_OVERHEAD_COMPONENTS[number]; maxUsd: string; reference: string; provisionalBound?: EvalCostBoundEvidence }>;
 }
 
 const object = (value: unknown, allowed: string[]) => {
@@ -15,6 +16,14 @@ const object = (value: unknown, allowed: string[]) => {
       || Object.keys(value).some(key => !allowed.includes(key))) throw new Error("Invalid operating overhead fields");
 };
 const reference = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,511}$/.test(value);
+
+export function operatingReservationBound(allowance: EvalOperatingOverhead, component: EvalOperatingOverhead["components"][number]) {
+  if (component.provisionalBound === undefined) return undefined;
+  return reservationBound("operating_allowance", component.provisionalBound, {
+    reference: allowance.reference, runner: allowance.runner, verifiedAt: allowance.verifiedAt, expiresAt: allowance.expiresAt,
+    component: { component: component.component, maxUsd: component.maxUsd, reference: component.reference },
+  });
+}
 
 export function validateOperatingOverhead(value: EvalOperatingOverhead, totalUsd: string): bigint {
   object(value, ["version", "reference", "runner", "verifiedAt", "expiresAt", "components"]);
@@ -29,7 +38,8 @@ export function validateOperatingOverhead(value: EvalOperatingOverhead, totalUsd
   const seen = new Set<string>();
   let reserved = 0n;
   for (const component of value.components) {
-    object(component, ["component", "maxUsd", "reference"]);
+    object(component, ["component", "maxUsd", "reference", "provisionalBound"]);
+    if (component.provisionalBound !== undefined) operatingReservationBound(value, component);
     if (!EVAL_OVERHEAD_COMPONENTS.includes(component.component) || seen.has(component.component)
         || !reference(component.reference) || typeof component.maxUsd !== "string"
         || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,9})?$/.test(component.maxUsd)) throw new Error("Invalid operating overhead component");

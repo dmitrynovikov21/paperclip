@@ -1,9 +1,10 @@
+import { validateReservationBound, type EvalReservationBound } from "./cost-bound-evidence.js";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, readFile, rm, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { usdToUnits } from "../../packages/shared/src/money.js";
-import { validateOperatingOverhead, type EvalOperatingOverhead } from "./operating-overhead.js";
+import { operatingReservationBound, validateOperatingOverhead, type EvalOperatingOverhead } from "./operating-overhead.js";
 
 export interface EvalSpendLimits {
   campaignId: string;
@@ -46,11 +47,12 @@ type Event =
   | { type: "campaign"; limits: EvalSpendLimits }
   | ({ type: "attempt_policy" } & EvalLegacyAttemptAudit)
   | { type: "attempt"; executionId: string; attemptId: string }
-  | { type: "reserve"; requestId: string; identity: EvalChargeIdentity; maxUsd: string }
+  | { type: "reserve"; requestId: string; identity: EvalChargeIdentity; maxUsd: string; bound?: EvalReservationBound }
+  | { type: "invalidate_bound"; requestId: string }
   | { type: "observe"; observation: EvalCostObservation }
   | { type: "finish"; requestId: string; outcome: "succeeded" | "failed" | "cancelled" };
 interface Line { seq: number; at: string; previous: string; event: Event; hash: string }
-interface RequestState { identity: EvalChargeIdentity; reserved: bigint; observations: EvalCostObservation[]; finished: boolean }
+interface RequestState { identity: EvalChargeIdentity; reserved: bigint; observations: EvalCostObservation[]; finished: boolean; bound?: EvalReservationBound; boundInvalidated?: boolean }
 const usd = (units: bigint) => `${units / 1_000_000_000n}.${String(units % 1_000_000_000n).padStart(9, "0")}`;
 export const validEvalLedgerId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,511}$/.test(value);
 const validId = validEvalLedgerId;
@@ -89,6 +91,7 @@ export class EvalSpendState {
       for (const component of this.limits.overhead.components) this.requests.set(`overhead:${component.component}`, {
         identity: { executionId: "campaign-overhead", attemptId: component.component, phase: "infrastructure" },
         reserved: amount(component.maxUsd), observations: [], finished: true,
+        ...(component.provisionalBound ? { bound: operatingReservationBound(this.limits.overhead, component) } : {}),
       });
     }
   }
@@ -105,7 +108,7 @@ export class EvalSpendState {
       resolved: finalized.length > 0 && amounts.size === 1 };
   }
   snapshot() {
-    let known = 0n, held = 0n, committed = 0n, inflight = 0, unknown = 0, conflicts = 0;
+    let known = 0n, held = 0n, committed = 0n, inflight = 0, unknown = 0, conflicts = 0, boundedUnresolved = 0;
     const breakdown: Record<"reported" | "estimated" | "allocated" | "reconciled", bigint> = { reported: 0n, estimated: 0n, allocated: 0n, reconciled: 0n };
     const requests = [...this.requests].map(([requestId, request]) => {
       const receipt = this.authoritative(request);
@@ -113,6 +116,9 @@ export class EvalSpendState {
       if (receipt.conflict) conflicts++;
       if (!receipt.resolved) unknown++;
       const cost = receipt.cost ?? 0n;
+      const pendingBounded = !receipt.resolved && !receipt.conflict && request.finished && !!request.bound
+        && !request.boundInvalidated && cost <= request.reserved;
+      if (pendingBounded) boundedUnresolved++;
       known += cost;
       if (receipt.classification !== "unknown") breakdown[receipt.classification] += cost;
       const commitment = !request.finished || !receipt.resolved
@@ -120,10 +126,10 @@ export class EvalSpendState {
       committed += commitment;
       held += commitment - cost;
       return { requestId, ...request.identity, reservedUsd: usd(request.reserved), costUsd: receipt.cost === null ? null : usd(cost),
-        classification: receipt.classification, conflict: receipt.conflict, receiptComplete: receipt.resolved, finished: request.finished };
+        classification: receipt.classification, conflict: receipt.conflict, receiptComplete: receipt.resolved, finished: request.finished, pendingBounded };
     });
     return { campaignId: this.limits.campaignId, limitUsd: usd(amount(this.limits.maxUsd)), knownUsd: usd(known), heldUsd: usd(held), committedUsd: usd(committed),
-      overBudget: committed > amount(this.limits.maxUsd), unknownRequests: unknown, conflictingRequests: conflicts, inflight,
+      overBudget: committed > amount(this.limits.maxUsd), unknownRequests: unknown, boundedUnresolvedRequests: boundedUnresolved, conflictingRequests: conflicts, inflight,
       breakdown: Object.fromEntries(Object.entries(breakdown).map(([key, value]) => [key, usd(value)])), requests,
       admittedAttempts: [...this.attempts].map(([attemptId, executionId]) => ({ executionId, attemptId })) };
   }
@@ -156,6 +162,8 @@ export class EvalSpendState {
       if (now >= Date.parse(this.limits.deadlineAt)) throw new EvalAdmissionError("Eval campaign deadline reached");
       if ([...this.attempts.values()].filter(id => id === event.executionId).length >= this.limits.maxAttemptsPerExecution) throw new EvalAdmissionError("Eval campaign attempt cap reached");
     } else if (event.type === "reserve") {
+      fields(event, ["type", "requestId", "identity", "maxUsd", "bound"]);
+      if (event.bound !== undefined) validateReservationBound(event.bound, event.identity.phase === "infrastructure");
       fields(event.identity, ["executionId", "attemptId", "phase", "runId"]);
       if (!validId(event.requestId) || !validId(event.identity.executionId) || !validId(event.identity.attemptId)
           || event.identity.runId !== undefined && !validId(event.identity.runId)
@@ -189,6 +197,9 @@ export class EvalSpendState {
         const request = this.providerRequests.get(`${o.provider}:${o.providerRequestId}`);
         if (request && request !== o.requestId) throw new Error("Provider request belongs to another reservation; reconcile identities before import");
       }
+    } else if (event.type === "invalidate_bound") {
+      fields(event, ["type", "requestId"]);
+      if (!this.requests.get(event.requestId)?.bound) throw new Error("Cannot invalidate an absent reservation bound");
     } else if (event.type === "finish") {
       if (!this.requests.has(event.requestId) || !["succeeded", "failed", "cancelled"].includes(event.outcome)) throw new Error("Invalid request completion");
     } else throw new Error("Unknown ledger event");
@@ -198,14 +209,15 @@ export class EvalSpendState {
       this.limits.maxAttemptsPerExecution = event.maxAttemptsPerExecution;
       for (const attempt of event.priorAttempts) this.attempts.set(attempt.attemptId, attempt.executionId);
     } else if (event.type === "attempt") this.attempts.set(event.attemptId, event.executionId);
-    else if (event.type === "reserve") this.requests.set(event.requestId, { identity: event.identity, reserved: amount(event.maxUsd), observations: [], finished: false });
+    else if (event.type === "reserve") this.requests.set(event.requestId, { identity: event.identity, reserved: amount(event.maxUsd), observations: [], finished: false, ...(event.bound ? { bound: event.bound } : {}) });
     else if (event.type === "observe") {
       const o = event.observation;
       if (this.observations.has(o.observationId)) return;
       this.observations.set(o.observationId, o);
       this.requests.get(o.requestId)!.observations.push(o);
       if (o.providerRequestId) this.providerRequests.set(`${o.provider}:${o.providerRequestId}`, o.requestId);
-    } else if (event.type === "finish") this.requests.get(event.requestId)!.finished = true;
+    } else if (event.type === "invalidate_bound") this.requests.get(event.requestId)!.boundInvalidated = true;
+    else if (event.type === "finish") this.requests.get(event.requestId)!.finished = true;
   }
 }
 
@@ -273,7 +285,8 @@ export async function openEvalCostLedger(file: string, limits: EvalSpendLimits) 
     return {
       adoptLegacyAttemptPolicy: (audit: EvalLegacyAttemptAudit) => append({ ...structuredClone(audit), type: "attempt_policy" }),
       admitAttempt: (executionId: string, attemptId: string) => append({ type: "attempt", executionId, attemptId }),
-      reserve: (requestId: string, identity: EvalChargeIdentity, maxUsd: string) => append({ type: "reserve", requestId, identity: structuredClone(identity), maxUsd }),
+      reserve: (requestId: string, identity: EvalChargeIdentity, maxUsd: string, bound?: EvalReservationBound) => append({ type: "reserve", requestId, identity: structuredClone(identity), maxUsd, ...(bound ? { bound: structuredClone(bound) } : {}) }),
+      invalidateBound: (requestId: string) => append({ type: "invalidate_bound", requestId }),
       observe: (observation: EvalCostObservation) => append({ type: "observe", observation: structuredClone(observation) }),
       finish: (requestId: string, outcome: "succeeded" | "failed" | "cancelled") => append({ type: "finish", requestId, outcome }),
       snapshot: () => state.snapshot(),

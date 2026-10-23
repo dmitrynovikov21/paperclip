@@ -1,3 +1,4 @@
+import { costBoundConfigurationSha256 } from "./cost-bound-evidence.js";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -354,4 +355,49 @@ it("refuses missing or unreviewed attribution checkpoints before request dispatc
   await expect(createEvalAttemptPhase(phasePath, identity)).rejects.toThrow();
   await writeFile(phasePath, JSON.stringify({ version: 1, ...identity, providerResponse: "private" }));
   await expect(readEvalAttemptPhase(phasePath, identity)).rejects.toThrow("Invalid eval phase");
+});
+
+const provisionalBound = { version: 1 as const, scope: "full_lifecycle" as const, evidenceSha256: "a".repeat(64),
+  configurationSha256: costBoundConfigurationSha256({ provider: route.provider, mode: route.mode, price: route.price,
+    maximumInputTokens: route.maximumInputTokens, maximumOutputTokens: route.maximumOutputTokens, reservation: evalRequestReservation(route) }) };
+it("retains a reviewed model bound through a partial response and durable reload without releasing the hold", async () => {
+  const f = await fixture();
+  const receipt = await forwardEvalRequest({ ...f, route: { ...route, provisionalBound }, transport: async () => {
+    expect((await readEvalCostLedger(f.file)).state.requests.values().next().value?.bound?.evidence).toEqual(provisionalBound);
+    return Response.json({ object: "response", status: "in_progress", model: "fixture" },
+      { headers: { "x-bt-used-endpoint": route.endpointName! } });
+  } });
+  expect(receipt).toMatchObject({ costUsd: null, final: false });
+  expect((await readEvalCostLedger(f.file)).state.snapshot()).toMatchObject({ boundedUnresolvedRequests: 1, heldUsd: "0.003000000" });
+});
+it.each(["no-headers", "route", "failover", "model", "input-limit", "output-limit"])("disqualifies a model bound on %s evidence", async reason => {
+  const f = await fixture();
+  await forwardEvalRequest({ ...f, route: { ...route, provisionalBound }, transport: async () => {
+    if (reason === "no-headers") throw new Error("No response headers");
+    return Response.json({ object: "response", status: "in_progress", model: reason === "model" ? "other" : "fixture",
+      usage: { input_tokens: reason === "input-limit" ? 1001 : 10, input_tokens_details: { cache_write_tokens: 0, cached_tokens: 0 },
+        output_tokens: reason === "output-limit" ? 101 : 0 } },
+      { headers: { "x-bt-used-endpoint": reason === "route" ? "OTHER" : route.endpointName!,
+        ...(reason === "failover" ? { "x-bt-failover-to": "OTHER" } : {}) } });
+  } });
+  const replay = (await readEvalCostLedger(f.file)).state;
+  expect(replay.snapshot()).toMatchObject({ boundedUnresolvedRequests: 0, unknownRequests: 1, inflight: 0 });
+  expect([...replay.requests.values()][0]!.boundInvalidated).toBe(true);
+});
+
+it("refuses a changed model limit or rate with a stale reviewed bound before dispatch", async () => {
+  const f = await fixture(), transport = vi.fn<typeof fetch>();
+  for (const changed of [{ ...route, maximumInputTokens: 500 }, { ...route, price: { ...route.price, inputUsdPerMillion: "20" } }]) {
+    await expect(forwardEvalRequest({ ...f, route: { ...changed, provisionalBound }, transport })).rejects.toThrow("configuration changed");
+  }
+  expect(transport).not.toHaveBeenCalled();
+  expect(f.ledger.snapshot().requests).toHaveLength(0);
+});
+
+it("disqualifies excessive reported input even when missing cache details prevent pricing", async () => {
+  const f = await fixture();
+  await forwardEvalRequest({ ...f, route: { ...route, provisionalBound }, transport: async () => Response.json({
+    object: "response", status: "completed", model: "fixture", usage: { input_tokens: 1001, output_tokens: 1 },
+  }, { headers: { "x-bt-used-endpoint": route.endpointName! } }) });
+  expect((await readEvalCostLedger(f.file)).state.snapshot()).toMatchObject({ boundedUnresolvedRequests: 0, unknownRequests: 1, heldUsd: "0.003000000" });
 });

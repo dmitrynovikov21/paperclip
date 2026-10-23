@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { sanitizeRuntimeServiceBaseEnv } from "./runtime-service-env.js";
 import { describeGitAuthFailure, scrubGitCredentialText, type GitRemoteAuthProvider } from "./git-credentials.js";
@@ -28,6 +29,10 @@ export async function materializeManagedProjectWorkspace(
     objectCacheCompanyDirectory?: string;
   },
 ): Promise<{ cwd: string; warning: string | null }> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+      (input.localSource || (input.repoUrl && !isRemoteGitRepositoryUrl(input.repoUrl)))) {
+    throw new Error("Isolated local secrets forbid host-local Git clone sources.");
+  }
   await fs.mkdir(path.dirname(cwd), { recursive: true });
   const stats = await fs.stat(cwd).catch(() => null);
 

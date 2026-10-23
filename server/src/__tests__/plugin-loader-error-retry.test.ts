@@ -12,7 +12,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { distributionBundleDigest, distributionPluginActivationGuard, readDistributionPluginCatalog } from "../services/distribution-plugin-catalog.js";
@@ -207,9 +207,9 @@ describe("pluginLoader.loadAll error retry", () => {
       runtime.workerManager.startWorker = startWorker;
       const loader = pluginLoader({} as Db, { localPluginDir: root }, runtime);
 
-      await expect(loader.installPlugin({ localPath: external })).rejects.toThrow(/bundled Kubernetes sandbox provider/);
-      await expect(loader.loadManifest(external)).rejects.toThrow(/bundled Kubernetes sandbox provider/);
-      await expect(loader.upgradePlugin(plugin.id, { localPath: external })).rejects.toThrow(/bundled Kubernetes sandbox provider/);
+      await expect(loader.installPlugin({ localPath: external })).rejects.toThrow(/bundled Kubernetes sandbox provider|verified release-bundled plugin/);
+      await expect(loader.loadManifest(external)).rejects.toThrow(/bundled Kubernetes sandbox provider|verified release-bundled plugin/);
+      await expect(loader.upgradePlugin(plugin.id, { localPath: external })).rejects.toThrow(/bundled Kubernetes sandbox provider|verified release-bundled plugin/);
       const loaded = await loader.loadSingle(plugin.id);
       expect(loaded.success).toBe(false);
       expect(loaded.error).toMatch(/bundled Kubernetes sandbox provider/);
@@ -320,7 +320,7 @@ describe("pluginLoader.loadAll error retry", () => {
   it.each(["retarget", "remove"] as const)(
     "uses the canonical bundle after a trusted alias is %s before manifest load",
     async (action) => {
-      const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "kubernetes-alias-")));
+      const root = realpathSync(mkdtempSync(path.join(process.cwd(), ".paperclip-kubernetes-alias-")));
       vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
       vi.stubEnv("PAPERCLIP_BUNDLED_PLUGIN_ROOT", path.join(root, "catalog"));
       try {
@@ -371,7 +371,7 @@ describe("pluginLoader.loadAll error retry", () => {
             expect(packageRoot).toBe(realpathSync(bundle));
             if (changed) return;
             changed = true;
-            rmSync(alias);
+            unlinkSync(alias);
             if (action === "retarget") symlinkSync(attacker, alias);
             else rmSync(path.join(bundle, "dist/worker.js"));
           },

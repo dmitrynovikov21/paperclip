@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -324,8 +324,15 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
   }, 15_000);
 
   it("enforces master-key isolation through heartbeat dispatch and the Kubernetes pod builders", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-dispatch-"));
+    const root = await mkdtemp(path.join(os.homedir(), ".paperclip-isolated-dispatch-"));
     tempRoots.push(root);
+    const workspaceRoot = path.join(root, "workspaces");
+    const workspace = path.join(workspaceRoot, "project");
+    const privateDir = path.join(root, "private");
+    const keyFile = path.join(privateDir, "master.key");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(privateDir, { mode: 0o700 });
+    await writeFile(keyFile, randomBytes(32).toString("base64"), { mode: 0o600 });
     const pluginId = randomUUID();
     const workerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
@@ -337,7 +344,12 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         if (method === "environmentRealizeWorkspace") return { cwd: "/workspace", metadata: {} };
         if (method === "environmentExecute") {
           const commandText = Array.isArray(payload.args) ? payload.args.join(" ") : "";
-          const stdout = commandText.includes("PAPERCLIP_GIT_CONTEXT_V1")
+          const batchFileCount = typeof payload.stdin === "string"
+            ? (payload.stdin.match(/<<'PAPERCLIP_TEXT_/g) ?? []).length
+            : 0;
+          const stdout = batchFileCount > 0
+            ? `${Array.from({ length: batchFileCount }, () => '{"uploaded":true}').join("\n")}\n`
+            : commandText.includes("PAPERCLIP_GIT_CONTEXT_V1")
             ? "\0PAPERCLIP_GIT_CONTEXT_V1\0\0PAPERCLIP_GIT_CONTEXT_END\0"
             : commandText.includes("$PATH")
               ? "\0/usr/bin:/bin\0"
@@ -368,9 +380,10 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         issuePrefix: `K${companyId.replace(/-/g, "").slice(0, 7).toUpperCase()}`,
         status: "active", defaultResponsibleUserId: "responsible-user",
       });
+      await grantResponsibleUser(companyId, "responsible-user");
       await db.insert(projects).values({ id: projectId, companyId, name: "Dispatch fixture", status: "active" });
       await db.insert(projectWorkspaces).values({
-        id: randomUUID(), companyId, projectId, name: "Primary", cwd: root, isPrimary: true,
+        id: randomUUID(), companyId, projectId, name: "Primary", cwd: workspace, isPrimary: true,
       });
       if (input.driver !== "local") {
         await db.insert(environments).values({
@@ -400,6 +413,10 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       return (await heartbeat.getRun(run!.id))!;
     }
 
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", undefined);
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", keyFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 1));
+    vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([workspaceRoot]));
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
     try {
       for (const candidate of [

@@ -697,7 +697,7 @@ describe("sandbox managed runtime", () => {
         client,
         workspaceLocalDir: workspace,
         onRuntimeProgress: async (status) => {
-          if (status.message !== "Syncing workspace to sandbox") return;
+          if (status.message !== "Syncing workspace to environment") return;
           await fsPromises.rename(workspace, path.join(allowedRoot, "original"));
           await symlink(secretDir, workspace);
         },
@@ -790,7 +790,7 @@ describe("sandbox managed runtime", () => {
           client,
           workspaceLocalDir: workspace,
           onRuntimeProgress: async (status) => {
-            if (status.message !== "Syncing workspace to sandbox") return;
+            if (status.message !== "Syncing workspace to environment") return;
             if (swappedEntry === "nested directory") {
               await fsPromises.rename(overlayDir, path.join(workspace, "src", "original"));
               await symlink(secretDir, overlayDir);
@@ -799,7 +799,7 @@ describe("sandbox managed runtime", () => {
               await symlink(secretFile, path.join(overlayDir, "master.key"));
             }
           },
-        })).rejects.toThrow(/ELOOP|ENOTDIR|symbolic link/i);
+        })).rejects.toThrow(/ELOOP|ENOTDIR|symbolic link|not a directory/i);
         // A failure while building either tar must prevent the merged syncIn.
         expect(syncIn).not.toHaveBeenCalled();
         await expect(readFile(path.join(remote, "src", "swap", "master.key"))).rejects.toThrow();
@@ -888,9 +888,9 @@ describe("sandbox managed runtime", () => {
         adapterKey: "test-adapter",
         client,
         workspaceLocalDir: workspace,
-        additionalSources: [{ localPath: project, projectId: "referenced" }],
+        additionalSources: [{ localPath: project, projectId: "referenced", ignoreResolution: { kind: "other" } }],
         onRuntimeProgress: async (status) => {
-          if (status.message !== "Syncing referenced project to sandbox") return;
+          if (status.message !== "Syncing referenced project to environment") return;
           await fsPromises.rename(project, path.join(allowedRoot, "original-project"));
           await symlink(secretDir, project);
         },

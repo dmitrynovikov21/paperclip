@@ -29,7 +29,8 @@ vi.mock("../services/fast-responses.js", () => ({
   supersedeFastResponse: vi.fn(async () => undefined),
 }));
 
-vi.mock("../routes/authz.js", () => ({
+vi.mock("../routes/authz.js", async () => ({
+  ...await vi.importActual<typeof import("../routes/authz.js")>("../routes/authz.js"),
   getActorInfo: () => ({ actorId: "user-1", agentId: null, runId: null }),
   assertCompanyAccess: () => {},
 }));

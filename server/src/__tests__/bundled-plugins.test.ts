@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -182,7 +182,7 @@ describe("resolveBundledPluginInstalls", () => {
         },
         enforceCatalogRoot: false,
       });
-      rmSync(alias);
+      unlinkSync(alias);
       symlinkSync(replacement, alias);
       expect(install?.localPath).toBe(realpathSync(bundle));
     },

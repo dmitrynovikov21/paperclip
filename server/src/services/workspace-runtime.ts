@@ -2759,10 +2759,15 @@ async function readAdvertisedDefaultBranch(repoRoot: string, resolveGitAuth?: Gi
   try {
     const remoteUrl = await runGit(["remote", "get-url", "origin"], repoRoot);
     const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl) : null;
+    const guardedCwd = await assertHostGitWorkspaceAllowed(repoRoot);
+    const git = prepareHostGitInvocation(
+      [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"],
+      { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
+    );
     const output = await new Promise<string>((resolve, reject) => {
-      execFile("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
-        cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
-        env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
+      execFile("git", git.args, {
+        cwd: guardedCwd, timeout: 10_000, maxBuffer: 64 * 1024,
+        env: git.env,
       }, (error, stdout) => error ? reject(error) : resolve(stdout));
     });
     return /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(output)?.[1] ?? null;
@@ -2821,9 +2826,11 @@ async function resolvePathForWorktreeComparison(value: string): Promise<string> 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<
   { paths: Set<string>; diagnostic?: never } | { paths?: never; diagnostic: ManagedGitInspectionDiagnostic }
 > {
+  const guardedCwd = await assertHostGitWorkspaceAllowed(repoRoot);
+  const git = prepareHostGitInvocation(["worktree", "list", "--porcelain"]);
   let proc: Awaited<ReturnType<typeof executeProcess>>;
   try {
-    proc = await executeProcess({ command: "git", args: ["worktree", "list", "--porcelain"], cwd: repoRoot });
+    proc = await executeProcess({ command: "git", args: git.args, cwd: guardedCwd, env: git.env });
   } catch (error) {
     return { diagnostic: readManagedGitInspectionDiagnostic({
       command: "worktree_list", failure: "spawn_failed", errorCode: (error as NodeJS.ErrnoException)?.code,

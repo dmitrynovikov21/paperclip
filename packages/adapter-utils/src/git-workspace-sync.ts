@@ -119,7 +119,11 @@ export async function runLocalGit(
   return await new Promise<GitCommandResult>((resolve, reject) => {
     execFile(
       "git",
-      ["-C", localDir, ...args],
+      [
+        "-C", localDir,
+        ...(isolated ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false"] : []),
+        ...args,
+      ],
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,

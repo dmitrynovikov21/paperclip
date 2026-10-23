@@ -238,7 +238,9 @@ Git workspaces must also have agent-immutable `.git` metadata, including a
 linked worktree's private and common Git directories. The service refuses Git
 config includes and executable or unrecognized Git settings in this mode;
 remove those settings before enabling isolation. Git commands ignore inherited
-`GIT_*` variables and system/global config while isolation is active.
+`GIT_*` variables and system/global config while isolation is active, and
+disable fsmonitor and hooks even if a service-owned hook delegates to an
+agent-writable script.
 Host-local Git clone URLs (including `file://`) are also refused before
 materializing a managed checkout; use a remote Git URL instead.
 Codex agents use a service-selected home under

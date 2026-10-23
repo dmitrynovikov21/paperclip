@@ -697,6 +697,8 @@ export interface PaperclipPluginManifestV1 {
   agentLifecycle?: true;
   /** Own project storage and durable workspace operations as one contract. */
   workspaceProvider?: {
+    /** Supports bounded run completion separately from removal-safety inspection. */
+    finalizationVersion?: 1;
     freshWorkspaceVersion?: 1;
     modes: Array<"shared_workspace" | "isolated_workspace" | "operator_branch">;
     strategies: Array<"project_primary" | "git_worktree">;

@@ -1,5 +1,5 @@
 {
-  "id": "d0059c44-7cf4-424e-a9d7-f2d8f4309482",
+  "id": "3e9741bf-ba88-4116-bbaf-6777b61e4428",
   "prevId": "45b4994f-189f-45a0-978a-04e168eb66b9",
   "version": "7",
   "dialect": "postgresql",
@@ -28830,6 +28830,30 @@
           "primaryKey": true,
           "notNull": true
         },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "agent_id": {
+          "name": "agent_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "adapter_type": {
+          "name": "adapter_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issue_id": {
+          "name": "issue_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "generation": {
           "name": "generation",
           "type": "integer",
@@ -28851,7 +28875,35 @@
           "default": "now()"
         }
       },
-      "indexes": {},
+      "indexes": {
+        "provider_state_scopes_owner_idx": {
+          "name": "provider_state_scopes_owner_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "agent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},

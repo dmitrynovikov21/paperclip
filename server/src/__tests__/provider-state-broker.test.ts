@@ -200,7 +200,7 @@ describe("[e2e_db] provider-state broker", () => {
       (await environmentService(db).getById(environmentId))!);
     const scope = providerStateScope({ companyId, agentId, adapterType: "codex_local", taskKey: issueId });
     const broker = providerStateBroker(db, { now: () => clock, operationTimeoutMs: 1_000 });
-    const expectedGeneration = await broker.snapshot(scope);
+    const expectedGeneration = await broker.snapshot(scope, issueId);
     return { companyId, agentId, environmentId, issueId, runId, lease, fixture, registration, scope, broker, expectedGeneration };
   }
 
@@ -313,10 +313,25 @@ describe("[e2e_db] provider-state broker", () => {
     expect(s.fixture.calls.length).toBe(0);
   });
 
+  it("fences an agent-wide reset before its first provider acquisition", async () => {
+    const s = await seed();
+    await heartbeatService(db).resetRuntimeSession(s.agentId);
+    await expect(acquire(s)).rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(s.fixture.calls.length).toBe(0);
+  });
+
+  it("keeps a pre-acquisition terminal fence after the task reopens", async () => {
+    const s = await seed();
+    await issueService(db).update(s.issueId, { status: "cancelled" });
+    await issueService(db).update(s.issueId, { status: "todo" });
+    await expect(acquire(s)).rejects.toMatchObject({ code: "provider_session_isolation_required" });
+    expect(s.fixture.calls.length).toBe(0);
+  });
+
   it("rejects acquisition for a different task before driver preparation", async () => {
     const s = await seed();
     const scope = providerStateScope({ ...s.scope, taskKey: randomUUID() });
-    await expect(s.broker.acquire({ scope, expectedGeneration: await s.broker.snapshot(scope),
+    await expect(s.broker.acquire({ scope, expectedGeneration: await s.broker.snapshot(scope, null),
       environmentLeaseId: s.lease.id, registration: s.registration, environmentDriver: "sandbox" }))
       .rejects.toMatchObject({ code: "provider_session_isolation_required" });
     expect(s.fixture.calls.length).toBe(0);
@@ -328,7 +343,7 @@ describe("[e2e_db] provider-state broker", () => {
     await expect(binding.assertWritable()).rejects.toMatchObject({ code: "provider_session_isolation_required" });
     expect(await commit(s, binding)).toBe(false);
     const scope = providerStateScope({ ...s.scope, adapterType: "acpx_local", taskKey: s.issueId });
-    await expect(s.broker.acquire({ scope, expectedGeneration: await s.broker.snapshot(scope),
+    await expect(s.broker.acquire({ scope, expectedGeneration: s.expectedGeneration,
       environmentLeaseId: s.lease.id, registration: s.registration, environmentDriver: "sandbox" }))
       .rejects.toMatchObject({ code: "provider_session_isolation_required" });
   });
@@ -408,7 +423,7 @@ describe("[e2e_db] provider-state broker", () => {
     await s.broker.destroy({ companyId: s.companyId, leaseId: old.leaseId }, "reset");
     const newLease = await environmentService(db).acquireLease({ companyId: s.companyId, environmentId: s.environmentId,
       issueId: s.issueId, heartbeatRunId: s.runId, providerLeaseId: randomUUID() });
-    const fresh = await s.broker.acquire({ scope: s.scope, expectedGeneration: await s.broker.snapshot(s.scope),
+    const fresh = await s.broker.acquire({ scope: s.scope, expectedGeneration: await s.broker.snapshot(s.scope, s.issueId),
       environmentLeaseId: newLease.id, registration: s.registration, environmentDriver: "sandbox" });
     expect(await commit(s, fresh)).toBe(true);
     expect(await commit(s, old)).toBe(false);

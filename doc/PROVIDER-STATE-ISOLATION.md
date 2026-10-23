@@ -48,8 +48,13 @@ adapters before workspace preparation while the declaration is absent.
 ## Broker and database contract
 
 Derive an opaque scope with `providerStateScope` from the company ID, agent ID,
-adapter type and task key. Snapshot the scope generation when a run starts, before
-asynchronous preparation. `acquire` checks that generation, reserves a
+adapter type and task key. Call `snapshot(scope, issueId)` when a run starts,
+before asynchronous preparation; use `null` only for a run without an issue.
+Snapshot creation locks the company, agent and issue before the scope. The
+durable fence records their identities without owner foreign keys. Agent-wide
+reset and terminal transitions invalidate snapshots even before a provider
+lease exists, so reopening a task cannot revive an older run. `acquire` checks
+that generation, reserves a
 `provisioning` environment lease and state reference durably, then calls the
 trusted driver. Activation uses a DB compare-and-swap after the probe. A reset
 before the first acquisition invalidates the earlier snapshot as well.
@@ -124,7 +129,8 @@ pnpm --filter @paperclipai/server exec vitest run src/__tests__/provider-state-b
 The suite starts its own disposable PostgreSQL instance on a random loopback port
 and creates a distinct test role. It covers missing/forged/stale capabilities,
 every failed deny probe, foreign scopes, configuration drift, reset before acquire,
-late preparation, a real stuck synthetic child, late pointer writes, cleanup
+late preparation, agent-wide reset before acquisition, terminal and reopen before
+acquisition, a real stuck synthetic child, late pointer writes, cleanup
 retry, owner deletion and fake-clock expiry. Driver reports in this suite are
 synthetic. They test capability validation and lifecycle; they do not attest a
 production OS boundary. Release QA must run actual sibling/host-control probes

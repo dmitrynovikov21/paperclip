@@ -45,9 +45,33 @@ export function providerStateScope(input: {
     taskScopeId: `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}` };
 }
 
-async function lockScope(tx: Tx, id: string) {
-  await tx.insert(providerStateScopes).values({ id }).onConflictDoNothing();
-  return (await tx.select().from(providerStateScopes).where(eq(providerStateScopes.id, id)).for("update"))[0]!;
+async function lockScope(tx: Tx, id: string, ownership?: { scope: ProviderStateScope; issueId: string | null }) {
+  if (ownership) {
+    await tx.insert(providerStateScopes).values({ id, companyId: ownership.scope.companyId,
+      agentId: ownership.scope.agentId, adapterType: ownership.scope.adapterType, issueId: ownership.issueId,
+    }).onConflictDoNothing();
+  }
+  const row = (await tx.select().from(providerStateScopes).where(eq(providerStateScopes.id, id)).for("update"))[0];
+  if (!row || (ownership && (row.companyId !== ownership.scope.companyId ||
+      row.agentId !== ownership.scope.agentId || row.adapterType !== ownership.scope.adapterType ||
+      row.issueId !== ownership.issueId))) throw new ProviderSessionIsolationRequired();
+  return row;
+}
+
+async function lockOwners(tx: Tx, scope: ProviderStateScope, issueId: string | null) {
+  const company = (await tx.select().from(companies).where(eq(companies.id, scope.companyId)).for("share"))[0];
+  const agent = (await tx.select().from(agents).where(and(eq(agents.id, scope.agentId),
+    eq(agents.companyId, scope.companyId))).for("share"))[0];
+  if (!company || company.status === "archived" || !agent || agent.status === "terminated" ||
+      agent.adapterType !== scope.adapterType) throw new ProviderSessionIsolationRequired();
+  if (issueId) {
+    if (providerStateScope({ ...scope, taskKey: issueId }).taskScopeId !== scope.taskScopeId) {
+      throw new ProviderSessionIsolationRequired();
+    }
+    const issue = (await tx.select().from(issues).where(and(eq(issues.id, issueId),
+      eq(issues.companyId, scope.companyId))).for("share"))[0];
+    if (!issue || issue.status === "done" || issue.status === "cancelled") throw new ProviderSessionIsolationRequired();
+  }
 }
 
 function leaseRequest(lease: Lease): ProviderStateDriverRequest {
@@ -86,6 +110,17 @@ async function requireOwners(tx: Tx, scope: ProviderStateScope, issueId: string 
 export async function invalidateProviderStateInTx(
   tx: Tx, selector: ProviderStateSelector, reason: ProviderStateDestroyReason, now = new Date(),
 ): Promise<string[]> {
+  // Serialize snapshots as well as provisioning. A reset must also fence scopes
+  // whose run has not acquired its first provider lease yet.
+  if (selector.issueId) {
+    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.id, selector.issueId),
+      eq(issues.companyId, selector.companyId))).for("update");
+  } else if (selector.agentId) {
+    await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.id, selector.agentId),
+      eq(agents.companyId, selector.companyId))).for("update");
+  } else if (!selector.leaseId && !selector.executionWorkspaceId) {
+    await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, selector.companyId)).for("update");
+  }
   const conditions = [eq(environmentLeases.companyId, selector.companyId), isNotNull(environmentLeases.providerStateStatus),
     ne(environmentLeases.providerStateStatus, "destroyed")];
   if (selector.agentId) conditions.push(eq(environmentLeases.providerStateAgentId, selector.agentId));
@@ -95,7 +130,14 @@ export async function invalidateProviderStateInTx(
   if (selector.executionWorkspaceId) conditions.push(eq(environmentLeases.executionWorkspaceId, selector.executionWorkspaceId));
   let candidates = await tx.select().from(environmentLeases).where(and(...conditions));
   const scopeIds = [...new Set(candidates.map((lease) => lease.taskScopeId!).filter(Boolean))];
-  if (selector.taskScopeId) scopeIds.push(selector.taskScopeId);
+  if (!selector.leaseId && !selector.executionWorkspaceId) {
+    const scopeConditions = [eq(providerStateScopes.companyId, selector.companyId)];
+    if (selector.agentId) scopeConditions.push(eq(providerStateScopes.agentId, selector.agentId));
+    if (selector.issueId) scopeConditions.push(eq(providerStateScopes.issueId, selector.issueId));
+    if (selector.taskScopeId) scopeConditions.push(eq(providerStateScopes.id, selector.taskScopeId));
+    const snapshots = await tx.select({ id: providerStateScopes.id }).from(providerStateScopes).where(and(...scopeConditions));
+    scopeIds.push(...snapshots.map((row) => row.id));
+  }
   // Stable lock order also serializes reset BEFORE the first lease is created.
   for (const scopeId of [...new Set(scopeIds)].sort()) {
     const fence = await lockScope(tx, scopeId);
@@ -219,8 +261,11 @@ export function providerStateBroker(db: Db, options: { now?: () => Date; operati
   }
 
   return {
-    async snapshot(scope: ProviderStateScope): Promise<number> {
-      return await db.transaction(async (tx) => (await lockScope(tx, scope.taskScopeId)).generation);
+    async snapshot(scope: ProviderStateScope, issueId: string | null): Promise<number> {
+      return await db.transaction(async (tx) => {
+        await lockOwners(tx, scope, issueId);
+        return (await lockScope(tx, scope.taskScopeId, { scope, issueId })).generation;
+      });
     },
 
     async acquire(input: {
@@ -232,25 +277,13 @@ export function providerStateBroker(db: Db, options: { now?: () => Date; operati
       const lease = await db.transaction(async (tx) => {
         // Owner/environment deletion takes these locks before its fence scan.
         // It must see every provisioning lease, including a first acquisition.
-        const company = (await tx.select().from(companies).where(eq(companies.id, input.scope.companyId)).for("share"))[0];
-        const agent = (await tx.select().from(agents).where(and(eq(agents.id, input.scope.agentId),
-          eq(agents.companyId, input.scope.companyId))).for("share"))[0];
-        if (!company || company.status === "archived" || !agent || agent.status === "terminated" ||
-            agent.adapterType !== input.scope.adapterType) throw new ProviderSessionIsolationRequired();
         const initial = (await tx.select().from(environmentLeases).where(eq(environmentLeases.id, input.environmentLeaseId)))[0];
         if (!initial) throw new ProviderSessionIsolationRequired();
+        await lockOwners(tx, input.scope, initial.issueId);
         const environment = (await tx.select().from(environments).where(eq(environments.id, initial.environmentId)).for("share"))[0];
         if (!environment || environment.status !== "active") throw new ProviderSessionIsolationRequired();
         requireProviderStateDriverForEnvironment(input.registration, environment);
-        if (initial.issueId) {
-          if (providerStateScope({ ...input.scope, taskKey: initial.issueId }).taskScopeId !== input.scope.taskScopeId) {
-            throw new ProviderSessionIsolationRequired();
-          }
-          const issue = (await tx.select().from(issues).where(and(eq(issues.id, initial.issueId),
-            eq(issues.companyId, input.scope.companyId))).for("share"))[0];
-          if (!issue || issue.status === "done" || issue.status === "cancelled") throw new ProviderSessionIsolationRequired();
-        }
-        const fence = await lockScope(tx, input.scope.taskScopeId);
+        const fence = await lockScope(tx, input.scope.taskScopeId, { scope: input.scope, issueId: initial.issueId });
         if (fence.generation !== input.expectedGeneration || fence.currentLeaseId) throw new ProviderSessionIsolationRequired();
         const row = (await tx.select().from(environmentLeases).where(eq(environmentLeases.id, input.environmentLeaseId)).for("update"))[0];
         if (!row || row.companyId !== input.scope.companyId || row.providerStateStatus !== null || row.status !== "active") {

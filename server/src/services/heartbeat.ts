@@ -13618,9 +13618,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const providerScope = requiresProviderState ? providerStateScope({ companyId: agent.companyId,
       agentId: agent.id, adapterType: agent.adapterType, taskKey: taskKey ?? run.id }) : null;
     let providerBinding: ProviderSessionBinding | null = null;
-    let providerGeneration = providerScope ? await environmentRuntime.providerStateBroker.snapshot(providerScope) : null;
-    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
+    let providerGeneration = providerScope ? await environmentRuntime.providerStateBroker.snapshot(providerScope, issueId) : null;
+    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
     const issueDependencyReadiness = issueId
       ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
@@ -14308,7 +14308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (providerScope && resetTaskSession) {
       await environmentRuntime.providerStateBroker.destroy({ companyId: agent.companyId,
         agentId: agent.id, taskScopeId: providerScope.taskScopeId }, "reset");
-      providerGeneration = await environmentRuntime.providerStateBroker.snapshot(providerScope);
+      providerGeneration = await environmentRuntime.providerStateBroker.snapshot(providerScope, issueId);
     }
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession || (requiresProviderState && !taskSession?.providerStateLeaseId)

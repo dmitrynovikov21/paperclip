@@ -29,6 +29,7 @@ import {
   asStringArray,
   parseObject,
   buildPaperclipEnv,
+  buildPaperclipRuntimeSkillsAssetDir,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
@@ -119,16 +120,12 @@ function cursorSkillsHome(): string {
 }
 
 async function buildCursorSkillsDir(config: Record<string, unknown>): Promise<string> {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-skills-"));
-  const target = path.join(tmp, "skills");
-  await fs.mkdir(target, { recursive: true });
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
-  for (const entry of availableEntries) {
-    if (!desiredNames.has(entry.key)) continue;
-    await fs.symlink(entry.source, path.join(target, entry.runtimeName));
-  }
-  return target;
+  return buildPaperclipRuntimeSkillsAssetDir(
+    availableEntries.filter((entry) => desiredNames.has(entry.key)),
+    "paperclip-cursor-skills-",
+  );
 }
 
 type EnsureCursorSkillsInjectedOptions = {
@@ -368,7 +365,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         assets: [{
           key: "skills",
           localDir: localSkillsDir,
-          followSymlinks: true,
+          followSymlinks: false,
         }],
       });
       restoreRemoteWorkspace = () =>
@@ -413,7 +410,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } catch (error) {
       await Promise.allSettled([
         restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
       throw error;
     }
@@ -757,7 +754,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await restoreRemoteWorkspace();
     }
     if (localSkillsDir) {
-      await fs.rm(localSkillsDir, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }

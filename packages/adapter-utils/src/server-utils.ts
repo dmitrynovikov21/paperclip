@@ -3017,12 +3017,15 @@ export async function ensurePaperclipSkillSymlink(
   return "repaired";
 }
 
-async function hashSkillDirectory(root: string): Promise<string> {
+async function hashSkillDirectory(root: string, rejectSymlinks = false): Promise<string> {
   const hash = createHash("sha256");
 
   async function visit(candidate: string, relativePath: string): Promise<void> {
     const stat = await fs.lstat(candidate);
     if (stat.isSymbolicLink()) {
+      if (rejectSymlinks) {
+        throw new Error(`Refusing to stage a skill containing a symbolic link: ${relativePath || "."}`);
+      }
       hash.update(`symlink:${relativePath}\n`);
       return;
     }
@@ -3038,7 +3041,17 @@ async function hashSkillDirectory(root: string): Promise<string> {
     }
     if (stat.isFile()) {
       hash.update(`file:${relativePath}:${stat.mode}\n`);
-      hash.update(await fs.readFile(candidate));
+      if (rejectSymlinks) {
+        const handle = await fs.open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try {
+          if (!(await handle.stat()).isFile()) throw new Error("Paperclip skill entry changed while staging.");
+          hash.update(await handle.readFile());
+        } finally {
+          await handle.close();
+        }
+      } else {
+        hash.update(await fs.readFile(candidate));
+      }
       hash.update("\n");
       return;
     }
@@ -3057,6 +3070,17 @@ async function materializedSkillFingerprintMatches(targetRoot: string, sourceFin
   } catch {
     return false;
   }
+}
+
+async function skillTreeContainsOnlyRealFiles(root: string): Promise<boolean> {
+  const stat = await fs.lstat(root).catch(() => null);
+  if (!stat) return false;
+  if (stat.isFile()) return true;
+  if (!stat.isDirectory()) return false;
+  for (const entry of await fs.readdir(root)) {
+    if (!await skillTreeContainsOnlyRealFiles(path.join(root, entry))) return false;
+  }
+  return true;
 }
 
 async function acquireMaterializeLock(lockDir: string): Promise<() => Promise<void>> {
@@ -3118,6 +3142,7 @@ async function removeStaleMaterializeLock(lockDir: string, staleMs: number): Pro
 export async function materializePaperclipSkillCopy(
   source: string,
   target: string,
+  options: { rejectSymlinks?: boolean } = {},
 ): Promise<MaterializedPaperclipSkillCopyResult> {
   const sourceRoot = path.resolve(source);
   const targetRoot = path.resolve(target);
@@ -3136,6 +3161,9 @@ export async function materializePaperclipSkillCopy(
   if (rootStat.isSymbolicLink()) {
     throw new Error("Refusing to materialize a skill root that is itself a symlink.");
   }
+  if (options.rejectSymlinks && (await fs.realpath(sourceRoot)) !== sourceRoot) {
+    throw new Error("Refusing to stage a skill through a symbolic-link ancestor.");
+  }
   if (!rootStat.isDirectory()) {
     throw new Error("Paperclip skills must be directories.");
   }
@@ -3152,6 +3180,9 @@ export async function materializePaperclipSkillCopy(
   async function copyEntry(sourcePath: string, targetPath: string, relativePath: string): Promise<void> {
     const stat = await fs.lstat(sourcePath);
     if (stat.isSymbolicLink()) {
+      if (options.rejectSymlinks) {
+        throw new Error(`Refusing to stage a skill containing a symbolic link: ${relativePath || "."}`);
+      }
       result.skippedSymlinks.push(relativePath || ".");
       return;
     }
@@ -3169,17 +3200,28 @@ export async function materializePaperclipSkillCopy(
 
     if (stat.isFile()) {
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
-      await fs.copyFile(sourcePath, targetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
-        await fs.copyFile(sourcePath, targetPath);
-      });
+      if (options.rejectSymlinks) {
+        const handle = await fs.open(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try {
+          if (!(await handle.stat()).isFile()) throw new Error("Paperclip skill entry changed while staging.");
+          await fs.writeFile(targetPath, await handle.readFile());
+        } finally {
+          await handle.close();
+        }
+      } else {
+        await fs.copyFile(sourcePath, targetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+          await fs.copyFile(sourcePath, targetPath);
+        });
+      }
       await fs.chmod(targetPath, stat.mode).catch(() => {});
       result.copiedFiles += 1;
     }
   }
 
   try {
-    const sourceFingerprint = await hashSkillDirectory(sourceRoot);
-    if (await materializedSkillFingerprintMatches(targetRoot, sourceFingerprint)) return result;
+    const sourceFingerprint = await hashSkillDirectory(sourceRoot, options.rejectSymlinks);
+    const targetIsSafe = () => !options.rejectSymlinks || skillTreeContainsOnlyRealFiles(targetRoot);
+    if (await targetIsSafe() && await materializedSkillFingerprintMatches(targetRoot, sourceFingerprint)) return result;
     await copyEntry(sourceRoot, tempRoot, "");
     await fs.writeFile(
       path.join(tempRoot, MATERIALIZED_SKILL_SENTINEL),
@@ -3191,13 +3233,38 @@ export async function materializePaperclipSkillCopy(
       }, null, 2)}\n`,
       "utf8",
     );
-    if (await materializedSkillFingerprintMatches(targetRoot, sourceFingerprint)) return result;
+    if (await targetIsSafe() && await materializedSkillFingerprintMatches(targetRoot, sourceFingerprint)) return result;
     await fs.rm(targetRoot, { recursive: true, force: true });
     await fs.rename(tempRoot, targetRoot);
     return result;
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
     await releaseLock();
+  }
+}
+
+/** Stage selected skills as real files before an SSH or sandbox asset is archived. */
+export async function buildPaperclipRuntimeSkillsAssetDir(
+  entries: Array<{ key: string; runtimeName: string; source: string }>,
+  prefix: string,
+): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const skillsDir = path.join(root, "skills");
+  try {
+    await fs.mkdir(skillsDir);
+    const names = new Set<string>();
+    for (const entry of entries) {
+      const name = entry.runtimeName;
+      if (!name || name === "." || name === ".." || /[\\/]/.test(name) || names.has(name)) {
+        throw new Error(`Invalid or duplicate Paperclip skill runtime name: ${name}`);
+      }
+      names.add(name);
+      await materializePaperclipSkillCopy(entry.source, path.join(skillsDir, name), { rejectSymlinks: true });
+    }
+    return skillsDir;
+  } catch (error) {
+    await fs.rm(root, { recursive: true, force: true });
+    throw error;
   }
 }
 

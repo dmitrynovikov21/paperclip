@@ -39,6 +39,8 @@ describe("workspace operation URL redaction", () => {
       + redactor.push("gresql://synthetic-user:synthetic-password")
       + redactor.flush();
     expect(output).toBe("connect postgresql://[REDACTED]");
+    expect(redactWorkspaceOperationExcerpt("connect postgresql://synthetic-user:synthetic-password"))
+      .toBe("connect postgresql://[REDACTED]");
   });
 
   it("masks a second URL after a host-only URL across output chunks", () => {

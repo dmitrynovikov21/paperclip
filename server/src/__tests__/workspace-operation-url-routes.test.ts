@@ -6,10 +6,11 @@ import { eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, workspaceOperations } from "@paperclipai/db";
+import { agents, companies, createDb, executionWorkspaces, heartbeatRuns, projects, workspaceOperations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
+import { executionWorkspaceRoutes } from "../routes/execution-workspaces.js";
 import { createLocalFileWorkspaceOperationLogStore } from "../services/workspace-operation-log-store.js";
 import { workspaceOperationService } from "../services/workspace-operations.js";
 
@@ -44,6 +45,7 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       next();
     });
     app.use("/api", agentRoutes(db));
+    app.use("/api", executionWorkspaceRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -53,9 +55,17 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
     const agentId = randomUUID();
     const runId = randomUUID();
     const operationId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
     const credential = "synthetic-reader:synthetic-password";
     const url = `postgresql://${credential}@db.example.test/app`;
+    const incompleteUrl = `postgresql://${credential}`;
     await db.insert(companies).values({ id: companyId, name: "URL privacy", issuePrefix: "URL" });
+    await db.insert(projects).values({ id: projectId, companyId, name: "URL privacy" });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId, companyId, projectId, mode: "isolated_workspace",
+      strategyType: "git_worktree", name: "URL privacy",
+    });
     await db.insert(agents).values({
       id: agentId, companyId, name: "Reader", role: "engineer", adapterType: "process",
       adapterConfig: {}, runtimeConfig: {}, permissions: {},
@@ -65,20 +75,26 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
     });
     await db.insert(workspaceOperations).values({
-      id: operationId, companyId, heartbeatRunId: runId, phase: "provision", status: "succeeded",
-      command: `echo ${url}`, metadata: { connection: url }, stdoutExcerpt: `connect ${url}`,
+      id: operationId, companyId, executionWorkspaceId, heartbeatRunId: runId,
+      phase: "provision", status: "succeeded", command: `echo ${url}`,
+      metadata: { connection: url }, stdoutExcerpt: `connect ${url}`,
+      stderrExcerpt: `connect ${incompleteUrl}`,
       logStore: "local_file", logRef: "pending.ndjson",
     });
 
     const store = createLocalFileWorkspaceOperationLogStore(logRoot);
     const handle = await store.begin({ companyId, operationId });
     await store.append(handle, { stream: "stdout", chunk: `connect ${url}`, ts: new Date().toISOString() });
+    await store.append(handle, { stream: "stderr", chunk: `connect ${incompleteUrl}`, ts: new Date().toISOString() });
     const filePath = path.join(logRoot, handle.logRef);
     const original = await fs.readFile(filePath);
     const expected = Buffer.from(original);
     const credentialOffset = original.indexOf(credential);
+    const incompleteCredentialOffset = original.lastIndexOf(credential);
     expect(credentialOffset).toBeGreaterThan(0);
+    expect(incompleteCredentialOffset).toBeGreaterThan(credentialOffset);
     expected.fill(0x2a, credentialOffset, credentialOffset + Buffer.byteLength(credential));
+    expected.fill(0x2a, incompleteCredentialOffset, incompleteCredentialOffset + Buffer.byteLength(credential));
     await db.update(workspaceOperations).set({ logRef: handle.logRef })
       .where(eq(workspaceOperations.id, operationId));
 
@@ -105,11 +121,19 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       expect(list.status).toBe(200);
       expect(list.body).toHaveLength(2);
       expect(JSON.stringify(list.body)).not.toContain(credential);
+      const historical = list.body.find((operation: { id: string }) => operation.id === operationId);
+      expect(historical?.stderrExcerpt).toBe("connect postgresql://[REDACTED]");
       for (const operation of list.body) {
         expect(operation.command).toContain("postgresql://[REDACTED]@db.example.test/app");
         expect(operation.metadata.connection).toContain("postgresql://[REDACTED]@db.example.test/app");
         expect(operation.stdoutExcerpt).toContain("postgresql://[REDACTED]@db.example.test/app");
       }
+      const workspaceList = await request(app)
+        .get(`/api/execution-workspaces/${executionWorkspaceId}/workspace-operations`);
+      expect(workspaceList.status).toBe(200);
+      expect(workspaceList.body).toHaveLength(1);
+      expect(workspaceList.body[0].stderrExcerpt).toBe("connect postgresql://[REDACTED]");
+      expect(JSON.stringify(workspaceList.body)).not.toContain(credential);
       let offset = 0;
       while (offset < original.length) {
         const page = await request(app)

@@ -1,6 +1,5 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -27,13 +26,13 @@ import {
   asString,
   asStringArray,
   buildPaperclipEnv,
+  buildPaperclipRuntimeSkillsAssetDir,
   buildRuntimeToolsEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   joinPromptSections,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
-  isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -173,17 +172,12 @@ function renderApiAccessNote(env: Record<string, string>): string {
 async function buildKimiSkillsDir(
   config: Record<string, unknown>,
 ): Promise<string> {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-kimi-skills-"));
-  const target = path.join(tmp, "skills");
-  await fs.mkdir(target, { recursive: true });
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
-  for (const entry of availableEntries) {
-    if (!desiredNames.has(entry.key)) continue;
-    if (isPaperclipSkillSourceMissing(entry)) continue;
-    await fs.symlink(entry.source, path.join(target, entry.runtimeName));
-  }
-  return target;
+  return buildPaperclipRuntimeSkillsAssetDir(
+    availableEntries.filter((entry) => desiredNames.has(entry.key)),
+    "paperclip-kimi-skills-",
+  );
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -360,7 +354,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         assets: [{
           key: "skills",
           localDir: localSkillsDir,
-          followSymlinks: true,
+          followSymlinks: false,
         }],
       });
       restoreRemoteWorkspace = () =>

@@ -25,6 +25,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  normalizePaperclipWakePayload,
+  renderPaperclipWakePrompt,
+} from "@paperclipai/adapter-utils/server-utils";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -349,6 +353,95 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
         "reassign_watched_subtree_issues",
       ],
     })]);
+  });
+
+  it("passes real stopped leaves and board instructions from the watchdog wake through the prompt", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ROOT", status: "blocked" });
+    const firstLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-1",
+      title: "First stopped leaf",
+      status: "blocked",
+      parentId: sourceId,
+    });
+    const secondLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-2",
+      title: "Second stopped leaf",
+      status: "in_review",
+      parentId: sourceId,
+    });
+    const leafIds = [firstLeafId, secondLeafId];
+    for (let index = 3; index <= 25; index += 1) {
+      leafIds.push(await seedIssue(companyId, {
+        identifier: `WDOG-LEAF-${index}`,
+        title: `Stopped leaf ${index}`,
+        status: "blocked",
+        parentId: sourceId,
+      }));
+    }
+    const lastLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-LEAF-26",
+      title: "Last stopped leaf",
+      status: "blocked",
+      parentId: sourceId,
+    });
+    leafIds.push(lastLeafId);
+    const agentId = await seedAgent(companyId);
+    const watchdog = await seedWatchdog(companyId, sourceId, agentId);
+    const instructions = "Check each stopped leaf.\nEscalate unresolved blockers.";
+    await db.update(issueWatchdogs).set({ instructions }).where(eq(issueWatchdogs.id, watchdog!.id));
+    const { service, wakes } = createService();
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot;
+    expect(context).toMatchObject({
+      customInstructions: instructions,
+      stoppedLeaves: expect.arrayContaining([
+        expect.objectContaining({ issueId: firstLeafId }),
+        expect.objectContaining({ issueId: secondLeafId }),
+      ]),
+    });
+    const normalized = normalizePaperclipWakePayload(context);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toHaveLength(26);
+    expect(new Set(normalized?.taskWatchdog?.terminalLeafSummaries.map((leaf) => leaf.id))).toEqual(new Set(leafIds));
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: firstLeafId, identifier: "WDOG-LEAF-1", title: "First stopped leaf", status: "blocked" }),
+      expect.objectContaining({ id: secondLeafId, identifier: "WDOG-LEAF-2", title: "Second stopped leaf", status: "in_review" }),
+      expect.objectContaining({ id: lastLeafId, identifier: "WDOG-LEAF-26", title: "Last stopped leaf", status: "blocked" }),
+    ]));
+    expect(normalized?.taskWatchdog?.customInstructions).toBe(instructions);
+
+    const prompt = renderPaperclipWakePrompt(context);
+    expect(prompt).toContain("Terminal / stopped leaves to verify:");
+    expect(prompt).toContain("- WDOG-LEAF-1 First stopped leaf (blocked)");
+    expect(prompt).toContain("- WDOG-LEAF-2 Second stopped leaf (in_review)");
+    expect(prompt).toContain("- WDOG-LEAF-26 Last stopped leaf (blocked)");
+    for (const leaf of normalized?.taskWatchdog?.terminalLeafSummaries ?? []) {
+      expect(prompt).toContain(`- ${leaf.identifier} ${leaf.title} (${leaf.status})`);
+    }
+    expect(prompt).toContain("Board-supplied watchdog instructions");
+    expect(prompt).toContain(instructions);
+    expect(prompt).not.toContain("No board-supplied watchdog instructions");
+  });
+
+  it("omits leaf and instruction blocks when the real watchdog wake has neither", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-EMPTY", status: "done" });
+    const agentId = await seedAgent(companyId);
+    const watchdog = await seedWatchdog(companyId, sourceId, agentId);
+    await db.update(issueWatchdogs).set({ instructions: "" }).where(eq(issueWatchdogs.id, watchdog!.id));
+    const { service, wakes } = createService();
+
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot;
+    const normalized = normalizePaperclipWakePayload(context);
+    expect(normalized?.taskWatchdog?.terminalLeafSummaries).toEqual([]);
+    expect(normalized?.taskWatchdog?.customInstructions).toBeNull();
+
+    const prompt = renderPaperclipWakePrompt(context);
+    expect(prompt).not.toContain("Terminal / stopped leaves to verify:");
+    expect(prompt).not.toContain("Board-supplied watchdog instructions (read after the mandate");
+    expect(prompt).toContain("No board-supplied watchdog instructions. Apply the mandate above.");
   });
 
   it("does not append duplicate review comments for an already-open same-fingerprint review", async () => {

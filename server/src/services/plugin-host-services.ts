@@ -1890,7 +1890,15 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         assertReadableOriginFilter(params.originKind);
-        return applyWindow((await issues.list(companyId, params as any)) as Issue[], params);
+        const limit = parseWindowValue(params.limit);
+        // The issue service applies this window in SQL. Run it even for an
+        // empty page so invalid filters still fail as they did before.
+        const page = (await issues.list(companyId, {
+          ...(params as any),
+          limit: limit === 0 ? 1 : limit ?? undefined,
+          offset: parseWindowValue(params.offset) ?? undefined,
+        })) as Issue[];
+        return limit === 0 ? [] : page;
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);

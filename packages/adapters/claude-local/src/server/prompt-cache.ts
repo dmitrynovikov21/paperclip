@@ -112,7 +112,11 @@ export async function prepareClaudePromptBundle(input: {
     runtimeNames.add(name);
     const target = path.join(skillsHome, entry.runtimeName);
     try {
-      await materializePaperclipSkillCopy(entry.source, target, { rejectSymlinks: strictSkillStaging });
+      const source = strictSkillStaging &&
+        process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true"
+        ? await fs.realpath(entry.source)
+        : entry.source;
+      await materializePaperclipSkillCopy(source, target, { rejectSymlinks: strictSkillStaging });
     } catch (err) {
       await onLog(
         "stderr",

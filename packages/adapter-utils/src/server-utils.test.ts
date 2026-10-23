@@ -18,6 +18,7 @@ import {
   copyStrictSkillDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  fingerprintPaperclipSkillDirectory,
   isPaperclipExternalChatContractTurn,
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
@@ -306,6 +307,44 @@ describe("sanitizeSshRemoteEnv", () => {
 });
 
 describe("materializePaperclipSkillCopy", () => {
+  it("stages a skill through a linked home only outside runtime isolation", async () => {
+    if (process.platform !== "linux") return;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-linked-skill-home-"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "false");
+    try {
+      const home = path.join(root, "real-home");
+      const source = path.join(home, "skills", "skill");
+      const alias = path.join(root, "linked-home");
+      await fs.mkdir(source, { recursive: true });
+      await fs.writeFile(path.join(source, "SKILL.md"), "# safe skill\n");
+      await fs.symlink(home, alias);
+      const linkedSource = path.join(alias, "skills", "skill");
+
+      await expect(fingerprintPaperclipSkillDirectory(linkedSource))
+        .resolves.toBe(await fingerprintPaperclipSkillDirectory(source));
+      const staged = await buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source: linkedSource }],
+        "paperclip-linked-skill-staged-",
+      );
+      try {
+        await expect(fs.readFile(path.join(staged, "skill", "SKILL.md"), "utf8"))
+          .resolves.toBe("# safe skill\n");
+      } finally {
+        await fs.rm(path.dirname(staged), { recursive: true, force: true });
+      }
+
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      await expect(fingerprintPaperclipSkillDirectory(linkedSource)).rejects.toThrow();
+      await expect(buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source: linkedSource }],
+        "paperclip-linked-skill-isolated-",
+      )).rejects.toThrow(/symbolic-link ancestor/);
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a nested directory swapped for a synthetic key link after validation", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-directory-race-"));
     const source = path.join(root, "skill");

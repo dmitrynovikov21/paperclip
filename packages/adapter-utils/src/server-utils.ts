@@ -4521,7 +4521,13 @@ export async function fingerprintPaperclipSkillDirectory(source: string): Promis
   if (process.platform !== "linux" && process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") {
     return hashSkillDirectory(path.resolve(source));
   }
-  const directory = await openStrictSkillDirectory(path.resolve(source));
+  // Ordinary Linux installs may reach PAPERCLIP_HOME through an operator-owned
+  // directory alias. Resolve it before the pinned walk, but never do so when
+  // the agent runtime must be isolated from the secret source.
+  const sourceRoot = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true"
+    ? path.resolve(source)
+    : await fs.realpath(source);
+  const directory = await openStrictSkillDirectory(sourceRoot);
   try {
     return await hashStrictSkillDirectory(directory);
   } finally {
@@ -4841,7 +4847,11 @@ export async function buildPaperclipRuntimeSkillsAssetDir(
         throw new Error(`Invalid or duplicate Paperclip skill runtime name: ${name}`);
       }
       names.add(name);
-      await materializePaperclipSkillCopy(entry.source, path.join(skillsDir, name), { rejectSymlinks: strictSkillStaging });
+      const source = strictSkillStaging &&
+        process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true"
+        ? await fs.realpath(entry.source)
+        : entry.source;
+      await materializePaperclipSkillCopy(source, path.join(skillsDir, name), { rejectSymlinks: strictSkillStaging });
     }
     return skillsDir;
   } catch (error) {

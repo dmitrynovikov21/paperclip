@@ -1,3 +1,4 @@
+import { measureRunPhase } from "../execution-preparation-timing.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { environmentTaskOperationSchema, environmentTaskResultSchema, type PluginEnvironmentTaskOperation, type PluginEnvironmentTaskResult, type PluginEnvironmentTaskCredential } from "@paperclipai/plugin-sdk";
@@ -44,7 +45,10 @@ export function createPluginRunnerTaskOwner(input: {
   const running = new Promise<void>((resolve, reject) => { markReady = resolve; failReady = reject; });
   void running.catch(() => undefined);
   const call = async (operation: PluginEnvironmentTaskOperation) => {
-    const result = environmentTaskResultSchema.parse(await input.task(operation));
+    const phase = ({ prepare: "execution.plugin_prepare", check_project_auth: "execution.plugin_project_auth",
+      submit: "execution.plugin_submit", connection: "execution.plugin_connection" } as const)[operation.kind as "prepare" | "check_project_auth" | "submit" | "connection"];
+    const result = environmentTaskResultSchema.parse(await (phase
+      ? measureRunPhase(phase, () => input.task(operation)) : input.task(operation)));
     if (result.kind !== (operation.kind === "read_file" ? "file" : operation.kind === "describe" ? "description" : operation.kind === "prepare" ? "prepared" : operation.kind === "check_project_auth" ? "project_auth" : ["read_state", "archive_state"].includes(operation.kind) ? "state" : ["status", "connection", "credentials"].includes(operation.kind) ? operation.kind : "accepted")) {
       throw new Error("Plugin Runner returned an invalid operation result");
     }
@@ -58,9 +62,9 @@ export function createPluginRunnerTaskOwner(input: {
     }));
     if (released || stopRequested) throw new Error("Plugin Runner preparation cancelled");
     if (result.kind !== "prepared") throw new Error("Plugin Runner preparation unavailable");
-    {
+    if (input.projectAuthCheckVersion !== 1) throw new Error("Plugin Runner managed project authentication validation unavailable");
+    if (!result.projectAuthCheckAtSubmit) {
       const provider = input.harness === "codex" ? "openai" : input.harness === "claude" ? "anthropic" : input.harness;
-      if (input.projectAuthCheckVersion !== 1) throw new Error("Plugin Runner managed project authentication validation unavailable");
       const validation = await call({ kind: "check_project_auth", configurationId: result.launch.configurationId,
         provider, projectIds: [...input.projectIds] });
       if (released || stopRequested) throw new Error("Plugin Runner preparation cancelled");

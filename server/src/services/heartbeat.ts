@@ -252,6 +252,7 @@ import {
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import {
   recordNativeLocalProcessStop,
+  settleNativeRunProcess,
 } from "./native-local-process-stop.js";
 
 import {
@@ -3849,6 +3850,12 @@ export function heartbeatService(
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
+        }
+        if (latestRun?.runtimeMode === "native" && isHeartbeatRunTerminalStatus(latestRun.status) &&
+            !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld) {
+          await settleNativeRunProcess(db, run.id).catch(error => {
+            logger.warn({ err: error, runId: run.id }, "failed to release settled native process identity");
+          });
         }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,

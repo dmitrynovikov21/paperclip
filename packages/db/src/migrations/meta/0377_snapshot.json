@@ -1,6 +1,6 @@
 {
-  "id": "9c1b4cac-52f1-4c6e-89b3-c9a7816016c7",
-  "prevId": "7caf727e-0913-40b3-b01c-842e9447666f",
+  "id": "a0fcd9b8-f125-4985-8795-f567466b9aef",
+  "prevId": "7832df38-fa1b-4687-bd06-eccbc29bd28c",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -28508,6 +28508,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "checkout_name": {
+          "name": "checkout_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
         "object_key": {
           "name": "object_key",
           "type": "text",
@@ -28601,8 +28608,8 @@
           "method": "btree",
           "with": {}
         },
-        "execution_workspace_restore_points_live_generation_uniq": {
-          "name": "execution_workspace_restore_points_live_generation_uniq",
+        "execution_workspace_restore_points_live_status_uniq": {
+          "name": "execution_workspace_restore_points_live_status_uniq",
           "columns": [
             {
               "expression": "execution_workspace_id",
@@ -28615,10 +28622,16 @@
               "isExpression": false,
               "asc": true,
               "nulls": "last"
+            },
+            {
+              "expression": "checkout_name",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
             }
           ],
           "isUnique": true,
-          "where": "\"execution_workspace_restore_points\".\"status\" <> 'deleted'",
+          "where": "\"execution_workspace_restore_points\".\"status\" in ('pending', 'active', 'expiring')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -38855,6 +38868,18 @@
         "resolved_at": {
           "name": "resolved_at",
           "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "dismissed_at": {
+          "name": "dismissed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "dismissed_by_user_id": {
+          "name": "dismissed_by_user_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": false
         },

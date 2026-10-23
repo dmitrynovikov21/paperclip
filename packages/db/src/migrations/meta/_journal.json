@@ -2626,6 +2626,13 @@
       "when": 1792783857131,
       "tag": "0376_clear_committed_native_recovery_state",
       "breakpoints": true
+    },
+    {
+      "idx": 377,
+      "version": "7",
+      "when": 1792790134086,
+      "tag": "0377_clear_settled_native_run_process_identity",
+      "breakpoints": true
     }
   ]
 }

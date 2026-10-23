@@ -2871,6 +2871,10 @@ This check selects only the run ID, company ID, agent ID, and status through
 configuration, or provider results. Keep this read fresh so terminal or deleted
 runs cannot publish late progress from an old executor snapshot.
 
+Native event and retry-exhaustion ingestion lock the run row to verify its
+company and agent bindings. That lock reads only those two fields. Sequence
+allocation, replay checks, and event insertion remain in the same transaction.
+
 Run the deterministic native event replay with the normal server test runner:
 
 ```sh

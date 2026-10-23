@@ -193,6 +193,16 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     }
     if (freshWorkspace && parsed.kind === "description" && parsed.freshWorkspaceVersion !== 1)
       throw new Error("Plugin-provided fresh workspace preparation unavailable");
+    if (operation.kind === "prepare" && parsed.kind === "prepared" && parsed.projectAuthCheckAtSubmit) {
+      const harness = operation.requirements.provider === "acpx" ? operation.requirements.settings.acpxAgent : operation.requirements.provider;
+      if (!harness) throw new Error("Plugin Runner prepared provider unavailable");
+      const provider = harness === "codex" ? "openai" : harness === "claude" ? "anthropic" : harness;
+      const saved = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+        runnerTaskProjectAuthValidation: { configurationId: parsed.launch.configurationId, provider, projectIds, atSubmit: true },
+      })}::jsonb` }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId),
+        eq(environmentLeases.status, "active"), sql`coalesce(${environmentLeases.metadata}->>'runnerTaskRetiring', 'false') != 'true'`)).returning({ id: environmentLeases.id });
+      if (saved.length !== 1) throw new Error("Plugin Runner project validation lease expired");
+    }
     if (operation.kind === "check_project_auth" && parsed.kind === "project_auth") {
       if (parsed.configurationId !== operation.configurationId || parsed.provider !== operation.provider) throw new Error("Plugin Runner project validation identity mismatch");
       if (parsed.allowed) {

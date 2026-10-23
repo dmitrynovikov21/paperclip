@@ -64,6 +64,25 @@ describe("plugin native Runner ownership", () => {
     await registration.release(); await registration.checkpoint("unsettled"); await handle.completion;
     expect(task.mock.calls.find(([op]) => op.kind === "submit")?.[0]).toMatchObject({ preparedLaunchId: "configuration" });
   });
+  it("omits duplicate project validation only when the provider enforces it at submission", async () => {
+    const { task } = provider();
+    const perform = task.getMockImplementation()!;
+    task.mockImplementation(async op => op.kind === "prepare"
+      ? { ...await perform(op) as object, projectAuthCheckAtSubmit: true } : perform(op));
+    const owner = createPluginRunnerTaskOwner({ projectAuthCheckVersion: 1,
+      task, projectIds: [], harness: "codex", pollMs: 1 });
+    await prepare(owner);
+    expect(task.mock.calls.map(([op]) => op.kind)).toEqual(["prepare"]);
+    ingress.connect.mockReturnValue({ ready: Promise.resolve(), close: async () => {} });
+    const registration = await owner.registration({} as never, "run");
+    const handle = owner.launcher(launchSpec());
+    registration.activate(); await registration.ready();
+    await registration.release(); await registration.checkpoint("unsettled"); await handle.completion;
+    expect(task.mock.calls.filter(([op]) => op.kind === "submit")).toHaveLength(1);
+    const unsupported = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex" });
+    await expect(prepare(unsupported)).rejects.toThrow("validation unavailable");
+  });
+
   it("does not accept a late preparation after task release", async () => {
     let finish!: () => void;
     const gate = new Promise<void>(resolve => { finish = resolve; });

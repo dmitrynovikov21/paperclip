@@ -48,7 +48,7 @@ import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
 import { prepareVerifiedRemoteProviderPack, useVerifiedPreinstalledRemoteProviderPack, runRemoteProviderVerification, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
-import { readNativeLocalProcessStop, PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
+import { readNativeLocalProcessStop, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
 import { remoteLeaseCleanupScope } from "../remote-execution-termination.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
@@ -3002,7 +3002,7 @@ export async function reconcileRetainedNativeSessionCleanup(
   } | null = null;
   try {
     claim = await db.transaction(async (tx) => {
-      const run = await tx
+      const row = await tx
         .select()
         .from(heartbeatRuns)
         .where(
@@ -3014,6 +3014,9 @@ export async function reconcileRetainedNativeSessionCleanup(
         .for("update", { noWait: true })
         .limit(1)
         .then((rows) => rows[0]);
+      const run = row
+        ? await withReleasedNativeRunProcess(tx as unknown as Db, row)
+        : row;
       if (
         !run ||
         run.runtimeMode !== "native" ||
@@ -4655,7 +4658,7 @@ async function verifyWarmTransitionRestart(input: {
       now: Date.now(),
     });
     if (!proof) return deny();
-    const prior = await tx
+    const priorRow = await tx
       .select()
       .from(heartbeatRuns)
       .where(
@@ -4667,6 +4670,9 @@ async function verifyWarmTransitionRestart(input: {
       .for("update")
       .limit(1)
       .then((rows) => rows[0]);
+    const prior = priorRow
+      ? await withReleasedNativeRunProcess(tx as unknown as Db, priorRow)
+      : priorRow;
     if (
       !prior ||
       prior.agentId !== binding.agentId ||
@@ -5127,6 +5133,14 @@ async function recoverQuiescentRunnerdState(input: {
         .then((rows) => rows[0] ?? null);
       if (!prior || !TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.status))
         continue;
+      const priorProcess =
+        prior.processPid === null && prior.processGroupId === null
+          ? await readNativeLocalProcessStop(
+              input.db,
+              input.execution.binding.companyId,
+              identity.runId,
+            )
+          : { processPid: prior.processPid, processGroupId: prior.processGroupId };
       const profile = record(prior.runnerProfileJson);
       const previous = parseNativeExecutionInput(profile.nativeExecutionInput);
       const checkpoint = record(profile.sessionCheckpoint);
@@ -5172,8 +5186,8 @@ async function recoverQuiescentRunnerdState(input: {
         checkpoint.activeTurnId !== null ||
         !Array.isArray(checkpoint.pendingRuntimeRequests) ||
         checkpoint.pendingRuntimeRequests.length !== 0 ||
-        !localProcessDefinitelyGone(prior.processPid) ||
-        !localProcessDefinitelyGone(prior.processGroupId, true)
+        !localProcessDefinitelyGone(priorProcess?.processPid) ||
+        !localProcessDefinitelyGone(priorProcess?.processGroupId, true)
       )
         continue;
       // Provider processes are normally inside the runner group. Check any
@@ -5205,8 +5219,8 @@ async function recoverQuiescentRunnerdState(input: {
         providerBytes,
         runner,
         runId: identity.runId,
-        processPid: prior.processPid!,
-        processGroupId: prior.processGroupId!,
+        processPid: priorProcess!.processPid!,
+        processGroupId: priorProcess!.processGroupId!,
       });
     } catch {
       // Unreadable, unsafe, unscoped, or unprovable state stays quarantined.

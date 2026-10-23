@@ -69,10 +69,12 @@ skills=/home/agent/.agents/skills/<name>/SKILL.md
 
 These are execution-host locations. Core does not copy the home for each run.
 The plugin must declare `projectAuthCheckVersion: 1` for all native tasks.
-Core requires `check_project_auth` to allow the exact prepared configuration
-before it sends credentials. The plugin must reject conflicting project or
-parent authentication settings. It must keep the checked configuration fixed
-until submission. See [managed account validation](PLUGIN_ENVIRONMENT_TASKS.md#managed-account-validation).
+Core requires an allowed `check_project_auth` result, or a prepared result with
+`projectAuthCheckAtSubmit: true`. The latter delegates the check to the trusted
+plugin's submit handler before credential installation or task start. The plugin
+must reject conflicting project or parent authentication settings. It must keep
+the checked configuration fixed until submission. See
+[launch authentication validation](PLUGIN_ENVIRONMENT_TASKS.md#launch-authentication-validation).
 
 Core sends authorized project IDs, the PRP identity, launch limits, and the
 bootstrap ticket through `submit`. It does not send a process command.

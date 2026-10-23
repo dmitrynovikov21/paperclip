@@ -3503,6 +3503,8 @@ describe("retained native cleanup activation", () => {
     "legacy_bad_proof",
     "legacy_extra_attempt",
     "legacy_activation",
+    "released_identity",
+    "released_identity_unproven",
   ])("preserves exact original evidence for %s", async (mode) => {
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
@@ -3745,8 +3747,17 @@ describe("retained native cleanup activation", () => {
       nativeSessionId: identity.normalizedSessionId,
       runnerInstanceId: identity.runnerInstanceId,
       finishedAt: new Date(),
-      processPid: mode.endsWith("live_owner") ? process.pid : 99_999_999,
-      processGroupId: mode.endsWith("live_owner") ? process.pid : 99_999_999,
+      processPid: mode.startsWith("released_identity")
+        ? null
+        : mode.endsWith("live_owner")
+          ? process.pid
+          : 99_999_999,
+      processGroupId: mode.startsWith("released_identity")
+        ? null
+        : mode.endsWith("live_owner")
+          ? process.pid
+          : 99_999_999,
+      processStartedAt: null,
       completionContractId: "contract",
       completionContractSha256: "sha",
       errorCode: mode === "provider_transport_failed" ? "provider_transport_failed" : "adapter_failed",
@@ -3770,6 +3781,7 @@ describe("retained native cleanup activation", () => {
       recoveryHistory: [],
     };
     let transactionOpen = false;
+    let stopReceiptRead = false;
     let releaseCommit!: () => void;
     const commitGate = new Promise<void>((release) => {
       releaseCommit = release;
@@ -3788,11 +3800,25 @@ describe("retained native cleanup activation", () => {
                 : table === nativeRunResults
                   ? [accepted]
                   : table === heartbeatRunEvents
-                    ? [identityRow]
+                    ? mode.startsWith("released_identity") && !stopReceiptRead
+                      ? ((stopReceiptRead = true),
+                        mode === "released_identity"
+                          ? [
+                              {
+                                eventType: "native.local_process_stopped",
+                                payload: {
+                                  processPid: 99_999_999,
+                                  processGroupId: 99_999_999,
+                                },
+                              },
+                            ]
+                          : [])
+                      : [identityRow]
                     : [];
           const query = {
             where: () => query,
             for: () => query,
+            orderBy: () => query,
             limit: async () => rows,
           };
           return query;
@@ -4603,6 +4629,7 @@ describe("retained native cleanup activation", () => {
         "bad_identity_hash",
         "foreign_semantic_scope",
         "wrong_provider_account",
+        "released_identity_unproven",
       ].includes(mode);
       const succeeds = [
         "digest_only_command",
@@ -4620,6 +4647,7 @@ describe("retained native cleanup activation", () => {
         "activation_commit_stalled",
         "empty_root",
         "distinct_provider_account",
+        "released_identity",
       ].includes(mode);
       expect(outcome.status).toBe(
         succeeds
@@ -11817,6 +11845,8 @@ describe("runnerd provider runtime wiring", () => {
     "live runner",
     "live group",
     "missing process identity",
+    "released process identity",
+    "released identity without stop receipt",
     "active prior run",
     "wrong checkpoint",
     "active goal",
@@ -11937,13 +11967,34 @@ describe("runnerd provider runtime wiring", () => {
                           }
                         : profile,
                     processPid:
-                      scenario === "missing process identity" ? null : 90000001,
-                    processGroupId: 90000001,
+                      scenario === "missing process identity" ||
+                      scenario.startsWith("released")
+                        ? null
+                        : 90000001,
+                    processGroupId: scenario.startsWith("released")
+                      ? null
+                      : 90000001,
                     contextSnapshot: {
                       paperclipEnvironment: { driver: "local" },
                     },
                   },
                 ]),
+              orderBy: () => ({
+                limit: () =>
+                  Promise.resolve(
+                    scenario === "released process identity"
+                      ? [
+                          {
+                            eventType: "native.local_process_stopped",
+                            payload: {
+                              processPid: 90000001,
+                              processGroupId: 90000001,
+                            },
+                          },
+                        ]
+                      : [],
+                  ),
+              }),
             }),
           }),
         }),
@@ -12043,6 +12094,7 @@ describe("runnerd provider runtime wiring", () => {
         state.createTransport.mockClear();
         const shouldRecover = [
           "quarantined",
+          "released process identity",
           "large control plane",
           "empty retry shell",
           "unsuspended current",

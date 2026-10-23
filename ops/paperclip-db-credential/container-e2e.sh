@@ -48,7 +48,32 @@ make_credential() {
 }
 make_credential pc-service pc_service "$service_password" "$root/credentials/service"
 
+# These fixtures are executable connection-source templates, not copies of the
+# host business logic. The production scripts require a separate SQL audit.
+mkdir -p /usr/local/libexec/paperclip/jobs
+install -m 0755 /work/run-host-job /usr/local/libexec/paperclip/run-host-job
+install -m 0755 /work/pg-client /usr/local/libexec/paperclip/pg-client
+for fixture in /work/fixtures/jobs/*; do
+  install -m 0644 "$fixture" /usr/local/libexec/paperclip/jobs/"${fixture##*/}"
+done
+admin -d synthetic -c '
+  CREATE TABLE daily_records (id integer);
+  CREATE TABLE fleet_records (id integer);
+  CREATE TABLE watchdog_state (checked boolean);
+  CREATE TABLE testdb_records (id integer);
+  CREATE TABLE wipcap_state (checked boolean);
+  CREATE TABLE disk_records (id integer);
+  INSERT INTO daily_records VALUES (1);
+  INSERT INTO fleet_records VALUES (1);
+  INSERT INTO watchdog_state VALUES (false);
+  INSERT INTO testdb_records VALUES (1);
+  INSERT INTO wipcap_state VALUES (false);
+  INSERT INTO disk_records VALUES (1);
+'
+
 jobs=(daily fleet watchdog testgc wipcap disk)
+tables=(daily_records fleet_records watchdog_state testdb_records wipcap_state disk_records)
+privileges=(SELECT SELECT UPDATE DELETE UPDATE SELECT)
 for index in "${!jobs[@]}"; do
   job=${jobs[$index]}
   role=pc_job_$((index + 1))
@@ -56,6 +81,7 @@ for index in "${!jobs[@]}"; do
   user=pcjob-$job
   useradd -u "$((2110 + index))" -M -s /usr/sbin/nologin "$user"
   admin -c "CREATE ROLE $role LOGIN PASSWORD '$password'; GRANT CONNECT ON DATABASE synthetic TO $role;"
+  admin -d synthetic -c "GRANT USAGE ON SCHEMA public TO $role; GRANT ${privileges[$index]} ON ${tables[$index]} TO $role;"
   make_credential "$user" "$role" "$password" "$root/credentials/$job"
 done
 
@@ -68,6 +94,33 @@ probe pc-service "$root/credentials/service/database-url" pc_service
 for index in "${!jobs[@]}"; do
   job=${jobs[$index]}
   probe "pcjob-$job" "$root/credentials/$job/database-url" "pc_job_$((index + 1))"
+done
+
+# Exercise every installed job entrypoint through the actual wrapper. Revoking
+# its one required table privilege then makes the same job fail closed.
+for index in "${!jobs[@]}"; do
+  job=${jobs[$index]}
+  credential_dir="$root/credentials/$job"
+  if runuser -u "pcjob-$job" -- env -i PATH=/usr/local/bin:/usr/bin:/bin \
+      CREDENTIALS_DIRECTORY="$credential_dir" \
+      /usr/local/libexec/paperclip/run-host-job "$job" >"$root/job-output" 2>&1; then
+    :
+  else
+    status=$?
+    echo "Synthetic $job job failed with its granted role (exit $status)" >&2
+    sed -E -e 's#postgres(ql)?://[^[:space:]]+#postgres://[REDACTED]#g' \
+      -e 's/(PASSWORD|PGPASSWORD)=[^[:space:]]+/\1=[REDACTED]/g' "$root/job-output" | tail -8 >&2
+    exit 1
+  fi
+  assertions=$((assertions + 1))
+  admin -d synthetic -c "REVOKE ${privileges[$index]} ON ${tables[$index]} FROM pc_job_$((index + 1));"
+  if runuser -u "pcjob-$job" -- env -i PATH=/usr/local/bin:/usr/bin:/bin \
+      CREDENTIALS_DIRECTORY="$credential_dir" \
+      /usr/local/libexec/paperclip/run-host-job "$job" >/dev/null 2>&1; then
+    echo "Synthetic $job job retained access after grant revocation" >&2
+    exit 1
+  fi
+  assertions=$((assertions + 1))
 done
 
 # A distinct agent UID cannot read any service/job credential, including

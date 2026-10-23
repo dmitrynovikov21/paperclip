@@ -34,6 +34,7 @@ import {
   asNumber,
   asString,
   parseObject,
+  readPaperclipRuntimeSkillEntries,
 } from "@paperclipai/adapter-utils/server-utils";
 import { normalizeCodexModel } from "../index.js";
 import { classifyCodexAuthRefreshFailure } from "./parse.js";
@@ -193,8 +194,15 @@ async function prepareCodexRemoteManagedHome(
     // workspace with no home asset, identical to the no-seam fallback.
     return { stagedRuntime: await input.stage([]) };
   }
-  // Curated allowlist temp dir (auth/config/skills only); caller owns cleanup.
-  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+  const selectedNames = new Set(input.selectedSkillNames);
+  const selectedSkills = (await readPaperclipRuntimeSkillEntries(input.config, moduleDir))
+    .filter((entry) => selectedNames.has(entry.runtimeName))
+    .map((entry) => ({ name: entry.runtimeName, source: entry.source }));
+  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+    runId,
+    authSourcePaths: [path.join(resolveSharedCodexHomeDir(process.env), "auth.json")],
+    skillSources: selectedSkills,
+  });
   let stagedRuntime;
   try {
     stagedRuntime = await input.stage([

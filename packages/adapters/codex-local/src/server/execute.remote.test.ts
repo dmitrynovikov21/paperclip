@@ -214,7 +214,7 @@ describe("codex remote execution", () => {
     }));
   });
 
-  it("stages only the allowlist into the home asset: keeps config.toml/skills/auth, drops session+sqlite state, no exclude", async () => {
+  it("stages only the allowlist and selected skills into the home asset", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-allowlist-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -233,7 +233,10 @@ describe("codex remote execution", () => {
     );
     await writeFile(path.join(codexHomeDir, "instructions.md"), "hi\n", "utf8");
     await mkdir(path.join(codexHomeDir, "skills", "demo"), { recursive: true });
-    await writeFile(path.join(codexHomeDir, "skills", "demo", "SKILL.md"), "# demo\n", "utf8");
+    await writeFile(path.join(codexHomeDir, "skills", "demo", "SKILL.md"), "# unselected\n", "utf8");
+    const selectedSkillSource = path.join(rootDir, "selected-skill");
+    await mkdir(selectedSkillSource, { recursive: true });
+    await writeFile(path.join(selectedSkillSource, "SKILL.md"), "# selected\n", "utf8");
     // Decoys:
     await writeFile(path.join(codexHomeDir, "logs_2.sqlite"), "x", "utf8");
     await writeFile(path.join(codexHomeDir, "state_5.sqlite"), "x", "utf8");
@@ -283,6 +286,12 @@ describe("codex remote execution", () => {
         env: {
           CODEX_HOME: codexHomeDir,
         },
+        paperclipSkillSync: { desiredSkills: ["fixture/selected"] },
+        paperclipRuntimeSkills: [{
+          key: "fixture/selected",
+          runtimeName: "selected",
+          source: selectedSkillSource,
+        }],
       },
       context: {
         paperclipWorkspace: {
@@ -322,10 +331,12 @@ describe("codex remote execution", () => {
     for (const decoy of ["logs_2.sqlite", "state_5.sqlite", "sessions", "tmp", "plugins"]) {
       expect(snap.entries).not.toContain(decoy);
     }
-    // Phase-3 behavioral invariants: provider routing + skills + auth survive staging.
+    // Provider routing, selected skills and auth survive; a planted unselected
+    // home skill cannot become a remote asset.
     expect(snap.configToml).toContain("[model_providers.bifrost]");
     expect(snap.configToml).toContain("model_provider");
-    expect(snap.skillEntries).toContain("demo");
+    expect(snap.skillEntries).toEqual(["selected"]);
+    expect(snap.skillEntries).not.toContain("demo");
     expect(snap.authJson).toContain("refresh_token");
 
     // The staged temp dir is removed after execute completes (cleanup on teardown).

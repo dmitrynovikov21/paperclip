@@ -755,11 +755,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // ship THAT as the `home` asset, instead of the whole managed
           // CODEX_HOME + a name denylist. Staged AFTER the config.toml rewrites
           // (provider merge + MCP block splice above) and skills injection, so the
-          // staged config.toml/skills reflect their final state. Symlinks (incl.
-          // the single-use `auth.json`) are dereferenced to bytes. This drops the
-          // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
+          // staged config.toml/skills reflect their final state. Only the bound
+          // shared auth source and server-selected skill sources are read. This
+          // drops the large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
-          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+          const selectedSkills = new Set(desiredSkillNames);
+          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+            runId,
+            authSourcePaths: [path.join(resolveSharedCodexHomeDir(process.env), "auth.json")],
+            skillSources: codexSkillEntries
+              .filter((entry) => selectedSkills.has(entry.key))
+              .map((entry) => ({ name: entry.runtimeName, source: entry.source })),
+          });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,

@@ -272,6 +272,8 @@ export interface AcpxRemoteManagedHomeContext {
   env: Record<string, string>;
   onLog: AdapterExecutionContext["onLog"];
   onRuntimeProgress: AdapterExecutionContext["onRuntimeProgress"];
+  /** Exact selected runtime skill names from the host preparation step. */
+  selectedSkillNames: string[];
   /**
    * Runs the shared workspace+assets staging seam and returns the prepared
    * runtime. The seam passes its per-adapter home `assets` here; the returned
@@ -1983,6 +1985,9 @@ async function buildRuntime(input: {
             env,
             onLog: input.ctx.onLog,
             onRuntimeProgress: input.ctx.onRuntimeProgress,
+            selectedSkillNames: Array.isArray(skillsIdentity.selectedSkills)
+              ? skillsIdentity.selectedSkills.filter((name): name is string => typeof name === "string")
+              : [],
             stage,
           });
           return {

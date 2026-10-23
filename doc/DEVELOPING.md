@@ -2858,6 +2858,12 @@ package avatar PNGs using the API renderer; static hosting needs no API proxy.
 
 ### Investigating polling load
 
+Runtime progress updates recheck the persisted run status before publication.
+This check selects only the run ID, company ID, agent ID, and status through
+`createHeartbeatRunState().getRunStatus`. It does not fetch prompts, runner
+configuration, or provider results. Keep this read fresh so terminal or deleted
+runs cannot publish late progress from an old executor snapshot.
+
 Run the deterministic native event replay with the normal server test runner:
 
 ```sh

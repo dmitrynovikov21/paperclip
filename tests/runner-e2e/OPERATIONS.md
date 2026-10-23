@@ -156,7 +156,17 @@ keys. The server environment strips the gateway token and upstream credentials.
 
 Every upstream attempt reserves its maximum estimated charge in an fsynced
 journal before dispatch. Requests, retries, and cancelled calls retain distinct
-IDs. Unknown usage keeps the reservation held. One shared writer serializes
+IDs. Braintrust gateway requests propagate the reserved request ID, campaign,
+execution, attempt and phase as allowlisted `paperclip_eval_*` metadata in the
+SDK-compatible parent context. The exact context is retained in the private
+receipt before dispatch, so a request canceled before response headers can
+still be looked up by `metadata.paperclip_eval_request_id` in project logs.
+This context contains no provider credential, prompt or response, and does not
+create an extra model call or a synthetic parent span. Direct provider routes
+receive no Braintrust context. Older project-only receipts cannot acquire this
+identity retroactively; time or session matches remain candidate evidence.
+A matching logged span does not itself prove complete usage or final billing.
+Unknown usage keeps the reservation held. One shared writer serializes
 admission across cells, so concurrent requests cannot each spend the same remaining
 allowance. Campaign deadline, request count, and in-flight count are also enforced.
 Private request receipts retain transport IDs, response IDs, usage and cache TTLs,

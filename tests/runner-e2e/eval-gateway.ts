@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { braintrustGatewayRequestParent } from "./braintrust-gateway-context.js";
 import { usdToUnits } from "../../packages/shared/src/money.js";
 import { estimateProviderCost, ProviderUsageAccumulator, type EvalModelPrice, type ProviderUsageReceipt } from "./provider-usage.js";
 import { EvalAdmissionError, validEvalLedgerId, type EvalChargeIdentity, type openEvalCostLedger } from "./cost-ledger.js";
@@ -19,7 +20,7 @@ export interface EvalGatewayRoute {
 }
 export interface EvalGatewayReceipt {
   requestId: string; status?: number; route: "direct" | "braintrust";
-  gatewayRequestId?: string; gatewaySpanId?: string; providerRequestId?: string;
+  gatewayRequestId?: string; gatewaySpanId?: string; providerRequestId?: string; braintrustParent?: string;
   endpoint?: string; cache?: string; failoverFrom?: string; failoverTo?: string; errorOrigin?: string;
   outcome: "succeeded" | "failed" | "cancelled"; errorCode?: string;
   usageComplete: boolean; final: boolean; costUsd: string | null;
@@ -111,7 +112,8 @@ export async function forwardEvalRequest(input: {
   if (input.signal?.aborted) throw new EvalRequestError("request_cancelled");
   if (Date.now() >= input.deadlineAt) throw new EvalAdmissionError("request_deadline_reached");
   const requestId = randomUUID();
-  const receipt: EvalGatewayReceipt = { requestId, route: route.mode, outcome: "failed", usageComplete: false, final: false, costUsd: null };
+  const receipt: EvalGatewayReceipt = { requestId, route: route.mode, outcome: "failed", usageComplete: false, final: false, costUsd: null,
+    ...(route.mode === "braintrust" ? { braintrustParent: braintrustGatewayRequestParent(route.projectId!, requestId, ledger.snapshot().campaignId, input.identity) } : {}) };
   const usage = new ProviderUsageAccumulator(route.provider, body);
   await ledger.reserve(requestId, input.identity, reservation);
   const abort = new AbortController();
@@ -122,7 +124,7 @@ export async function forwardEvalRequest(input: {
     const headers: Record<string, string> = { "content-type": "application/json", "accept-encoding": "identity" };
     if (route.mode === "braintrust") Object.assign(headers, {
       authorization: `Bearer ${route.apiKey}`, "x-bt-project-id": route.projectId!, "x-bt-endpoint-name": route.endpointName!,
-      "x-bt-parent": `project_id:${route.projectId}`, "x-bt-use-cache": "never", "cache-control": "no-cache, no-store",
+      "x-bt-parent": receipt.braintrustParent!, "x-bt-use-cache": "never", "cache-control": "no-cache, no-store",
     });
     else if (route.provider === "openai") headers.authorization = `Bearer ${route.apiKey}`;
     else headers["x-api-key"] = route.apiKey;

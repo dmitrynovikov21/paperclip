@@ -1,6 +1,7 @@
+import { validateWorkerTiming } from "./worker-timing.js";
 import { connectionCheckpoints, connectionEvidencePasses, connectionRunSignals } from "./connection-evidence.js";
 import { STARTUP_REUSE_LAYERS, STARTUP_REUSE_REASONS } from "../../packages/adapter-utils/src/startup-reuse.js";
-import type { RunnerE2EResult } from "./types.js";
+import type { RunnerE2ECampaignAccounting, RunnerE2EResult } from "./types.js";
 import { DEPENDABLE_CELLS } from "./dependable-qualification.js";
 
 type Rule = (value: unknown, at: string) => void;
@@ -117,7 +118,7 @@ const relativeFile: Rule = (value, at) => {
 };
 const runtime = shape({
   provider: oneOf("local", "daytona"),
-  agentRunDurationMs: number,
+  agentRunDurationMs: nullable(number),
   leaseDurationMs: nullable(number),
   leaseCount: integer,
   cpuCores: optional(number),
@@ -138,12 +139,14 @@ const llm = shape({
   runCount: integer,
   runsWithTokenUsage: integer,
   runsWithReportedCost: integer,
+  runsWithEstimatedCost: optional(integer),
   inputTokens: number,
   outputTokens: number,
   cachedInputTokens: number,
   totalTokens: number,
   reportedCostUsd: number,
-  costStatus: oneOf("reported", "partial", "unpriced", "unavailable"),
+  estimatedCostUsd: optional(number),
+  costStatus: oneOf("reported", "estimated", "partial", "unpriced", "unavailable"),
 });
 const billing = shape({
   judge: optional(shape({ inputTokens: nullable(number), outputTokens: nullable(number), estimatedCostUsd: nullable(number), reservedCostUsd: number })),
@@ -155,6 +158,43 @@ const billing = shape({
   observedAndEstimatedCostUsd: nullable(number),
   complete: boolean,
 });
+const tracing = shape({
+  projectId: string, traceId: string, spanId: string, status: oneOf("pending", "accepted", "failed"),
+  verification: oneOf("unverified"), nativeConfiguration: oneOf("not_started", "configured", "failed"),
+  companyId: optional(string), revision: optional(string), errorCode: optional(string), httpStatus: optional(number),
+  finalization: optional(shape({ spanId: string, status: oneOf("accepted", "failed"), outcome: oneOf("passed", "failed"),
+    verification: oneOf("unverified"), errorCode: optional(string), httpStatus: optional(number) })),
+});
+const feedback = shape({
+  version: (value, at) => { if (value !== 1) invalid(at); },
+  collection: oneOf("complete", "partial", "unavailable", "not_started"),
+  invocationCollection: oneOf("complete", "partial", "unavailable", "not_started"),
+  toolAvailability: oneOf("observed", "unknown"),
+  complaints: integer, suggestions: integer, bodiesCollected: integer, runsInspected: integer,
+  invocations: shape({ completed: integer, failed: integer, unknown: integer }),
+  review: array(shape({ fingerprint: (value, at) => { if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) invalid(at); },
+    kind: oneOf("complaint", "suggestion"), occurrences: integer, disposition: oneOf("needs_investigation") })),
+});
+
+export function validateCampaignAccounting(value: RunnerE2ECampaignAccounting) {
+  shape({
+    version: (version, at) => { if (version !== 1) invalid(at); },
+    scope: oneOf("retained_attempts", "selected_results"),
+    missingAttempts: integer,
+    excludedArtifacts: integer,
+    attempts: array(shape({
+      id: string, executionId: string, attempt: integer,
+      startedAt: date, finishedAt: date, durationMs: number,
+      status: oneOf("passed", "failed"), cleanup: oneOf("not_started", "passed", "failed"), billing, feedback: optional(feedback), tracing: optional(tracing),
+    })),
+  })(value, "accounting");
+  if (new Set(value.attempts.map(attempt => attempt.id)).size !== value.attempts.length) invalid("accounting.attempts duplicate id");
+  for (const attempt of value.attempts) {
+    if (attempt.workerTiming !== undefined) {
+      try { validateWorkerTiming(attempt.workerTiming, attempt); } catch { invalid("accounting.attempts.workerTiming"); }
+    }
+  }
+}
 const matcher: Rule = (value, at) => {
   object(value, at);
   const item = value as Record<string, unknown>;
@@ -182,6 +222,7 @@ const matcher: Rule = (value, at) => {
   rule(value, at);
 };
 const fields = {
+  accountingIdentity: optional(shape({ campaignId: string, attemptId: string })),
   publicMcp: optional(assistant),
   schema: oneOf(
     "paperclip.runner-e2e.result/v1",
@@ -268,11 +309,13 @@ const fields = {
   startedAt: date,
   finishedAt: date,
   durationMs: number,
+  workerTiming: optional(object),
   // Provider usage is intentionally opaque. Billing reads only finite numbers;
   // the dashboard shows opaque diagnostics through escaped JSON.
   usage: optional(nullable(object)),
   runtimeUsage: optional(runtime),
   billing: optional(billing),
+  feedback: optional(feedback), tracing: optional(tracing),
   matcherResults: optional(
     array(shape({ matcher, passed: boolean, detail: string })),
   ),
@@ -344,6 +387,9 @@ export function validateRetainedRunnerResult(
 ): asserts value is RunnerE2EResult {
   result(value, "result");
   const checked = value as RunnerE2EResult;
+  if (checked.workerTiming !== undefined) {
+    try { validateWorkerTiming(checked.workerTiming, checked); } catch { invalid("result.workerTiming"); }
+  }
   if (checked.suiteId === "product-journeys" && checked.status === "passed") {
     const evidence = checked.productJourney;
     if (!evidence) return invalid("result.productJourney");

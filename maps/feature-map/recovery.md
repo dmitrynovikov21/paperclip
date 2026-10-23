@@ -67,6 +67,16 @@ Use the task's Retry action. It can create an isolated attempt after old executi
 is contained even when old-file preservation remains unresolved. Approval,
 credentials, budget and deliberate pause use their existing specific controls.
 
+For a connected conversation, click Retry while an exact retained source still
+needs containment. Observe a saved wait with no new executor. After verified
+containment, the same chat receipt must admit one successor with the original
+source batch. Reload and repeat reconciliation. Check that a paused endpoint,
+changed source, superseded request or revoked access cannot start that work.
+The connected-chat database regression in
+[chat channel integration](../../server/src/__tests__/chat-channels.integration.test.ts)
+exercises admission and queue continuation. It does not establish hosted
+provider recovery or successful delivery.
+
 ### `post-stop-message`
 
 After a stop, send a new instruction on the same task or inspect one already

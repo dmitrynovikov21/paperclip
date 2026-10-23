@@ -69,7 +69,11 @@ board task-mutation authority, not agent retry authority. The only request
 fields are a UUID idempotency key and observed source run (or null). It accepts
 no paths, stop attestations or client-selected strategy. The source-scoped
 exact-run and maintenance APIs retain their existing contracts. Connected-chat
-Retry reuses chat admission and its external identity. See the
+Retry reuses chat admission and its external identity. It can persist a wait
+only for the exact current system recovery generation. The chat owner resumes
+that same deferred receipt through normal admission after containment. The
+board intent and external principal remain separate authorities; current task,
+connection, pause and budget gates still apply. See the
 [durable contract](../../doc/task-recovery.md). Agent Chat also requires its
 current conversation owner and feature enablement at admission and locked
 dispatch; generic board mutation permission does not replace chat ownership.

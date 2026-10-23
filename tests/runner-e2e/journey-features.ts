@@ -34,6 +34,9 @@ associate(["local-session-integrity", "extended-harnesses", "grok-qualification"
 associate(["question-resume"], {
   "question-answer-resume": ["questions-and-approvals/questions", "questions-and-approvals/continuation"],
 });
+associate(["feedback-persistence"], {
+  "complaint-and-suggestion": ["activity/agent-commentary"],
+});
 associate(["continuation"], {
   "answer-updates-scope": ["questions-and-approvals/questions", "questions-and-approvals/continuation"],
   "clarification-not-approval": ["questions-and-approvals/questions", "questions-and-approvals/confirmations"],

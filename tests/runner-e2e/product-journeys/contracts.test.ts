@@ -143,6 +143,8 @@ describe("deployment journey contracts", () => {
     onboarding.runIds=["run-1"]; onboarding.usage={runs:[{runId:"run-1",usage:{costUsd:0.5,inputTokens:10,outputTokens:10}}]};
     onboarding.productJourney!.operations={campaignId:"campaign",attemptId:"attempt",modelCostUsd:0.7,setupCostUsd:0.2,requestCount:2,feedback:{collection:"complete",complaints:0,suggestions:1},traceIds:[]};
     expect(aggregateCampaignBilling([onboarding,result()]).observedAndEstimatedCostUsd).toBeCloseTo(0.7);
+    onboarding.usage={runs:[{runId:"run-1",usage:{costUsdExact:"0.5",costStatus:"estimated",inputTokens:10,outputTokens:10}}]};
+    expect(aggregateCampaignBilling([onboarding,result()]).observedAndEstimatedCostUsd).toBeCloseTo(0.7);
     expect(()=>validateJourneyCollection({journeyId:"cloud-onboarding",runIds:["run"],usage:{runs:[{runId:"run",usage:{apiKey:"not-retainable"} as any}]}})).toThrow("invalid_collection_receipt");
     onboarding.productJourney!.operations.modelCostUsd=null;
     expect(aggregateCampaignBilling([onboarding,result()]).observedAndEstimatedCostUsd).toBeNull();

@@ -511,3 +511,8 @@ covers projectless task files, deferred repository acquisition, controller resta
 and nested Git/dirty-file persistence on legacy local, native local and native
 Daytona OpenCode. Its three configured cells use independent filesystem, public
 API and download oracles; no live qualification is implied by fixture registration.
+
+The explicit-only [feedback persistence case](../tests/runner-e2e/README.md#feedback-persistence-explicit-only)
+checks real native complaint/suggestion submissions and retained bodies with
+run-attributed tool receipts. It is manual, uses the normal Product E2E report,
+and keeps synthetic feedback distinct from actionable product findings.

@@ -802,6 +802,9 @@ describe("remote runner process supervision", () => {
     await writeFile(fixture, 'require("node:net").createServer().listen(0,"127.0.0.1",()=>process.stdout.write("ready\\n"));');
     let child: ReturnType<typeof spawn> | undefined;
     let probes = 0;
+    let healthyProbes = 0;
+    let releaseExitProbe!: () => void;
+    const exitProbeReady = new Promise<void>(resolve => { releaseExitProbe = resolve; });
     let settled = false;
     const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
     const execute = vi.fn(async (input: { command: string; args?: string[] }) => {
@@ -817,12 +820,15 @@ describe("remote runner process supervision", () => {
         return ok;
       }
       if (label === "paperclip-runner-monitor" && ++probes === 1) return { ...ok, exitCode: null, timedOut: true };
-      return await new Promise<{ exitCode: number | null; signal: null; timedOut: boolean; stdout: string; stderr: string }>(resolve => {
+      if (label === "paperclip-runner-monitor" && probes > 2) await exitProbeReady;
+      const observed = await new Promise<{ exitCode: number | null; signal: null; timedOut: boolean; stdout: string; stderr: string }>(resolve => {
         execFile(input.command, input.args ?? [], { timeout: 2_000 }, (error, stdout, stderr) => resolve({
           exitCode: error ? typeof error.code === "number" ? error.code : null : 0,
           signal: null, timedOut: !!error?.killed, stdout, stderr,
         }));
       });
+      if (label === "paperclip-runner-monitor" && observed.exitCode === 0 && !observed.timedOut) healthyProbes++;
+      return observed;
     });
     const handle = createRemoteRunnerProcessLauncher({
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
@@ -831,17 +837,21 @@ describe("remote runner process supervision", () => {
     })({ command: fixture, args: [], cwd: root, environment: {} });
     void handle.completion.then(() => { settled = true; }, () => { settled = true; });
     try {
-      await vi.waitFor(() => expect(probes).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+      await vi.waitFor(() => expect(healthyProbes).toBe(1), { timeout: 5_000 });
       expect(settled).toBe(false);
       expect(handle.isExitConfirmed?.()).toBe(false);
       expect(() => process.kill(child!.pid!, 0)).not.toThrow();
       expect((await readFile(marker, "utf8")).split("\n")[1]).toBe(String(child!.pid));
       expect(execute.mock.calls.filter(([x]) => x.args?.[2] === "paperclip-runner-launch")).toHaveLength(1);
+      const childStopped = new Promise<void>(resolve => { child!.once("exit", () => resolve()); });
       child!.kill("SIGTERM");
+      await childStopped;
+      releaseExitProbe();
       await handle.completion;
       expect(handle.isExitConfirmed?.()).toBe(true);
     } finally {
       child?.kill("SIGKILL");
+      releaseExitProbe();
       await handle.completion.catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }

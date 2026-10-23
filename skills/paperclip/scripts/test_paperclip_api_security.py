@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 
@@ -44,6 +45,17 @@ def token_in_proc_argv(token, pids):
                 return True
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
+    return False
+
+
+def wait_for_token_in_proc_argv(token, process, timeout=5):
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if token_in_proc_argv(token, process_tree(process.pid)):
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
     return False
 
 
@@ -259,7 +271,8 @@ class ApiHelperSecurityTest(unittest.TestCase):
         token = self.token.encode()
         control = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)", self.token])
         try:
-            self.assertTrue(token_in_proc_argv(token, process_tree(control.pid)), "RED control missed /proc argv")
+            self.assertFalse(wait_for_token_in_proc_argv(b"absent." + token, control, timeout=0.05))
+            self.assertTrue(wait_for_token_in_proc_argv(token, control), "RED control missed /proc argv")
             self.assertTrue(token_in_ps_argv(token, process_tree(control.pid)), "RED control missed ps argv")
         finally:
             control.terminate()

@@ -602,6 +602,40 @@ describe("native runner file handoff", () => {
       .rejects.toThrow(/size|hash/);
   });
 
+  it("reads provider files before mutation locks and replays without reading again", async () => {
+    const body = Buffer.from("Provider callback output\n");
+    const reader = vi.fn(async () => {
+      await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '500ms'`);
+        await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, agentId)).for("share");
+      });
+      return body;
+    });
+    const remote = authority({ executionTargetKind: "remote", readRemoteTaskFile: reader });
+    const call = callFor("proof.txt", body, "provider-lock-callback");
+    const result = await remote.execute(call);
+    reader.mockRejectedValueOnce(new Error("The original file is no longer available"));
+    await expect(remote.execute(call)).resolves.toEqual(result);
+    expect(reader).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects publication if agent authority changes during a provider read", async () => {
+    const body = Buffer.from("Revoked output\n");
+    const before = await db.select({ id: issueAttachments.id }).from(issueAttachments);
+    const reader = vi.fn(async () => {
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      return body;
+    });
+    try {
+      await expect(authority({ executionTargetKind: "remote", readRemoteTaskFile: reader })
+        .execute(callFor("proof.txt", body, "revoked-during-read")))
+        .rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
+      expect(await db.select({ id: issueAttachments.id }).from(issueAttachments)).toEqual(before);
+    } finally {
+      await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+    }
+  });
+
   it("registers an absolute file only through a task-location-authorizing reader", async () => {
     const body=Buffer.from("Home output\n");const reader=vi.fn(async()=>body);
     const call=callFor("/home/agent/proof.txt",body,"home-output");

@@ -108,6 +108,16 @@ async function pathExists(candidate: string): Promise<boolean> {
   return fs.access(candidate).then(() => true).catch(() => false);
 }
 
+async function writeInstructionFileIfAbsent(candidate: string, contents: Buffer): Promise<boolean> {
+  try {
+    await fs.writeFile(candidate, contents, { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
 async function stageGrokProjectAssets(input: {
   cwd: string;
   instructionsFilePath: string;
@@ -129,12 +139,17 @@ async function stageGrokProjectAssets(input: {
 
   const instructionsTarget = path.join(input.cwd, "Agents.md");
   if (input.instructionsFilePath) {
-    if (!await pathExists(instructionsTarget)) {
+    let targetExists = await pathExists(instructionsTarget);
+    if (!targetExists) {
       const instructions = await readHostFileForAgent(input.instructionsFilePath);
-      await fs.writeFile(instructionsTarget, instructions, { flag: "wx", mode: 0o600 });
-      ensureCleanupFile(instructionsTarget);
-      stagedInstructionsPath = instructionsTarget;
-    } else if (path.resolve(instructionsTarget) !== path.resolve(input.instructionsFilePath)) {
+      if (await writeInstructionFileIfAbsent(instructionsTarget, instructions)) {
+        ensureCleanupFile(instructionsTarget);
+        stagedInstructionsPath = instructionsTarget;
+      } else {
+        targetExists = true;
+      }
+    }
+    if (targetExists && path.resolve(instructionsTarget) !== path.resolve(input.instructionsFilePath)) {
       rulesFilePath = input.instructionsFilePath;
       await input.onLog(
         "stdout",
@@ -145,9 +160,10 @@ async function stageGrokProjectAssets(input: {
     const canonicalAgents = path.join(input.cwd, "AGENTS.md");
     if (!await pathExists(instructionsTarget) && await pathExists(canonicalAgents)) {
       const instructions = await readHostFileForAgent(canonicalAgents);
-      await fs.writeFile(instructionsTarget, instructions, { flag: "wx", mode: 0o600 });
-      ensureCleanupFile(instructionsTarget);
-      stagedInstructionsPath = instructionsTarget;
+      if (await writeInstructionFileIfAbsent(instructionsTarget, instructions)) {
+        ensureCleanupFile(instructionsTarget);
+        stagedInstructionsPath = instructionsTarget;
+      }
     }
   }
 

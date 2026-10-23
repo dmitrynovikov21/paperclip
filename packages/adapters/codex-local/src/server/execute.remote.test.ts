@@ -91,6 +91,34 @@ describe("codex remote execution", () => {
     }
   });
 
+  it.skipIf(process.platform !== "linux")("rejects linked instructions before workspace staging or bridge startup", async () => {
+    const root = await mkdtemp(path.join(process.cwd(), ".codex-instructions-guard-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const key = path.join(root, "master.key");
+    const instruction = path.join(root, "instructions.md");
+    await mkdir(workspace);
+    await writeFile(key, "SYNTHETIC_MASTER_KEY");
+    await symlink(key, instruction);
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100000));
+    const logs: string[] = [];
+
+    await expect(execute({
+      runId: "codex-instructions-guard",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      config: { engine: "cli", env: { OPENAI_API_KEY: "sk-test-key" }, instructionsFilePath: instruction },
+      context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+      executionTarget: { kind: "remote", transport: "sandbox" },
+      onLog: async (_stream: "stdout" | "stderr", chunk: string) => { logs.push(chunk); },
+    } as never)).rejects.toThrow();
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
+    expect(runChildProcess).not.toHaveBeenCalled();
+    expect(logs.join("")).not.toContain("SYNTHETIC_MASTER_KEY");
+  });
+
   it("refuses an agent-selected home with a linked synthetic key before sandbox sync", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-home-escape-"));
     cleanupDirs.push(root);

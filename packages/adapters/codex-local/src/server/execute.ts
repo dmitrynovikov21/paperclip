@@ -670,6 +670,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     : useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const envConfig = parseObject(config.env);
+  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  let instructionsPrefix = "";
+  if (instructionsFilePath) {
+    try {
+      const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
+      instructionsPrefix =
+        `${instructionsContents}\n\n` +
+        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsDir}.\n\n`;
+    } catch (err) {
+      if (isolatedHostAgentRuntimeEnabled()) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      await onLog(
+        "stdout",
+        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
+      );
+    }
+  }
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   let configuredCodexHome =
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
@@ -1176,25 +1195,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
-    }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
-    let instructionsPrefix = "";
-    if (instructionsFilePath) {
-      try {
-        const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
-        instructionsPrefix =
-          `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${instructionsFilePath}. ` +
-          `Resolve any relative file references from ${instructionsDir}.\n\n`;
-      } catch (err) {
-        if (isolatedHostAgentRuntimeEnabled()) throw err;
-        const reason = err instanceof Error ? err.message : String(err);
-        await onLog(
-          "stdout",
-          `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
-        );
-      }
     }
     const repoAgentsNote =
       "Codex exec automatically applies repo-scoped AGENTS.md instructions from the current workspace; Paperclip does not currently suppress that discovery.";

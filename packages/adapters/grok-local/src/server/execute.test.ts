@@ -403,6 +403,39 @@ describe("grok_local execute", () => {
     expect(logs.map((entry) => entry.chunk)).not.toEqual([]);
   });
 
+  it.each([true, false])("keeps another run's Agents.md after an exclusive-write collision (custom=%s)", async (custom) => {
+    const root = await makeTempRoot();
+    const source = custom ? path.join(root, "managed", "AGENTS.md") : path.join(root, "AGENTS.md");
+    const target = path.join(root, "Agents.md");
+    await fs.mkdir(path.dirname(source), { recursive: true });
+    await fs.writeFile(source, "source instructions");
+    const realWriteFile = fs.writeFile.bind(fs);
+    let collided = false;
+    const writeSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      const [candidate, , options] = args;
+      if (!collided && String(candidate) === target && typeof options === "object" && options?.flag === "wx") {
+        collided = true;
+        await realWriteFile(target, "another run's instructions", { flag: "wx", mode: 0o600 });
+        throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+      }
+      return realWriteFile(...args);
+    });
+    runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+    const ctx = await makeCtx("grok-instruction-collision", root);
+    if (custom) ctx.config.instructionsFilePath = source;
+
+    try {
+      expect(await execute(ctx)).toMatchObject({ exitCode: 0 });
+      expect(collided).toBe(true);
+      expect(await fs.readFile(target, "utf8")).toBe("another run's instructions");
+      const args = runProcessMock.mock.calls[0][3] as string[];
+      expect(args.includes("--rules")).toBe(custom);
+      if (custom) expect(args).toContain("@" + source);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
   it("reports real per-run token usage, marks it as per_run, and only surfaces cost for API billing", async () => {
     runProcessMock.mockImplementation(async () => ({
       exitCode: 0,

@@ -228,6 +228,12 @@ In isolation mode, the Kubernetes provider must resolve to the exact bundled
 directory. An npm install with the expected package name or plugin key is not
 trusted without artifact verification and is refused before its worker starts;
 a local path override outside the bundled directory is also refused.
+The bundle, every ancestor directory, and the bundle's files and dependency
+symlink targets must be owned by the service UID or root, with no group or
+other write permission. Startup and plugin activation refuse an agent-writable
+checkout or bundle before importing its manifest or starting its worker. Move
+the release image or checkout under a service/root-owned path before cutover;
+changing only the master key file permissions is insufficient.
 The same pre-import rule applies to every plugin identity: only built-in release
 bundles and digest-verified distribution bundles may load. Other npm packages
 and local plugin paths are refused before a build, executable manifest import,

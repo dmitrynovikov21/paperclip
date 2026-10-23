@@ -31,13 +31,30 @@ export async function runLocalGit(
     maxBuffer?: number;
   } = {},
 ): Promise<GitCommandResult> {
+  // Do not let an ambient Git environment redirect repository discovery or
+  // load executable config from a path outside the checked repository when
+  // the service process holds the local master key.
+  const isolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
+  const gitEnv = isolated
+    ? Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")))
+    : process.env;
+  if (isolated) {
+    gitEnv.GIT_CONFIG_NOSYSTEM = "1";
+    gitEnv.GIT_CONFIG_GLOBAL = "/dev/null";
+    gitEnv.GIT_TERMINAL_PROMPT = "0";
+  }
   return await new Promise<GitCommandResult>((resolve, reject) => {
     execFile(
       "git",
-      ["-C", localDir, ...args],
+      [
+        "-C", localDir,
+        ...(isolated ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "core.fsmonitor=false"] : []),
+        ...args,
+      ],
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
+        env: gitEnv,
       },
       (error, stdout, stderr) => {
         if (error) {

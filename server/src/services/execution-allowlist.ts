@@ -29,6 +29,8 @@ export const KUBERNETES_PROVIDER_KEY = "kubernetes" as const;
  */
 export interface ExecutionPolicy {
   executionMode?: "kubernetes" | "any";
+  /** A local master key is held by a service UID; agent code must run elsewhere. */
+  requireIsolatedAgentRuntime?: boolean;
 }
 
 /**
@@ -77,6 +79,14 @@ export function evaluateExecutionAllowlist(
   policy: ExecutionPolicy | null | undefined,
   candidate: ExecutionEnvironmentCandidate,
 ): ExecutionAllowlistDecision {
+  if (policy?.requireIsolatedAgentRuntime && !isKubernetesSandboxEnvironment(candidate)) {
+    return {
+      allowed: false,
+      reason: "Isolated local secrets require the Kubernetes sandbox provider; local, SSH and other sandbox execution is refused.",
+      deniedDriver: candidate.driver,
+      deniedProvider: candidate.provider ?? null,
+    };
+  }
   if (!isExecutionForcedToKubernetes(policy)) {
     return { allowed: true };
   }

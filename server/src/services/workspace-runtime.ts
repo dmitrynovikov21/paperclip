@@ -39,6 +39,7 @@ import { workspaceOperationService, type WorkspaceOperationRecorder } from "./wo
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -579,11 +580,13 @@ async function executeProcess(input: {
 }
 
 async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
+  const guardedCwd = await assertHostGitWorkspaceAllowed(cwd);
+  const git = prepareHostGitInvocation(args, opts?.env);
   const proc = await executeProcess({
     command: "git",
-    args,
-    cwd,
-    env: opts?.env,
+    args: git.args,
+    cwd: guardedCwd,
+    env: git.env,
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
@@ -973,10 +976,13 @@ async function getGitWorktreeBranchAncestryVerdict(input: {
 }): Promise<GitWorktreeBranchAncestryVerdict> {
   if (!input.expectedHeadSha || !input.actualHeadSha) return "unknown";
 
+  const guardedCwd = await assertHostGitWorkspaceAllowed(input.repoRoot);
+  const git = prepareHostGitInvocation(["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha]);
   const proc = await executeProcess({
     command: "git",
-    args: ["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha],
-    cwd: input.repoRoot,
+    args: git.args,
+    cwd: guardedCwd,
+    env: git.env,
   }).catch(() => null);
   if (!proc) return "unknown";
   if (proc.code === 0) return "ancestor";
@@ -2520,10 +2526,13 @@ async function recordGitOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
+      const guardedCwd = await assertHostGitWorkspaceAllowed(input.cwd);
+      const git = prepareHostGitInvocation(input.args);
       const result = await executeProcess({
         command: "git",
-        args: input.args,
-        cwd: input.cwd,
+        args: git.args,
+        cwd: guardedCwd,
+        env: git.env,
       });
       stdout = result.stdout;
       stderr = result.stderr;
@@ -2572,6 +2581,11 @@ async function recordWorkspaceCommandOperation(
     onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   },
 ) {
+  // These commands run on the Paperclip host as the service UID, before the
+  // sandbox agent starts. That UID owns the local master key in isolated mode.
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    throw new Error("Isolated local secrets forbid host workspace commands.");
+  }
   if (!recorder) {
     await runWorkspaceCommand(input);
     return null;
@@ -4245,6 +4259,9 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    throw new Error("Isolated local secrets forbid host runtime services.");
+  }
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
   const startedByRunId = input.startedByRunId === undefined ? input.runId : input.startedByRunId;
   const identity = resolveRuntimeServiceReuseIdentity({

@@ -2597,6 +2597,13 @@ export function createToolGatewayService(
     parameters: unknown;
     timeoutMs: number;
   }): Promise<unknown> {
+    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+      throw new ToolGatewayHttpError(
+        403,
+        "Local stdio MCP connections are unavailable with isolated local secrets",
+        "local_stdio_unavailable_in_isolated_mode",
+      );
+    }
     if (!input.template.command) {
       throw new ToolGatewayHttpError(
         501,

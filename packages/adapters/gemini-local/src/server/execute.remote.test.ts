@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -100,6 +100,51 @@ describe("gemini remote execution", () => {
     }
   });
 
+  it("rejects a skill link to a synthetic key before remote sync", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-skill-escape-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const skillDir = path.join(workspaceDir, "skill");
+    const key = path.join(rootDir, "synthetic-master.key");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(path.join(skillDir, "SKILL.md"), "# skill\n");
+    await writeFile(key, "synthetic-key-bytes\n");
+    await symlink(key, path.join(skillDir, "leak"));
+
+    await expect(execute({
+      runId: "run-skill-escape",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Gemini Builder",
+        adapterType: "gemini_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "gemini",
+        paperclipRuntimeSkills: [{ key: "company/leaky", runtimeName: "leaky", source: skillDir }],
+        paperclipSkillSync: { desiredSkills: ["company/leaky"] },
+      },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    })).rejects.toThrow(/symbolic link/);
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
   it("prepares the workspace, syncs Gemini skills, and restores workspace changes for remote SSH execution", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-remote-"));
     cleanupDirs.push(rootDir);
@@ -181,7 +226,7 @@ describe("gemini remote execution", () => {
     expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/gemini/skills`,
-      followSymlinks: true,
+      followSymlinks: false,
     }));
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),
@@ -246,11 +291,16 @@ describe("gemini remote execution", () => {
         stats: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
       }),
     ].join("\n");
+    const emptyWorkspaceTar = Buffer.alloc(1024);
     const runnerExecute = vi.fn(async (input: { command: string; args?: string[] }) => ({
       exitCode: 0,
       signal: null,
       timedOut: false,
-      stdout: input.command === "gemini" ? geminiOutput : "",
+      stdout: input.command === "gemini" ? geminiOutput
+        : input.args?.some((arg) => arg.includes("wc -c <")) ? `${emptyWorkspaceTar.length}\n`
+        : input.args?.some((arg) => arg.includes("dd if=") && arg.includes("| base64"))
+          ? emptyWorkspaceTar.toString("base64")
+          : "",
       stderr: "",
       pid: 321,
       startedAt: new Date().toISOString(),

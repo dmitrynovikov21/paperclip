@@ -122,6 +122,7 @@ describe("gemini remote execution", () => {
       },
       runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
       config: {
+        engine: "cli",
         command: "gemini",
         paperclipRuntimeSkills: [{ key: "company/leaky", runtimeName: "leaky", source: skillDir }],
         paperclipSkillSync: { desiredSkills: ["company/leaky"] },

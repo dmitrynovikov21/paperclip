@@ -193,9 +193,11 @@ describePostgres("heartbeat Unicode context", () => {
     const saved = await heartbeat.getRun(run!.id);
     expect(saved?.status).toBe("succeeded");
     expect(saved?.errorCode).not.toBe("setup_failed");
-    expect(saved?.contextSnapshot).toMatchObject({ nested: { damaged: "\uFFFD" } });
+    expect(saved?.contextSnapshot).toMatchObject({ issueId, commentId, annotationCommentId: annotationId });
+    expect(saved?.contextSnapshot).not.toHaveProperty("nested");
     expect(JSON.stringify(saved?.contextSnapshot)).not.toMatch(/\\u[dD][89aAbB][0-9a-fA-F]{2}/);
-    expect(capturedContexts).toHaveLength(1);
+    // A successful run can schedule bounded task-liveness continuations.
+    expect(capturedContexts.length).toBeGreaterThan(0);
     expect((capturedContexts[0]?.paperclipIssue as { description: string }).description).toBe(description);
     const capturedWake = capturedContexts[0]?.paperclipWake as {
       issue: { description: string };

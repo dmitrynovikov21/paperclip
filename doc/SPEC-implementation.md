@@ -664,6 +664,9 @@ The watched subtree is the source issue plus descendants reached through `parent
 
 Task-watchdog wakes must include server-derived capability metadata that names the watched root, reusable watchdog issue, excluded `task_watchdog` origin branches, allowed operations, and denied operations. Watchdogs must use that metadata and server denials for capability discovery; they must not create visible probe issues, comments, or throwaway tasks to learn their permissions.
 
+An active source-scoped recovery action remains owned by its recovery owner. If another agent is the watchdog, the wake metadata must withhold status-transition and reassignment capabilities for that issue, identify the affected issue, recovery action, and owner, and retain those capabilities for other eligible issues in the watched subtree. The watchdog verifies that this action is still active and, when it already supplies the next live path, records its finding on the reusable watchdog issue without changing or commenting on the recovery-owned issue.
+Recovery-owner handoffs are safety-critical capability metadata and must not be silently truncated in the wake or prompt; every protected issue needs its own denial and owner even when the watched subtree is large.
+
 ### Allowed watchdog mutations
 
 Within the watched subtree, a watchdog run may perform only mutations that restore or clarify the next live/waiting path:

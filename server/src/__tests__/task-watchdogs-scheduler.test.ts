@@ -14,6 +14,7 @@ import {
   issueDocuments,
   issueApprovals,
   issueLabels,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -62,6 +63,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueWatchdogs);
+    await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -254,6 +256,123 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       waitsByIssueId: {},
     });
     expect(watchdog?.triggerCount).toBe(1);
+  });
+
+  it("hands a recovery-owned blocked leaf to its owner without another watchdog wake", async () => {
+    const companyId = await seedCompany();
+    const workerId = await seedAgent(companyId, { name: "Worker" });
+    const recoveryOwnerId = await seedAgent(companyId, { name: "Recovery owner" });
+    const watchdogAgentId = await seedAgent(companyId, { name: "Watchdog" });
+    const sourceId = await seedIssue(companyId, {
+      identifier: "WDOG-RECOVERY",
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    const [recoveryAction] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: sourceId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwnerId,
+      previousOwnerAgentId: workerId,
+      returnOwnerAgentId: workerId,
+      cause: "issue_continuation_waiting_on_review",
+      fingerprint: "review-recovery-state",
+      nextAction: "Return the issue to review.",
+    }).returning();
+    await seedWatchdog(companyId, sourceId, watchdogAgentId);
+    const { service, wakes } = createService();
+
+    const first = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(first).toMatchObject({ checked: 1, triggered: 1 });
+    expect(wakes[0]?.opts?.contextSnapshot).toMatchObject({
+      taskWatchdog: {
+        capabilities: {
+          recoveryHandoffs: [{
+            issueId: sourceId,
+            recoveryActionId: recoveryAction?.id,
+            recoveryOwnerAgentId: recoveryOwnerId,
+          }],
+        },
+      },
+    });
+    const context = wakes[0]?.opts?.contextSnapshot as {
+      taskWatchdog?: { capabilities?: { operations?: string[] } };
+    } | undefined;
+    expect(context?.taskWatchdog?.capabilities?.operations).not.toContain("transition_watched_subtree_issue_status");
+    expect(context?.taskWatchdog?.capabilities?.operations).not.toContain("reassign_watched_subtree_issues");
+
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    await seedWatchdogReviewRun(watchdog!, "succeeded");
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, watchdog!.watchdogIssueId!));
+    const second = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(second.triggered).toBe(0);
+    expect(wakes).toHaveLength(1);
+    const sourceComments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceId));
+    expect(sourceComments).toHaveLength(0);
+    const [reviewed] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    expect(reviewed?.lastReviewedFingerprint).toBe(watchdog?.lastObservedFingerprint);
+  });
+
+  it("keeps status and assignment capabilities for an unowned sibling leaf", async () => {
+    const companyId = await seedCompany();
+    const workerId = await seedAgent(companyId, { name: "Worker" });
+    const recoveryOwnerId = await seedAgent(companyId, { name: "Recovery owner" });
+    const watchdogAgentId = await seedAgent(companyId, { name: "Watchdog" });
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ROOT", status: "done" });
+    const protectedLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-PROTECTED",
+      parentId: sourceId,
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    await seedIssue(companyId, {
+      identifier: "WDOG-FREE",
+      parentId: sourceId,
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: protectedLeafId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwnerId,
+      previousOwnerAgentId: workerId,
+      returnOwnerAgentId: workerId,
+      cause: "issue_continuation_waiting_on_review",
+      fingerprint: "protected-leaf-review-state",
+      nextAction: "Return the protected leaf to review.",
+    });
+    await seedWatchdog(companyId, sourceId, watchdogAgentId);
+    const { service, wakes } = createService();
+
+    const result = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(result).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot as {
+      taskWatchdog?: { capabilities?: {
+        operations?: string[];
+        deniedOperations?: string[];
+        recoveryHandoffs?: Array<{ issueId: string; deniedOperations: string[] }>;
+      } };
+    } | undefined;
+    expect(context?.taskWatchdog?.capabilities?.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(context?.taskWatchdog?.capabilities?.deniedOperations).not.toContain("transition_watched_subtree_issue_status");
+    expect(context?.taskWatchdog?.capabilities?.recoveryHandoffs).toEqual([expect.objectContaining({
+      issueId: protectedLeafId,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
+    })]);
   });
 
   it("passes real stopped leaves and board instructions from the watchdog wake through the prompt", async () => {

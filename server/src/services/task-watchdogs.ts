@@ -11,6 +11,7 @@ import {
   issueDocuments,
   issueApprovals,
   issueRelations,
+  issueRecoveryActions,
   issues,
   issueThreadInteractions,
   issueWatchdogs,
@@ -681,12 +682,86 @@ function stoppedFingerprintMetadata(input: {
   };
 }
 
+type WatchdogRecoveryAction = {
+  id: string;
+  sourceIssueId: string;
+  status: string;
+  ownerType: string;
+  ownerAgentId: string | null;
+  ownerUserId: string | null;
+};
+
+export function taskWatchdogWakeCapabilities(input: {
+  watchdogAgentId: string;
+  watchedIssues: Pick<TaskWatchdogClassifierIssue, "id" | "identifier" | "assigneeAgentId">[];
+  activeRecoveryActions: WatchdogRecoveryAction[];
+}) {
+  const watchedById = new Map(input.watchedIssues.map((issue) => [issue.id, issue]));
+  const recoveryHandoffs = input.activeRecoveryActions
+    .filter((action) => action.status === "active" || action.status === "escalated")
+    .flatMap((action) => {
+      const issue = watchedById.get(action.sourceIssueId);
+      if (!issue || issue.assigneeAgentId === input.watchdogAgentId || action.ownerAgentId === input.watchdogAgentId) {
+        return [];
+      }
+      return [{
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        recoveryActionId: action.id,
+        recoveryOwnerType: action.ownerType,
+        recoveryOwnerAgentId: action.ownerAgentId,
+        recoveryOwnerUserId: action.ownerUserId,
+        deniedOperations: [
+          "transition_watched_subtree_issue_status",
+          "reassign_watched_subtree_issues",
+        ],
+      }];
+    })
+    .sort((left, right) => left.issueId.localeCompare(right.issueId));
+  const recoveryLockedIssueIds = new Set(recoveryHandoffs.map((handoff) => handoff.issueId));
+  const allWatchedIssuesRecoveryLocked = recoveryHandoffs.length > 0 &&
+    input.watchedIssues.every((issue) => recoveryLockedIssueIds.has(issue.id));
+  return {
+    operations: [
+      "comment_on_watched_subtree_issues",
+      ...(!allWatchedIssuesRecoveryLocked ? [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ] : []),
+      "create_child_issues_under_non_watchdog_watched_subtree",
+      "create_product_bug_followups_outside_watched_subtree",
+      "resolve_eligible_request_confirmation_plan_interactions",
+      "update_reusable_watchdog_issue",
+    ],
+    deniedOperations: [
+      "create_visible_probe_issues_or_throwaway_tasks",
+      "create_product_bug_followups_as_source_tree_children",
+      "mutate_task_watchdog_descendants",
+      "mutate_outside_watched_subtree",
+      "resolve_board_only_or_security_sensitive_approvals",
+      "create_nested_task_watchdogs",
+      ...(allWatchedIssuesRecoveryLocked ? [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ] : []),
+    ],
+    recoveryHandoffs,
+  };
+}
+
 function watchdogWakeContext(input: {
   watchdog: IssueWatchdogRow;
   watchdogIssue: IssueRow;
   sourceIssue: IssueRow;
   classification: Extract<TaskWatchdogClassifierResult, { state: "stopped" }>;
+  watchedIssues: TaskWatchdogClassifierIssue[];
+  activeRecoveryActions: WatchdogRecoveryAction[];
 }) {
+  const capabilities = taskWatchdogWakeCapabilities({
+    watchdogAgentId: input.watchdog.watchdogAgentId,
+    watchedIssues: input.watchedIssues,
+    activeRecoveryActions: input.activeRecoveryActions,
+  });
   return {
     issueId: input.watchdogIssue.id,
     taskId: input.watchdogIssue.id,
@@ -716,23 +791,7 @@ function watchdogWakeContext(input: {
           includeNonWatchdogDescendants: true,
           excludedOriginKinds: [TASK_WATCHDOG_ORIGIN_KIND],
         },
-        operations: [
-          "comment_on_watched_subtree_issues",
-          "transition_watched_subtree_issue_status",
-          "reassign_watched_subtree_issues",
-          "create_child_issues_under_non_watchdog_watched_subtree",
-          "create_product_bug_followups_outside_watched_subtree",
-          "resolve_eligible_request_confirmation_plan_interactions",
-          "update_reusable_watchdog_issue",
-        ],
-        deniedOperations: [
-          "create_visible_probe_issues_or_throwaway_tasks",
-          "create_product_bug_followups_as_source_tree_children",
-          "mutate_task_watchdog_descendants",
-          "mutate_outside_watched_subtree",
-          "resolve_board_only_or_security_sensitive_approvals",
-          "create_nested_task_watchdogs",
-        ],
+        ...capabilities,
       },
     },
     watchdogId: input.watchdog.id,
@@ -1702,6 +1761,22 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       watchdogIssue,
       sourceIssue,
       classification,
+      watchedIssues: input.issues,
+      activeRecoveryActions: await db
+        .select({
+          id: issueRecoveryActions.id,
+          sourceIssueId: issueRecoveryActions.sourceIssueId,
+          status: issueRecoveryActions.status,
+          ownerType: issueRecoveryActions.ownerType,
+          ownerAgentId: issueRecoveryActions.ownerAgentId,
+          ownerUserId: issueRecoveryActions.ownerUserId,
+        })
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, watchdog.companyId),
+          inArray(issueRecoveryActions.sourceIssueId, classification.includedIssueIds),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )),
     });
     const wake = deps.enqueueWakeup
       ? await deps.enqueueWakeup(watchdog.watchdogAgentId, {

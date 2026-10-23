@@ -1,5 +1,10 @@
 # Runner E2E fixture authoring
 
+[Deployment-targeted journeys](PRODUCT-JOURNEYS.md) resolve only their requested
+fixture graph through `FixtureRegistry.setupAll(requested)`. Omitting the
+argument preserves the existing all-fixtures behavior. A verified onboarding
+context may seed the graph; independent setup is labeled as recipe provenance.
+
 ## Connection creation fixtures
 
 See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only

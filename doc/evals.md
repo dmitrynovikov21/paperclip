@@ -6,6 +6,12 @@ one bound continuation, and an exact saved confirmation. Its four development
 cells use the recorded Codex and Claude models. Registration and calibration do
 not establish Slack, staging authentication, warm lifecycle, or live qualification.
 
+[Reusable Product journeys](../tests/runner-e2e/PRODUCT-JOURNEYS.md) add explicit
+deployment targets and starting-state recipes. The shared task-properties
+journey uses no model; Cloud onboarding supplies reusable verified state. Cloud
+fleet operations and trusted CI remain private. Local eval gateway qualification
+does not qualify Cloud routes, and these selections stay outside `--all`.
+
 The explicit-only [case handoff workflow](../tests/runner-e2e/README.md#persistent-case-handoffs-explicit-only)
 contains arithmetic and receipt smoke cells for a same-task round trip among three native agents using real case/task
 APIs, saved documents, handoff receipts, and browser readback. Receipt smoke has

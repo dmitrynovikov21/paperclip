@@ -2042,3 +2042,5 @@ export function runnerExecutionById(id: string): MatrixExecution {
   if (!execution) throw new Error(`Unknown runner E2E execution id: ${id}`);
   return execution;
 }
+
+export { productJourneys } from "./product-journeys/catalog.js";

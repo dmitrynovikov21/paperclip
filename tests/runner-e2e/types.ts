@@ -316,9 +316,9 @@ export interface RunnerE2EResult {
   profileId: string;
   environmentId: RunnerEnvironmentId;
   caseId: string;
-  provider: string;
-  model: string;
-  runtimeMode: RunnerGeneration;
+  provider: string | null;
+  model: string | null;
+  runtimeMode: RunnerGeneration | "none";
   issueId?: string;
   issueIdentifier?: string | null;
   runIds?: string[];
@@ -354,6 +354,7 @@ export interface RunnerE2EResult {
     /** Absent in historical results; new captures bind the exact PNG bytes. */
     sha256?: string;
   }>;
+  productJourney?: import("./product-journeys/types.js").JourneyEvidence;
   firstTask?: import("./first-task-scoring.js").FirstTaskEvidence;
   providerConnection?: import("./connection-evidence.js").ConnectionEvidence;
   completionQuality?: import("./completion-quality.js").CompletionQualityRecord[];
@@ -436,8 +437,8 @@ export interface RunnerE2EHistoryExecution {
   profileId: string;
   environmentId: RunnerEnvironmentId;
   caseId: string;
-  provider: string;
-  model: string;
+  provider: string | null;
+  model: string | null;
   status: "passed" | "failed" | "incomplete";
   durationMs: number;
   attempt: number;

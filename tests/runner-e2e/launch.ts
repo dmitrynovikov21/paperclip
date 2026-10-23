@@ -973,6 +973,11 @@ async function runWithConcurrency<T, R>(
 }
 
 async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes("--target-config") || args.includes("product-journeys")) {
+    const { launchProductJourneys } = await import("./product-journeys/launch.js");
+    return launchProductJourneys(args, repositoryRoot);
+  }
   let options: ReturnType<typeof parseRunnerSelectors>;
   try {
     options = parseRunnerSelectors(process.argv.slice(2));

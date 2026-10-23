@@ -146,6 +146,7 @@ function renderCase(
   const outcome = entry ? renderCaseOutcome(entry.result, entry.valid, entry.errors) : "";
   const passed = state === "passed" && entry?.result.status === "passed";
   const firstTaskChecks = entry?.result.firstTask?.checks;
+  const productChecks = entry?.result.productJourney?.checks;
   const notReached = firstTaskChecks?.filter((c) => c.notReached).length ?? 0;
   const matcherResults = firstTaskChecks?.length
     ? firstTaskChecks.filter((c) => !c.notReached).map((c) => ({
@@ -153,7 +154,10 @@ function renderCase(
         passed: c.passed,
         detail: c.detail,
       }))
-    : entry?.result.matcherResults ?? [];
+    : productChecks?.length ? productChecks.map(c => ({
+        matcher: { kind: "json_path" as const, path: `productJourney.checks.${c.id}`, expected: true },
+        passed: c.passed, detail: c.id.replaceAll("-", " "),
+      })) : entry?.result.matcherResults ?? [];
   const passedMatchers = matcherResults.filter(
     (result) => result.passed,
   ).length;

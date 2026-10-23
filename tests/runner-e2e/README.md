@@ -227,6 +227,11 @@ settlement substitutes for first visible response. The legacy warm-turn
 accordingly. Report regeneration recomputes interval verdicts, retains changed
 `recordedVerdict` values and all bounds, and leaves the original files intact.
 
+The explicit [deployment-targeted Product journeys](PRODUCT-JOURNEYS.md) reuse
+browser actions across managed self-hosted and Cloud targets. They include a
+model-free task-properties story, fresh Cloud onboarding, credential-free
+previews, private evidence, and prerequisite reuse; `--all` is unchanged.
+
 ## Live provider connection journeys
 
 See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only

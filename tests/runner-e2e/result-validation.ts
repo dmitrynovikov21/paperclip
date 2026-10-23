@@ -25,6 +25,10 @@ const integer: Rule = (value, at) => {
 const boolean: Rule = (value, at) => {
   if (typeof value !== "boolean") invalid(at);
 };
+const booleanRecord: Rule = (value, at) => {
+  object(value, at);
+  for (const [key, entry] of Object.entries(value as object)) boolean(entry, `${at}.${key}`);
+};
 const object: Rule = (value, at) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) invalid(at);
 };
@@ -218,9 +222,9 @@ const fields = {
   profileId: string,
   environmentId: oneOf("local", "daytona"),
   caseId: string,
-  provider: string,
-  model: string,
-  runtimeMode: oneOf("legacy", "native"),
+  provider: nullable(string),
+  model: nullable(string),
+  runtimeMode: oneOf("legacy", "native", "none"),
   issueId: optional(string),
   issueIdentifier: optional(nullable(string)),
   runIds: optional(array(string)),
@@ -292,6 +296,19 @@ const fields = {
       tasks: array(object), agents: array(object), comments: array(object), interactions: array(object), documents: array(object), attachments: optional(array(object)), runs: array(object) })),
     checks: array(shape({ id: string, passed: boolean, notReached: optional(string), evidence: array(string), detail: string })),
   })),
+  productJourney: optional(shape({
+    targetId: optional(string),
+    campaignId: optional(string), attemptId: optional(string),
+    operations: optional(closedShape({ campaignId: string, attemptId: string, modelCostUsd: nullable(number), setupCostUsd: nullable(number), requestCount: integer,
+      feedback: closedShape({ collection: oneOf("complete", "partial", "unavailable"), complaints: integer, suggestions: integer }), traceIds: array(string) })),
+    outcome: oneOf("passed", "failed", "blocked", "unsupported"),
+    deployment: optional(shape({ kind: oneOf("self-hosted", "cloud"), targetId: string, origin: url, commit: string, cloudRelease: nullable(string), runtimeImage: nullable(string), configurationHash: string,
+      effectiveFeatures: optional(booleanRecord), executionEnvironment: optional(closedShape({ id: string, driver: string, status: string })) })),
+    startingState: oneOf("recipe", "onboarding"), privacy: oneOf("private"),
+    phases: array(shape({ phase: oneOf("authentication", "setup", "journey", "collection", "cleanup"), outcome: oneOf("passed", "failed", "blocked", "unsupported"), code: optional(string) })),
+    checks: array(shape({ id: string, passed: boolean })),
+    resourceDisposition: oneOf("released", "retained", "cleanup-failed"),
+  })),
   providerConnection: optional(shape({
     version: integer,
     outcome: oneOf("running", "passed", "failed", "awaiting_user", "missing_credential", "blocked_target"),
@@ -327,5 +344,13 @@ export function validateRetainedRunnerResult(
 ): asserts value is RunnerE2EResult {
   result(value, "result");
   const checked = value as RunnerE2EResult;
+  if (checked.suiteId === "product-journeys" && checked.status === "passed") {
+    const evidence = checked.productJourney;
+    if (!evidence) return invalid("result.productJourney");
+    const required = checked.caseId === "task-properties" ? ["assignment-persisted", "no-agent-work"] : ["fresh-workspace", "ui-connection-and-native-agent", "first-task-complete", "downloadable-artifact-verified", "native-trace-verified"];
+    if (evidence.outcome !== "passed" || !evidence.deployment || !required.every(id => evidence.checks.some(c => c.id === id && c.passed)) || evidence.phases.some(p => p.outcome !== "passed") || checked.cleanup !== "passed") invalid("result.productJourney");
+    if (checked.caseId === "task-properties" && (checked.runtimeMode !== "none" || checked.provider !== null || checked.model !== null || checked.runIds?.length)) invalid("result.browserOnly");
+    if (checked.caseId === "cloud-onboarding" && (!checked.runIds?.length || !evidence.operations || !evidence.operations.requestCount || !evidence.operations.traceIds.length || evidence.operations.campaignId !== evidence.campaignId || evidence.operations.attemptId !== evidence.attemptId)) invalid("result.paidJourneyReceipt");
+  }
   if (checked.suiteId === "provider-connections" && checked.status === "passed" && (!checked.providerConnection || !connectionEvidencePasses(checked.providerConnection))) invalid("result.providerConnection");
 }

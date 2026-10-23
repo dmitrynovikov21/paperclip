@@ -1,5 +1,12 @@
 # Runner E2E security for a public repository
 
+[Cloud Product journey bundles](PRODUCT-JOURNEYS.md) are always private and
+rejected by public history publication. Authentication uses an isolated browser
+context without saved storage state or auth tracing. Only closed error codes
+and normalized operations receipts cross the private target-provider boundary.
+The private Cloud repository owns operator credentials, conditional S3 leases,
+ownership manifests, cleanup recovery, and environment-protected CI dispatch.
+
 ## Attended connection authentication
 
 See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only

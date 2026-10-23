@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildRemoteGitDeltaBundleScript,
@@ -28,6 +28,7 @@ describe("git workspace sync", () => {
   const cleanupDirs: string[] = [];
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;
@@ -47,6 +48,28 @@ describe("git workspace sync", () => {
     await git(repo, ["commit", "-m", "base"]);
     return repo;
   }
+
+  it("does not invoke a Git hook that delegates to an agent-writable script in isolated mode", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-hook-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    const marker = path.join(rootDir, "hook-ran");
+    const agentScript = path.join(repo, "agent-script.sh");
+    const hook = path.join(repo, ".git", "hooks", "reference-transaction");
+    const head = await git(repo, ["rev-parse", "HEAD"]);
+    await writeFile(agentScript, `#!/bin/sh\nprintf 'agent script ran\\n' > '${marker}'\n`, { mode: 0o777 });
+    await writeFile(hook, `#!/bin/sh\n'${agentScript}'\n`, { mode: 0o755 });
+
+    // The hook file is service-owned, but its target is editable by the agent.
+    // A normal update-ref executes it; the isolated Git invocation must not.
+    await git(repo, ["update-ref", "refs/paperclip/probe-before", head]);
+    await expect(readFile(marker, "utf8")).resolves.toContain("agent script ran");
+    await rm(marker);
+
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    await git(repo, ["update-ref", "refs/paperclip/probe-after", head]);
+    await expect(readFile(marker)).rejects.toThrow();
+  });
 
   it("creates a shallow standalone clone from the local HEAD snapshot", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-sync-"));

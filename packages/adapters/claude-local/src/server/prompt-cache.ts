@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, type Hash } from "node:crypto";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
-  ensurePaperclipSkillSymlink,
+  materializePaperclipSkillCopy,
   resolvePaperclipInstanceRootForAdapter,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -49,12 +49,6 @@ async function hashPathContents(
 
   if (stat.isSymbolicLink()) {
     hash.update(`symlink:${relativePath}\n`);
-    const resolved = await fs.realpath(candidate).catch(() => null);
-    if (!resolved) {
-      hash.update("missing\n");
-      return;
-    }
-    await hashPathContents(resolved, hash, relativePath, seenDirectories);
     return;
   }
 
@@ -146,15 +140,22 @@ export async function prepareClaudePromptBundle(input: {
   const skillsHome = path.join(rootDir, ".claude", "skills");
   await fs.mkdir(skillsHome, { recursive: true });
 
+  const runtimeNames = new Set<string>();
   for (const entry of skills) {
+    const name = entry.runtimeName;
+    if (!name || name === "." || name === ".." || /[\\/]/.test(name) || runtimeNames.has(name)) {
+      throw new Error(`Invalid or duplicate Paperclip skill runtime name: ${name}`);
+    }
+    runtimeNames.add(name);
     const target = path.join(skillsHome, entry.runtimeName);
     try {
-      await ensurePaperclipSkillSymlink(entry.source, target);
+      await materializePaperclipSkillCopy(entry.source, target, { rejectSymlinks: true });
     } catch (err) {
       await onLog(
         "stderr",
         `[paperclip] Failed to materialize Claude skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`,
       );
+      throw err;
     }
   }
 

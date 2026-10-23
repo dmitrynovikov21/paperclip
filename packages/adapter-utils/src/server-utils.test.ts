@@ -14,6 +14,7 @@ import {
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
+  buildPaperclipRuntimeSkillsAssetDir,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   isPaperclipExternalChatContractTurn,
@@ -304,6 +305,77 @@ describe("sanitizeSshRemoteEnv", () => {
 });
 
 describe("materializePaperclipSkillCopy", () => {
+  it("rejects a nested link to a synthetic key before building a sandbox skills asset", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-asset-test-"));
+    try {
+      const source = path.join(root, "skill");
+      const key = path.join(root, "synthetic-master.key");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# safe skill\n");
+      await fs.writeFile(key, "synthetic-key-bytes\n");
+      await fs.symlink(key, path.join(source, "leak"));
+
+      await expect(buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-skill-asset-reject-",
+      )).rejects.toThrow(/symbolic link/);
+      await expect(fs.readFile(key, "utf8")).resolves.toBe("synthetic-key-bytes\n");
+
+      await fs.rm(path.join(source, "leak"));
+      const staged = await buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-skill-asset-allow-",
+      );
+      try {
+        await expect(fs.readFile(path.join(staged, "skill", "SKILL.md"), "utf8"))
+          .resolves.toBe("# safe skill\n");
+        expect((await fs.lstat(path.join(staged, "skill"))).isDirectory()).toBe(true);
+      } finally {
+        await fs.rm(path.dirname(staged), { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a skill source reached through a symlinked parent", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-parent-link-"));
+    try {
+      const source = path.join(root, "real", "skill");
+      await fs.mkdir(source, { recursive: true });
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      await fs.symlink(path.join(root, "real"), path.join(root, "linked"));
+
+      await expect(materializePaperclipSkillCopy(
+        path.join(root, "linked", "skill"),
+        path.join(root, "staged"),
+        { rejectSymlinks: true },
+      )).rejects.toThrow(/symbolic-link ancestor/);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds a cached strict skill copy if a symlink appears in the target", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-target-link-"));
+    try {
+      const source = path.join(root, "source");
+      const target = path.join(root, "target");
+      const key = path.join(root, "synthetic-master.key");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      await fs.writeFile(key, "synthetic-key-bytes\n");
+      await materializePaperclipSkillCopy(source, target, { rejectSymlinks: true });
+      await fs.symlink(key, path.join(target, "leak"));
+
+      await materializePaperclipSkillCopy(source, target, { rejectSymlinks: true });
+      await expect(fs.lstat(path.join(target, "leak"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.readFile(path.join(target, "SKILL.md"), "utf8")).resolves.toBe("# skill\n");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to materialize into an ancestor of the source", async () => {
     const root = await fs.mkdtemp(
       path.join(os.tmpdir(), "paperclip-skill-copy-"),

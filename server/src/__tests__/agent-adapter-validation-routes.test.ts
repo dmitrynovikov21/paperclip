@@ -129,7 +129,13 @@ const externalAdapter: ServerAdapterModule = {
 
 const missingAdapterType = "missing_adapter_validation_test";
 
-async function createApp() {
+async function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -137,13 +143,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   const db = {
@@ -277,6 +277,7 @@ describe("agent routes adapter validation", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await unregisterTestAdapter("external_test");
     await unregisterTestAdapter(missingAdapterType);
   });
@@ -406,6 +407,34 @@ describe("agent routes adapter validation", () => {
     const adapterConfig = createInput.adapterConfig as Record<string, unknown>;
     const env = adapterConfig.env as Record<string, unknown>;
     expect(env.OPENAI_API_KEY).toBe("sk-test-key");
+    expect(String(env.CODEX_HOME)).toContain(`/companies/company-1/agents/${agentId}/codex-home`);
+  });
+
+  it("rejects agent-selected CODEX_HOME in isolated mode and assigns the managed home", async () => {
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId: "company-1",
+      source: "agent_jwt",
+    });
+    const denied = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send({
+        adapterConfig: { env: { CODEX_HOME: "/agent/workspace" } },
+      }),
+    );
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+
+    const accepted = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send({
+        adapterConfig: { model: "gpt-5.4" },
+      }),
+    );
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(200);
+    const patch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const env = (patch.adapterConfig as { env: Record<string, unknown> }).env;
     expect(String(env.CODEX_HOME)).toContain(`/companies/company-1/agents/${agentId}/codex-home`);
   });
 

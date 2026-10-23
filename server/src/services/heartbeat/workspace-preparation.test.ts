@@ -640,10 +640,7 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     const namespace = join(source, ".paperclip-repositories");
     const guard = vi.spyOn(input.services.executionWorkspacesSvc, "assertTaskRepositoryPublicationAllowed")
       .mockImplementation(async () => {
-        const candidates = await readdir(namespace);
-        expect(candidates).toHaveLength(1);
-        expect(candidates[0]).toContain(".clone-");
-        expect(await readFile(join(namespace, candidates[0]!, "README.md"), "utf8")).toBe("source content\n");
+        expect(await readdir(namespace)).toEqual([]);
         throw new Error("Task binding changed during clone");
       });
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Task binding changed during clone");

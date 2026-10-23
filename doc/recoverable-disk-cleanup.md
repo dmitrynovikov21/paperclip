@@ -214,6 +214,51 @@ still keep a worktree from expiring.
 Restore points are refused when the file storage is `s3` and the secrets master key
 does not come from `PAPERCLIP_SECRETS_MASTER_KEY`.
 
+## Nested project repository worktrees
+
+Extra project repositories that have no configured local folder are no longer full
+clones inside every task. Each task's `.paperclip-repositories/<name>-<key>` checkout is a
+Git worktree of one shared clone per company, project and repository URL: the managed
+project checkout for that URL under the instance's `projects/` directory (the same clone
+that main task worktrees use when the repository is a task's primary source). Objects are
+stored once in that clone, so a new task adds only its working files. Repositories with a
+configured local folder are still seeded as independent copies, and existing standalone
+nested clones keep working unchanged; they are not migrated.
+
+Each nested worktree checks out its own branch, `paperclip/<id>/<branch>`, where `<id>`
+derives from the worktree path and `<branch>` is the remote's current default branch
+(refreshed before each new worktree) or the configured branch ref, tracking
+`origin/<branch>`. Reopening derives the upstream from the saved source ref, not from the
+branch name. A tag or commit ref is checked out detached, as
+before. Branch names therefore never collide between tasks. When a checkout kept under
+`.paperclip-runtime/detached-repositories/` still holds that branch, the new worktree
+uses `paperclip/<id>/r<n>/<branch>` instead, so the retained work is never reset. `git pull` works as before;
+pushing needs an explicit destination such as `git push origin HEAD:<branch>`. Adding the
+worktree, fetching and removing registrations are serialized per shared clone. Each new
+worktree first fetches with `--prune`, so a branch deleted upstream is rejected as a fresh
+clone would reject it. Server-side Git commands on the shared clone run with hooks
+disabled, so hooks an agent plants there never run in the server.
+
+Branches and reflogs of a worktree live partly in the shared clone. Expiration and restore
+points therefore scope their checks to what belongs to the nested worktree: its `HEAD`,
+`HEAD` reflog, `ORIG_HEAD`, index and working tree (stored per worktree) and every branch
+under its own `paperclip/<id>/` prefix together with that branch's reflog. Those must be on
+the remote or saved in a restore point exactly as for a standalone checkout. Checking out
+any other branch, stashes, unsupported refs or custom local config in the shared clone
+still block expiration. Branches outside the prefix, other tasks' branches and their
+history stay in the shared clone and never block or get deleted. Commits that existed only
+in the nested worktree's `HEAD` reflog are written back into the restored worktree's `HEAD`
+reflog, so they stay protected after reopening.
+
+Expiring a task removes the nested worktree's registration from the shared clone and
+deletes its own branch only at the verified recorded commit. Reopening recreates the
+worktree from the shared clone (re-cloning the shared clone if it is gone) on the same
+branch and commit and applies its restore point. Deleting or archiving a task removes the
+registration of each of its nested worktrees and deletes their branches only when every
+commit is on a remote-tracking ref; an unpushed branch stays in the shared clone. Moving a
+nested worktree to `.paperclip-runtime/detached-repositories/` when its repository leaves
+the project repairs its registration.
+
 Reopening the issue, or the next run that recreates the worktree, imports the bundle,
 re-adds the worktree at the saved commit, applies the restore point and verifies the
 result. The bundle is always imported, so history-only commits are present again as

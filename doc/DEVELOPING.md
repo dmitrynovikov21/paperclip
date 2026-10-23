@@ -1297,7 +1297,7 @@ publication receipts, binding checks, and lifecycle locks remain authoritative.
 
 ## Project Repository Checkouts
 
-Tasks use every distinct repository attached to their project, including repository-only sources with no local folder. Paperclip creates a managed checkout when no local folder is configured. The selected repository remains at the task workspace root. Other project repositories have editable, independent Git checkouts under `.paperclip-repositories/<name>-<key>`. Workspace hints expose each checkout path to the agent.
+Tasks use every distinct repository attached to their project, including repository-only sources with no local folder. Paperclip creates a managed checkout when no local folder is configured. The selected repository remains at the task workspace root. Other project repositories have editable Git checkouts under `.paperclip-repositories/<name>-<key>`. Workspace hints expose each checkout path to the agent. A repository without a configured local folder is checked out as a Git worktree of one shared managed clone per project and repository URL, on its own `paperclip/<id>/<branch>` branch tracking `origin/<branch>`, so its objects are stored once; see [Recoverable disk cleanup](recoverable-disk-cleanup.md#nested-project-repository-worktrees). Existing standalone checkouts keep working.
 
 When an additional repository has a configured local checkout, Paperclip seeds the task copy from its current commit and uncommitted files. Git-ignored files stay out of that copy. Subsequent task edits stay in the task copy. They do not overwrite the configured source folder. Existing task copies retain their work across runs.
 
@@ -3012,7 +3012,10 @@ the project's repositories and it passes the same checks as the worktree
 state), stock Git storage (no custom hooks), no linked worktrees, no
 unreachable objects, and every commit reachable from its refs or reflogs is
 reachable from a current upstream branch or tag, read fresh from the project
-repository's URL with the company's Git identity. Task repositories
+repository's URL with the company's Git identity. A checkout that is a worktree of the project's shared clone is
+checked against its own `HEAD`, `HEAD` reflog, index and branches under its
+`paperclip/<id>/` prefix instead of the clone's storage and other tasks' refs.
+Task repositories
 (`task-repo-*`) always prevent deletion. Inspection runs Git with
 `core.fsmonitor` disabled, so a repository's local config cannot make it run a
 command. Standard linked-worktree `FETCH_HEAD` records are retained unless every

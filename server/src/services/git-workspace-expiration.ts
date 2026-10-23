@@ -12,6 +12,7 @@ import { currentRestorePointSnapshot, RestorePointSkip, type RestorePointLimits 
 import { abandonGitRestorePoint, abandonGitRestorePointsByKey, activateGitRestorePoints, restorePointHistoryUnchanged, restorePointSnapshotMatches, storeGitRestorePoint } from "./git-restore-point-storage.js";
 import { withIsolatedRepositorySourceLock, verifiedRecordedIsolatedRemoteSource } from "./isolated-remote-workspace-source.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
+import { nestedRepositoryBaseCandidates } from "./nested-repository-worktrees.js";
 import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { assertReproducibleGitFiles, assertReproducibleBaseGitStorage, assertReproducibleManagedCheckout, provenManagedCheckoutHistory, inspectGitCacheRecipe, inspectGitCacheRecipeForRestorePoint, readGitCacheRestoration, GIT_CACHE_RESTORATION_SCHEMA_V2,
   verifyRemoteGitCommit, gitCacheExpirationLockLocations, recoverGitCacheExpirationLocks, GitCacheRestorationFailure, type ManagedCheckoutProver, gitCacheCommand, readGitCacheExpiration, finishGitCacheTrash, type GitCacheExpiration, type GitCacheRestoration, GIT_CACHE_RESTORATION_KEY, GIT_CACHE_EXPIRATION_REASON } from "./git-workspace-restoration.js";
@@ -236,10 +237,11 @@ function managedCheckoutProver(db: Db, workspace: Workspace, auth: GitRemoteAuth
     const source = selectRestoredProjectRepositories(await rows, readGitCacheRestoration(workspace)?.contents).find(row => row.repoUrl
       && managedProjectCheckoutName({ id: row.id, repoUrl: row.repoUrl, repoRef: row.repoRef, cwd: row.cwd }) === name);
     if (!source?.repoUrl) throw new Error("unknown_managed_checkout");
-    try { await assertReproducibleManagedCheckout(checkoutPath, { repoUrl: source.repoUrl, resolveGitAuth: auth, signal }); }
+    const baseCandidates = nestedRepositoryBaseCandidates({ companyId: workspace.companyId, projectId: workspace.projectId, repoUrl: source.repoUrl });
+    try { await assertReproducibleManagedCheckout(checkoutPath, { repoUrl: source.repoUrl, resolveGitAuth: auth, signal, baseCandidates }); }
     catch (error) {
       if (!restorePoints || !CHECKOUT_RESTORE_POINT_RELAXABLE.has(skipReason(error))) throw error;
-      const { headOnRemote } = await assertReproducibleManagedCheckout(checkoutPath, { repoUrl: source.repoUrl, resolveGitAuth: auth, signal, restorePoint: true });
+      const { headOnRemote } = await assertReproducibleManagedCheckout(checkoutPath, { repoUrl: source.repoUrl, resolveGitAuth: auth, signal, restorePoint: true, baseCandidates });
       restorePoints.set(name, { headOnRemote, path: checkoutPath, repoUrl: source.repoUrl });
     }
     checkouts.set(name, await readManagedCheckoutContents(checkoutPath, name, { ...source, repoUrl: source.repoUrl }, signal));
@@ -366,7 +368,7 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
           await persist();
         }
         await recoverGitCacheExpirationLocks(workspace!);
-        const lockLocations = gitCacheExpirationLockLocations(workspace!);
+        const lockLocations = await gitCacheExpirationLockLocations(workspace!);
         await options.beforeDelete?.(workspace!);
         if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, options.idleCutoff)) throw new Error("live_or_unresolved_consumer");
         if (!state.workspaceRemoved && present) {

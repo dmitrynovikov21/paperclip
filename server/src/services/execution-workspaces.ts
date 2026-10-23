@@ -4011,7 +4011,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             eq(projectWorkspaces.companyId, row.companyId), eq(projectWorkspaces.projectId, row.projectId!),
           )).orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
           await prepareProjectRepositoryWorkspaces({ cwd: targetCwd, anchorRepoUrl: row.repoUrl, workspaces: repositoryRows,
-            resolveGitAuth: gitAuth,
+            sharedBase: { companyId: row.companyId, projectId: row.projectId! }, resolveGitAuth: gitAuth,
             prepareLocalSource: async sourceCwd => {
               const sourceIdentity = await fs.realpath(sourceCwd);
               return async () => {

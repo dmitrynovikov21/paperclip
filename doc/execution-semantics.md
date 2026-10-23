@@ -1780,6 +1780,15 @@ timeout retain the one-minute host default. A resume failure still preserves
 the recorded sandbox unless the provider proves it lost and replacement passes
 the existing backup checks.
 
+A replacement workspace can also host a newly admitted provider session that
+has never run. That session may start without a backup only when its durable
+identity matches the current run, runner and lease, it has no connections or
+committed events, and all commands are pending bootstrap commands. The runner
+must atomically claim an absent remote session directory under real, readable
+parents. Existing session files, prior activity, missing proof or any saved
+backup retain the verified-restore requirement. Workspace replacement alone
+never authorizes a provider-session reset.
+
 For the native runner, warm mode requests a reusable sandbox lease **before**
 lease acquisition. The environment's explicit runner lifecycle overrides the
 agent default; an inherited lifecycle uses the current agent setting on each

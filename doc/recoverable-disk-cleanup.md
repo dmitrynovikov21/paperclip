@@ -114,8 +114,15 @@ Before removal it saves a restore point:
 - a git bundle of commits the remote does not have, against a remote-verified base,
   including commits only reachable from the reflog or `ORIG_HEAD`;
 - deterministic snapshots of the index and working tree, including untracked files and
-  non-default file modes. Ignored files are left out, and so are untracked `.env` and
-  `.env.*` files, which provisioning recreates with current secrets.
+  non-default file modes. Untracked `.env` and `.env.*` files are left out, because
+  provisioning recreates them with current secrets;
+- a separate snapshot of ignored files, such as build caches or files an agent kept out of
+  git. It leaves out `.env` files, nested `.paperclip-repositories` checkouts (they get their
+  own restore points), `.claude/settings.local.json` (saved with the workspace contents)
+  and anything inside a regenerable directory such as `node_modules` or `dist`. A
+  restore point with ignored files uses payload schema `v2`, which older servers reject
+  instead of restoring without them. Restoring never overwrites an ignored file that already
+  exists, and an ignored nested repository keeps the worktree.
 
 The restore point is encrypted with a per-restore-point key wrapped by the instance
 secrets key, uploaded to file storage, read back and hash-checked, then activated in
@@ -134,6 +141,12 @@ remote lacks, when any reflog holds commits that are neither on the remote nor p
 the checked-out history the restore point bundles, when it has objects reachable from
 nothing, or when its `COMMIT_EDITMSG` holds a draft that matches no commit in its
 history. A `COMMIT_EDITMSG` that matches a commit is accepted for every nested checkout.
+A nested checkout's remote-tracking refs (`refs/remotes/origin/*`) and their reflogs can
+point at commits the remote has since dropped, for example a branch deleted after a squash
+merge. Strict expiration keeps such a checkout. In restore point mode those commits are
+saved in the checkout's restore point instead, as history-only objects (the remote-tracking
+refs themselves are not recreated), and any change to the remote-tracking refs after capture
+rolls expiration back.
 Each restore point also records a digest of its `HEAD` reflog and `ORIG_HEAD`; under the
 expiration locks that history must be unchanged too, so a commit followed by a reset
 after capture rolls expiration back. Reopening

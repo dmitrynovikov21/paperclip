@@ -321,6 +321,74 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
       vi.unstubAllEnvs();
     });
 
+    async function staleRemoteTrackingRef(f: Awaited<ReturnType<typeof nestedFixture>>) {
+      git(f.nestedSource, "checkout", "-q", "-b", "squashed-away");
+      await fs.writeFile(path.join(f.nestedSource, "feature.txt"), "merged by squash, then deleted\n");
+      git(f.nestedSource, "add", "."); git(f.nestedSource, "commit", "-m", "Feature");
+      const feature = git(f.nestedSource, "rev-parse", "HEAD");
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "squashed-away");
+      git(f.nestedSource, "checkout", "-q", "main");
+      git(f.nested.cwd, "fetch", "-q", "origin", "+refs/heads/squashed-away:refs/remotes/origin/squashed-away");
+      git(f.nestedRemote, "branch", "-D", "squashed-away");
+      git(f.nestedRemote, "reflog", "expire", "--expire=now", "--all");
+      git(f.nestedRemote, "gc", "-q", "--prune=now");
+      expect(() => git(f.nestedRemote, "cat-file", "-e", `${feature}^{commit}`)).toThrow();
+      return feature;
+    }
+
+    it("saves a clean nested checkout's stale remote-tracking commits in its restore point", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      const feature = await staleRemoteTrackingRef(f);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout" });
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+      const recipe = (await f.row()).metadata?.gitCacheRestoration as Record<string, any>;
+      expect(recipe.contents.checkouts[0].restorePoint).toMatchObject({ head: f.nestedA, headOnRemote: true, worktree: null });
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+      expect(git(f.nested.cwd, "cat-file", "-t", feature)).toBe("commit");
+      vi.unstubAllEnvs();
+    });
+
+    it("rolls back when a nested checkout's remote-tracking refs change after capture", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      await staleRemoteTrackingRef(f);
+      const result = await f.expire({ expireBase: false, restorePoint: restorePoint(), beforeDelete: async () => {
+        const later = execFileSync("git", ["commit-tree", git(f.nested.cwd, "rev-parse", "HEAD^{tree}"), "-p", "HEAD", "-m", "Fetched after capture"],
+          { cwd: f.nested.cwd, env: gitEnv, encoding: "utf8" }).trim();
+        git(f.nested.cwd, "update-ref", "refs/remotes/origin/fetched-later", later);
+      } });
+      expect(result).toMatchObject({ expired: false, skipReason: "restore_point_contents_changed" });
+      expect(await exists(f.cwd)).toBe(true);
+      vi.unstubAllEnvs();
+    });
+
+    it("rolls back when only a nested checkout's remote-tracking reflog changes after capture", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      await staleRemoteTrackingRef(f);
+      const result = await f.expire({ expireBase: false, restorePoint: restorePoint(), beforeDelete: async () => {
+        const tip = git(f.nested.cwd, "rev-parse", "refs/remotes/origin/squashed-away");
+        git(f.nested.cwd, "update-ref", "-m", "moved", "--create-reflog", "refs/remotes/origin/squashed-away", f.nestedA);
+        git(f.nested.cwd, "update-ref", "-m", "moved back", "refs/remotes/origin/squashed-away", tip);
+      } });
+      expect(result).toMatchObject({ expired: false, skipReason: "restore_point_contents_changed" });
+      vi.unstubAllEnvs();
+    });
+
+    it("counts distinct reflog commits, not repeated entries, against the tip budget", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      await unpushedNestedWork(f.nested.cwd);
+      const head = git(f.nested.cwd, "rev-parse", "HEAD");
+      const log = path.join(f.nested.cwd, ".git", "logs", "refs", "heads", "main");
+      const entry = `${head} ${head} Fixture <fixture@example.test> 1700000000 +0000\treset: moving to HEAD\n`;
+      await fs.appendFile(log, entry.repeat(6_000));
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+      vi.unstubAllEnvs();
+    });
+
     it("keeps a workspace whose nested checkout has unpushed work on another branch", async () => {
       vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
       const f = await nestedFixture(false);

@@ -1,3 +1,4 @@
+import { restorePointSavesIgnoredFile } from "./git-restore-point.js";
 import { validateGitWorkspaceContents, type GitWorkspaceContents } from "./git-workspace-contents.js";
 import { recoverGitExpirationLocks, type GitExpirationLockLocation } from "./git-workspace-expiration-locks.js";
 import fs from "node:fs/promises";
@@ -249,7 +250,7 @@ async function assertCommitMessageSaved(cwd: string, gitDir: string, signal?: Ab
 
 export async function assertReproducibleManagedCheckout(checkout: string, input: {
   repoUrl: string; resolveGitAuth: GitRemoteAuthProvider; signal?: AbortSignal; restorePoint?: boolean;
-}): Promise<{ headOnRemote: boolean }> {
+}): Promise<{ headOnRemote: boolean; preserve: string[] }> {
   const { signal } = input;
   const gitDir = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
   if (!gitDir?.isDirectory()) throw new Error("unproven_managed_checkout");
@@ -265,30 +266,10 @@ export async function assertReproducibleManagedCheckout(checkout: string, input:
   const refs = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(refname)"], signal)).trim().split("\n").filter(Boolean);
   if (refs.some(ref => !/^refs\/(heads|tags|remotes\/origin)\//.test(ref))) throw new Error("unsupported_managed_checkout_refs");
   if (input.restorePoint) {
-    const head = (await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
-    const shas = (output: string) => output.split("\n").map(line => line.trim()).filter(sha => shaPattern.test(sha));
-    const covered = new Set([head,
-      ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(() => "")),
-      ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(() => ""))]);
-    const recorded = new Set([
-      ...shas(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"], signal)),
-      ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H"], signal).catch(() => "")),
-    ]);
-    const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
-    const otherTips = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], signal))
-      .split("\n").map(line => line.trim().split(" ")).filter(([sha, ref]) => shaPattern.test(sha ?? "") && ref !== current).map(([sha]) => sha!);
-    if (otherTips.length && await hasCommitsMissingUpstream(checkout, otherTips, input.repoUrl, input.resolveGitAuth, signal, [head])) {
-      throw new Error("unpushed_managed_checkout_branches");
-    }
-    const uncovered = [...recorded].filter(sha => !covered.has(sha));
-    if (uncovered.length + covered.size > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
-    if (uncovered.length && await hasCommitsMissingUpstream(checkout, uncovered, input.repoUrl, input.resolveGitAuth, signal, [...covered])) {
-      throw new Error("unpushed_managed_checkout_branches");
-    }
-    const headOnRemote = !await hasCommitsMissingUpstream(checkout, [head], input.repoUrl, input.resolveGitAuth, signal);
+    const { headOnRemote, preserve } = await provenManagedCheckoutHistory(checkout, input.repoUrl, input.resolveGitAuth, signal);
     const unreachable = await gitCacheCommand(checkout, ["fsck", "--connectivity-only", "--unreachable", "--no-progress"], signal);
     if (unreachable.trim()) throw new Error("unreachable_managed_checkout_objects");
-    return { headOnRemote };
+    return { headOnRemote, preserve };
   }
   const localTips = new Set([
     ...(await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).split("\n"),
@@ -301,13 +282,61 @@ export async function assertReproducibleManagedCheckout(checkout: string, input:
   }
   const unreachable = await gitCacheCommand(checkout, ["fsck", "--connectivity-only", "--unreachable", "--no-progress"], signal);
   if (unreachable.trim()) throw new Error("unreachable_managed_checkout_objects");
-  return { headOnRemote: true };
+  return { headOnRemote: true, preserve: [] };
 }
 
 const MANAGED_CHECKOUT_LOCAL_TIP_LIMIT = 5_000;
 
+export async function provenManagedCheckoutHistory(checkout: string, repoUrl: string, resolveGitAuth: GitRemoteAuthProvider,
+  signal?: AbortSignal): Promise<{ headOnRemote: boolean; preserve: string[] }> {
+  const head = (await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
+  const shas = (output: string) => output.split("\n").map(line => line.trim()).filter(sha => shaPattern.test(sha));
+  const covered = new Set([head,
+    ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(() => "")),
+    ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(() => ""))]);
+  const reflogs = [...new Set((await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H %gD"], signal).catch(() => ""))
+    .split("\n").map(line => line.trim().split(" ")).filter(([sha]) => shaPattern.test(sha ?? ""))
+    .map(([sha, selector]) => `${sha} ${(selector ?? "").startsWith("refs/remotes/") ? "remote" : "local"}`))].map(entry => entry.split(" "));
+  if (reflogs.length > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
+  const remote = (kind: string | undefined) => kind === "remote";
+  const recorded = new Set([
+    ...shas(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"], signal)),
+    ...reflogs.filter(([, selector]) => !remote(selector)).map(([sha]) => sha!),
+  ]);
+  const remoteTracked = [...new Set([
+    ...shas(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)", "refs/remotes"], signal)),
+    ...reflogs.filter(([, selector]) => remote(selector)).map(([sha]) => sha!),
+  ])];
+  const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
+  const otherTips = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], signal))
+    .split("\n").map(line => line.trim().split(" ")).filter(([sha, ref]) => shaPattern.test(sha ?? "") && ref !== current).map(([sha]) => sha!);
+  if (otherTips.length && await hasCommitsMissingUpstream(checkout, otherTips, repoUrl, resolveGitAuth, signal, [head])) {
+    throw new Error("unpushed_managed_checkout_branches");
+  }
+  const uncovered = [...recorded].filter(sha => !covered.has(sha));
+  if (uncovered.length + covered.size + remoteTracked.length > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
+  if (uncovered.length && await hasCommitsMissingUpstream(checkout, uncovered, repoUrl, resolveGitAuth, signal, [...covered])) {
+    throw new Error("unpushed_managed_checkout_branches");
+  }
+  const headOnRemote = !await hasCommitsMissingUpstream(checkout, [head], repoUrl, resolveGitAuth, signal);
+  const preserve = remoteTracked.length
+    ? await tipsMissingUpstream(checkout, remoteTracked, repoUrl, resolveGitAuth, signal, [...covered, ...recorded]) : [];
+  return { headOnRemote, preserve };
+}
+
+async function tipsMissingUpstream(checkout: string, tips: string[], repoUrl: string,
+  resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal, covered: string[] = []) {
+  const missing = new Set(await commitsMissingUpstream(checkout, tips, repoUrl, resolveGitAuth, signal, covered));
+  return tips.filter(tip => missing.has(tip)).sort();
+}
+
 async function hasCommitsMissingUpstream(checkout: string, localTips: string[], repoUrl: string,
   resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal, covered: string[] = []) {
+  return (await commitsMissingUpstream(checkout, localTips, repoUrl, resolveGitAuth, signal, covered, 1)).length > 0;
+}
+
+async function commitsMissingUpstream(checkout: string, localTips: string[], repoUrl: string,
+  resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal, covered: string[] = [], limit?: number) {
   const store = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-checkout-proof-"));
   try {
     const options = { timeout: 120_000, signal, maxBuffer: 16 * 1024 * 1024, cwd: os.tmpdir(),
@@ -323,8 +352,9 @@ async function hasCommitsMissingUpstream(checkout: string, localTips: string[], 
       if (signal?.aborted) throw error;
       throw new Error("managed_checkout_upstream_unavailable");
     }
-    const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*", ...covered], options);
-    return missing.stdout.trim() !== "";
+    const missing = await execFile("git", ["-C", store, "rev-list", ...(limit ? [`--max-count=${limit}`] : []), ...localTips,
+      "--not", "--glob=refs/upstream/*", ...covered], options);
+    return missing.stdout.split("\n").map(line => line.trim()).filter(Boolean);
   } finally {
     await fs.rm(store, { recursive: true, force: true });
   }
@@ -390,7 +420,7 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
   const regenerable = await findRegenerableWorkspaceDirs(cwd, { signal });
   const ignored = (await gitCacheCommand(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], signal)).split("\0").filter(Boolean);
   const unexplained = ignored.filter(file => !(options.preserveSettings && file === PAPERCLIP_CLAUDE_SETTINGS_FILE) && !regenerable.some(dir => file.startsWith(`${dir}/`))
-    && !(options.restorePoint && /^\.env(\..*)?$/.test(path.posix.basename(file))));
+    && !(options.restorePoint && (/^\.env(\..*)?$/.test(path.posix.basename(file)) || restorePointSavesIgnoredFile(file))));
   const checkouts = new Set<string>();
   for (const file of unexplained) {
     const [namespace, name, rest] = file.split("/", 3);

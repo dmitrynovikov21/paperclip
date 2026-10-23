@@ -13,7 +13,7 @@ import { abandonGitRestorePoint, abandonGitRestorePointsByKey, activateGitRestor
 import { withIsolatedRepositorySourceLock, verifiedRecordedIsolatedRemoteSource } from "./isolated-remote-workspace-source.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
 import type { GitRemoteAuthProvider } from "./git-credentials.js";
-import { assertReproducibleGitFiles, assertReproducibleBaseGitStorage, assertReproducibleManagedCheckout, inspectGitCacheRecipe, inspectGitCacheRecipeForRestorePoint, readGitCacheRestoration, GIT_CACHE_RESTORATION_SCHEMA_V2,
+import { assertReproducibleGitFiles, assertReproducibleBaseGitStorage, assertReproducibleManagedCheckout, provenManagedCheckoutHistory, inspectGitCacheRecipe, inspectGitCacheRecipeForRestorePoint, readGitCacheRestoration, GIT_CACHE_RESTORATION_SCHEMA_V2,
   verifyRemoteGitCommit, gitCacheExpirationLockLocations, recoverGitCacheExpirationLocks, GitCacheRestorationFailure, type ManagedCheckoutProver, gitCacheCommand, readGitCacheExpiration, finishGitCacheTrash, type GitCacheExpiration, type GitCacheRestoration, GIT_CACHE_RESTORATION_KEY, GIT_CACHE_EXPIRATION_REASON } from "./git-workspace-restoration.js";
 
 async function allocatedBytes(target: string, shouldContinue: () => boolean): Promise<number> {
@@ -294,7 +294,9 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
             } else if (!headOnRemote) throw new Error("upstream_commit_unverified");
             for (const [name, need] of [...checkoutRestorePoints.entries()].sort(([a], [b]) => a.localeCompare(b))) {
               const storedCheckout = await storeGitRestorePoint({ db, storage: options.restorePoint!.storage, workspace: owner,
-                cwd: need.path, checkout: name, generation, headOnRemote: need.headOnRemote, limits: options.restorePoint!.limits,
+                cwd: need.path, checkout: name, generation, headOnRemote: need.headOnRemote,
+                resolvePreserveCommits: async () => (await provenManagedCheckoutHistory(need.path, need.repoUrl, auth, options.signal)).preserve,
+                limits: options.restorePoint!.limits,
                 signal: options.signal, upstreamCommits: await restorePointBoundary(need.path, need.repoUrl, need.headOnRemote, auth, options.signal) });
               if (!storedCheckout) {
                 if (!need.headOnRemote) throw new Error("unpushed_managed_checkout");

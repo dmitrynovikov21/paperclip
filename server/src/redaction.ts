@@ -1064,12 +1064,13 @@ function redactPostgresUrlsInValueAtKey<T>(input: T, key?: string, possiblyParti
       },
     );
     // The 32 KiB stdout/stderr excerpt cap keeps the right edge. Historical
-    // rows can therefore start inside userinfo with no scheme to recognize.
-    // Hide the first token only when the excerpt reached that cap.
+    // rows can therefore start inside userinfo or query text with no scheme.
+    // Hide the entire first token only when the excerpt reached that cap.
+    // A cut-off query value may contain @ without any URL scheme or userinfo.
     return (key === "stdoutExcerpt" || key === "stderrExcerpt") &&
       Buffer.byteLength(input, "utf8") >= MAX_EXCERPT_BYTES - 3 &&
       !/^postgres(?:ql)?:\/\//i.test(redacted)
-      ? redacted.replace(/^[^\s@]+/, REDACTED_EVENT_VALUE) as T
+      ? redacted.replace(/^\S+/, REDACTED_EVENT_VALUE) as T
       : redacted as T;
   }
   if (Array.isArray(input)) {

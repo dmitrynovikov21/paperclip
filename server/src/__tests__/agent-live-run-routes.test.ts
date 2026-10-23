@@ -349,6 +349,7 @@ describe("agent live run routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
     mockHeartbeatService.getRetryExhaustedReason.mockResolvedValue(null);
+    mockHeartbeatService.list.mockResolvedValue([]);
     mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
       ...run,
       currentStatusMessage: null,
@@ -725,8 +726,27 @@ describe("agent live run routes", () => {
       "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     ));
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.stdoutExcerpt).toBe("***REDACTED***@db.example.test/app finished");
+    expect(res.body.stdoutExcerpt).toBe("***REDACTED*** finished");
     expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
+
+    const querySecret = "q".repeat(33_000);
+    const queryOutput = `postgres://worker:synthetic@db.example.test/app?token=${querySecret}@synthetic-tail finished`;
+    const queryExcerpt = Buffer.from(queryOutput).subarray(-32 * 1024).toString("utf8");
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+      stdoutExcerpt: queryExcerpt,
+    });
+    const queryRes = await requestApp(await createApp({ select: vi.fn(() => identityQuery) }, actor), (url) => request(url).get(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    ));
+    expect(queryRes.status, JSON.stringify(queryRes.body)).toBe(200);
+    expect(queryRes.body.stdoutExcerpt).toBe("***REDACTED*** finished");
+    expect(queryRes.body.stdoutExcerpt).not.toContain("synthetic-tail");
   }, 45_000);
 
   it("masks a shortened run-list URL before registered-secret replacement changes its length", async () => {
@@ -847,7 +867,7 @@ describe("agent live run routes", () => {
       "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     ));
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.stdoutExcerpt).toMatch(/^\*\*\*REDACTED\*\*\*@db\.example\.test\/app /);
+    expect(res.body.stdoutExcerpt).toBe("***REDACTED*** ***REDACTED***");
     expect(res.body.stdoutExcerpt).not.toContain(password.slice(0, 32));
     expect(res.body.stdoutExcerpt).toContain("***REDACTED***");
   }, 45_000);

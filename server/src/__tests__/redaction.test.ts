@@ -115,9 +115,15 @@ describe("redaction", () => {
     expect(excerpt.startsWith("q")).toBe(true);
     const result = redactPostgresUrlsInValue({ stdoutExcerpt: excerpt, stderrExcerpt: excerpt });
     for (const redacted of [result.stdoutExcerpt, result.stderrExcerpt]) {
-      expect(redacted).toMatch(/^\*\*\*REDACTED\*\*\*@db\.example\.test\/app finished$/);
+      expect(redacted).toBe("***REDACTED*** finished");
       expect(redacted).not.toContain(password.slice(0, 32));
     }
+    const querySecret = "q".repeat(33_000);
+    const queryOutput = `postgres://worker:synthetic@db.example.test/app?token=${querySecret}@synthetic-tail finished`;
+    const queryExcerpt = Buffer.from(queryOutput).subarray(-32 * 1024).toString("utf8");
+    const queryResult = redactPostgresUrlsInValue({ stdoutExcerpt: queryExcerpt });
+    expect(queryResult.stdoutExcerpt).toBe("***REDACTED*** finished");
+    expect(queryResult.stdoutExcerpt).not.toContain("synthetic-tail");
   });
 
   it("preserves the actual Copilot receipt producer discriminator through nested durable redaction", () => {

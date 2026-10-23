@@ -32,8 +32,13 @@ test("browses passive cases and rolled-up task documents without starting work o
   // Dismiss through the ordinary Board control, including after reloads.
   const dismissAnnouncement = page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
     .getByRole("button", { name: "Dismiss announcement", exact: true });
-  const dismissAnnouncements = async () => { await dismissAnnouncement.click(); };
-  await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements);
+  const dismissAnnouncements = async () => {
+    await dismissAnnouncement.first().click({ force: true, timeout: 2_000 });
+  };
+  // A second announcement may arrive while the first is being dismissed.
+  // Let the next action trigger the handler again without waiting for every
+  // announcement to disappear in one callback.
+  await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements, { noWaitAfter: true });
   const api = page.request;
   const original = await json(await api.get("/api/instance/settings/experimental"));
   const company = await json(await api.post("/api/companies", { data: { name: `Read-only cases ${randomUUID()}` } }));
@@ -195,7 +200,7 @@ test("browses passive cases and rolled-up task documents without starting work o
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(openReceipt).toBeFocused();
-  await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements);
+  await page.addLocatorHandler(dismissAnnouncement, dismissAnnouncements, { noWaitAfter: true });
   const auditLink = casePage.getByRole("link", { name: "View in Audit", exact: true });
   await expect(auditLink).toHaveAttribute("href", `/${company.issuePrefix}/activity?entityType=case&entityId=${receipt.id}`);
   await auditLink.click();

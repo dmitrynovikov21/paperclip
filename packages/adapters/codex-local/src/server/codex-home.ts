@@ -351,6 +351,8 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
 export interface StageCodexHomeForSyncOptions {
   /** Run id, used only to make the staged temp-dir name traceable in logs. */
   runId?: string;
+  /** Optional subset of the fixed allowlist; probes only need auth and config. */
+  entries?: readonly (typeof CODEX_SYNC_ALLOWLIST)[number][];
   /** Exact trusted chain for a managed auth.json symlink, ending at a regular file. */
   authSourcePaths?: readonly string[];
   /** Selected, server-resolved skill sources. Unlisted home entries are never staged. */
@@ -491,7 +493,7 @@ async function stageCodexHomeEntry(
 }
 
 /**
- * Stages exactly {@link CODEX_SYNC_ALLOWLIST} from `effectiveCodexHome` into a
+ * Stages {@link CODEX_SYNC_ALLOWLIST} (or a selected subset) from `effectiveCodexHome` into a
  * fresh private temp dir and returns its path, for registration as the sandbox
  * `home` asset. This replaces syncing the whole managed home + a name denylist:
  * only the files Codex actually needs are uploaded, so oversized runtime state
@@ -521,7 +523,10 @@ export async function stageCodexHomeForSync(
   try {
     const sourceHome = await openDirectoryNoFollow(effectiveCodexHome);
     try {
-      for (const entry of CODEX_SYNC_ALLOWLIST) {
+      for (const entry of options.entries ?? CODEX_SYNC_ALLOWLIST) {
+        if (!(CODEX_SYNC_ALLOWLIST as readonly string[]).includes(entry)) {
+          throw new Error("Codex home staging entry is not allowlisted");
+        }
         await stageCodexHomeEntry(sourceHome, effectiveCodexHome, stagedHome, entry, options);
       }
     } finally {

@@ -1,5 +1,5 @@
 import express from "express";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
@@ -45,6 +45,7 @@ const mockEnvironmentRuntime = vi.hoisted(() => ({
 }));
 
 const mockResolveEnvironmentExecutionTarget = vi.hoisted(() => vi.fn());
+const CODEX_AUTH_RACE_TEST = "keeps a swapped Codex auth link out of the remote asset and HTTP response";
 const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
 }));
@@ -128,7 +129,7 @@ async function unregisterTestAdapter(type: string) {
 }
 
 describe("agent test-environment route", () => {
-  beforeEach(async () => {
+  beforeEach(async (context) => {
     vi.resetModules();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
@@ -177,14 +178,121 @@ describe("agent test-environment route", () => {
       ],
       testedAt: new Date(0).toISOString(),
     });
-    await unregisterTestAdapter("external_test");
-    const { registerServerAdapter } = await import("../adapters/index.js");
-    registerServerAdapter(externalAdapter);
+    if (context.task.name !== CODEX_AUTH_RACE_TEST) {
+      await unregisterTestAdapter("external_test");
+      const { registerServerAdapter } = await import("../adapters/index.js");
+      registerServerAdapter(externalAdapter);
+    }
   });
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
   });
+
+  it(CODEX_AUTH_RACE_TEST, async () => {
+    const scratch = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-codex-route-"));
+    const sharedHome = path.join(scratch, "shared-codex");
+    const serviceCredential = path.join(scratch, "service-db-url");
+    const syntheticCredential = "postgres://fixture:synthetic-only@localhost/fixture";
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousDatabaseSource = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    let swapAfterPrepare = false;
+    let uploadedAuth: string | null = null;
+    const prepareRuntime = vi.fn(async (input: { assets?: Array<{ key: string; localDir: string }> }) => {
+      const home = input.assets?.find((asset) => asset.key === "home");
+      if (home) uploadedAuth = await readFile(path.join(home.localDir, "auth.json"), "utf8");
+      return {
+        assetDirs: { home: "/remote/probe-home" },
+        restoreWorkspace: async () => {},
+      };
+    });
+    const runProbe = vi.fn(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}',
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+
+    vi.doMock("@paperclipai/adapter-utils/execution-target", async () => ({
+      ...(await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+        "@paperclipai/adapter-utils/execution-target",
+      )),
+      ensureAdapterExecutionTargetDirectory: vi.fn(async () => {}),
+      ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
+      maybeRunSandboxInstallCommand: vi.fn(async () => null),
+      prepareAdapterExecutionTargetRuntime: prepareRuntime,
+      runAdapterExecutionTargetProcess: runProbe,
+    }));
+    vi.doMock("../../../packages/adapters/codex-local/src/server/codex-home.js", async () => {
+      const actual = await vi.importActual<typeof import("../../../packages/adapters/codex-local/src/server/codex-home.js")>(
+        "../../../packages/adapters/codex-local/src/server/codex-home.js",
+      );
+      return {
+        ...actual,
+        prepareManagedCodexHome: async (...args: Parameters<typeof actual.prepareManagedCodexHome>) => {
+          const managedHome = await actual.prepareManagedCodexHome(...args);
+          if (swapAfterPrepare) {
+            await unlink(path.join(managedHome, "auth.json"));
+            await symlink(serviceCredential, path.join(managedHome, "auth.json"));
+          }
+          return managedHome;
+        },
+      };
+    });
+
+    try {
+      await mkdir(sharedHome);
+      await writeFile(path.join(sharedHome, "auth.json"), '{"OPENAI_API_KEY":"sk-bound"}');
+      await writeFile(serviceCredential, syntheticCredential);
+      process.env.PAPERCLIP_HOME = path.join(scratch, "paperclip-home");
+      process.env.CODEX_HOME = sharedHome;
+      process.env.PAPERCLIP_DATABASE_URL_FILE = serviceCredential;
+      mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fixture",
+        remoteCwd: "/remote/workspace",
+        runner: { execute: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      });
+      const app = await createApp();
+      const url = "/api/companies/company-1/adapters/codex_local/test-environment";
+      const payload = {
+        adapterConfig: { engine: "cli", command: "codex" },
+        environmentId: "11111111-1111-4111-8111-111111111111",
+      };
+
+      const valid = await request(app).post(url).send(payload);
+      expect(valid.status, valid.text).toBe(200);
+      expect(valid.body.status).toBe("pass");
+      expect(valid.body.checks.map((check: { code: string }) => check.code).join(", ")).toContain("codex_hello_probe_passed");
+      expect(uploadedAuth).toBe('{"OPENAI_API_KEY":"sk-bound"}');
+      expect(JSON.stringify(valid.body)).not.toContain(syntheticCredential);
+
+      swapAfterPrepare = true;
+      const attacked = await request(app).post(url).send(payload);
+      expect(attacked.status).toBeGreaterThanOrEqual(400);
+      expect(attacked.text).not.toContain(syntheticCredential);
+      expect(uploadedAuth).not.toContain(syntheticCredential);
+      expect(prepareRuntime).toHaveBeenCalledTimes(1);
+      expect(runProbe).toHaveBeenCalledTimes(1);
+      const remoteOutput = await runProbe.mock.results[0]?.value;
+      expect(`${remoteOutput?.stdout ?? ""}\n${remoteOutput?.stderr ?? ""}`).not.toContain(syntheticCredential);
+    } finally {
+      vi.doUnmock("@paperclipai/adapter-utils/execution-target");
+      vi.doUnmock("../../../packages/adapters/codex-local/src/server/codex-home.js");
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousDatabaseSource === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousDatabaseSource;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it.each(["opencode_local", "pi_local"] as const)(
     "does not launch %s discovery under the service UID with a file-backed DB source",

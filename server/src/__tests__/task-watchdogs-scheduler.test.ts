@@ -13,11 +13,13 @@ import {
   issueComments,
   issueDocuments,
   issueApprovals,
+  issueLabels,
   issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
   issueWatchdogs,
+  labels,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,6 +47,8 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issueLabels);
+    await db.delete(labels);
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueThreadInteractions);
@@ -518,6 +522,67 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     expect(result).toMatchObject({ checked: 1, triggered: 1 });
     expect(wakes).toHaveLength(1);
+  });
+
+  it.each([
+    ["done", "blocked"],
+    ["blocked", "in_review"],
+  ] as const)("does not rearm either reviewed watchdog after a %s leaf label sweep", async (initialStatus, nextStatus) => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-LABEL-ROOT", status: "done" });
+    const leafId = await seedIssue(companyId, {
+      identifier: "WDOG-LABEL-LEAF",
+      parentId: sourceId,
+      status: initialStatus,
+    });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    await seedWatchdog(companyId, leafId, agentId);
+    const { service, wakes } = createService();
+
+    const first = await service.reconcileTaskWatchdogs({ companyId });
+    expect(first).toMatchObject({ checked: 2, triggered: 2 });
+    const before = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.companyId, companyId));
+    expect(before).toHaveLength(2);
+    for (const watchdog of before) {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, watchdog.watchdogIssueId!));
+    }
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({
+      checked: 2,
+      triggered: 0,
+      alreadyReviewed: 2,
+    });
+
+    const [label] = await db.insert(labels).values({
+      companyId,
+      name: "after-audit",
+      color: "#abcdef",
+    }).returning();
+    await db.insert(issueLabels).values({ companyId, issueId: leafId, labelId: label!.id });
+    await db.update(issues).set({
+      updatedAt: new Date(Date.now() + 60_000),
+    }).where(eq(issues.id, leafId));
+
+    const afterLabelSweep = await service.reconcileForIssueAndAncestors(companyId, leafId);
+    expect(afterLabelSweep).toMatchObject({ checked: 2, triggered: 0 });
+    const unchanged = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.companyId, companyId));
+    for (const watchdog of unchanged) {
+      const original = before.find((row) => row.id === watchdog.id)!;
+      expect(watchdog.lastObservedFingerprint).toBe(original.lastObservedFingerprint);
+      expect(watchdog.triggerCount).toBe(1);
+    }
+    expect(wakes).toHaveLength(2);
+
+    await db.update(issues).set({ status: nextStatus }).where(eq(issues.id, leafId));
+    const afterStatusChange = await service.reconcileForIssueAndAncestors(companyId, leafId);
+    expect(afterStatusChange).toMatchObject({ checked: 2, triggered: 2 });
+    const changed = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.companyId, companyId));
+    for (const watchdog of changed) {
+      const original = before.find((row) => row.id === watchdog.id)!;
+      expect(watchdog.lastObservedFingerprint).not.toBe(original.lastObservedFingerprint);
+      expect(watchdog.triggerCount).toBe(2);
+    }
+    expect(wakes).toHaveLength(4);
   });
 
   it("marks a completed watchdog fingerprint reviewed, then reuses the same issue for a later stopped state", async () => {

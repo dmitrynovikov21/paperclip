@@ -32,6 +32,9 @@ const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT = 2;
+const TASK_WATCHDOG_MAX_REJECTED_WAKES_PER_FINGERPRINT = 4;
+const TASK_WATCHDOG_FAILED_RUN_UNBLOCK_ACTION = "Inspect the failed task-watchdog runs and explicitly resolve the review or change the watched subtree to start a new review.";
+const TASK_WATCHDOG_REJECTED_WAKE_UNBLOCK_ACTION = "Inspect rejected task-watchdog wakes, restore scheduling or the agent's on-demand wake policy, then explicitly reopen the review or change the watched subtree to start a new review.";
 // Grace window after an issue is created/assigned during which its first
 // assignment run/wake may have been enqueued but is not yet visible to a
 // watchdog evaluation (the eval can race the issue's own assignment run).
@@ -1240,6 +1243,10 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
   async function watchdogIssueHasBlockedPath(watchdogIssue: IssueRow) {
     if (watchdogIssue.unblockDescriptor) return true;
+    return watchdogIssueHasUnresolvedDependencies(watchdogIssue);
+  }
+
+  async function watchdogIssueHasUnresolvedDependencies(watchdogIssue: IssueRow) {
     const readiness = await issuesSvc.listDependencyReadiness(watchdogIssue.companyId, [watchdogIssue.id]);
     return readiness.get(watchdogIssue.id)?.isDependencyReady === false;
   }
@@ -1390,9 +1397,18 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     const fallback = existing ?? await findTaskWatchdogIssue(input.watchdog.companyId, input.sourceIssue.id);
 
     if (fallback) {
+      const shouldAnnounceStop = !input.watchdog.lastTriggeredAt ||
+        fallback.originFingerprint !== input.classification.stopFingerprint;
+      const hasStaleAutomaticBlocker = fallback.status === "blocked" &&
+        fallback.originFingerprint !== input.classification.stopFingerprint &&
+        fallback.unblockDescriptor?.owner === "board" &&
+        (fallback.unblockDescriptor.action === TASK_WATCHDOG_FAILED_RUN_UNBLOCK_ACTION ||
+          fallback.unblockDescriptor.action === TASK_WATCHDOG_REJECTED_WAKE_UNBLOCK_ACTION) &&
+        !await watchdogIssueHasUnresolvedDependencies(fallback);
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
         (fallback.status === "blocked" && !await watchdogIssueHasBlockedPath(fallback)) ||
+        hasStaleAutomaticBlocker ||
         await watchdogIssueNeedsFreshWake(fallback);
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
@@ -1403,6 +1419,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           goalId: input.sourceIssue.goalId,
           billingCode: input.sourceIssue.billingCode,
           originFingerprint: input.classification.stopFingerprint,
+          unblockDescriptor: hasStaleAutomaticBlocker ? null : undefined,
         }) ?? fallback
         : fallback;
       if (!shouldReopen && watchdogIssue.originFingerprint !== input.classification.stopFingerprint) {
@@ -1412,26 +1429,28 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           .where(and(eq(issues.companyId, input.watchdog.companyId), eq(issues.id, watchdogIssue.id)));
         watchdogIssue.originFingerprint = input.classification.stopFingerprint;
       }
-      await issuesSvc.addComment(
-        watchdogIssue.id,
-        buildStoppedFingerprintComment({
-          sourceIssue: input.sourceIssue,
-          stopFingerprint: input.classification.stopFingerprint,
-          stoppedLeaves: input.classification.stoppedLeaves,
-          pendingInteractionsByIssueId: input.classification.pendingInteractionsByIssueId,
-          resumed: true,
-        }),
-        { runId: input.runId ?? null },
-        {
-          authorType: "system",
-          metadata: stoppedFingerprintMetadata({
-            sourceIssueId: input.sourceIssue.id,
+      if (shouldAnnounceStop) {
+        await issuesSvc.addComment(
+          watchdogIssue.id,
+          buildStoppedFingerprintComment({
+            sourceIssue: input.sourceIssue,
             stopFingerprint: input.classification.stopFingerprint,
-            waitsByIssueId: input.classification.stopSnapshot.waitsByIssueId,
+            stoppedLeaves: input.classification.stoppedLeaves,
+            pendingInteractionsByIssueId: input.classification.pendingInteractionsByIssueId,
             resumed: true,
           }),
-        },
-      );
+          { runId: input.runId ?? null },
+          {
+            authorType: "system",
+            metadata: stoppedFingerprintMetadata({
+              sourceIssueId: input.sourceIssue.id,
+              stopFingerprint: input.classification.stopFingerprint,
+              waitsByIssueId: input.classification.stopSnapshot.waitsByIssueId,
+              resumed: true,
+            }),
+          },
+        );
+      }
       return watchdogIssue;
     }
 
@@ -1555,32 +1574,49 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
     // A cancelled or failed review must be retried, but a permanently failing
     // adapter must not create an unbounded wake loop for an unchanged stop.
-    // Count runs, not trigger activity: enqueueWakeup can reject a wake before
-    // it queues a run (for example while scheduling is suppressed).
+    // A rejected wake does not consume a run attempt, but repeated rejection
+    // must also have a finite path when agent policy never allows the wake.
     if (existingWatchdogIssue) {
-      const [attempts] = await db
-        .select({ count: sql<number>`count(*)::int` })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.companyId, watchdog.companyId),
-          eq(heartbeatRuns.agentId, watchdog.watchdogAgentId),
-          sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${existingWatchdogIssue.id}
-            OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${existingWatchdogIssue.id})`,
-          sql`${heartbeatRuns.contextSnapshot}->>'watchdogId' = ${watchdog.id}`,
-          sql`${heartbeatRuns.contextSnapshot}->'taskWatchdog'->>'stopFingerprint' = ${classification.stopFingerprint}`,
-        ));
-      if ((attempts?.count ?? 0) >= TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT) {
+      const [[attempts], [rejectedWakes]] = await Promise.all([
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, watchdog.companyId),
+            eq(heartbeatRuns.agentId, watchdog.watchdogAgentId),
+            sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${existingWatchdogIssue.id}
+              OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${existingWatchdogIssue.id})`,
+            sql`${heartbeatRuns.contextSnapshot}->>'watchdogId' = ${watchdog.id}`,
+            sql`${heartbeatRuns.contextSnapshot}->'taskWatchdog'->>'stopFingerprint' = ${classification.stopFingerprint}`,
+          )),
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, watchdog.companyId),
+            eq(agentWakeupRequests.agentId, watchdog.watchdogAgentId),
+            eq(agentWakeupRequests.status, "skipped"),
+            eq(agentWakeupRequests.idempotencyKey, taskWatchdogWakeIdempotencyKey(watchdog.id, classification.stopFingerprint)),
+          )),
+      ]);
+      const runLimitReached = (attempts?.count ?? 0) >= TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT;
+      const rejectedWakeLimitReached = (rejectedWakes?.count ?? 0) >= TASK_WATCHDOG_MAX_REJECTED_WAKES_PER_FINGERPRINT;
+      if (runLimitReached || rejectedWakeLimitReached) {
         if (existingWatchdogIssue.status !== "blocked" || !existingWatchdogIssue.unblockDescriptor) {
           const unblockDescriptor = existingWatchdogIssue.unblockDescriptor ?? {
             owner: "board" as const,
-            action: "Inspect the failed task-watchdog runs and explicitly resolve the review or change the watched subtree to start a new review.",
+            action: runLimitReached
+              ? TASK_WATCHDOG_FAILED_RUN_UNBLOCK_ACTION
+              : TASK_WATCHDOG_REJECTED_WAKE_UNBLOCK_ACTION,
           };
           await issuesSvc.update(existingWatchdogIssue.id, {
             status: "blocked",
             unblockDescriptor,
           });
           await issuesSvc.addComment(existingWatchdogIssue.id, [
-            `Task watchdog review stopped after ${TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT} automatic wake attempts for this fingerprint.`,
+            runLimitReached
+              ? `Task watchdog review stopped after ${TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT} queued run attempts for this fingerprint.`
+              : `Task watchdog review stopped after ${TASK_WATCHDOG_MAX_REJECTED_WAKES_PER_FINGERPRINT} rejected wake requests for this fingerprint.`,
             "",
             `Stopped fingerprint: \`${classification.stopFingerprint}\``,
             `Unblock owner: board. Action: ${unblockDescriptor.action}`,
@@ -1599,6 +1635,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
               watchdogIssueId: existingWatchdogIssue.id,
               stopFingerprint: classification.stopFingerprint,
               wakeAttempts: attempts?.count ?? 0,
+              rejectedWakes: rejectedWakes?.count ?? 0,
               unblockDescriptor,
             },
           });
@@ -1617,6 +1654,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       classification,
       runId: opts.runId ?? null,
     });
+    const firstTriggerForFingerprint = !watchdog.lastTriggeredAt ||
+      existingWatchdogIssue?.originFingerprint !== classification.stopFingerprint;
     const now = new Date();
     await db
       .update(issueWatchdogs)
@@ -1630,24 +1669,26 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       })
       .where(eq(issueWatchdogs.id, watchdog.id));
 
-    await logActivity(db, {
-      companyId: sourceIssue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: watchdog.watchdogAgentId,
-      runId: opts.runId ?? null,
-      action: "issue.task_watchdog_triggered",
-      entityType: "issue",
-      entityId: sourceIssue.id,
-      details: {
-        source: "task_watchdogs.evaluate",
-        watchdogId: watchdog.id,
-        watchdogIssueId: watchdogIssue.id,
-        stopFingerprint: classification.stopFingerprint,
-        stopSnapshot: classification.stopSnapshot,
-        stoppedLeaves: classification.stoppedLeaves,
-      },
-    });
+    if (firstTriggerForFingerprint) {
+      await logActivity(db, {
+        companyId: sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: watchdog.watchdogAgentId,
+        runId: opts.runId ?? null,
+        action: "issue.task_watchdog_triggered",
+        entityType: "issue",
+        entityId: sourceIssue.id,
+        details: {
+          source: "task_watchdogs.evaluate",
+          watchdogId: watchdog.id,
+          watchdogIssueId: watchdogIssue.id,
+          stopFingerprint: classification.stopFingerprint,
+          stopSnapshot: classification.stopSnapshot,
+          stoppedLeaves: classification.stoppedLeaves,
+        },
+      });
+    }
 
     const context = watchdogWakeContext({
       watchdog,

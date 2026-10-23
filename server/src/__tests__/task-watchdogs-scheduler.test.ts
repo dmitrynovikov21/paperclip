@@ -324,7 +324,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       .select()
       .from(issueComments)
       .where(eq(issueComments.issueId, watchdogIssueId));
-    expect(comments).toHaveLength(2);
+    expect(comments).toHaveLength(1);
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     expect(watchdog?.triggerCount).toBe(2);
   });
@@ -379,7 +379,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     const service = taskWatchdogService(db, {
       enqueueWakeup: async (wokenAgentId, opts) => {
         wakeRequests += 1;
-        if (wakeRequests < 3) {
+        if (wakeRequests <= 3) {
           await db.insert(agentWakeupRequests).values({
             companyId,
             agentId: wokenAgentId,
@@ -387,6 +387,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
             source: "automation",
             reason: "heartbeat.scheduling_suppressed",
             payload: opts?.payload,
+            idempotencyKey: opts?.idempotencyKey,
           });
           return null;
         }
@@ -404,24 +405,94 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
-    expect(wakeRequests).toBe(3);
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    expect(wakeRequests).toBe(4);
     const skippedWakes = await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, companyId),
       eq(agentWakeupRequests.status, "skipped"),
     ));
-    expect(skippedWakes).toHaveLength(2);
+    expect(skippedWakes).toHaveLength(3);
 
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     const [reviewIssue] = await db.select().from(issues).where(eq(issues.id, watchdog!.watchdogIssueId!));
     expect(reviewIssue).toMatchObject({ status: "todo", unblockDescriptor: null });
     expect(watchdog?.lastReviewedFingerprint).toBeNull();
     expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 0, live: 1 });
-    expect(wakeRequests).toBe(3);
+    expect(wakeRequests).toBe(4);
+    const reviewComments = await db.select().from(issueComments).where(eq(issueComments.issueId, reviewIssue!.id));
+    expect(reviewComments).toHaveLength(1);
+    const triggerActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceId),
+      eq(activityLog.action, "issue.task_watchdog_triggered"),
+    ));
+    expect(triggerActivity).toHaveLength(1);
     const escalationActivity = await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, sourceId),
       eq(activityLog.action, "issue.task_watchdog_retry_exhausted"),
     ));
     expect(escalationActivity).toHaveLength(0);
+  });
+
+  it("bounds permanently rejected wakes without repeating the stop announcement", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-REJECTED-WAKE", status: "blocked" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    let wakeRequests = 0;
+    const service = taskWatchdogService(db, {
+      enqueueWakeup: async (wokenAgentId, opts) => {
+        wakeRequests += 1;
+        await db.insert(agentWakeupRequests).values({
+          companyId,
+          agentId: wokenAgentId,
+          status: "skipped",
+          source: "automation",
+          reason: "heartbeat.wakeOnDemand.disabled",
+          payload: opts?.payload,
+          idempotencyKey: opts?.idempotencyKey,
+        });
+        return null;
+      },
+    });
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    }
+    const escalated = await service.reconcileTaskWatchdogs({ companyId });
+    const unchanged = await service.reconcileTaskWatchdogs({ companyId });
+    expect(escalated).toMatchObject({ triggered: 0, alreadyReviewed: 0, live: 1 });
+    expect(unchanged).toMatchObject({ triggered: 0, alreadyReviewed: 0, live: 1 });
+    expect(wakeRequests).toBe(4);
+
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    const [reviewIssue] = await db.select().from(issues).where(eq(issues.id, watchdog!.watchdogIssueId!));
+    expect(watchdog?.lastReviewedFingerprint).toBeNull();
+    expect(reviewIssue).toMatchObject({
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: expect.stringContaining("on-demand wake policy") },
+    });
+    const reviewComments = await db.select().from(issueComments).where(eq(issueComments.issueId, reviewIssue!.id));
+    expect(reviewComments).toHaveLength(2);
+    expect(reviewComments.filter((comment) => comment.body.includes("rejected wake requests"))).toHaveLength(1);
+    const triggerActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceId),
+      eq(activityLog.action, "issue.task_watchdog_triggered"),
+    ));
+    expect(triggerActivity).toHaveLength(1);
+    const escalationActivity = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceId),
+      eq(activityLog.action, "issue.task_watchdog_retry_exhausted"),
+    ));
+    expect(escalationActivity).toHaveLength(1);
+
+    await db.update(issues).set({ status: "done", updatedAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, sourceId));
+    expect(await service.reconcileTaskWatchdogs({ companyId })).toMatchObject({ triggered: 1 });
+    expect(wakeRequests).toBe(5);
+    const [rearmedIssue] = await db.select().from(issues).where(eq(issues.id, reviewIssue!.id));
+    expect(rearmedIssue).toMatchObject({ status: "todo", unblockDescriptor: null });
+    const [rearmedWatchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.id, watchdog!.id));
+    expect(rearmedWatchdog?.lastObservedFingerprint).not.toBe(watchdog?.lastObservedFingerprint);
   });
 
   it("escalates a repeatedly cancelled review once without an unbounded wake loop", async () => {
@@ -453,7 +524,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       unblockDescriptor: { owner: "board", action: expect.stringContaining("Inspect the failed task-watchdog runs") },
     });
     const escalationComments = await db.select().from(issueComments).where(eq(issueComments.issueId, reviewIssue!.id));
-    expect(escalationComments.filter((comment) => comment.body.includes("automatic wake attempts"))).toHaveLength(1);
+    expect(escalationComments.filter((comment) => comment.body.includes("queued run attempts"))).toHaveLength(1);
     const escalationActivity = await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, sourceId),
       eq(activityLog.action, "issue.task_watchdog_retry_exhausted"),
@@ -779,6 +850,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       reviewedFingerprint: oldFingerprint,
       lastObservedFingerprint: newerFingerprint,
     });
+    const triggerActivities = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, sourceId),
+      eq(activityLog.action, "issue.task_watchdog_triggered"),
+    ));
+    expect(triggerActivities).toHaveLength(2);
     expect(wakes.length).toBe(2);
   });
 

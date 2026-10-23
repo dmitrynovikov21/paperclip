@@ -1,7 +1,7 @@
 import { prepareRuntimeSettingsPatch } from "../services/agent-runtime-settings.js";
 import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
-import { agentHarnessType, type AgentRunnerChoice } from "@paperclipai/shared";
+import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -587,7 +587,7 @@ export function agentRoutes(
   const approvalsSvc = approvalService(db);
   const budgets = budgetService(db);
   const environmentsSvc = environmentService(db);
-  const { resolveAdapterTestEnvironmentId, resolveAdapterTestExecutionContext, assertAdapterTestEnvironmentForCompany, testManagedEnvironment } = agentEnvironmentTestService(db, options.pluginWorkerManager);
+  const { resolveAdapterTestEnvironmentId, resolveAdapterTestExecutionContext, assertAdapterTestEnvironmentForCompany, assertAdapterTestEnvironmentBinding, testManagedEnvironment } = agentEnvironmentTestService(db, options.pluginWorkerManager);
   const environmentRuntime = environmentRuntimeService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
@@ -3231,10 +3231,12 @@ export function agentRoutes(
         aiBinding?.provider === "github",
       );
       // Fail closed on a foreign environment before any secret resolution, env
-      // merge, target resolution, sandbox lease, or adapter test runs.
-      if (requestedEnvironmentId) {
-        await assertAdapterTestEnvironmentForCompany(companyId, requestedEnvironmentId, type);
-      }
+      // merge, target resolution, sandbox lease, or adapter test runs. The
+      // driver check waits for runner selection: a Claude harness on a plugin
+      // environment is only allowed once it resolves to Paperclip Runner.
+      const requestedEnvironment = requestedEnvironmentId
+        ? await assertAdapterTestEnvironmentBinding(companyId, requestedEnvironmentId)
+        : null;
       // Agent reads redact every plain environment value. When this is a saved
       // agent test, restore those display-only placeholders from the
       // server-side config before validating or resolving secrets; otherwise
@@ -3254,9 +3256,13 @@ export function agentRoutes(
           ? restoreRedactedAgentEnv(inputAdapterConfig, savedAgent.adapterConfig)
           : inputAdapterConfig;
       }
+      // A saved adapter that cannot run on the requested environment re-resolves
+      // its runner, so testing a Claude agent on a Runner-only environment
+      // tests the Runner configuration a save would produce.
       const retainsSavedExecution = savedAgent && req.body.runner === undefined
         && savedAgent.adapterType === type
-        && agentHarnessType(type, adapterConfigForTest) === agentHarnessType(savedAgent.adapterType, savedAgent.adapterConfig);
+        && agentHarnessType(type, adapterConfigForTest) === agentHarnessType(savedAgent.adapterType, savedAgent.adapterConfig)
+        && (!requestedEnvironment || isEnvironmentDriverSupportedForAdapter(type, requestedEnvironment.driver));
       const selection = retainsSavedExecution
         ? { adapterType: type, adapterConfig: adapterConfigForTest }
         : await resolveNewAgentRunnerForCompany(db, companyId, {
@@ -3266,6 +3272,7 @@ export function agentRoutes(
         });
       type = selection.adapterType;
       adapterConfigForTest = selection.adapterConfig;
+      if (requestedEnvironment) await assertAdapterTestEnvironmentForCompany(companyId, requestedEnvironment.id, type);
       const adapter = requireServerAdapter(type);
       if (!retainsSavedExecution) await assertSelectableAdapterType(type, adapterConfigForTest);
       if (poolBinding?.mode === "router") {

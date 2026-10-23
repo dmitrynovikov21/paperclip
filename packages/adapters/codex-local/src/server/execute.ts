@@ -5,7 +5,7 @@ import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provid
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import { isolatedHostAgentRuntimeEnabled, readHostFileForAgent } from "@paperclipai/adapter-utils/isolated-host-file";
+import { assertIsolatedHostAssetDirectory, isolatedHostAgentRuntimeEnabled, readHostFileForAgent } from "@paperclipai/adapter-utils/isolated-host-file";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -588,21 +588,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const expectedHome = resolveIsolatedCodexAgentHomeDir(process.env, companyId, agentId);
     const env = parseObject(ctx.config.env);
     const requestedHome = env.CODEX_HOME;
+    const managedConnectionHome = ctx.managedAiCredentialHome;
+    if (managedConnectionHome && !ctx.config.managedAiConnection) {
+      throw new Error("Isolated Codex execution requires a managed AI connection for its credential home.");
+    }
+    const trustedHome = managedConnectionHome ?? expectedHome;
     if (
       requestedHome !== undefined &&
-      (typeof requestedHome !== "string" || path.resolve(requestedHome.trim()) !== expectedHome)
+      (typeof requestedHome !== "string" || path.resolve(requestedHome.trim()) !== trustedHome)
     ) {
       throw new Error("Isolated Codex execution refuses an untrusted CODEX_HOME.");
     }
-    await assertIsolatedCodexHomeEntries(expectedHome);
-    // Both the CLI and ACP paths need the same operator-managed credential
-    // source. ACP treats an explicit CODEX_HOME as already prepared, so seed it
-    // here before either engine can read or upload home assets.
-    await seedManagedCodexHome(expectedHome, process.env, ctx.onLog, {
-      apiKey: typeof env.OPENAI_API_KEY === "string" ? env.OPENAI_API_KEY : null,
-    });
-    await assertIsolatedCodexHomeEntries(expectedHome);
-    ctx = { ...ctx, config: { ...ctx.config, env: { ...env, CODEX_HOME: expectedHome } } };
+    if (managedConnectionHome) {
+      // The server already provisioned this disposable home from the selected
+      // connection. Do not replace its credential with the shared host login.
+      await assertIsolatedHostAssetDirectory(managedConnectionHome);
+    } else {
+      await assertIsolatedCodexHomeEntries(expectedHome);
+      // Both the CLI and ACP paths need the same operator-managed credential
+      // source. ACP treats an explicit CODEX_HOME as already prepared, so seed it
+      // here before either engine can read or upload home assets.
+      await seedManagedCodexHome(expectedHome, process.env, ctx.onLog, {
+        apiKey: typeof env.OPENAI_API_KEY === "string" ? env.OPENAI_API_KEY : null,
+      });
+      await assertIsolatedCodexHomeEntries(expectedHome);
+    }
+    ctx = { ...ctx, config: { ...ctx.config, env: { ...env, CODEX_HOME: trustedHome } } };
   }
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {

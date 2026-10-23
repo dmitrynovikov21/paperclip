@@ -276,6 +276,60 @@ describe("codex remote execution", () => {
     expect(logs.join("")).not.toContain("sk-test-key");
   });
 
+  it("uses the server-created managed connection home without overwriting its credential", async () => {
+    const root = await mkdtemp(path.join(process.cwd(), ".codex-managed-connection-"));
+    cleanupDirs.push(root);
+    const workspace = path.join(root, "workspace");
+    const providerHome = path.join(root, "provider");
+    const credential = JSON.stringify({ OPENAI_API_KEY: "sk-managed-connection" });
+    await mkdir(workspace, { mode: 0o700 });
+    await mkdir(providerHome, { mode: 0o700 });
+    await writeFile(path.join(providerHome, "auth.json"), credential, { mode: 0o600 });
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 100000));
+
+    await execute({
+      runId: "managed-connection-home",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli",
+        command: "codex",
+        managedAiConnection: { grantId: "grant-1" },
+        env: { CODEX_HOME: providerHome },
+      },
+      managedAiCredentialHome: providerHome,
+      context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+        strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    } as never);
+
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
+    expect(await readFile(path.join(providerHome, "auth.json"), "utf8")).toBe(credential);
+  });
+
+  it("rejects a caller-selected managed connection path without the server-owned context", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-managed-spoof-"));
+    cleanupDirs.push(root);
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "instance"));
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    await expect(execute({
+      runId: "managed-connection-spoof",
+      agent: { id: "agent-1", companyId: "company-1", adapterType: "codex_local" },
+      config: { engine: "cli", managedAiConnection: { grantId: "grant-1" }, env: { CODEX_HOME: root } },
+      context: {},
+      executionTarget: { kind: "remote", transport: "sandbox" },
+      onLog: async () => {},
+    } as never)).rejects.toThrow("untrusted CODEX_HOME");
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+  });
+
   it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-"));
     cleanupDirs.push(rootDir);

@@ -7086,8 +7086,8 @@ export function agentRoutes(
       });
     }
 
-    res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
-      getActorInfo(req).actorId) : null);
+    res.json(run ? redactPostgresUrlsInValue(await runRedactions.redactForRun(run.companyId, run.id,
+      redactPostgresUrlsInValue(run, { onlyPartial: true }), getActorInfo(req).actorId)) : null);
   });
 
   router.post(

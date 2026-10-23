@@ -21,6 +21,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
+  cancelRun: vi.fn(),
   getRun: vi.fn(),
   list: vi.fn(),
   listEvents: vi.fn(),
@@ -653,7 +654,7 @@ describe("agent live run routes", () => {
       });
       await store.append(handle, {
         stream: "stdout",
-        chunk: "postgres://worker:p%40ss\n[paperclip truncated run log chunk: omitted 100 chars]\ndiagnostic tail",
+        chunk: "postgres://worker:p%40ss\n[paperclip truncated run log chunk: omitted 100 chars]\nword@db.example.test/app diagnostic tail",
         ts: "test-time",
       });
       mockHeartbeatService.readLog.mockImplementation(async (_run, options) => ({
@@ -678,6 +679,7 @@ describe("agent live run routes", () => {
       expect(full.body.content).not.toContain("worker");
       expect(full.body.content).not.toContain("p%40ss");
       expect(full.body.content).toContain("diagnostic tail");
+      expect(full.body.content).not.toContain("word@db.example.test");
 
       const raw = await store.read(handle);
       const passwordOffset = raw.content.indexOf("p%40ssword");
@@ -699,6 +701,36 @@ describe("agent live run routes", () => {
     } finally {
       await fs.rm(basePath, { recursive: true, force: true });
     }
+  }, 45_000);
+
+  it("masks historical PostgreSQL credentials in a terminal run cancel response", async () => {
+    const run = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      agentId: routeAgentId,
+      scopeKind: "company",
+      issueId: null,
+      status: "succeeded",
+      stdoutExcerpt: "ps postgres://worker:synthetic-password@db.example.test/app done",
+      stderrExcerpt: "postgresql://etl:p%40ss@db.example.test/app failed",
+      resultJson: { summary: "postgres://worker:synthetic@db.example.test/app?sslpassword=synthetic-query-secret" },
+    };
+    mockHeartbeatService.getRun.mockResolvedValue(run);
+    // A terminal run returns its existing row without changing its result.
+    mockHeartbeatService.cancelRun.mockResolvedValue(run);
+
+    const response = await requestApp(await createApp(), (url) => request(url).post(
+      "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/cancel",
+    ).send({}));
+    expect(response.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    expect(response.body).toMatchObject({
+      status: "succeeded",
+      stdoutExcerpt: "ps postgres://***REDACTED***@db.example.test/app done",
+      stderrExcerpt: "postgresql://***REDACTED***@db.example.test/app failed",
+      resultJson: { summary: "postgres://***REDACTED***@db.example.test/app?***REDACTED***" },
+    });
+    expect(JSON.stringify(response.body)).not.toMatch(/synthetic-password|p%40ss|synthetic-query-secret|worker|etl:/);
   }, 45_000);
 
   it.each(["board", "agent"])("masks truncated historical run excerpts for a %s reader", async (actorType) => {

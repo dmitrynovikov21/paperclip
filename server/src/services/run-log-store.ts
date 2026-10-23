@@ -150,6 +150,16 @@ function maskPostgresCredentialsInRange(
       while (urlEnd < stream.text.length && !/[\s"`<>\\]/.test(stream.text[urlEnd]!)) urlEnd += 1;
       const queryStart = stream.text.indexOf("?", userinfoStart);
       if (queryStart >= 0 && queryStart < urlEnd) maskCharacters(queryStart + 1, urlEnd);
+      // A historical compacted chunk can resume inside userinfo or a query
+      // value after this marker. The tail has no scheme to rediscover it, so
+      // conceal its first token even when the read starts at offset zero.
+      const marker = RUN_LOG_TRUNCATION_MARKER_RE.exec(stream.text.slice(urlEnd));
+      if (marker) {
+        const tailStart = urlEnd + marker[0].length;
+        let tailEnd = tailStart;
+        while (tailEnd < stream.text.length && !/\s/.test(stream.text[tailEnd]!)) tailEnd += 1;
+        maskCharacters(tailStart, tailEnd);
+      }
     }
   }
 }

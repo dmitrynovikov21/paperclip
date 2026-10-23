@@ -431,7 +431,7 @@ describe("createDurableRunLogStore", () => {
     const marker = "\n[paperclip truncated run log chunk: omitted 100 chars]\n";
     await store.append(handle, {
       stream: "stdout",
-      chunk: `ps --dbname=postgresql://worker:p%40ss${marker}diagnostic tail`,
+      chunk: `ps --dbname=postgresql://worker:p%40ss${marker}word@db.example.test/app diagnostic tail`,
       ts: "t1",
     });
     const raw = await store.read(handle);
@@ -447,8 +447,42 @@ describe("createDurableRunLogStore", () => {
     }
     expect(content).toMatch(/postgresql:\/\/\*+\\n\[paperclip truncated run log chunk:/);
     expect(content).toContain("diagnostic tail");
+    expect(content).not.toContain("word@db.example.test");
     expect(content).not.toContain("worker");
     expect(content).not.toContain("p%40ss");
+    expect((await store.read(handle)).content).toBe(raw.content);
+  });
+
+  it.each([false, true])("masks a historical URL resumed after truncation in local/S3 reads (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const marker = "\n[paperclip truncated run log chunk: omitted 100 chars]\n";
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: `postgresql://worker:p%40ss${marker}word@db.example.test/app next postgres://etl:synthetic@db.example.test/app?sslpassword=synthetic-${marker}query-secret complete`,
+      ts: "t",
+    });
+    const raw = await store.read(handle);
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    const full = await store.read(handle, { redactPostgresCredentials: true });
+    expect(full.nextOffset).toBeUndefined();
+    expect(Buffer.byteLength(full.content)).toBe(Buffer.byteLength(raw.content));
+    const chunks: string[] = [];
+    for (let offset = 0; offset < Buffer.byteLength(raw.content); offset += 9) {
+      const page = await store.read(handle, { offset, limitBytes: 9, redactPostgresCredentials: true });
+      chunks.push(page.content);
+      expect(page.nextOffset).toBe(offset + 9 < Buffer.byteLength(raw.content) ? offset + 9 : undefined);
+    }
+    expect(chunks.join("")).toBe(full.content);
+    const record = JSON.parse(full.content.trim()) as { chunk: string };
+    expect(record.chunk).toContain(marker);
+    expect(record.chunk).toContain(" next ");
+    expect(record.chunk).toContain(" complete");
+    expect(record.chunk).not.toMatch(/worker|p%40ss|word@|synthetic-|query-secret/);
     expect((await store.read(handle)).content).toBe(raw.content);
   });
 

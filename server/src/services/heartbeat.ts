@@ -1561,9 +1561,9 @@ async function materializeManagedProjectWorkspace(
   // materialization (another process, or a run racing this one) can neither adopt a broken
   // checkout nor lose its own completed one.
   const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
-  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
+  let cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
-    await assertHostGitWorkspaceAllowed(cloneTmpDir);
+    cloneTmpDir = await assertHostGitWorkspaceAllowed(cloneTmpDir);
     const git = prepareHostGitInvocation(
       [...(auth?.configArgs ?? []), "clone", "--", input.repoUrl, cloneTmpDir],
       {
@@ -1836,9 +1836,9 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  await assertHostGitWorkspaceAllowed(normalized);
+  const guardedCwd = await assertHostGitWorkspaceAllowed(normalized);
   const git = prepareHostGitInvocation(["rev-parse", "--show-toplevel"]);
-  return execFile("git", git.args, { cwd: normalized, env: git.env })
+  return execFile("git", git.args, { cwd: guardedCwd, env: git.env })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -1853,9 +1853,9 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  await assertHostGitWorkspaceAllowed(normalized);
+  const guardedCwd = await assertHostGitWorkspaceAllowed(normalized);
   const remoteGit = prepareHostGitInvocation(["remote"]);
-  const remoteNames = await execFile("git", remoteGit.args, { cwd: normalized, env: remoteGit.env })
+  const remoteNames = await execFile("git", remoteGit.args, { cwd: guardedCwd, env: remoteGit.env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -1866,7 +1866,7 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
 
   for (const remoteName of remoteNames) {
     const git = prepareHostGitInvocation(["remote", "get-url", "--push", remoteName]);
-    const pushUrl = await execFile("git", git.args, { cwd: normalized, env: git.env })
+    const pushUrl = await execFile("git", git.args, { cwd: guardedCwd, env: git.env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;

@@ -9,6 +9,7 @@ import {
   type SandboxManagedRuntimeClient,
 } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { assertGitWorktreeBaseWorkspaceReady } from "../services/heartbeat.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "../services/host-git-security.js";
 import {
   ensurePersistedExecutionWorkspaceAvailable,
   realizeExecutionWorkspace,
@@ -64,6 +65,25 @@ const agent = { id: "agent-test", name: "Test", companyId: "company-test" };
 const config = { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}" } };
 
 describe.skipIf(process.platform !== "linux")("isolated host Git before sandbox sync", () => {
+  it("pins Git cwd to the checked repository when an agent-writable alias changes", async () => {
+    const { root, repoRoot, keyFile } = await createFixture();
+    const mutableParent = path.join(root, "agent-mutable");
+    const alias = path.join(mutableParent, "checkout");
+    await fs.mkdir(mutableParent);
+    await fs.chmod(mutableParent, 0o777);
+    await fs.symlink(repoRoot, alias);
+    enableIsolation(repoRoot, keyFile);
+
+    const guardedCwd = await assertHostGitWorkspaceAllowed(alias);
+    expect(guardedCwd).toBe(repoRoot);
+    await fs.unlink(alias);
+    await fs.symlink(path.dirname(keyFile), alias);
+
+    const git = prepareHostGitInvocation(["rev-parse", "--show-toplevel"]);
+    const result = await execFile("git", git.args, { cwd: guardedCwd, env: git.env });
+    expect(result.stdout.trim()).toBe(repoRoot);
+  });
+
   it("creates a worktree without calling a service-owned hook or ambient fsmonitor script", async () => {
     const { root, repoRoot, keyFile } = await createFixture();
     const hookMarker = path.join(root, "hook-called");

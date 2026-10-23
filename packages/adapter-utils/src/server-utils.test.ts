@@ -376,6 +376,43 @@ describe("materializePaperclipSkillCopy", () => {
     }
   });
 
+  it("stages remote skills on macOS outside key isolation without following links", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-macos-skill-asset-"));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "false");
+    Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+    try {
+      const source = path.join(root, "skill");
+      const privateFile = path.join(root, "synthetic-master.key");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      await fs.writeFile(privateFile, "synthetic-key-bytes\n");
+      await fs.symlink(privateFile, path.join(source, "leak"));
+      const staged = await buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-macos-skill-staged-",
+      );
+      try {
+        await expect(fs.readFile(path.join(staged, "skill", "SKILL.md"), "utf8"))
+          .resolves.toBe("# skill\n");
+        await expect(fs.lstat(path.join(staged, "skill", "leak")))
+          .rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await fs.rm(path.dirname(staged), { recursive: true, force: true });
+      }
+
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      await expect(buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-macos-isolated-skill-staged-",
+      )).rejects.toThrow(/requires Linux/);
+    } finally {
+      Object.defineProperty(process, "platform", originalPlatform);
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a skill source reached through a symlinked parent", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-parent-link-"));
     try {

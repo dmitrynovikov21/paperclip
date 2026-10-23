@@ -102,6 +102,8 @@ export async function prepareClaudePromptBundle(input: {
   await fs.mkdir(skillsHome, { recursive: true });
 
   const runtimeNames = new Set<string>();
+  const strictSkillStaging = process.platform === "linux" ||
+    process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
   for (const entry of skills) {
     const name = entry.runtimeName;
     if (!name || name === "." || name === ".." || /[\\/]/.test(name) || runtimeNames.has(name)) {
@@ -110,7 +112,7 @@ export async function prepareClaudePromptBundle(input: {
     runtimeNames.add(name);
     const target = path.join(skillsHome, entry.runtimeName);
     try {
-      await materializePaperclipSkillCopy(entry.source, target, { rejectSymlinks: true });
+      await materializePaperclipSkillCopy(entry.source, target, { rejectSymlinks: strictSkillStaging });
     } catch (err) {
       await onLog(
         "stderr",

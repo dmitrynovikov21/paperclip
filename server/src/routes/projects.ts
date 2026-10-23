@@ -648,8 +648,8 @@ export function projectRoutes(db: Db) {
       req,
       collectProjectWorkspaceCommandPaths(req.body),
     );
-    await assertNoManagedSandboxWorkspacePath(req.body);
     assertNoAgentHostWorkspacePathMutation(req, req.body);
+    await assertNoManagedSandboxWorkspacePath(req.body);
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
       res.status(422).json({ error: "Invalid project workspace payload" });
@@ -685,13 +685,13 @@ export function projectRoutes(db: Db) {
       const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
       if (!existing) return;
       if (!(await assertProjectReadAllowed(req, res, existing))) return;
-    if (!(await assertProjectWorkspaceWriteAllowed(req, res, existing))) return;
+      if (!(await assertProjectWorkspaceWriteAllowed(req, res, existing))) return;
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectProjectWorkspaceCommandPaths(req.body),
       );
-      await assertNoManagedSandboxWorkspacePath(req.body);
       assertNoAgentHostWorkspacePathMutation(req, req.body);
+      await assertNoManagedSandboxWorkspacePath(req.body);
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {
         res.status(404).json({ error: "Project workspace not found" });

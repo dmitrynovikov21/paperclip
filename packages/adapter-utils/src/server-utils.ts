@@ -4518,6 +4518,9 @@ async function hashStrictSkillDirectory(source: SkillDirectoryHandle): Promise<s
 }
 
 export async function fingerprintPaperclipSkillDirectory(source: string): Promise<string> {
+  if (process.platform !== "linux" && process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") {
+    return hashSkillDirectory(path.resolve(source));
+  }
   const directory = await openStrictSkillDirectory(path.resolve(source));
   try {
     return await hashStrictSkillDirectory(directory);
@@ -4718,6 +4721,11 @@ export async function materializePaperclipSkillCopy(
     skippedSymlinks: [],
   };
 
+  // Ordinary copies can be reused even while another process owns the lock.
+  // Strict copies keep their target validation under the lock.
+  if (!options.rejectSymlinks &&
+      await materializedSkillFingerprintMatches(targetRoot, await hashSkillDirectory(sourceRoot))) return result;
+
   const lockDir = `${targetRoot}.lock`;
   const releaseLock = await acquireMaterializeLock(lockDir);
   const tempRoot = `${targetRoot}.tmp-${process.pid}-${randomUUID()}`;
@@ -4823,13 +4831,15 @@ export async function buildPaperclipRuntimeSkillsAssetDir(
   try {
     await fs.mkdir(skillsDir);
     const names = new Set<string>();
+    const strictSkillStaging = process.platform === "linux" ||
+      process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
     for (const entry of entries) {
       const name = entry.runtimeName;
       if (!name || name === "." || name === ".." || /[\\/]/.test(name) || names.has(name)) {
         throw new Error(`Invalid or duplicate Paperclip skill runtime name: ${name}`);
       }
       names.add(name);
-      await materializePaperclipSkillCopy(entry.source, path.join(skillsDir, name), { rejectSymlinks: true });
+      await materializePaperclipSkillCopy(entry.source, path.join(skillsDir, name), { rejectSymlinks: strictSkillStaging });
     }
     return skillsDir;
   } catch (error) {

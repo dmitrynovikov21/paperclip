@@ -9,6 +9,7 @@ import {
   type SandboxManagedRuntimeClient,
 } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { assertGitWorktreeBaseWorkspaceReady } from "../services/heartbeat.js";
+import { buildGitAuthInvocation } from "../services/git-credentials.js";
 import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "../services/host-git-security.js";
 import {
   ensurePersistedExecutionWorkspaceAvailable,
@@ -65,6 +66,19 @@ const agent = { id: "agent-test", name: "Test", companyId: "company-test" };
 const config = { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}" } };
 
 describe.skipIf(process.platform !== "linux")("isolated host Git before sandbox sync", () => {
+  it("retains trusted GitHub SSH rewrites after removing ambient Git configuration", async () => {
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    const auth = buildGitAuthInvocation({ token: "synthetic-token", source: "managed_connection", secretName: null });
+    const git = prepareHostGitInvocation(
+      [...auth.configArgs, "ls-remote", "--get-url", "git@github.com:example/private.git"],
+      { ...process.env, ...auth.env, GIT_CONFIG_KEY_99: "core.fsmonitor", GIT_CONFIG_VALUE_99: "malicious-command" },
+    );
+    expect(git.env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(git.env.GIT_CONFIG_KEY_99).toBeUndefined();
+    const result = await execFile("git", git.args, { env: git.env });
+    expect(result.stdout.trim()).toBe("https://github.com/example/private.git");
+  });
+
   it("pins Git cwd to the checked repository when an agent-writable alias changes", async () => {
     const { root, repoRoot, keyFile } = await createFixture();
     const mutableParent = path.join(root, "agent-mutable");

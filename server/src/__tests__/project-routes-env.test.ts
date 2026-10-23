@@ -244,6 +244,7 @@ describe("project env routes", () => {
 
   it("rejects agent-selected host cwd before creating or updating a project workspace in isolation mode", async () => {
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    mockProjectService.list.mockResolvedValue([]);
     mockProjectService.getById.mockResolvedValue(buildProject());
     const app = await createApp("agent");
     try {
@@ -255,7 +256,7 @@ describe("project env routes", () => {
         .send({ cwd: "/private/secrets" });
       const localRepo = await request(app).post("/api/projects/project-1/workspaces")
         .send({ repoUrl: "file:///private/secrets/repo" });
-      expect([project.status, created.status, updated.status, localRepo.status]).toEqual([403, 403, 403, 403]);
+      expect([project.status, created.status, updated.status, localRepo.status], JSON.stringify([project.body, created.body, updated.body, localRepo.body])).toEqual([403, 403, 403, 403]);
       expect(mockProjectService.create).not.toHaveBeenCalled();
       expect(mockProjectService.createWorkspace).not.toHaveBeenCalled();
       expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();

@@ -2,10 +2,10 @@
 
 When work produces a user-inspectable file, upload true deliverables to the current issue before final disposition. Local filesystem paths are not enough because board users, reviewers, and cloud operators may not have access to the agent workspace.
 
-Use the helper bundled with this skill. From an installed `paperclip` skill directory, the helper lives at `scripts/paperclip-upload-artifact.sh`:
+Set `PAPERCLIP_SKILL_DIR` to the absolute directory of this `paperclip` skill, as described in its `SKILL.md`. Use the helper at `"$PAPERCLIP_SKILL_DIR/scripts/paperclip-upload-artifact.sh"` from any working directory:
 
 ```bash
-scripts/paperclip-upload-artifact.sh path/to/output.webm \
+"$PAPERCLIP_SKILL_DIR/scripts/paperclip-upload-artifact.sh" path/to/output.webm \
   --title "Walkthrough render" \
   --summary "Rendered walkthrough for review"
 ```
@@ -52,33 +52,25 @@ workspace root; do not use host-local absolute paths in `resourceRef`.
 Create the work product with:
 
 ```bash
-curl -sS -X POST \
-  "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -H "Content-Type: application/json" \
-  --data-binary @workspace-file-work-product.json
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+  "/api/issues/$PAPERCLIP_TASK_ID/work-products" --body-stdin \
+  < workspace-file-work-product.json
 ```
 
-If the helper is unavailable, use the Paperclip API directly:
+To upload directly without the artifact helper, use the argv-free API client:
 
 ```bash
-curl -sS -X POST \
-  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -F 'file=@"path/to/output.webm";type=video/webm'
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+  "/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
+  --multipart-file path/to/output.webm --content-type video/webm
 ```
 
 Then create a work product when the file is the deliverable. The server canonicalizes attachment-backed artifact metadata from the `attachmentId`:
 
 ```bash
-curl -sS -X POST \
-  "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -H "Content-Type: application/json" \
-  --data-binary '{
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST \
+  "/api/issues/$PAPERCLIP_TASK_ID/work-products" --body-stdin <<'JSON'
+{
     "type": "artifact",
     "provider": "paperclip",
     "title": "Walkthrough render",
@@ -86,7 +78,8 @@ curl -sS -X POST \
     "reviewState": "needs_board_review",
     "isPrimary": true,
     "metadata": { "attachmentId": "<uploaded-attachment-id>" }
-  }'
+}
+JSON
 ```
 
 In your final issue comment, link the uploaded attachment or work product and

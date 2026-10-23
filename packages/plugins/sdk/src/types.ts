@@ -230,6 +230,8 @@ export interface PluginEvent<TPayload = unknown> {
  * @see PLUGIN_SPEC.md §13.6 — `runJob`
  */
 export interface PluginJobContext {
+  /** Company selected by the host for this run, when configured. */
+  companyId?: string;
   /** Stable job key matching the declaration in the manifest. */
   jobKey: string;
   /** UUID for this specific job run instance. */

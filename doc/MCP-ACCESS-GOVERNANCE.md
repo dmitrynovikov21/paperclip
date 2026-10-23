@@ -4,6 +4,16 @@ Operator guide for Paperclip's MCP tool access surface. Audience: board users an
 
 > Time-to-first-success: under 5 minutes if you follow [Quick start](#quick-start) and use the bundled example. Everything else is reference and how-to material that you read on demand.
 
+## Safe API commands
+
+Run the examples from the repository root after sourcing the helper once in the same Bash shell:
+
+```sh
+source scripts/operator-http.sh
+```
+
+`board_api` reads `BOARD_API_KEY` from env; `gateway_api` reads `GATEWAY_TOKEN`. The helper sends the request body through stdin and keeps credentials and request URLs out of process arguments. It rejects redirects and never prints credentials on request errors. Keep shell tracing disabled while using credentials.
+
 ## Contents
 
 - [Mental model](#mental-model)
@@ -75,18 +85,10 @@ The fastest path is the bundled example. From the Tools & Access UI (`/<prefix>/
 
 ```sh
 # Install the example application + connection + profile in one call.
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/examples/safe-read-only-todo-kv/install" \
-  -d '{}' | jq .
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/examples/safe-read-only-todo-kv/install" '{}' | jq .
 
 # Run the bundled smoke check (validates an allowed read, a denied write, audit visibility).
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/examples/safe-read-only-todo-kv/smoke" \
-  -d '{}' | jq '{ok, checks: [.checks[] | {name, ok, decision, reasonCode}]}'
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/examples/safe-read-only-todo-kv/smoke" '{}' | jq '{ok, checks: [.checks[] | {name, ok, decision, reasonCode}]}'
 ```
 
 Expected: `ok: true` with three green checks: `allow_read_tool`, `deny_write_tool`, `audit_written`.
@@ -140,11 +142,7 @@ Operators do not paste arbitrary `command` / `args` for stdio. Allowed stdio ent
 ### Create a connection (remote_http)
 
 ```sh
-curl -fsS -X POST \
-  -H "Authorization: Bearer $BOARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/connections" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/connections" '{
     "applicationId": "'"$APPLICATION_ID"'",
     "name": "Linear (remote)",
     "transport": "remote_http",
@@ -165,24 +163,18 @@ Connections are created `enabled: false`. Run a health check and a catalog refre
 
 ```sh
 # Health check (no secrets in output)
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/health-check" -d '{}' \
+board_api POST "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/health-check" '{}' \
   | jq '{connection: {healthStatus: .connection.healthStatus, healthMessage: .connection.healthMessage}}'
 
 # Catalog refresh (pulls schema, sets risk levels, quarantines unexpected writes)
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/catalog/refresh" -d '{}' \
+board_api POST "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID/catalog/refresh" '{}' \
   | jq '{discoveredCount, quarantinedCount}'
 
 # Enable
-curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
-  -d '{"enabled": true, "status": "active"}' | jq '{id, enabled, status, healthStatus}'
+board_api PATCH "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" '{"enabled": true, "status": "active"}' | jq '{id, enabled, status, healthStatus}'
 
 # Disable (does not delete; preserves audit history)
-curl -fsS -X PATCH -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" \
-  -d '{"enabled": false, "status": "disabled"}' | jq '{id, enabled, status}'
+board_api PATCH "$PAPERCLIP_URL/api/tool-connections/$CONNECTION_ID" '{"enabled": false, "status": "disabled"}' | jq '{id, enabled, status}'
 ```
 
 Connection statuses: `draft`, `active`, `disabled`, `archived`. Health statuses: `ok`, `unchecked`, `degraded`, `failed`, `error`, `missing_secret`.
@@ -209,9 +201,7 @@ Example: create a profile that allows only read-only tools and bind it to a proj
 
 ```sh
 # Profile with default-deny and one include entry for read-only catalog entries.
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles" '{
     "profileKey": "engineering.read-only",
     "name": "Engineering read-only",
     "defaultAction": "deny",
@@ -221,9 +211,7 @@ curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: ap
   }' | jq '{id, name, defaultAction}'
 
 # Bind it to a project so every agent run in that project gets this profile.
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/$PROFILE_ID/bind" \
-  -d '{ "targetType": "project", "targetId": "'"$PROJECT_ID"'", "priority": 10 }' | jq .
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/$PROFILE_ID/bind" '{ "targetType": "project", "targetId": "'"$PROJECT_ID"'", "priority": 10 }' | jq .
 ```
 
 Selector types:
@@ -238,8 +226,7 @@ Effects: `include` adds to the allowed set, `exclude` removes. `defaultAction` i
 Binding scopes, narrowest first: `issue` > `routine` > `agent` > `project` > `company`. The effective profile for an agent is computed at session time and cached on the gateway session. To preview:
 
 ```sh
-curl -fsS -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
+board_api GET "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/profiles/effective/agents/$AGENT_ID" \
   | jq '{profileIds, allowedToolNames}'
 ```
 
@@ -264,9 +251,7 @@ Order of evaluation:
 To dry-run a policy decision without making a real call. The dry-run endpoint takes a structured `{ companyId, actor, request, runContext? }` body and returns the decision under `.decision`:
 
 ```sh
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/policy/test" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/policy/test" '{
     "companyId": "'"$COMPANY_ID"'",
     "actor": {
       "actorType": "agent",
@@ -297,31 +282,23 @@ After approval, the operator can promote that approval into a **trust rule**: a 
 
 ```sh
 # Approve via API (UI does the same). Approval requires companyId — body or query.
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/action-requests/$ACTION_REQUEST_ID/approve" \
-  -d '{ "companyId": "'"$COMPANY_ID"'" }' | jq '{id, status, resolvedAt, resolvedByUserId}'
+board_api POST "$PAPERCLIP_URL/api/tool-gateway/action-requests/$ACTION_REQUEST_ID/approve" '{ "companyId": "'"$COMPANY_ID"'" }' | jq '{id, status, resolvedAt, resolvedByUserId}'
 
 # Retry the original tool call with approvedActionRequestId (the agent does this).
-curl -fsS -X POST -H "X-Paperclip-Tool-Gateway-Token: $GATEWAY_TOKEN" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/tool-gateway/tools/call" \
-  -d '{
+gateway_api POST "$PAPERCLIP_URL/api/tool-gateway/tools/call" '{
     "tool": "create_item",
     "parameters": { "title": "Approved item" },
     "approvedActionRequestId": "'"$ACTION_REQUEST_ID"'"
   }' | jq '{invocationId, status, tool, result}'
 
 # Promote the approval to a trust rule
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/action-requests/$ACTION_REQUEST_ID/trust-rule" \
-  -d '{
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/action-requests/$ACTION_REQUEST_ID/trust-rule" '{
     "approvalThreshold": 2,
     "expiresAt": "2026-09-01T00:00:00.000Z"
   }' | jq '{id, policyType, priority, config: {trustRule: .config.trustRule}}'
 
 # Revoke a trust rule (audit-safe; does not delete)
-curl -fsS -X POST -H "Authorization: Bearer $BOARD_API_KEY" -H "Content-Type: application/json" \
-  "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/trust-rules/$POLICY_ID/revoke" \
-  -d '{ "reason": "Catalog schema changed." }' | jq '{id, enabled, config: {revokedAt: .config.trustRule.revokedAt}}'
+board_api POST "$PAPERCLIP_URL/api/companies/$COMPANY_ID/tools/trust-rules/$POLICY_ID/revoke" '{ "reason": "Catalog schema changed." }' | jq '{id, enabled, config: {revokedAt: .config.trustRule.revokedAt}}'
 ```
 
 Trust rules carry the catalog and schema hashes captured at approval time. If the upstream tool changes its schema or the canonical argument hash drifts, the trust rule stops applying — the next matching call falls back to `require_approval`. The retry-with-`approvedActionRequestId` flow enforces the same invariant for a single approval: change the arguments between approval and retry and the call fails with `reasonCode: "signed_arguments_mismatch"`. This is intentional: an approval is for a specific argument shape, not for "future versions of this tool, sight unseen".
@@ -356,8 +333,7 @@ Every tool invocation lands in the **call event log** (`tool_call_events`). Each
 To pull recent audit:
 
 ```sh
-curl -fsS -H "Authorization: Bearer $BOARD_API_KEY" \
-  "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=100" \
+board_api GET "$PAPERCLIP_URL/api/tool-gateway/audit?companyId=$COMPANY_ID&limit=100" \
   | jq '[.[] | {createdAt, action: .action, decision: .details.decision, tool: .details.tool, outcome: .details.outcome, reasonCode: .details.reasonCode}]'
 ```
 

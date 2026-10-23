@@ -17,13 +17,19 @@ In Paperclip, **task** and **issue** refer to the same work item. The UI may use
 
 ## Authentication
 
-Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For sandbox-backed local adapters, the Bash/tool environment may receive `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` for a run-scoped bridge instead of the host API directly; use those exact env vars from Bash/curl and do not assume the host port is reachable from browser or web tools. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL, and never paste the API key or bridge token into prompts, comments, documents, restored workspace files, or logs.
+Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For sandbox-backed local adapters, the Bash/tool environment may receive `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` for a run-scoped bridge instead of the host API directly; use those exact env vars from the shell and do not assume the host port is reachable from browser or web tools. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All endpoints are under `/api`, all JSON. Never hard-code the API URL, and never paste the API key or bridge token into prompts, comments, documents, restored workspace files, or logs.
+
+Set `PAPERCLIP_SKILL_DIR` to the absolute directory containing this `SKILL.md` in each shell that runs the examples. From the repository root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`; from the installed `paperclip` skill root, use `export PAPERCLIP_SKILL_DIR="$PWD"`. Check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"` before use. If the installed copy lacks the helper, report the missing bundle asset for the approved release path; do not fall back to bearer headers in command arguments.
+
+Use `python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" METHOD /api/path` for API calls. It reads the run JWT from env in memory, adds the run audit header on mutations, and accepts JSON request bodies only via `--body-stdin`. Never pass a bearer header or JSON body as a command argument. For process diagnostics, use `python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-processes.py"` (the only `ps` columns are `pid,etime,comm`). The helper rejects `--args` because arbitrary bearer-token arguments cannot be reliably redacted. Do not run unfiltered `ps ... args` on a shared host.
+
+The exact commands and synthetic end-to-end probe are in `references/argv-safety.md`.
 
 Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes. When present, it contains the compact issue summary and the ordered batch of new comment payloads for this wake. Use it first. For comment wakes, treat that batch as the highest-priority new context in the heartbeat: in your first task update or response, acknowledge the latest comment and say how it changes your next action before broad repo exploration or generic wake boilerplate. Only fetch the thread/comments API immediately when `fallbackFetchNeeded` is true or you need broader context than the inline batch provides.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.
 
-**Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
+**Run audit trail:** The API helper adds `X-Paperclip-Run-Id` from `PAPERCLIP_RUN_ID` to every mutation. This links your actions to the current heartbeat run for traceability.
 
 ## The Heartbeat Procedure
 
@@ -58,9 +64,8 @@ Overrides and special cases:
 **Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
 
 ```
-POST /api/issues/{issueId}/checkout
-Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
-{ "agentId": "{your-agent-id}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
+printf '%s' '{"agentId":"{your-agent-id}","expectedStatuses":["todo","backlog","blocked","in_review"]}' |
+  python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST /api/issues/{issueId}/checkout --body-stdin
 ```
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
@@ -457,17 +462,13 @@ Before proposing a credential you MUST read the "Agent secret proposals" section
 When authenticated with the current run's agent JWT, list the secrets available to that run before fetching a value:
 
 ```bash
-PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
-PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
-curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  "$PAPERCLIP_API_BASE/api/agents/me/secrets"
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET /api/agents/me/secrets
 ```
 
 The list is metadata-only. Fetch a specific value only when needed; the request has no body:
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  "$PAPERCLIP_API_BASE/api/agents/me/secrets/github_token/value"
+secret_response="$(python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST /api/agents/me/secrets/github_token/value)"
 ```
 
 - An `env.*` secret binding also grants API read access; `access.*` bindings grant API access without env injection.

@@ -1,6 +1,6 @@
 {
   "name": "@paperclipai/adapter-utils",
-  "version": "0.3.1",
+  "version": "2026.618.0",
   "license": "MIT",
   "homepage": "https://github.com/paperclipai/paperclip",
   "bugs": {
@@ -38,7 +38,7 @@
     "acpx"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node ../../scripts/bundle-adapter-utils-acpx.mjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit"
   },

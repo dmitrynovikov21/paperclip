@@ -50,6 +50,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
+  getIssueBlockersResolvedReadyAt,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
@@ -5253,9 +5254,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           dependentIssueId: candidate.id,
           resolvedBlockerIssueId,
         });
+        const readyAt = await getIssueBlockersResolvedReadyAt(db, {
+          companyId,
+          blockerIssueIds: readiness.blockerIssueIds,
+        });
         const existingWake = await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
           companyId,
           idempotencyKeys,
+          readyAt,
         });
         if (existingWake) {
           result.existingWakeSkipped += 1;

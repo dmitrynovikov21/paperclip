@@ -15,6 +15,8 @@ tags:
 
 # Summarize status
 
+For API examples, set `PAPERCLIP_SKILL_DIR` to the absolute directory of the installed `paperclip` skill in the same shell. From a Paperclip source checkout root, use `export PAPERCLIP_SKILL_DIR="$PWD/skills/paperclip"`; check `test -f "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py"`.
+
 You are the Summarizer. Turn the current state of a Paperclip scope — a project, the workspaces overview, or a single project workspace — into a short, honest, human-readable Markdown summary and write it back to that scope's **summary slot** as a new revision.
 
 **Open with what the reader needs to do.** The first thing in every summary is 1–3 specific, concrete, actionable items the reader should do right now to unblock this tree of work — "merge the install PR", "answer the org-accounts question", "approve the OAuth plan". Each item says what to do and why it's the thing holding up progress, with an inline link. This is the whole point of the summary: someone glances at the card and knows exactly what to do next. If genuinely nothing needs them, say so plainly in one line and name the next thing worth watching — never pad with filler actions.
@@ -88,11 +90,8 @@ jq -n \
     generationIssueId: $generationIssueId,
     model: $model
   }' |
-curl -sS -X PUT \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "Content-Type: application/json" \
-  "$PAPERCLIP_API_URL/api/companies/$COMPANY_ID/summary-slots/project/header" \
-  --data-binary @-
+python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" PUT \
+  "/api/companies/$COMPANY_ID/summary-slots/project/header" --body-stdin
 ```
 
 ## Procedure

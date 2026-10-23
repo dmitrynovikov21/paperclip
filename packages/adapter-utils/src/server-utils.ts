@@ -1104,13 +1104,11 @@ function normalizePaperclipWakeExecutionPrincipal(value: unknown): PaperclipWake
   };
 }
 
-const MAX_WATCHDOG_INSTRUCTIONS_CHARS = 4_000;
-const MAX_WATCHDOG_LEAF_SUMMARIES = 25;
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
 function normalizePaperclipWakeTaskWatchdogLeaf(value: unknown): PaperclipWakeTaskWatchdogLeaf | null {
   const leaf = parseObject(value);
-  const id = asString(leaf.id, "").trim() || null;
+  const id = asString(leaf.id, "").trim() || asString(leaf.issueId, "").trim() || null;
   const identifier = asString(leaf.identifier, "").trim() || null;
   const title = asString(leaf.title, "").trim() || null;
   const status = asString(leaf.status, "").trim() || null;
@@ -1156,22 +1154,26 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
   };
 }
 
-function normalizePaperclipWakeTaskWatchdog(value: unknown): PaperclipWakeTaskWatchdogContext | null {
+function normalizePaperclipWakeTaskWatchdog(
+  value: unknown,
+  payload: Record<string, unknown>,
+): PaperclipWakeTaskWatchdogContext | null {
   const watchdog = parseObject(value);
+  if (Object.keys(watchdog).length === 0) return null;
   const watchedIssueId = asString(watchdog.watchedIssueId, "").trim() || null;
   const watchedIssueIdentifier = asString(watchdog.watchedIssueIdentifier, "").trim() || null;
   const watchedIssueTitle = asString(watchdog.watchedIssueTitle, "").trim() || null;
   const stopFingerprint = asString(watchdog.stopFingerprint, "").trim() || null;
-  const customInstructionsRaw = asString(watchdog.customInstructions, "");
-  const customInstructionsTrimmed = customInstructionsRaw.trim();
-  const customInstructions = customInstructionsTrimmed
-    ? customInstructionsTrimmed.length > MAX_WATCHDOG_INSTRUCTIONS_CHARS
-      ? customInstructionsTrimmed.slice(0, MAX_WATCHDOG_INSTRUCTIONS_CHARS)
-      : customInstructionsTrimmed
-    : null;
-  const terminalLeafSummaries = Array.isArray(watchdog.terminalLeafSummaries)
-    ? watchdog.terminalLeafSummaries
-        .slice(0, MAX_WATCHDOG_LEAF_SUMMARIES)
+  const customInstructionsRaw = asString(
+    watchdog.customInstructions === undefined ? payload.customInstructions : watchdog.customInstructions,
+    "",
+  );
+  const customInstructions = customInstructionsRaw.trim() || null;
+  const leafSummariesRaw = watchdog.terminalLeafSummaries === undefined
+    ? payload.stoppedLeaves
+    : watchdog.terminalLeafSummaries;
+  const terminalLeafSummaries = Array.isArray(leafSummariesRaw)
+    ? leafSummariesRaw
         .map((entry) => normalizePaperclipWakeTaskWatchdogLeaf(entry))
         .filter((entry): entry is PaperclipWakeTaskWatchdogLeaf => Boolean(entry))
     : [];
@@ -1289,7 +1291,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
         .filter((entry): entry is PaperclipWakeAnnotationDelta => Boolean(entry))
     : [];
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(payload.livenessContinuation);
-  const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
+  const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog, payload);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
     ? payload.childIssueSummaries
@@ -2241,10 +2243,27 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Control-plane credentials are never valid agent configuration, even when a
+// key does not use the PAPERCLIP_ prefix.
+export const PAPERCLIP_SERVER_ONLY_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+]);
+
+export function isPaperclipServerOnlyEnvKey(key: string): boolean {
+  return PAPERCLIP_SERVER_ONLY_ENV_KEYS.has(key.toUpperCase());
+}
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
+    if (isPaperclipServerOnlyEnvKey(key)) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;

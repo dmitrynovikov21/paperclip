@@ -1,5 +1,5 @@
 {
-  "id": "62870394-2c24-4b51-b341-1d5462defb67",
+  "id": "45b4994f-189f-45a0-978a-04e168eb66b9",
   "prevId": "c56d3441-2ed4-4249-a115-99d55d395899",
   "version": "7",
   "dialect": "postgresql",
@@ -947,18 +947,6 @@
           "primaryKey": false,
           "notNull": true
         },
-        "provider_state_lease_id": {
-          "name": "provider_state_lease_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_generation": {
-          "name": "provider_state_generation",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
         "session_params_json": {
           "name": "session_params_json",
           "type": "jsonb",
@@ -1112,19 +1100,6 @@
             "id"
           ],
           "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "agent_task_sessions_provider_state_lease_id_environment_leases_id_fk": {
-          "name": "agent_task_sessions_provider_state_lease_id_environment_leases_id_fk",
-          "tableFrom": "agent_task_sessions",
-          "tableTo": "environment_leases",
-          "columnsFrom": [
-            "provider_state_lease_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "restrict",
           "onUpdate": "no action"
         },
         "agent_task_sessions_last_run_id_heartbeat_runs_id_fk": {
@@ -13037,85 +13012,6 @@
           "primaryKey": false,
           "notNull": false
         },
-        "task_scope_id": {
-          "name": "task_scope_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_agent_id": {
-          "name": "provider_state_agent_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_adapter_type": {
-          "name": "provider_state_adapter_type",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_generation": {
-          "name": "provider_state_generation",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "provider_state_status": {
-          "name": "provider_state_status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_ref": {
-          "name": "provider_state_ref",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_driver_id": {
-          "name": "provider_state_driver_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_driver_revision": {
-          "name": "provider_state_driver_revision",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_configuration_digest": {
-          "name": "provider_state_configuration_digest",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_hard_expires_at": {
-          "name": "provider_state_hard_expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_tombstoned_at": {
-          "name": "provider_state_tombstoned_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_cleanup_claim": {
-          "name": "provider_state_cleanup_claim",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "provider_state_cleanup_claim_expires_at": {
-          "name": "provider_state_cleanup_claim_expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
         "acquired_at": {
           "name": "acquired_at",
           "type": "timestamp with time zone",
@@ -13286,39 +13182,6 @@
           "columns": [
             {
               "expression": "provider_lease_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "environment_leases_provider_state_scope_idx": {
-          "name": "environment_leases_provider_state_scope_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "provider_state_agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "provider_state_adapter_type",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "task_scope_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -26933,6 +26796,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'instance'"
         }
       },
       "indexes": {
@@ -28807,45 +28677,6 @@
           "onUpdate": "no action"
         }
       },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.provider_state_scopes": {
-      "name": "provider_state_scopes",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "generation": {
-          "name": "generation",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "current_lease_id": {
-          "name": "current_lease_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},

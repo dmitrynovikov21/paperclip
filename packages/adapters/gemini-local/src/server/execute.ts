@@ -118,11 +118,10 @@ function renderApiAccessNote(env: Record<string, string>): string {
   if (!hasNonEmptyEnvValue(env, "PAPERCLIP_API_URL") || !hasNonEmptyEnvValue(env, "PAPERCLIP_API_KEY")) return "";
   return [
     "Paperclip API access note:",
-    "Use run_shell_command with curl to make Paperclip API requests.",
-    "GET example:",
-    `  run_shell_command({ command: "curl -s -H \\"Authorization: Bearer $PAPERCLIP_API_KEY\\" \\"$PAPERCLIP_API_URL/api/agents/me\\"" })`,
-    "POST/PATCH example:",
-    `  run_shell_command({ command: "curl -s -X POST -H \\"Authorization: Bearer $PAPERCLIP_API_KEY\\" -H 'Content-Type: application/json' -H \\"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\\" -d '{...}' \\"$PAPERCLIP_API_URL/api/issues/{id}/checkout\\"" })`,
+    "Set PAPERCLIP_SKILL_DIR to the absolute directory of the installed Paperclip runtime skill (containing SKILL.md and scripts/paperclip-api.py). Use run_shell_command with the argv-free client.",
+    "The client reads PAPERCLIP_API_KEY from env in memory and JSON request bodies from stdin. Never put bearer headers or JSON bodies in command arguments.",
+    "GET example: python3 \"$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py\" GET /api/agents/me",
+    "POST example: printf '%s' '{\"body\":\"Status update\"}' | python3 \"$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py\" POST /api/issues/{id}/comments --body-stdin",
     "",
     "",
   ].join("\n");

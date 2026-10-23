@@ -16,6 +16,7 @@ RELEASE_PIPELINE="release-coverage-${RUN_KEY}"
 FEATURE_PIPELINE="feature-content-${RUN_KEY}"
 CONTENT_PIPELINE="content-production-${RUN_KEY}"
 TMP_DIR="$(mktemp -d)"
+API_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/skills/paperclip/scripts/paperclip-api.py"
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -31,15 +32,9 @@ api_json() {
   local path="$2"
   local body="${3:-}"
   if [[ -n "$body" ]]; then
-    curl -sS -X "$method" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      -H "Content-Type: application/json" \
-      --data "$body" \
-      "${PAPERCLIP_API_URL%/}$path"
+    printf '%s' "$body" | python3 "$API_HELPER" "$method" "$path" --body-stdin
   else
-    curl -sS -X "$method" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      "${PAPERCLIP_API_URL%/}$path"
+    python3 "$API_HELPER" "$method" "$path"
   fi
 }
 

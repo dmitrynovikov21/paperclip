@@ -21,7 +21,7 @@ const cheapProfile: AdapterModelProfileDefinition = {
 };
 
 describe("heartbeat model profile application", () => {
-  it("keeps Codex on its primary model when cheap has no explicit model override", async () => {
+  it("uses the supported Codex cheap default for a cheap request", async () => {
     const modelProfile = resolveModelProfileApplication({
       adapterModelProfiles: await listAdapterModelProfiles("codex_local"),
       agentRuntimeConfig: {},
@@ -41,9 +41,9 @@ describe("heartbeat model profile application", () => {
       applied: "cheap",
       configSource: "adapter_default",
       fallbackReason: null,
-      adapterConfig: {},
+      adapterConfig: { model: "gpt-6-luna", modelReasoningEffort: "low" },
     });
-    expect(merged).toEqual({ model: "primary" });
+    expect(merged).toEqual({ model: "gpt-6-luna", modelReasoningEffort: "low" });
   });
 
   it("applies cheap profile patches before explicit issue adapter config overrides", () => {

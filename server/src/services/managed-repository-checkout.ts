@@ -61,7 +61,7 @@ export async function materializeManagedProjectWorkspace(
   let auth = input.resolveGitAuth && !input.localSource
     ? await measureRunPhase("workspace.checkout.git_auth", () => input.resolveGitAuth!(input.repoUrl!))
     : null;
-  const cloneTmpDir = await fs.mkdtemp(input.stagingParent
+  let cloneTmpDir = await fs.mkdtemp(input.stagingParent
     ? path.join(input.stagingParent, `${path.basename(cwd)}.clone-`)
     : `${cwd}.clone-`);
   const cloneSource = input.localSource ?? input.repoUrl;
@@ -81,7 +81,7 @@ export async function materializeManagedProjectWorkspace(
     try {
       const clone = (referencePath: string | null) => measureRunPhase("workspace.checkout.git_clone", async () => {
         recordRepositoryObjectCacheDetail({ referenceSupplied: referencePath !== null });
-        await assertHostGitWorkspaceAllowed(cloneTmpDir);
+        cloneTmpDir = await assertHostGitWorkspaceAllowed(cloneTmpDir);
         const git = prepareHostGitInvocation(
           [...(auth?.configArgs ?? []), ...(referencePath ? ["-c", "repack.updateServerInfo=false"] : []), "clone", "--no-hardlinks", ...(referencePath ? ["--reference-if-able", referencePath, "--dissociate"] : []), "--", cloneSource, cloneTmpDir],
           {
@@ -126,12 +126,12 @@ export async function materializeManagedProjectWorkspace(
         if (baseline) await disposeDirectorySnapshot(baseline);
         await disposeGitWorkspaceSnapshot(snapshot);
       }
-      await assertHostGitWorkspaceAllowed(cloneTmpDir);
+      cloneTmpDir = await assertHostGitWorkspaceAllowed(cloneTmpDir);
       const git = prepareHostGitInvocation(["-C", cloneTmpDir, "remote", "set-url", "origin", input.repoUrl]);
       await execFile("git", git.args, { timeout: 10_000, env: git.env });
     } else if (input.repoRef) {
       await measureRunPhase("workspace.checkout.git_ref", async () => {
-        await assertHostGitWorkspaceAllowed(cloneTmpDir);
+        cloneTmpDir = await assertHostGitWorkspaceAllowed(cloneTmpDir);
         const git = prepareHostGitInvocation(["-C", cloneTmpDir, "checkout", input.repoRef!]);
         return execFile("git", git.args, { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS, env: git.env });
       });
@@ -179,13 +179,13 @@ export async function ensureManagedRepositoriesIgnored(cwd: string, options: { p
   if (!gitEntry) return;
   if (gitEntry.isSymbolicLink()) throw new Error("Workspace Git metadata must not be a symlink");
   let excludePath: string;
-  await assertHostGitWorkspaceAllowed(cwd);
+  const guardedCwd = await assertHostGitWorkspaceAllowed(cwd);
   try {
-    const git = prepareHostGitInvocation(["-C", cwd, "rev-parse", "--git-path", "info/exclude"], { ...process.env, LC_ALL: "C" });
+    const git = prepareHostGitInvocation(["-C", guardedCwd, "rev-parse", "--git-path", "info/exclude"], { ...process.env, LC_ALL: "C" });
     const result = await execFile("git", git.args, {
       timeout: 10_000, env: git.env,
     });
-    excludePath = path.resolve(cwd, result.stdout.trim());
+    excludePath = path.resolve(guardedCwd, result.stdout.trim());
   } catch (error) {
     const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
     if (options.plainTaskDirectory && failure.code === 128 && failure.signal == null &&

@@ -914,12 +914,12 @@ async function runGit(args: string[], cwd: string, opts?: {
   env?: NodeJS.ProcessEnv;
   observe?: (result: Awaited<ReturnType<typeof executeProcess>>) => void;
 }): Promise<string> {
-  await assertHostGitWorkspaceAllowed(cwd);
+  const guardedCwd = await assertHostGitWorkspaceAllowed(cwd);
   const git = prepareHostGitInvocation(args, opts?.env);
   const proc = await executeProcess({
     command: "git",
     args: git.args,
-    cwd,
+    cwd: guardedCwd,
     env: git.env,
   });
   opts?.observe?.(proc);
@@ -1372,10 +1372,13 @@ async function getGitWorktreeBranchAncestryVerdict(input: {
 }): Promise<GitWorktreeBranchAncestryVerdict> {
   if (!input.expectedHeadSha || !input.actualHeadSha) return "unknown";
 
+  const guardedCwd = await assertHostGitWorkspaceAllowed(input.repoRoot);
+  const git = prepareHostGitInvocation(["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha]);
   const proc = await executeProcess({
     command: "git",
-    args: ["merge-base", "--is-ancestor", input.expectedHeadSha, input.actualHeadSha],
-    cwd: input.repoRoot,
+    args: git.args,
+    cwd: guardedCwd,
+    env: git.env,
   }).catch(() => null);
   if (!proc) return "unknown";
   if (proc.code === 0) return "ancestor";
@@ -3117,12 +3120,12 @@ async function recordGitOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
-      await assertHostGitWorkspaceAllowed(input.cwd);
+      const guardedCwd = await assertHostGitWorkspaceAllowed(input.cwd);
       const git = prepareHostGitInvocation(input.args);
       const result = await executeProcess({
         command: "git",
         args: git.args,
-        cwd: input.cwd,
+        cwd: guardedCwd,
         env: git.env,
       });
       stdout = result.stdout;

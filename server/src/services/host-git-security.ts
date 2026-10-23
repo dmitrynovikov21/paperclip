@@ -3,9 +3,11 @@ import path from "node:path";
 import { assertIsolatedWorkspaceSyncAllowed } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 
 /** Git must not read agent-controlled metadata before the sandbox sync guard runs. */
-export async function assertHostGitWorkspaceAllowed(cwd: string): Promise<void> {
-  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") return;
-  await assertIsolatedWorkspaceSyncAllowed(path.resolve(cwd));
+export async function assertHostGitWorkspaceAllowed(cwd: string): Promise<string> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") return cwd;
+  // Git must use this canonical path. The original cwd may cross an alias in an
+  // agent-writable directory that can be retargeted after the guard returns.
+  return assertIsolatedWorkspaceSyncAllowed(path.resolve(cwd));
 }
 
 /** Apply to every host Git process that can run while the service owns the master key. */

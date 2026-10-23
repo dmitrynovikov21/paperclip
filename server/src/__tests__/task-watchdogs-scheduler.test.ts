@@ -289,6 +289,64 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(reviewed?.lastReviewedFingerprint).toBe(watchdog?.lastObservedFingerprint);
   });
 
+  it("keeps status and assignment capabilities for an unowned sibling leaf", async () => {
+    const companyId = await seedCompany();
+    const workerId = await seedAgent(companyId, { name: "Worker" });
+    const recoveryOwnerId = await seedAgent(companyId, { name: "Recovery owner" });
+    const watchdogAgentId = await seedAgent(companyId, { name: "Watchdog" });
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-ROOT", status: "done" });
+    const protectedLeafId = await seedIssue(companyId, {
+      identifier: "WDOG-PROTECTED",
+      parentId: sourceId,
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    await seedIssue(companyId, {
+      identifier: "WDOG-FREE",
+      parentId: sourceId,
+      status: "blocked",
+      assigneeAgentId: workerId,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: protectedLeafId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: recoveryOwnerId,
+      previousOwnerAgentId: workerId,
+      returnOwnerAgentId: workerId,
+      cause: "issue_continuation_waiting_on_review",
+      fingerprint: "protected-leaf-review-state",
+      nextAction: "Return the protected leaf to review.",
+    });
+    await seedWatchdog(companyId, sourceId, watchdogAgentId);
+    const { service, wakes } = createService();
+
+    const result = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(result).toMatchObject({ checked: 1, triggered: 1 });
+    const context = wakes[0]?.opts?.contextSnapshot as {
+      taskWatchdog?: { capabilities?: {
+        operations?: string[];
+        deniedOperations?: string[];
+        recoveryHandoffs?: Array<{ issueId: string; deniedOperations: string[] }>;
+      } };
+    } | undefined;
+    expect(context?.taskWatchdog?.capabilities?.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(context?.taskWatchdog?.capabilities?.deniedOperations).not.toContain("transition_watched_subtree_issue_status");
+    expect(context?.taskWatchdog?.capabilities?.recoveryHandoffs).toEqual([expect.objectContaining({
+      issueId: protectedLeafId,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
+    })]);
+  });
+
   it("does not append duplicate review comments for an already-open same-fingerprint review", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-DUPE", status: "done" });

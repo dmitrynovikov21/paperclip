@@ -222,6 +222,7 @@ type PaperclipWakeTaskWatchdogCapabilities = {
     recoveryOwnerType: string;
     recoveryOwnerAgentId: string | null;
     recoveryOwnerUserId: string | null;
+    deniedOperations: string[];
   }>;
   targetScope: {
     watchedIssueId: string | null;
@@ -1128,6 +1129,7 @@ function normalizePaperclipWakeTaskWatchdogRecoveryHandoff(value: unknown) {
     recoveryOwnerType: asString(handoff.recoveryOwnerType, "").trim() || "unknown",
     recoveryOwnerAgentId: asString(handoff.recoveryOwnerAgentId, "").trim() || null,
     recoveryOwnerUserId: asString(handoff.recoveryOwnerUserId, "").trim() || null,
+    deniedOperations: normalizeStringList(handoff.deniedOperations, MAX_WATCHDOG_CAPABILITY_ITEMS),
   };
 }
 
@@ -1854,7 +1856,7 @@ export function renderPaperclipWakePrompt(
         }
       }
       if (watchdog.capabilities.operations.length > 0) {
-        lines.push(`- Allowed operations: ${watchdog.capabilities.operations.join(", ")}.`);
+        lines.push(`- Allowed operations${watchdog.capabilities.recoveryHandoffs.length > 0 ? " (subject to issue-specific denials below)" : ""}: ${watchdog.capabilities.operations.join(", ")}.`);
       }
       if (watchdog.capabilities.deniedOperations.length > 0) {
         lines.push(`- Denied operations: ${watchdog.capabilities.deniedOperations.join(", ")}.`);
@@ -1867,8 +1869,12 @@ export function renderPaperclipWakePrompt(
             : handoff.recoveryOwnerUserId
               ? `user ${handoff.recoveryOwnerUserId}`
               : handoff.recoveryOwnerType;
+          const issueDenials = handoff.deniedOperations.length > 0
+            ? `Denied on this issue: ${handoff.deniedOperations.join(", ")}. `
+            : "";
           lines.push(
             `  - ${handoff.issueIdentifier ?? handoff.issueId}: action ${handoff.recoveryActionId} belongs to ${owner}. ` +
+            issueDenials +
             "Handoff: that owner resolves the recovery action. While it is active, do not PATCH or comment on this watched issue. " +
             "If the action already supplies a live path, record that finding on the reusable watchdog issue.",
           );

@@ -436,7 +436,36 @@ describe("task watchdog recovery-owner capabilities", () => {
       recoveryOwnerType: "agent",
       recoveryOwnerAgentId: "recovery-owner",
       recoveryOwnerUserId: null,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
     }]);
+  });
+
+  it("retains PATCH capabilities for another leaf when one leaf has a recovery owner", () => {
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [
+        issue({ status: "blocked" }),
+        issue({ id: childId, identifier: "PAP-2", parentId: sourceId, status: "blocked" }),
+      ],
+      activeRecoveryActions: [recoveryAction],
+    });
+
+    expect(capabilities.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(capabilities.deniedOperations).not.toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.deniedOperations).not.toContain("reassign_watched_subtree_issues");
+    expect(capabilities.recoveryHandoffs).toEqual([expect.objectContaining({
+      issueId: sourceId,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
+    })]);
   });
 
   it("keeps capabilities when the watchdog is also the recovery owner", () => {

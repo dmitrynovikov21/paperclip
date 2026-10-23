@@ -706,14 +706,20 @@ export function taskWatchdogWakeCapabilities(input: {
         recoveryOwnerType: action.ownerType,
         recoveryOwnerAgentId: action.ownerAgentId,
         recoveryOwnerUserId: action.ownerUserId,
+        deniedOperations: [
+          "transition_watched_subtree_issue_status",
+          "reassign_watched_subtree_issues",
+        ],
       }];
     })
     .sort((left, right) => left.issueId.localeCompare(right.issueId));
-  const recoveryOwnerLocksMutations = recoveryHandoffs.length > 0;
+  const recoveryLockedIssueIds = new Set(recoveryHandoffs.map((handoff) => handoff.issueId));
+  const allWatchedIssuesRecoveryLocked = recoveryHandoffs.length > 0 &&
+    input.watchedIssues.every((issue) => recoveryLockedIssueIds.has(issue.id));
   return {
     operations: [
       "comment_on_watched_subtree_issues",
-      ...(!recoveryOwnerLocksMutations ? [
+      ...(!allWatchedIssuesRecoveryLocked ? [
         "transition_watched_subtree_issue_status",
         "reassign_watched_subtree_issues",
       ] : []),
@@ -729,7 +735,7 @@ export function taskWatchdogWakeCapabilities(input: {
       "mutate_outside_watched_subtree",
       "resolve_board_only_or_security_sensitive_approvals",
       "create_nested_task_watchdogs",
-      ...(recoveryOwnerLocksMutations ? [
+      ...(allWatchedIssuesRecoveryLocked ? [
         "transition_watched_subtree_issue_status",
         "reassign_watched_subtree_issues",
       ] : []),

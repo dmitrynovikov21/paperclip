@@ -709,6 +709,50 @@ describe("sandbox managed runtime", () => {
     }
   });
 
+  it("rejects agent-writable Git config before fsmonitor or syncIn can run", async () => {
+    const root = await mkdtemp(path.join(os.homedir(), ".paperclip-key-git-config-"));
+    cleanupDirs.push(root);
+    const approvedRoot = path.join(root, "workspaces");
+    const workspace = path.join(approvedRoot, "project");
+    const secretFile = path.join(root, "private", "secrets", "master.key");
+    const marker = path.join(root, "fsmonitor-called");
+    const fsmonitor = path.join(workspace, "fsmonitor.sh");
+    await mkdir(workspace, { recursive: true });
+    await mkdir(path.dirname(secretFile), { recursive: true });
+    await writeFile(secretFile, "synthetic-key-never-upload");
+    await git(workspace, ["init"]);
+    await writeFile(path.join(workspace, "README.md"), "safe\n");
+    await git(workspace, ["add", "README.md"]);
+    await git(workspace, ["-c", "user.name=Paperclip Test", "-c", "user.email=test@paperclip.dev", "commit", "-m", "base"]);
+    await writeFile(fsmonitor, `#!/bin/sh\nprintf called > '${marker}'\n`);
+    await fsPromises.chmod(fsmonitor, 0o755);
+    await git(workspace, ["config", "core.fsmonitor", fsmonitor]);
+    await git(workspace, ["status", "--ignored", "--porcelain=v1"]);
+    await expect(readFile(marker, "utf8")).resolves.toBe("called");
+    await rm(marker);
+    await fsPromises.chmod(path.join(workspace, ".git", "config"), 0o666);
+
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 1));
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", secretFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([approvedRoot]));
+    const client = makeFilesystemClient();
+    const syncIn = vi.fn(client.syncIn!);
+    client.syncIn = syncIn;
+    try {
+      await expect(prepareSandboxManagedRuntime({
+        spec: { transport: "sandbox", provider: "test", sandboxId: "git-config", remoteCwd: path.join(root, "remote"), timeoutMs: 30_000, apiKey: null },
+        adapterKey: "test-adapter",
+        client,
+        workspaceLocalDir: workspace,
+      })).rejects.toThrow(/agent-immutable Git metadata/);
+      await expect(readFile(marker)).rejects.toThrow();
+      expect(syncIn).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it.each(["nested directory", "final file"])(
     "refuses a Git overlay whose %s becomes a symlink after the snapshot",
     async (swappedEntry) => {

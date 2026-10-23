@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { classifyTaskWatchdogSubtree, type TaskWatchdogClassifierIssue } from "../services/task-watchdogs.ts";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import {
+  classifyTaskWatchdogSubtree,
+  taskWatchdogWakeCapabilities,
+  type TaskWatchdogClassifierIssue,
+} from "../services/task-watchdogs.ts";
 
 const companyId = "company-1";
 const sourceId = "source-1";
@@ -407,5 +412,130 @@ describe("task watchdog subtree classifier", () => {
     });
 
     expect(result.state).toBe("not_applicable");
+  });
+});
+
+describe("task watchdog recovery-owner capabilities", () => {
+  const recoveryAction = {
+    id: "recovery-1",
+    sourceIssueId: sourceId,
+    status: "active",
+    ownerType: "agent",
+    ownerAgentId: "recovery-owner",
+    ownerUserId: null,
+  };
+
+  it("advertises transition and reassignment when no recovery action owns the issue", () => {
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [issue({ status: "blocked" })],
+      activeRecoveryActions: [],
+    });
+
+    expect(capabilities.operations).toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.operations).toContain("reassign_watched_subtree_issues");
+    expect(capabilities.deniedOperations).not.toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.recoveryHandoffs).toEqual([]);
+  });
+
+  it("withholds PATCH capabilities and identifies another recovery owner", () => {
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [issue({ status: "blocked" })],
+      activeRecoveryActions: [recoveryAction],
+    });
+
+    expect(capabilities.operations).not.toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.operations).not.toContain("reassign_watched_subtree_issues");
+    expect(capabilities.deniedOperations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(capabilities.recoveryHandoffs).toEqual([{
+      issueId: sourceId,
+      issueIdentifier: "PAP-1",
+      recoveryActionId: "recovery-1",
+      recoveryOwnerType: "agent",
+      recoveryOwnerAgentId: "recovery-owner",
+      recoveryOwnerUserId: null,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
+    }]);
+  });
+
+  it("retains PATCH capabilities for another leaf when one leaf has a recovery owner", () => {
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [
+        issue({ status: "blocked" }),
+        issue({ id: childId, identifier: "PAP-2", parentId: sourceId, status: "blocked" }),
+      ],
+      activeRecoveryActions: [recoveryAction],
+    });
+
+    expect(capabilities.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(capabilities.deniedOperations).not.toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.deniedOperations).not.toContain("reassign_watched_subtree_issues");
+    expect(capabilities.recoveryHandoffs).toEqual([expect.objectContaining({
+      issueId: sourceId,
+      deniedOperations: [
+        "transition_watched_subtree_issue_status",
+        "reassign_watched_subtree_issues",
+      ],
+    })]);
+  });
+
+  it("keeps every recovery-owner denial in the wake prompt beyond 50 protected leaves", () => {
+    const protectedLeaves = Array.from({ length: 51 }, (_, index) => {
+      const number = String(index + 1).padStart(3, "0");
+      return issue({ id: `protected-${number}`, identifier: `PAP-${number}`, status: "blocked" });
+    });
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [...protectedLeaves, issue({ id: "free-leaf", identifier: "PAP-FREE", status: "blocked" })],
+      activeRecoveryActions: protectedLeaves.map((leaf) => ({
+        ...recoveryAction,
+        id: `recovery-${leaf.id}`,
+        sourceIssueId: leaf.id,
+      })),
+    });
+    const prompt = renderPaperclipWakePrompt({
+      reason: "task_watchdog_stopped_subtree",
+      issue: { id: "watchdog-issue", identifier: "PAP-WATCHDOG", title: "Watchdog", status: "in_progress" },
+      taskWatchdog: {
+        watchedIssueId: sourceId,
+        terminalLeafSummaries: [{ id: "free-leaf", identifier: "PAP-FREE", status: "blocked" }],
+        capabilities,
+      },
+    });
+
+    expect(capabilities.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(capabilities.recoveryHandoffs).toHaveLength(51);
+    expect(prompt).toContain("Allowed operations (subject to issue-specific denials below)");
+    expect(prompt).toContain("PAP-FREE (blocked)");
+    const lastHandoffLine = prompt.split("\n").find((line) => line.includes("PAP-051: action"));
+    expect(lastHandoffLine).toContain("recovery-protected-051 belongs to agent recovery-owner.");
+    expect(lastHandoffLine).toContain("Denied on this issue: transition_watched_subtree_issue_status, reassign_watched_subtree_issues.");
+    expect(prompt.match(/Denied on this issue:/g)).toHaveLength(51);
+    expect(prompt).toContain("do not PATCH or comment on this watched issue");
+  });
+
+  it("keeps capabilities when the watchdog is also the recovery owner", () => {
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [issue({ status: "blocked" })],
+      activeRecoveryActions: [{ ...recoveryAction, ownerAgentId: "watchdog-agent" }],
+    });
+
+    expect(capabilities.operations).toContain("transition_watched_subtree_issue_status");
+    expect(capabilities.recoveryHandoffs).toEqual([]);
   });
 });

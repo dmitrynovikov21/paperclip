@@ -216,6 +216,15 @@ type PaperclipWakeTaskWatchdogLeaf = {
 type PaperclipWakeTaskWatchdogCapabilities = {
   operations: string[];
   deniedOperations: string[];
+  recoveryHandoffs: Array<{
+    issueId: string;
+    issueIdentifier: string | null;
+    recoveryActionId: string;
+    recoveryOwnerType: string;
+    recoveryOwnerAgentId: string | null;
+    recoveryOwnerUserId: string | null;
+    deniedOperations: string[];
+  }>;
   targetScope: {
     watchedIssueId: string | null;
     watchedIssueIdentifier: string | null;
@@ -1107,6 +1116,22 @@ function normalizePaperclipWakeExecutionPrincipal(value: unknown): PaperclipWake
 
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
+function normalizePaperclipWakeTaskWatchdogRecoveryHandoff(value: unknown) {
+  const handoff = parseObject(value);
+  const issueId = asString(handoff.issueId, "").trim();
+  const recoveryActionId = asString(handoff.recoveryActionId, "").trim();
+  if (!issueId || !recoveryActionId) return null;
+  return {
+    issueId,
+    issueIdentifier: asString(handoff.issueIdentifier, "").trim() || null,
+    recoveryActionId,
+    recoveryOwnerType: asString(handoff.recoveryOwnerType, "").trim() || "unknown",
+    recoveryOwnerAgentId: asString(handoff.recoveryOwnerAgentId, "").trim() || null,
+    recoveryOwnerUserId: asString(handoff.recoveryOwnerUserId, "").trim() || null,
+    deniedOperations: normalizeStringList(handoff.deniedOperations, MAX_WATCHDOG_CAPABILITY_ITEMS),
+  };
+}
+
 function normalizePaperclipWakeTaskWatchdogLeaf(value: unknown): PaperclipWakeTaskWatchdogLeaf | null {
   const leaf = parseObject(value);
   const id = asString(leaf.id, "").trim() || asString(leaf.issueId, "").trim() || null;
@@ -1132,6 +1157,12 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
   const capabilities = parseObject(value);
   const operations = normalizeStringList(capabilities.operations, MAX_WATCHDOG_CAPABILITY_ITEMS);
   const deniedOperations = normalizeStringList(capabilities.deniedOperations, MAX_WATCHDOG_CAPABILITY_ITEMS);
+  // Each handoff is a safety boundary for one issue; truncation would make a protected issue look mutable.
+  const recoveryHandoffs = Array.isArray(capabilities.recoveryHandoffs)
+    ? capabilities.recoveryHandoffs
+        .map((entry) => normalizePaperclipWakeTaskWatchdogRecoveryHandoff(entry))
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+    : [];
   const targetScopeRaw = parseObject(capabilities.targetScope);
   const targetScope = {
     watchedIssueId: asString(targetScopeRaw.watchedIssueId, "").trim() || null,
@@ -1147,10 +1178,11 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
       targetScope.includeNonWatchdogDescendants ||
       targetScope.excludedOriginKinds.length > 0,
   );
-  if (operations.length === 0 && deniedOperations.length === 0 && !hasTargetScope) return null;
+  if (operations.length === 0 && deniedOperations.length === 0 && recoveryHandoffs.length === 0 && !hasTargetScope) return null;
   return {
     operations,
     deniedOperations,
+    recoveryHandoffs,
     targetScope: hasTargetScope ? targetScope : null,
   };
 }
@@ -1827,10 +1859,29 @@ export function renderPaperclipWakePrompt(
         }
       }
       if (watchdog.capabilities.operations.length > 0) {
-        lines.push(`- Allowed operations: ${watchdog.capabilities.operations.join(", ")}.`);
+        lines.push(`- Allowed operations${watchdog.capabilities.recoveryHandoffs.length > 0 ? " (subject to issue-specific denials below)" : ""}: ${watchdog.capabilities.operations.join(", ")}.`);
       }
       if (watchdog.capabilities.deniedOperations.length > 0) {
         lines.push(`- Denied operations: ${watchdog.capabilities.deniedOperations.join(", ")}.`);
+      }
+      if (watchdog.capabilities.recoveryHandoffs.length > 0) {
+        lines.push("- Recovery-owner handoffs (recheck each action before acting):");
+        for (const handoff of watchdog.capabilities.recoveryHandoffs) {
+          const owner = handoff.recoveryOwnerAgentId
+            ? `agent ${handoff.recoveryOwnerAgentId}`
+            : handoff.recoveryOwnerUserId
+              ? `user ${handoff.recoveryOwnerUserId}`
+              : handoff.recoveryOwnerType;
+          const issueDenials = handoff.deniedOperations.length > 0
+            ? `Denied on this issue: ${handoff.deniedOperations.join(", ")}. `
+            : "";
+          lines.push(
+            `  - ${handoff.issueIdentifier ?? handoff.issueId}: action ${handoff.recoveryActionId} belongs to ${owner}. ` +
+            issueDenials +
+            "Handoff: that owner resolves the recovery action. While it is active, do not PATCH or comment on this watched issue. " +
+            "If the action already supplies a live path, record that finding on the reusable watchdog issue.",
+          );
+        }
       }
     }
     if (watchdog.terminalLeafSummaries.length > 0) {

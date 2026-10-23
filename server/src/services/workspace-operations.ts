@@ -7,11 +7,17 @@ import { notFound } from "../errors.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
+import {
+  createWorkspaceOperationUrlStreamRedactor,
+  redactTruncatedWorkspaceOperationOutput,
+  redactWorkspaceOperationExcerpt,
+  redactWorkspaceOperationUrls,
+} from "./workspace-operation-url-redaction.js";
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
 
 function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
-  return {
+  return redactWorkspaceOperationUrls({
     id: row.id,
     companyId: row.companyId,
     executionWorkspaceId: row.executionWorkspaceId ?? null,
@@ -27,14 +33,14 @@ function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
     logBytes: row.logBytes ?? null,
     logSha256: row.logSha256 ?? null,
     logCompressed: row.logCompressed,
-    stdoutExcerpt: row.stdoutExcerpt ?? null,
-    stderrExcerpt: row.stderrExcerpt ?? null,
+    stdoutExcerpt: redactWorkspaceOperationExcerpt(row.stdoutExcerpt ?? null),
+    stderrExcerpt: redactWorkspaceOperationExcerpt(row.stderrExcerpt ?? null),
     metadata: (row.metadata as Record<string, unknown> | null) ?? null,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-  };
+  });
 }
 
 function appendExcerpt(current: string, chunk: string) {
@@ -59,7 +65,11 @@ export interface WorkspaceOperationRecorder {
     command?: string | null;
     cwd?: string | null;
     metadata?: Record<string, unknown> | null;
-    run: () => Promise<{
+    run: (reportProgress: (input: {
+      stdout?: string | null;
+      stderr?: string | null;
+      system?: string | null;
+    }) => Promise<void>) => Promise<{
       status?: WorkspaceOperationStatus;
       exitCode?: number | null;
       stdout?: string | null;
@@ -121,16 +131,43 @@ export function workspaceOperationService(db: Db) {
 
           let stdoutExcerpt = "";
           let stderrExcerpt = "";
+          const streamRedactors = {
+            stdout: createWorkspaceOperationUrlStreamRedactor(),
+            stderr: createWorkspaceOperationUrlStreamRedactor(),
+            system: createWorkspaceOperationUrlStreamRedactor(),
+          };
+          const pendingEvents: Record<"stdout" | "stderr" | "system", { chunk: string; ts: string } | null> = {
+            stdout: null,
+            stderr: null,
+            system: null,
+          };
+          const writePendingEvent = async (stream: "stdout" | "stderr" | "system") => {
+            const event = pendingEvents[stream];
+            pendingEvents[stream] = null;
+            if (!event?.chunk) return;
+            if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, event.chunk);
+            if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, event.chunk);
+            await logStore.append(handle, { stream, ...event });
+          };
           const append = async (stream: "stdout" | "stderr" | "system", chunk: string | null | undefined) => {
             if (!chunk) return;
-            const sanitizedChunk = redactCurrentUserText(chunk, currentUserRedactionOptions);
-            if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-            if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
-            await logStore.append(handle, {
-              stream,
-              chunk: sanitizedChunk,
-              ts: new Date().toISOString(),
-            });
+            const sanitizedChunk = streamRedactors[stream].push(redactTruncatedWorkspaceOperationOutput(
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            ));
+            const event = pendingEvents[stream] ?? { chunk: "", ts: new Date().toISOString() };
+            event.chunk += sanitizedChunk;
+            pendingEvents[stream] = event;
+            if (!streamRedactors[stream].hasPending() || event.chunk.length >= 256 * 1024) {
+              await writePendingEvent(stream);
+            }
+          };
+          const flushPendingOutput = async () => {
+            for (const stream of ["stdout", "stderr", "system"] as const) {
+              const event = pendingEvents[stream] ?? { chunk: "", ts: new Date().toISOString() };
+              event.chunk += streamRedactors[stream].flush();
+              pendingEvents[stream] = event;
+              await writePendingEvent(stream);
+            }
           };
 
           await db.insert(workspaceOperations).values({
@@ -140,24 +177,29 @@ export function workspaceOperationService(db: Db) {
             heartbeatRunId: input.heartbeatRunId ?? null,
             issueId: input.issueId ?? null,
             phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
+            command: redactWorkspaceOperationUrls(recordInput.command ?? null),
+            cwd: redactWorkspaceOperationUrls(recordInput.cwd ?? null),
             status: "running",
             logStore: handle.store,
             logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
+            metadata: redactWorkspaceOperationUrls(redactCurrentUserValue(
               recordInput.metadata ?? null,
               currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
+            )) as Record<string, unknown> | null,
             startedAt,
           });
           createdIds.push(id);
 
           try {
-            const result = await recordInput.run();
+            const result = await recordInput.run(async (progress) => {
+              await append("system", progress.system ?? null);
+              await append("stdout", progress.stdout ?? null);
+              await append("stderr", progress.stderr ?? null);
+            });
             await append("system", result.system ?? null);
             await append("stdout", result.stdout ?? null);
             await append("stderr", result.stderr ?? null);
+            await flushPendingOutput();
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
             const row = await db
@@ -171,10 +213,10 @@ export function workspaceOperationService(db: Db) {
                 logBytes: finalized.bytes,
                 logSha256: finalized.sha256,
                 logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
+                metadata: redactWorkspaceOperationUrls(redactCurrentUserValue(
                   combineMetadata(recordInput.metadata, result.metadata),
                   currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
+                )) as Record<string, unknown> | null,
                 finishedAt,
                 updatedAt: finishedAt,
               })
@@ -185,6 +227,7 @@ export function workspaceOperationService(db: Db) {
             return toWorkspaceOperation(row);
           } catch (error) {
             await append("stderr", error instanceof Error ? error.message : String(error));
+            await flushPendingOutput();
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
             await db
@@ -253,8 +296,7 @@ export function workspaceOperationService(db: Db) {
         store: operation.logStore,
         logRef: operation.logRef,
         ...result,
-        // Workspace-operation log chunks are sanitized before append-time storage.
-        // Returning the stored chunk avoids another whole-string rewrite per poll.
+        // The store also masks historical byte-range pages without changing offsets.
         content: result.content,
       };
     },

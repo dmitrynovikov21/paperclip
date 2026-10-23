@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -305,6 +305,44 @@ describe("sanitizeSshRemoteEnv", () => {
 });
 
 describe("materializePaperclipSkillCopy", () => {
+  it("rejects a nested directory swapped for a synthetic key link after validation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-directory-race-"));
+    const source = path.join(root, "skill");
+    const nested = path.join(source, "nested");
+    const secretDirectory = path.join(root, "protected");
+    const target = path.join(root, "staged");
+    const syntheticKey = "synthetic-master-key-race-test\n";
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(secretDirectory);
+    await fs.writeFile(path.join(nested, "SKILL.md"), "# safe skill\n");
+    await fs.writeFile(path.join(secretDirectory, "master.key"), syntheticKey);
+
+    const originalLstat = fs.lstat.bind(fs);
+    let nestedChecks = 0;
+    let swapped = false;
+    const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (candidate) => {
+      const stat = await originalLstat(candidate);
+      if (path.basename(String(candidate)) === "nested" && ++nestedChecks === 2) {
+        await fs.rename(nested, path.join(root, "held-nested"));
+        await fs.symlink(secretDirectory, nested);
+        swapped = true;
+      }
+      return stat;
+    });
+    try {
+      await expect(materializePaperclipSkillCopy(source, target, { rejectSymlinks: true }))
+        .rejects.toThrow();
+      expect(swapped).toBe(true);
+      await expect(fs.lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await fs.readdir(root)).some((entry) => entry.startsWith("staged.tmp-"))).toBe(false);
+      await expect(fs.readFile(path.join(secretDirectory, "master.key"), "utf8"))
+        .resolves.toBe(syntheticKey);
+    } finally {
+      lstatSpy.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a nested link to a synthetic key before building a sandbox skills asset", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-asset-test-"));
     try {

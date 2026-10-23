@@ -1,4 +1,5 @@
 import { skillAccessService } from "../skill-access.js";
+import { buildReviewPathRecoveryDisposition } from "../recovery/review-path-recovery.js";
 import type { AuthorizationActor } from "../authorization.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
@@ -2739,12 +2740,14 @@ export async function buildPaperclipWakePayload(input: {
       : [],
     childIssueSummaryTruncated:
       input.contextSnapshot.childIssueSummaryTruncated === true,
-    dispositionRepair: input.contextSnapshot.legacyDispositionEpisode ? {
-      attempt: input.contextSnapshot.dispositionRepairAttempt,
-      maxAttempts: input.contextSnapshot.dispositionRepairMaxAttempts,
-      sourceRunId: input.contextSnapshot.retryOfRunId,
-      instruction: input.contextSnapshot.dispositionRepairInstruction,
-    } : null,
+    dispositionRepair:
+      buildReviewPathRecoveryDisposition(input.contextSnapshot) ??
+      (input.contextSnapshot.legacyDispositionEpisode ? {
+        attempt: input.contextSnapshot.dispositionRepairAttempt,
+        maxAttempts: input.contextSnapshot.dispositionRepairMaxAttempts,
+        sourceRunId: input.contextSnapshot.retryOfRunId,
+        instruction: input.contextSnapshot.dispositionRepairInstruction,
+      } : null),
     livenessContinuation:
       readNonEmptyString(input.contextSnapshot.livenessContinuationState) ||
       readNonEmptyString(

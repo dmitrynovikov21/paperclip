@@ -258,6 +258,12 @@ reading its files or syncing assets to a pod. The managed home may link only
 Links inside `skills/` must target a server-selected skill directory.
 Update existing Codex agent configurations before enabling isolation. A saved
 external `CODEX_HOME` makes the run fail until an operator clears it.
+For Grok subscription runs, the company `grok-home` (or managed connection
+`GROK_HOME`) and every existing ancestor must also be immutable to
+`hostAgentUid`. Its `auth.json` must be a service-owned regular file with mode
+`0600` or stricter. Isolated staging rejects links, writable directories, and
+other credential sources before uploading a sandbox asset. A missing home or
+`auth.json` stages no credential.
 
 Inline `PAPERCLIP_SECRETS_MASTER_KEY` is refused. Startup refuses a missing, linked,
 group-readable, or agent-owned key and a writable/untrusted ancestor directory.

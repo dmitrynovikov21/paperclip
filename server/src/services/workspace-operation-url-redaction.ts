@@ -85,10 +85,7 @@ export function redactWorkspaceOperationExcerpt(value: string | null): string | 
   const input = value.length >= 4096 && !truncatedCapture
     ? redactUnknownLeadingAuthority(value)
     : redactTruncatedWorkspaceOperationOutput(value);
-  const sanitized = redactor.push(input) + redactor.flush();
-  const captureMarker = TRUNCATED_OUTPUT_PREFIX_RE.exec(sanitized)?.[0] ?? "";
-  return captureMarker + sanitized.slice(captureMarker.length)
-    .replace(/([^/]+)@(?=(?:\[[^\]\s/?#@]+\]|[^/?#\s"'<>;,}@]+)?(?::\d+)?(?:[/?#\s"'<>;,}]|$))/gi, `${REDACTED_USERINFO}@`);
+  return redactor.push(input) + redactor.flush();
 }
 
 export function redactWorkspaceOperationUrls<T>(value: T): T {

@@ -27,10 +27,19 @@ describe("workspace operation URL redaction", () => {
     expect(output).not.toContain("synthetic-password");
     expect(redactWorkspaceOperationUrlUserInfo("postgres://reader:one@db.test/app"))
       .toBe("postgres://[REDACTED]@db.test/app");
-    expect(redactWorkspaceOperationExcerpt("the tail synthetic-password@db.test/app"))
+    const clipped = "[output truncated to last 262144 bytes; total 262200 bytes]\n"
+      + "the tail synthetic-password@db.test/app";
+    expect(redactWorkspaceOperationExcerpt(clipped))
       .toContain("[REDACTED]@db.test/app");
-    expect(redactWorkspaceOperationExcerpt("the tail synthetic-password@db.test/app"))
+    expect(redactWorkspaceOperationExcerpt(clipped))
       .not.toContain("synthetic-password");
+  });
+
+  it("preserves ordinary email and preceding diagnostics in a complete excerpt", () => {
+    const excerpt = "step 1 ok\nmail ops@example.test\nstep 2 ok";
+    expect(redactWorkspaceOperationExcerpt(excerpt)).toBe(excerpt);
+    expect(redactWorkspaceOperationExcerpt(`${excerpt}\npostgres://reader:password@db.test/app`))
+      .toBe(`${excerpt}\npostgres://[REDACTED]@db.test/app`);
   });
 
   it("masks an unfinished URL when a stream ends before the @", () => {
@@ -136,10 +145,11 @@ describe("workspace operation URL redaction", () => {
     const output = redactor.push(`connect ${url}`) + redactor.flush();
     expect(output).toBe("connect postgresql://[REDACTED]@db.example.test/app");
     expect(redactWorkspaceOperationUrlUserInfo(url)).toBe("postgresql://[REDACTED]@db.example.test/app");
+    const marker = "[output truncated to last 262144 bytes; total 262200 bytes]\n";
     for (const hostAndPath of ["/app", "?host=db.example.test/app"]) {
-      expect(redactWorkspaceOperationExcerpt(`word tail'password@${hostAndPath}`))
+      expect(redactWorkspaceOperationExcerpt(`${marker}word tail'password@${hostAndPath}`))
         .toContain(`[REDACTED]@${hostAndPath}`);
-      expect(redactWorkspaceOperationExcerpt(`word tail'password@${hostAndPath}`))
+      expect(redactWorkspaceOperationExcerpt(`${marker}word tail'password@${hostAndPath}`))
         .not.toContain("tail'password");
     }
   });
@@ -163,9 +173,10 @@ describe("workspace operation URL redaction", () => {
         + redactor.flush();
       expect(output).toBe("connect postgres://[REDACTED]@db.example.test/app");
       expect(redactWorkspaceOperationUrlUserInfo(url)).toBe("postgres://[REDACTED]@db.example.test/app");
-      expect(redactWorkspaceOperationExcerpt(`tail ${credential}@db.example.test/app`))
+      const clipped = `[output truncated to last 262144 bytes; total 262200 bytes]\ntail ${credential}@db.example.test/app`;
+      expect(redactWorkspaceOperationExcerpt(clipped))
         .toContain("[REDACTED]@db.example.test/app");
-      expect(redactWorkspaceOperationExcerpt(`tail ${credential}@db.example.test/app`))
+      expect(redactWorkspaceOperationExcerpt(clipped))
         .not.toContain(credential);
 
       const raw = Buffer.from(JSON.stringify({ chunk: url }));

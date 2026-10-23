@@ -83,7 +83,8 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
     await db.insert(workspaceOperations).values({
       id: operationId, companyId, executionWorkspaceId, heartbeatRunId: runId,
       phase: "provision", status: "succeeded", command: `echo ${url}`,
-      metadata: { connection: url }, stdoutExcerpt: `connect ${url}`,
+      metadata: { connection: url },
+      stdoutExcerpt: `step 1 ok\nmail ops@example.test\nstep 2 ok\nconnect ${url}`,
       stderrExcerpt: longExcerpt,
       logStore: "local_file", logRef: "pending.ndjson",
     });
@@ -135,6 +136,8 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       expect(JSON.stringify(list.body)).not.toContain(longCredentialTail);
       const historical = list.body.find((operation: { id: string }) => operation.id === operationId);
       expect(historical?.stderrExcerpt).toBe("[REDACTED]");
+      expect(historical?.stdoutExcerpt)
+        .toBe("step 1 ok\nmail ops@example.test\nstep 2 ok\nconnect postgresql://[REDACTED]@db.example.test/app");
       const written = list.body.find((operation: { id: string }) => operation.id === newOperation.id);
       expect(written?.stderrExcerpt).toBe("connect postgresql://[REDACTED]/");
       for (const operation of list.body) {
@@ -147,6 +150,7 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       expect(workspaceList.status).toBe(200);
       expect(workspaceList.body).toHaveLength(1);
       expect(workspaceList.body[0].stderrExcerpt).toBe("[REDACTED]");
+      expect(workspaceList.body[0].stdoutExcerpt).toBe(historical?.stdoutExcerpt);
       expect(JSON.stringify(workspaceList.body)).not.toContain(credential);
       expect(JSON.stringify(workspaceList.body)).not.toContain(longCredentialTail);
       let offset = 0;

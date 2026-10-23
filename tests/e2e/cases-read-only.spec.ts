@@ -33,7 +33,11 @@ test("browses passive cases and rolled-up task documents without starting work o
   const dismissAnnouncement = page.getByRole("complementary", { name: "Paperclip announcements", exact: true })
     .getByRole("button", { name: "Dismiss announcement", exact: true });
   const dismissAnnouncements = async () => {
-    await dismissAnnouncement.first().click({ force: true, timeout: 2_000 });
+    // React may remove the card between the handler trigger and its action.
+    // evaluateAll acts on buttons that still exist without waiting for a stale locator.
+    await dismissAnnouncement.evaluateAll(buttons => {
+      for (const button of buttons) (button as HTMLButtonElement).click();
+    });
   };
   // A second announcement may arrive while the first is being dismissed.
   // Let the next action trigger the handler again without waiting for every

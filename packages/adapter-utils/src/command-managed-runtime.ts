@@ -1,3 +1,4 @@
+import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
@@ -81,6 +82,9 @@ export interface CommandManagedRuntimeRunner {
     env?: Record<string, string>;
     stdin?: string;
     timeoutMs?: number;
+    /** Optional execution deadline for a session command, separate from an
+     * individual provider observation timeout. Zero means no command deadline. */
+    commandTimeoutMs?: number;
     onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
     /**
@@ -541,11 +545,16 @@ export async function prepareCommandManagedRuntime(input: {
   runtimeRootDir?: string;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
+  workspaceSnapshotIsolation?: "worker";
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
+  workspaceCheckpoint?: boolean;
+  onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
+  workspaceSeedCacheDirectory?: string;
+  workspaceSeedCacheCompanyDirectory?: string;
   workspaceBaseline?: DirectorySnapshot;
   workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
+  workspaceRepositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   workspaceExclude?: string[];
-  /** Plain persistent directories include all files, independent of Git and task cache exclusions. */
   workspaceFileMode?: "all";
   preserveAbsentOnRestore?: string[];
   assets?: CommandManagedRuntimeAsset[];
@@ -562,6 +571,8 @@ export async function prepareCommandManagedRuntime(input: {
   // prepareSandboxManagedRuntime so the host pack time rides one `pack` span
   // under the `stage.sync` step. The default is a no-op.
   runtimeSpan?: RuntimeSpanRunner;
+  /** Copy-back retry delays; pass `[]` for throwaway workspaces that must not wait on retries. */
+  workspaceRestoreRetryDelaysMs?: readonly number[];
 }): Promise<PreparedSandboxManagedRuntime> {
   const timeoutMs = input.spec.timeoutMs && input.spec.timeoutMs > 0 ? input.spec.timeoutMs : 300_000;
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
@@ -609,9 +620,15 @@ export async function prepareCommandManagedRuntime(input: {
           runtimeRootDir: input.runtimeRootDir,
           syncWorkspace: input.syncWorkspace,
           workspaceInboundMode: input.workspaceInboundMode,
+          workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
           workspaceDurableSeed: input.workspaceDurableSeed,
+          workspaceCheckpoint: input.workspaceCheckpoint,
+          onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+          workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
+          workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
           workspaceBaseline: input.workspaceBaseline,
           workspaceGitSnapshot: input.workspaceGitSnapshot,
+          workspaceRepositories: input.workspaceRepositories,
           workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
           workspaceFileMode: input.workspaceFileMode,
           preserveAbsentOnRestore: input.preserveAbsentOnRestore,
@@ -620,6 +637,7 @@ export async function prepareCommandManagedRuntime(input: {
           onProgress: input.onProgress,
           onRuntimeProgress: input.onRuntimeProgress,
           runtimeSpan: input.runtimeSpan,
+          workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
         });
       }
     }
@@ -654,9 +672,15 @@ export async function prepareCommandManagedRuntime(input: {
     runtimeRootDir: input.runtimeRootDir,
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
+    workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
     workspaceDurableSeed: input.workspaceDurableSeed,
+    workspaceCheckpoint: input.workspaceCheckpoint,
+    onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,
+    workspaceSeedCacheDirectory: input.workspaceSeedCacheDirectory,
+    workspaceSeedCacheCompanyDirectory: input.workspaceSeedCacheCompanyDirectory,
     workspaceBaseline: input.workspaceBaseline,
     workspaceGitSnapshot: input.workspaceGitSnapshot,
+    workspaceRepositories: input.workspaceRepositories,
     workspaceExclude: mergeRuntimeExcludes(input.workspaceExclude),
     workspaceFileMode: input.workspaceFileMode,
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
@@ -665,5 +689,6 @@ export async function prepareCommandManagedRuntime(input: {
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
     runtimeSpan: input.runtimeSpan,
+    workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
   });
 }

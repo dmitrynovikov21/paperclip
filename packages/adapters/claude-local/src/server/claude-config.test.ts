@@ -207,6 +207,9 @@ describe("prepareSandboxClaudeProbeRuntime managed-config diagnostics", () => {
 
     const failed = checks.find((check) => check.code === "claude_managed_config_dir_failed");
     expect(failed).toBeTruthy();
+    expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ syncWorkspace: false, assets: [expect.objectContaining({ key: "config-seed" })] }),
+    );
     const checkText = JSON.stringify(checks);
     expect(checkText).not.toContain(opaqueCredMarker);
     expect(checkText).not.toContain("proxy.corp.internal");

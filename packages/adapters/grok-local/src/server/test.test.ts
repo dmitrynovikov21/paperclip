@@ -282,7 +282,7 @@ describe("grok_local testEnvironment", () => {
 
     expect(prepareRuntimeMock).toHaveBeenCalledOnce();
     expect(prepareRuntimeMock).toHaveBeenCalledWith(
-      expect.objectContaining({ workspaceRemoteDir: "/sandbox/workspace" }),
+      expect.objectContaining({ workspaceRemoteDir: "/sandbox/workspace", syncWorkspace: false }),
     );
     expect(workspaceLocalDirAtCall).not.toBe("/sandbox/workspace");
     expect(workspaceExistedAtCall).toBe(true);

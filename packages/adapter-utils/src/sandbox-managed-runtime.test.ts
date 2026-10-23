@@ -672,6 +672,51 @@ describe("sandbox managed runtime", () => {
     }
   });
 
+  it("stages probe assets without reading a temporary workspace outside isolated roots", async () => {
+    const root = await mkdtemp(path.join(os.homedir(), ".paperclip-isolated-probe-"));
+    const temporaryWorkspace = await mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-probe-workspace-"));
+    cleanupDirs.push(root, temporaryWorkspace);
+    const secretDir = path.join(root, "private", "secrets");
+    const assetDir = path.join(root, "auth-asset");
+    const remote = path.join(root, "remote");
+    await mkdir(secretDir, { recursive: true });
+    await mkdir(assetDir);
+    await mkdir(path.join(root, "workspaces"));
+    await writeFile(path.join(secretDir, "master.key"), "synthetic-key-never-upload");
+    await writeFile(path.join(temporaryWorkspace, "workspace.txt"), "do-not-upload");
+    await writeFile(path.join(assetDir, "auth.txt"), "synthetic-probe-auth");
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 1));
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(secretDir, "master.key"));
+    vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([path.join(root, "workspaces")]));
+    const client = makeFilesystemClient();
+    const syncIn = vi.fn(client.syncIn!);
+    client.syncIn = syncIn;
+    const input = {
+      spec: { transport: "sandbox" as const, provider: "test", sandboxId: "isolated-probe", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+      adapterKey: "test-adapter",
+      client,
+      workspaceLocalDir: temporaryWorkspace,
+    };
+    try {
+      await expect(prepareSandboxManagedRuntime(input)).rejects.toThrow(/outside the operator-approved/);
+      expect(syncIn).not.toHaveBeenCalled();
+
+      const prepared = await prepareSandboxManagedRuntime({
+        ...input,
+        syncWorkspace: false,
+        assets: [{ key: "auth", localDir: assetDir }],
+      });
+      expect(syncIn).toHaveBeenCalledTimes(1);
+      await expect(readFile(path.join(prepared.assetDirs.auth!, "auth.txt"), "utf8"))
+        .resolves.toBe("synthetic-probe-auth");
+      await expect(readFile(path.join(remote, "workspace.txt"))).rejects.toThrow();
+      await expect(readFile(path.join(remote, "master.key"))).rejects.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("refuses a workspace root replaced by a key-directory link after the initial guard", async () => {
     const root = await mkdtemp(path.join(os.homedir(), ".paperclip-key-workspace-race-"));
     cleanupDirs.push(root);

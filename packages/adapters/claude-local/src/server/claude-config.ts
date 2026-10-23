@@ -313,6 +313,8 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
         adapterKey: "claude",
         workspaceLocalDir: tempWorkspaceDir,
         workspaceRemoteDir: managedRemoteCwd,
+        // The probe only uploads config; its host temp dir is not an agent workspace.
+        syncWorkspace: false,
         timeoutSec: Math.max(1, input.helloProbeTimeoutSec),
         // The probe workspace is a throwaway temp dir; never wait on copy-back retries.
         workspaceRestoreRetryDelaysMs: [],

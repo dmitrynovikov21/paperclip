@@ -1104,13 +1104,11 @@ function normalizePaperclipWakeExecutionPrincipal(value: unknown): PaperclipWake
   };
 }
 
-const MAX_WATCHDOG_INSTRUCTIONS_CHARS = 4_000;
-const MAX_WATCHDOG_LEAF_SUMMARIES = 25;
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
 function normalizePaperclipWakeTaskWatchdogLeaf(value: unknown): PaperclipWakeTaskWatchdogLeaf | null {
   const leaf = parseObject(value);
-  const id = asString(leaf.id, "").trim() || null;
+  const id = asString(leaf.id, "").trim() || asString(leaf.issueId, "").trim() || null;
   const identifier = asString(leaf.identifier, "").trim() || null;
   const title = asString(leaf.title, "").trim() || null;
   const status = asString(leaf.status, "").trim() || null;
@@ -1156,22 +1154,26 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
   };
 }
 
-function normalizePaperclipWakeTaskWatchdog(value: unknown): PaperclipWakeTaskWatchdogContext | null {
+function normalizePaperclipWakeTaskWatchdog(
+  value: unknown,
+  payload: Record<string, unknown>,
+): PaperclipWakeTaskWatchdogContext | null {
   const watchdog = parseObject(value);
+  if (Object.keys(watchdog).length === 0) return null;
   const watchedIssueId = asString(watchdog.watchedIssueId, "").trim() || null;
   const watchedIssueIdentifier = asString(watchdog.watchedIssueIdentifier, "").trim() || null;
   const watchedIssueTitle = asString(watchdog.watchedIssueTitle, "").trim() || null;
   const stopFingerprint = asString(watchdog.stopFingerprint, "").trim() || null;
-  const customInstructionsRaw = asString(watchdog.customInstructions, "");
-  const customInstructionsTrimmed = customInstructionsRaw.trim();
-  const customInstructions = customInstructionsTrimmed
-    ? customInstructionsTrimmed.length > MAX_WATCHDOG_INSTRUCTIONS_CHARS
-      ? customInstructionsTrimmed.slice(0, MAX_WATCHDOG_INSTRUCTIONS_CHARS)
-      : customInstructionsTrimmed
-    : null;
-  const terminalLeafSummaries = Array.isArray(watchdog.terminalLeafSummaries)
-    ? watchdog.terminalLeafSummaries
-        .slice(0, MAX_WATCHDOG_LEAF_SUMMARIES)
+  const customInstructionsRaw = asString(
+    watchdog.customInstructions === undefined ? payload.customInstructions : watchdog.customInstructions,
+    "",
+  );
+  const customInstructions = customInstructionsRaw.trim() || null;
+  const leafSummariesRaw = watchdog.terminalLeafSummaries === undefined
+    ? payload.stoppedLeaves
+    : watchdog.terminalLeafSummaries;
+  const terminalLeafSummaries = Array.isArray(leafSummariesRaw)
+    ? leafSummariesRaw
         .map((entry) => normalizePaperclipWakeTaskWatchdogLeaf(entry))
         .filter((entry): entry is PaperclipWakeTaskWatchdogLeaf => Boolean(entry))
     : [];
@@ -1289,7 +1291,7 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
         .filter((entry): entry is PaperclipWakeAnnotationDelta => Boolean(entry))
     : [];
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(payload.livenessContinuation);
-  const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog);
+  const taskWatchdog = normalizePaperclipWakeTaskWatchdog(payload.taskWatchdog, payload);
   const recovery = normalizePaperclipWakeRecovery(payload.recovery);
   const childIssueSummaries = Array.isArray(payload.childIssueSummaries)
     ? payload.childIssueSummaries

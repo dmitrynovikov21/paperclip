@@ -12,7 +12,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { distributionBundleDigest, distributionPluginActivationGuard, readDistributionPluginCatalog } from "../services/distribution-plugin-catalog.js";
@@ -277,7 +277,7 @@ describe("pluginLoader.loadAll error retry", () => {
   });
 
   it("loads a digest-verified distribution manifest in isolation mode", async () => {
-    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "isolated-distribution-")));
+    const root = realpathSync(mkdtempSync(path.join(process.cwd(), ".isolated-distribution-")));
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
     try {
       const packageRoot = path.join(root, "distribution/example");
@@ -424,6 +424,54 @@ describe("pluginLoader.loadAll error retry", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform !== "linux" || !process.getuid || process.getuid() === 0)(
+    "does not import or start a distribution worker made agent-writable after catalog read",
+    async () => {
+      const root = realpathSync(mkdtempSync(path.join(process.cwd(), ".isolated-distribution-worker-")));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      try {
+        const packageRoot = path.join(root, "distribution", "example");
+        const dist = path.join(packageRoot, "dist");
+        mkdirSync(dist, { recursive: true });
+        const plugin = createPluginRecord({ status: "ready", packagePath: packageRoot });
+        const importedMarker = path.join(root, "untrusted-manifest-imported");
+        writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+          name: plugin.packageName,
+          version: "1.0.0",
+          type: "module",
+          paperclipPlugin: { manifest: "dist/manifest.js", worker: "dist/worker.js" },
+        }));
+        writeFileSync(path.join(dist, "manifest.js"), `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(importedMarker)}, 'executed'); export default ${JSON.stringify(plugin.manifestJson)};`);
+        const worker = path.join(dist, "worker.js");
+        writeFileSync(worker, "export default {};");
+        writeFileSync(path.join(root, "distribution", "catalog.json"), JSON.stringify({
+          schemaVersion: 1,
+          plugins: [{ key: "example", pluginKey: plugin.pluginKey, version: "1.0.0", directory: "example", digest: distributionBundleDigest(packageRoot) }],
+        }));
+        const entries = readDistributionPluginCatalog(root, []);
+        chmodSync(worker, 0o666);
+        writeFileSync(worker, "throw new Error('agent-controlled worker');");
+
+        mockRegistry.getById.mockResolvedValue(plugin);
+        const runtime = createRuntimeServices();
+        const startWorker = vi.fn();
+        runtime.workerManager.startWorker = startWorker;
+        const loader = pluginLoader({} as Db, {
+          trustedDistributionPlugins: entries,
+          assertPackageActivation: distributionPluginActivationGuard(root, entries, ["example"]),
+        }, runtime);
+        const result = await loader.loadSingle(plugin.id);
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/immutable distribution|verified release-bundled plugin/);
+        expect(existsSync(importedMarker)).toBe(false);
+        expect(startWorker).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("does not import an npm fallback for a removed distribution install", async () => {
     const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "distribution-removal-")));

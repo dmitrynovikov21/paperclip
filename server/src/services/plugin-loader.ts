@@ -51,6 +51,7 @@ import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot, trustedBundledKubernetesProviderPath, trustedBundledPluginPath } from "./bundled-plugins.js";
+import { assertReleaseOwnedDistributionBundle } from "./distribution-plugin-catalog.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1186,11 +1187,16 @@ export function pluginLoader(
     const builtIn = trustedBundledPluginPath(packagePath);
     let trusted = builtIn;
     if (!trusted) {
-      try {
-        const actual = realpathSync(packagePath);
+      let actual: string | null = null;
+      try { actual = realpathSync(packagePath); }
+      catch { /* Missing source must not fall back to npm. */ }
+      if (actual) {
         const distribution = trustedDistributionPlugins.find((entry) => entry.localPath === actual);
-        if (distribution) trusted = { packagePath: actual, pluginKey: distribution.pluginKey };
-      } catch { /* Missing source must not fall back to npm. */ }
+        if (distribution) {
+          assertReleaseOwnedDistributionBundle(actual);
+          trusted = { packagePath: actual, pluginKey: distribution.pluginKey };
+        }
+      }
     }
     if (!trusted || (declaredKey && trusted.pluginKey !== declaredKey)) {
       throw new Error(declaredKey === KUBERNETES_PLUGIN_KEY ? ISOLATED_KUBERNETES_ERROR : ISOLATED_PLUGIN_ERROR);
@@ -2448,13 +2454,13 @@ export function pluginLoader(
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
       };
 
-      // Repo-local plugin installs can resolve workspace TS sources at runtime
-      // (for example @paperclipai/shared exports). Run those workers through
-      // the tsx loader so first-party example plugins work in development.
-      if (activePlugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
+      // Repo-local development plugins may need tsx. In isolation mode only
+      // prebuilt release code may run as the service UID.
+      if (!isolated && activePlugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
         workerOptions.execArgv = ["--import", DEV_TSX_LOADER_PATH];
       }
 
+      if (isolated && trustedBundlePath) requireTrustedIsolationPath(trustedBundlePath, pluginKey);
       await workerManager.startWorker(pluginId, workerOptions);
       registered.worker = true;
 

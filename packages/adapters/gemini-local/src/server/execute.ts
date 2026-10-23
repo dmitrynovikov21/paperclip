@@ -35,7 +35,6 @@ import {
   asStringArray,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
-  buildPaperclipRuntimeSkillsAssetDir,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
@@ -71,7 +70,7 @@ import {
   createGeminiAcpExecutor,
   resolveGeminiExecutionEngineForRun,
 } from "./acp.js";
-import { resolveGeminiSkillsHome } from "./skills.js";
+import { buildGeminiSkillsDir, resolveGeminiSkillsHome } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeGeminiAcp = createGeminiAcpExecutor();
@@ -190,17 +189,6 @@ async function ensureGeminiSkillsInjected(
       );
     }
   }
-}
-
-async function buildGeminiSkillsDir(
-  config: Record<string, unknown>,
-): Promise<string> {
-  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
-  return buildPaperclipRuntimeSkillsAssetDir(
-    availableEntries.filter((entry) => desiredNames.has(entry.key)),
-    "paperclip-gemini-skills-",
-  );
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {

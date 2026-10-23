@@ -1158,9 +1158,9 @@ function normalizePaperclipWakeTaskWatchdogCapabilities(value: unknown): Papercl
   const capabilities = parseObject(value);
   const operations = normalizeStringList(capabilities.operations, MAX_WATCHDOG_CAPABILITY_ITEMS);
   const deniedOperations = normalizeStringList(capabilities.deniedOperations, MAX_WATCHDOG_CAPABILITY_ITEMS);
+  // Each handoff is a safety boundary for one issue; truncation would make a protected issue look mutable.
   const recoveryHandoffs = Array.isArray(capabilities.recoveryHandoffs)
     ? capabilities.recoveryHandoffs
-        .slice(0, MAX_WATCHDOG_CAPABILITY_ITEMS)
         .map((entry) => normalizePaperclipWakeTaskWatchdogRecoveryHandoff(entry))
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
     : [];

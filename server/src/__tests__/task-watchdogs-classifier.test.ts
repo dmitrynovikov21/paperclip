@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
   classifyTaskWatchdogSubtree,
   taskWatchdogWakeCapabilities,
@@ -466,6 +467,44 @@ describe("task watchdog recovery-owner capabilities", () => {
         "reassign_watched_subtree_issues",
       ],
     })]);
+  });
+
+  it("keeps every recovery-owner denial in the wake prompt beyond 50 protected leaves", () => {
+    const protectedLeaves = Array.from({ length: 51 }, (_, index) => {
+      const number = String(index + 1).padStart(3, "0");
+      return issue({ id: `protected-${number}`, identifier: `PAP-${number}`, status: "blocked" });
+    });
+    const capabilities = taskWatchdogWakeCapabilities({
+      watchdogAgentId: "watchdog-agent",
+      watchedIssues: [...protectedLeaves, issue({ id: "free-leaf", identifier: "PAP-FREE", status: "blocked" })],
+      activeRecoveryActions: protectedLeaves.map((leaf) => ({
+        ...recoveryAction,
+        id: `recovery-${leaf.id}`,
+        sourceIssueId: leaf.id,
+      })),
+    });
+    const prompt = renderPaperclipWakePrompt({
+      reason: "task_watchdog_stopped_subtree",
+      issue: { id: "watchdog-issue", identifier: "PAP-WATCHDOG", title: "Watchdog", status: "in_progress" },
+      taskWatchdog: {
+        watchedIssueId: sourceId,
+        terminalLeafSummaries: [{ id: "free-leaf", identifier: "PAP-FREE", status: "blocked" }],
+        capabilities,
+      },
+    });
+
+    expect(capabilities.operations).toEqual(expect.arrayContaining([
+      "transition_watched_subtree_issue_status",
+      "reassign_watched_subtree_issues",
+    ]));
+    expect(capabilities.recoveryHandoffs).toHaveLength(51);
+    expect(prompt).toContain("Allowed operations (subject to issue-specific denials below)");
+    expect(prompt).toContain("PAP-FREE (blocked)");
+    const lastHandoffLine = prompt.split("\n").find((line) => line.includes("PAP-051: action"));
+    expect(lastHandoffLine).toContain("recovery-protected-051 belongs to agent recovery-owner.");
+    expect(lastHandoffLine).toContain("Denied on this issue: transition_watched_subtree_issue_status, reassign_watched_subtree_issues.");
+    expect(prompt.match(/Denied on this issue:/g)).toHaveLength(51);
+    expect(prompt).toContain("do not PATCH or comment on this watched issue");
   });
 
   it("keeps capabilities when the watchdog is also the recovery owner", () => {

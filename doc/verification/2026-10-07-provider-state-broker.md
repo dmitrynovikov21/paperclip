@@ -1,5 +1,10 @@
 # Provider state broker verification — 2026-10-07
 
+Historical snapshot. The branch has since incorporated the accepted lockfile,
+regenerated the broker migration as 0213, and fixed fencing before acquisition.
+See [PR #17](https://github.com/dmitrynovikov21/paperclip/pull/17) for checks of the
+current head; the results below describe the earlier revision only.
+
 This report covers the broker foundation and synthetic integration tests. It does
 not attest a production OS boundary. No production driver was installed and no
 runtime or host-storage rollout was performed.

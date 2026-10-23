@@ -396,6 +396,8 @@ skills/paperclip/scripts/paperclip-upload-artifact.sh out/walkthrough.webm \
 The helper uploads the file as an issue attachment, creates an artifact work
 product by default, and prints markdown links for the final issue comment. See
 `doc/AGENT-ARTIFACTS.md` for the full completion pattern and direct API shape.
+Its API transport rejects control characters in `PAPERCLIP_RUN_ID` before it
+opens an HTTP connection.
 If a file intentionally remains workspace-only, create a work product with
 `metadata.resourceRef.kind: "workspace_file"` and include the workspace-relative
 path in the final comment. Use browse/search only as the fallback for recovering

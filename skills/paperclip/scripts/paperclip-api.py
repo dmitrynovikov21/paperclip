@@ -13,6 +13,10 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
+class InvalidRunId(ValueError):
+    """A run ID cannot be used as an HTTP header value."""
+
+
 class NoRedirect(HTTPRedirectHandler):
     """Keep the bearer header on the configured origin only."""
 
@@ -57,6 +61,9 @@ def headers(method: str, content_type: str | None):
         if not run_id and os.environ.get("PAPERCLIP_AGENT_ID"):
             raise ValueError("PAPERCLIP_RUN_ID is required for mutations")
         if run_id:
+            # Validate before either HTTP transport opens a connection.
+            if re.search(r"[\x00-\x1f\x7f-\x9f]", run_id):
+                raise InvalidRunId("PAPERCLIP_RUN_ID contains a control character")
             result["X-Paperclip-Run-Id"] = run_id
     if content_type:
         result["Content-Type"] = content_type
@@ -132,6 +139,8 @@ def main():
         return 0
     except HTTPError as error:
         print(f"Paperclip API returned HTTP {error.code}", file=sys.stderr)
+    except InvalidRunId:
+        print("PAPERCLIP_RUN_ID contains a control character", file=sys.stderr)
     except (URLError, OSError, ValueError, http.client.HTTPException) as error:
         # The exception is deliberately not echoed: it may contain a URL or header.
         print(f"Paperclip API request failed ({type(error).__name__})", file=sys.stderr)

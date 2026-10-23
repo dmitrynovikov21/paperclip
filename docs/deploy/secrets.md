@@ -229,6 +229,11 @@ stored workspaces are checked again before every archive or upload, including
 referenced projects. Agent API keys cannot set a project workspace `cwd` in
 this mode; an operator must select the host path. Keep the approved roots
 separate from the service's key, database, backups, and other private data.
+The source directory and every ancestor up to `/` must be immutable to
+`hostAgentUid`: they cannot be owned by that UID or writable by group/other.
+This includes the parent of each workspace and of each referenced project;
+otherwise the agent could swap a checked pathname for a link to the key before
+the server archives or uploads it. A missing `hostAgentUid` fails closed.
 Host-local Git clone URLs (including `file://`) are also refused before
 materializing a managed checkout; use a remote Git URL instead.
 Codex agents use a service-selected home under

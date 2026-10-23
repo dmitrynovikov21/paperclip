@@ -862,6 +862,9 @@ export async function prepareSandboxManagedRuntime(input: {
         //    which sits under `.paperclip-runtime`, survives to run its own extract.
         if (gitSnapshot) {
           await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to sandbox");
+          if (await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+            throw new Error("Isolated workspace source changed before archive staging.");
+          }
           const gitTarPath = path.join(tempDir, "git-workspace.tar");
           const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
           await withShallowGitWorkspaceClone({
@@ -889,6 +892,9 @@ export async function prepareSandboxManagedRuntime(input: {
         //    extracted git tree (no wipe); a plain workspace wipes every child except
         //    the preserved names first. The extract runs AFTER the git extract.
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
+        if (await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+          throw new Error("Isolated workspace source changed before archive staging.");
+        }
         const workspaceTarPath = path.join(tempDir, "workspace.tar");
         const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : workspaceLocalDir;
         if (gitSnapshot) {
@@ -1025,6 +1031,9 @@ export async function prepareSandboxManagedRuntime(input: {
         }
         const remoteProjectDir = path.posix.join(runtimeRootDir, label);
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to sandbox");
+        if (await assertIsolatedWorkspaceSyncAllowed(canonicalLocalPath) !== canonicalLocalPath) {
+          throw new Error("Isolated referenced project source changed before upload.");
+        }
         await stageConfinedSyncIn({
           files: [{
             sourcePath: canonicalLocalPath,

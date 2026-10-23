@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,7 +11,7 @@ describe("isolated workspace source guard", () => {
   });
 
   it("accepts an approved workspace and refuses key directories, aliases, and broad roots", async () => {
-    const temp = await mkdtemp(path.join(os.tmpdir(), "paperclip-isolated-workspace-"));
+    const temp = await mkdtemp(path.join(os.homedir(), ".paperclip-isolated-workspace-"));
     cleanup.push(temp);
     const workspaceRoot = path.join(temp, "workspaces");
     const workspace = path.join(workspaceRoot, "project");
@@ -22,6 +22,7 @@ describe("isolated workspace source guard", () => {
     await symlink(secretDirectory, path.join(workspaceRoot, "secret-alias"));
     const env = {
       PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME: "true",
+      PAPERCLIP_SECRETS_HOST_AGENT_UID: String((process.getuid?.() ?? 0) + 1),
       PAPERCLIP_SECRETS_MASTER_KEY_FILE: path.join(secretDirectory, "master.key"),
       PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON: JSON.stringify([workspaceRoot]),
     };
@@ -37,6 +38,17 @@ describe("isolated workspace source guard", () => {
       ...env,
       PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON: "[]",
     })).rejects.toThrow(/roots/);
+    await expect(assertIsolatedWorkspaceSyncAllowed(workspace, {
+      ...env,
+      PAPERCLIP_SECRETS_HOST_AGENT_UID: String(process.getuid?.()),
+    })).rejects.toThrow(/separate/);
+    await expect(assertIsolatedWorkspaceSyncAllowed(workspace, {
+      ...env,
+      PAPERCLIP_SECRETS_HOST_AGENT_UID: "",
+    })).rejects.toThrow(/agent UID/);
+
+    await chmod(workspaceRoot, 0o777);
+    await expect(assertIsolatedWorkspaceSyncAllowed(workspace, env)).rejects.toThrow(/agent-immutable/);
   });
 
   it("admits remote Git URLs but rejects host-local clone sources", () => {

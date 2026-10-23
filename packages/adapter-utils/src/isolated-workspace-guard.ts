@@ -25,6 +25,12 @@ export async function assertIsolatedWorkspaceSyncAllowed(
 ): Promise<string> {
   if (env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") return sourcePath;
 
+  const hostAgentUid = Number(env.PAPERCLIP_SECRETS_HOST_AGENT_UID);
+  if (process.platform !== "linux" || !Number.isSafeInteger(hostAgentUid) || hostAgentUid <= 0 ||
+      hostAgentUid === process.getuid?.()) {
+    throw new Error("Isolated workspace sync requires a separate non-root host agent UID.");
+  }
+
   let configuredRoots: unknown;
   try {
     configuredRoots = JSON.parse(env.PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON ?? "[]");
@@ -58,6 +64,19 @@ export async function assertIsolatedWorkspaceSyncAllowed(
   }
   if (!approved || isWithin(secretDirectory, source)) {
     throw new Error("Workspace source is outside the operator-approved isolated workspace roots.");
+  }
+
+  // A pathname check cannot protect a later tar -C or provider upload if the
+  // agent can rename any component. Ownership matters even for a read-only
+  // directory: its owner can chmod it writable after this check. Group/other
+  // write also covers agent supplementary groups and POSIX ACL write masks.
+  for (let directory = source; ; directory = path.dirname(directory)) {
+    const entry = await fs.lstat(directory);
+    if (!entry.isDirectory() || entry.isSymbolicLink() || entry.uid === hostAgentUid ||
+        (entry.mode & 0o022) !== 0) {
+      throw new Error(`Isolated workspace sync requires agent-immutable directory ancestors: ${directory}`);
+    }
+    if (directory === path.dirname(directory)) break;
   }
   return source;
 }

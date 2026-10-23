@@ -101,6 +101,11 @@ export async function storeGitRestorePoint(input: {
   const objectKey = restorePointObjectKey(input.workspace.companyId, input.workspace.id, input.generation, id, input.checkout);
   const [ledger] = await input.db.transaction(async (tx) => {
     await notifyGitRestorePointWork(tx, `workspace:${input.workspace.id}`);
+    await tx.update(executionWorkspaceRestorePoints).set({ status: "superseded", updatedAt: new Date() })
+      .where(and(eq(executionWorkspaceRestorePoints.executionWorkspaceId, input.workspace.id),
+        eq(executionWorkspaceRestorePoints.generation, input.generation),
+        eq(executionWorkspaceRestorePoints.checkoutName, input.checkout ?? ""),
+        eq(executionWorkspaceRestorePoints.status, "pending")));
     return tx.insert(executionWorkspaceRestorePoints).values({
       companyId: input.workspace.companyId,
       executionWorkspaceId: input.workspace.id,

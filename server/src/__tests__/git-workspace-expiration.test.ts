@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -18,7 +19,7 @@ import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-r
 import { realizeExecutionWorkspace, ensurePersistedExecutionWorkspaceAvailable } from "../services/workspace-runtime.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { prepareProjectRepositoryWorkspaces, mergeExecutionWorkspaceMetadataForPersistence } from "../services/heartbeat/workspaces.js";
-import { expireReconstructableGitWorkspace } from "../services/git-workspace-expiration.js";
+import { describeGitExpirationFailure, expireReconstructableGitWorkspace } from "../services/git-workspace-expiration.js";
 import * as activityLog from "../services/activity-log.js";
 import { readGitCacheRestoration } from "../services/git-workspace-restoration.js";
 import { gitCacheExpirationLockLocations, readGitCacheExpiration } from "../services/git-workspace-restoration.js";
@@ -386,6 +387,24 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
       const entry = `${head} ${head} Fixture <fixture@example.test> 1700000000 +0000\treset: moving to HEAD\n`;
       await fs.appendFile(log, entry.repeat(6_000));
       expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+      vi.unstubAllEnvs();
+    });
+
+    it("expires despite a stale pending restore point left by an earlier attempt", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      await unpushedNestedWork(f.nested.cwd);
+      const generation = Number((await f.row()).metadata?.lifecycleGeneration ?? 0) + 1;
+      const base = { companyId: f.companyId, executionWorkspaceId: f.workspaceId, sourceIssueId: f.issueId, generation,
+        sha256: "0".repeat(64), byteSize: 1 };
+      const [stale] = await db.insert(executionWorkspaceRestorePoints).values([
+        { ...base, checkoutName: path.basename(f.nested.cwd), objectKey: `stale/${randomUUID()}.pcrp`, status: "pending" },
+        { ...base, checkoutName: "", objectKey: `stale/${randomUUID()}.pcrp`, status: "superseded" },
+      ]).returning();
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+      const rows = await ledger(f.workspaceId);
+      expect(rows.find(row => row.id === stale!.id)).toMatchObject({ status: "superseded" });
+      expect(rows.filter(row => row.status === "active").map(row => row.checkoutName)).toEqual([path.basename(f.nested.cwd)]);
       vi.unstubAllEnvs();
     });
 
@@ -801,6 +820,47 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     await db.update(executionWorkspaces).set({ metadata: { ...row.metadata, reopenPendingConsumption: true } }).where(eq(executionWorkspaces.id, f.workspaceId));
     expect((await f.expire()).expired).toBe(false);
     expect(await exists(f.cwd)).toBe(true);
+  });
+
+  it("describes an unexpected inspection failure without the command or credentials", async () => {
+    const f = await fixture();
+    await fs.writeFile(path.join(f.cwd, ".git"), `gitdir: ${path.join(f.cwd, "missing-admin")}\n`);
+    const result = await f.expire();
+    expect(result).toMatchObject({ expired: false, skipReason: "inspection_failed",
+      failure: { name: "Error", code: expect.any(String), at: expect.stringMatching(/^at /), stderr: expect.stringContaining("not a git repository") } });
+    expect(await exists(f.cwd)).toBe(true);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("describes an unexpected failure while inspecting the base", async () => {
+    const f = await fixture();
+    const locked = path.join(f.baseCwd, "locked-dir");
+    const result = await f.expire({ beforeDelete: async () => {
+      await fs.mkdir(locked);
+      await fs.writeFile(path.join(locked, "file"), "x");
+      await fs.chmod(locked, 0o000);
+    } });
+    await fs.chmod(locked, 0o755);
+    expect(result).toMatchObject({ expired: true, baseExpired: false, skipReason: "inspection_failed",
+      failure: { code: "EACCES", at: expect.stringMatching(/^at /) } });
+  });
+
+  it("redacts credentials from a described git failure", async () => {
+    const error = await promisify(execFile)("git", ["-c", "http.extraHeader=Authorization: Bearer sk-secret-header",
+      "ls-remote", "https://user:sk-secret-pass@127.0.0.1:9/repo.git"], { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } })
+      .then(() => { throw new Error("expected git to fail"); }, (error: Error) => error);
+    const described = describeGitExpirationFailure(error);
+    expect(JSON.stringify(described)).not.toContain("sk-secret");
+    expect(JSON.stringify(described)).not.toContain("ls-remote");
+    expect(described).toMatchObject({ name: "Error", code: expect.any(String), stderr: expect.any(String) });
+  });
+
+  it("redacts credentials that git echoes on stderr", () => {
+    const error = Object.assign(new Error("Command failed: git fetch https://user:sk-secret-pass@example.test/repo.git"), {
+      code: 128, stderr: "fatal: unable to access 'https://user:sk-secret-pass@example.test/repo.git/'\nheader Authorization: Bearer sk-secret-header\n" });
+    const described = describeGitExpirationFailure(error);
+    expect(JSON.stringify(described)).not.toContain("sk-secret");
+    expect(described.stderr).toContain("https://<redacted>@example.test/repo.git");
+    expect(described.code).toBe("128");
   });
 
   it("retries after interruption with the restoration recipe already committed", async () => {

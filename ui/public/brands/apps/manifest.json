@@ -479,7 +479,7 @@
     {
       "slug": "vercel",
       "provider": "Vercel",
-      "catalogVisible": false,
+      "catalogVisible": true,
       "localAsset": "/brands/apps/vercel.svg",
       "darkAsset": "/brands/apps/vercel-dark.svg"
     },

@@ -49,15 +49,17 @@ it("paginates all jobs and preserves nonstandard compute as unpriced", async () 
 it("rejects changing, truncated, duplicated, misattributed, rerun and uncompleted evidence", async () => {
   for (const override of [{ run: { run_attempt: 2 } }, { run: { status: "in_progress" } }, { run: { path: "other.yml" } },
     { finalRun: { head_sha: "b".repeat(40) } }, { jobPage: { total_count: 2 } }, { jobs: [job(), job()] },
-    { jobs: [{ ...job(), run_id: 999 }] }, { jobs: [{ ...job(), completed_at: null }] }, { jobPage: { total_count: 1001 } },
+    { jobs: [{ ...job(), run_id: 999 }] }, { jobs: [{ ...job(), runner_id: null }] },
+    { jobs: [{ ...job(), runner_id: undefined }] }, { jobs: [{ ...job(), conclusion: "skipped", runner_id: undefined }] },
+    { jobs: [{ ...job(), completed_at: null }] }, { jobPage: { total_count: 1001 } },
     { artifactPage: { artifacts: [{ ...artifact, workflow_run: { id: 999, head_sha: sha } }] } },
     { artifactPage: { artifacts: [{ ...artifact, size_in_bytes: -1 }] } }]) {
     await expect(readGitHubOperatingUsage("123", api(override).read, now)).rejects.toThrow();
   }
 });
 
-it("accounts skipped jobs without requiring a fictitious VM and keeps expired artifact identity", async () => {
-  const source = api({ jobs: [{ ...job(), conclusion: "skipped", runner_id: 0, started_at: null, completed_at: null }],
+it.each([0, null])("accounts skipped jobs with runner ID %s without requiring a fictitious VM", async (runnerId) => {
+  const source = api({ jobs: [{ ...job(), conclusion: "skipped", runner_id: runnerId, started_at: null, completed_at: null }],
     artifactPage: { artifacts: [{ ...artifact, expired: true }] } });
   expect(await readGitHubOperatingUsage("123", source.read, now)).toMatchObject({ summedJobSeconds: 0,
     jobs: [{ runner: "not_started" }], artifacts: { retainedBytes: 0, inventory: [{ id: 9, expired: true }] } });

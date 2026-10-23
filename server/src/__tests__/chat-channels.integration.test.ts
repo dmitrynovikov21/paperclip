@@ -3375,6 +3375,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           limitations: [...parameters.coverage!.limitations.slice(0, 50), "Changed final limitation"] } };
         await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: changedCoverage }))
           .rejects.toMatchObject({ status: 409, reasonCode: "github_idempotency_conflict" });
+        const invalidCoverage = await gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+          parameters: { ...parameters, coverage: { ...parameters.coverage!, reviewedPaths: ["outside-this-pr.ts"] } } })
+          .then(() => null, error => error);
+        expect(invalidCoverage).toMatchObject({ status: 409,
+          message: "Assessment coverage and findings must refer to this PR's allowed changed files" });
+        expect(invalidCoverage).not.toHaveProperty("reasonCode");
       }
       await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke publication", policyType: "block", priority: 0,
         selectors: { catalogEntryId: tool.catalogEntryId! } });

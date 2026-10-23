@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertIsolatedLocalSecretsKey, localEncryptedProvider } from "./local-encrypted-provider.js";
+import { assertIsolatedLocalSecretsKey, deriveLocalEncryptedInstanceSecret, localEncryptedProvider } from "./local-encrypted-provider.js";
 
 const roots: string[] = [];
 const serverUid = process.getuid?.();
@@ -53,9 +53,17 @@ describe("isolated local encrypted key preflight", () => {
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
     expect((await localEncryptedProvider.healthCheck()).status).toBe("error");
     chmodSync(key, 0o600);
+    expect(deriveLocalEncryptedInstanceSecret("tool-action-signing", { PAPERCLIP_SECRETS_MASTER_KEY_FILE: key })).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(() => deriveLocalEncryptedInstanceSecret("tool-action-signing", {
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: key,
+      PAPERCLIP_SECRETS_MASTER_KEY: randomBytes(32).toString("base64"),
+    })).toThrow(/inline master key/);
     const link = path.join(dir, "linked.key");
     symlinkSync(key, link);
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(() => assertIsolatedLocalSecretsKey({ ...input, keyFilePath: link })).toThrow(/regular service-owned file/);
+    expect(() => deriveLocalEncryptedInstanceSecret("tool-action-signing", {
+      PAPERCLIP_SECRETS_MASTER_KEY_FILE: link,
+    })).toThrow(/regular service-owned file/);
   });
 });

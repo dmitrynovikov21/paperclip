@@ -435,7 +435,9 @@ The collector uses the existing `gh` authentication and only reads
 revision and repository, reads every returned job/artifact page up to 1,000
 records per inventory, and rejects changed or incomplete inventories. It retains
 job identities, summed job seconds, run-start delay, artifact sizes and expiration
-dates. It omits arbitrary job names, artifact names and upstream responses.
+dates. Skipped jobs with a null or zero runner ID count as not started and use
+zero VM time. Started jobs still require a numeric runner identity. It omits
+arbitrary job names, artifact names and upstream responses.
 Existing output files cannot be replaced. This is a current inventory, not an
 invoice: deleted artifacts are absent, compressed bytes are not billed
 byte-hours, job duration is not VM lifetime, and present repository visibility

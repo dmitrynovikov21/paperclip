@@ -305,7 +305,7 @@ describe("AppDefinition catalog", () => {
         (entry) => !connectableSlugs.has(entry.slug),
       ),
     ).toEqual([]);
-    for (const entry of BLOCKED_MCP_PROVIDERS)
+    for (const entry of BLOCKED_MCP_PROVIDERS.filter(entry => entry.slug !== "vercel"))
       expect(getAppStoreDefinition(entry.slug)).toBeNull();
   });
   it("separates GitHub tools from the review bot without changing the provider identity", () => {
@@ -886,7 +886,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(86);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(87);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -953,8 +953,12 @@ describe("AppDefinition catalog", () => {
       expect(appSupportsCatalogSetup(definitions.get(candidate.slug))).toBe(
         true,
       );
-    for (const blocked of BLOCKED_MCP_PROVIDERS)
-      expect(getAppStoreDefinition(blocked.slug)).toBeNull();
+    for (const blocked of BLOCKED_MCP_PROVIDERS) {
+      // MCP client eligibility does not apply to Vercel's reviewed REST adapter.
+      if (blocked.slug === "vercel") {
+        expect(getAppStoreDefinition(blocked.slug)?.methods).toMatchObject([{ key: "rest-api-key", transport: "rest_api" }]);
+      } else expect(getAppStoreDefinition(blocked.slug)).toBeNull();
+    }
   });
   it("keeps all Google Workspace profiles aligned with their app, endpoint, scopes, ownership, risk, and write policy", () => {
     expect(GOOGLE_WORKSPACE_CONNECTOR_PROFILE_IDS).toEqual(
@@ -1434,8 +1438,8 @@ describe("AppDefinition catalog", () => {
       "make:mcp-api-token:zone",
       "shopify:storefront-mcp:storeDomain",
       "shopify:ucp-commerce:storeDomain",
-      "supabase:mcp-api-key:projectRef",
-      "supabase:mcp-oauth:projectRef",
+      "supabase:management-api:projectRef",
+      "vercel:rest-api-key:teamId",
     ]);
   });
   it("limits Vercel Connect setup to the reviewed pilot methods", () => {
@@ -1477,8 +1481,7 @@ describe("AppDefinition catalog", () => {
       )?.review.principalModes,
     ).toEqual(["app"]);
     expect(
-      APP_DEFINITIONS.find((app) => app.slug === "vercel")?.availability
-        ?.available,
+      APP_DEFINITIONS.find((app) => app.slug === "vercel")?.methods.some(method => method.credentialSources?.vercelConnect),
     ).toBe(false);
   });
 });
@@ -1495,6 +1498,31 @@ describe("Railway provider", () => {
   });
 });
 
+
+describe("Deployment connectors", () => {
+  it("offers Supabase account-level MCP and project-scoped configuration", () => {
+    const app = getAppStoreDefinition("supabase")!;
+    expect(app.methods.map(method => method.key)).toEqual(["mcp-oauth", "mcp-api-key", "management-api"]);
+    for (const method of app.methods.filter(method => method.transport === "mcp_remote")) {
+      expect(method.tenantFields?.find(field => field.key === "projectRef")).toMatchObject({ advanced: true });
+      expect(method.tenantFields?.find(field => field.key === "projectRef")?.required).not.toBe(true);
+    }
+    expect(app.methods.find(method => method.key === "management-api")).toMatchObject({
+      transport: "rest_api", auth: "api_key", defaults: { serverUrl: "https://api.supabase.com/v1" },
+      tenantFields: [expect.objectContaining({ key: "projectRef", required: true })],
+    });
+  });
+  it("offers Vercel deployment setup independently of MCP eligibility", () => {
+    const app = getAppStoreDefinition("vercel")!;
+    expect(app.availability?.available).toBe(true);
+    expect(getAvailableConnectionMethods(app)).toMatchObject([{
+      key: "rest-api-key", auth: "api_key", transport: "rest_api", riskTier: "S4",
+      defaults: { serverUrl: "https://api.vercel.com" },
+      tenantFields: [expect.objectContaining({ key: "teamId", required: true })],
+    }]);
+    expect(getAvailableConnectionMethod(app, "mcp-oauth")).toBeNull();
+  });
+});
 
 describe("tool method permission review", () => {
   const audit = JSON.parse(fs.readFileSync(new URL("../../../doc/connections/tool-method-permission-reviews.json", import.meta.url), "utf8")) as {

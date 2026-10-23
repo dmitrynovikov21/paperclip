@@ -42,9 +42,9 @@ export async function readGitHubOperatingUsage(runId: string, read: ReadGitHub, 
   const rawJobs = await inventory(read, `${prefix}/actions/runs/${runId}/attempts/1/jobs`, "jobs");
   if (!rawJobs.length) throw new Error("Missing workflow jobs");
   const jobs = rawJobs.map(job => {
-    if (job.run_id !== run.id || job.run_attempt !== 1 || job.status !== "completed" || !integer(job.runner_id)
+    const skipped = job.conclusion === "skipped" && (job.runner_id === 0 || job.runner_id === null);
+    if (job.run_id !== run.id || job.run_attempt !== 1 || job.status !== "completed" || !skipped && !integer(job.runner_id)
         || !Array.isArray(job.labels) || job.labels.some((label: unknown) => typeof label !== "string")) throw new Error("Invalid workflow job identity");
-    const skipped = job.conclusion === "skipped" && job.runner_id === 0;
     if (!skipped && (!timestamp(job.started_at) || !timestamp(job.completed_at)
         || Date.parse(job.started_at) < Date.parse(run.created_at) || Date.parse(job.completed_at) > now
         || Date.parse(job.completed_at) < Date.parse(job.started_at))) throw new Error("Incomplete workflow job timing");

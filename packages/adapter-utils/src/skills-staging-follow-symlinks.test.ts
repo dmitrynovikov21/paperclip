@@ -71,10 +71,10 @@ async function findSkillsStagingSites(): Promise<Map<string, boolean[]>> {
 }
 
 // The known `key: "skills"` staging sites and their reviewed
-// `followSymlinks` setting, as of this test's authorship. The false entries
-// stage already-materialized copies, so they must not dereference symlinks
-// planted after materialization. The true entries stage live skill directories
-// and may need to resolve the user's own symlinks.
+// `followSymlinks` setting, as of this test's authorship. These sites stage
+// already-materialized copies, so they must not dereference symlinks planted
+// after materialization. A future site staging live skill directories may need
+// to resolve the user's own symlinks.
 // A change to any value, or a new unlisted site, must force a review.
 const EXPECTED_SKILLS_STAGING_SITES: Record<string, boolean> = {
   "claude-local/src/server/acp.ts": false,
@@ -82,7 +82,7 @@ const EXPECTED_SKILLS_STAGING_SITES: Record<string, boolean> = {
   "cursor-local/src/server/execute.ts": false,
   "gemini-local/src/server/acp.ts": false,
   "gemini-local/src/server/execute.ts": false,
-  "kimi-local/src/server/execute.ts": true,
+  "kimi-local/src/server/execute.ts": false,
   "opencode-local/src/server/execute.ts": false,
   "pi-local/src/server/execute.ts": false,
 };

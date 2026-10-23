@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/paperclip-issue-update.sh [--issue-id ID] [--status STATUS] [--comment TEXT] [--dry-run]
+  scripts/paperclip-issue-update.sh [--issue-id ID] [--status STATUS] [--dry-run]
 
 Reads a multiline markdown comment from stdin when stdin is piped. This preserves
 newlines when building the JSON payload for PATCH /api/issues/{issueId}.
@@ -35,7 +35,6 @@ require_command() {
 
 issue_id="${PAPERCLIP_TASK_ID:-}"
 status=""
-comment_arg=""
 dry_run=0
 
 while [[ $# -gt 0 ]]; do
@@ -46,10 +45,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --status)
       status="${2:-}"
-      shift 2
-      ;;
-    --comment)
-      comment_arg="${2:-}"
       shift 2
       ;;
     --dry-run)
@@ -74,23 +69,18 @@ if [[ -z "$issue_id" ]]; then
 fi
 
 comment=""
-if [[ -n "$comment_arg" ]]; then
-  comment="$comment_arg"
-elif [[ ! -t 0 ]]; then
+if [[ ! -t 0 ]]; then
   comment="$(cat)"
 fi
 
-require_command jq
+require_command python3
 
-payload="$(
-  jq -nc \
-    --arg status "$status" \
-    --arg comment "$comment" \
-    '
-      (if $status == "" then {} else {status: $status} end) +
-      (if $comment == "" then {} else {comment: $comment} end)
-    '
-)"
+payload="$(printf '%s' "$comment" | python3 -c '
+import json, sys
+status, comment = sys.argv[1], sys.stdin.read()
+body = ({"status": status} if status else {}) | ({"comment": comment} if comment else {})
+print(json.dumps(body))
+' "$status")"
 
 if [[ "$dry_run" == "1" ]]; then
   printf '%s\n' "$payload"
@@ -102,9 +92,5 @@ if [[ -z "${PAPERCLIP_API_URL:-}" || -z "${PAPERCLIP_API_KEY:-}" || -z "${PAPERC
   exit 1
 fi
 
-curl -sS -X PATCH \
-  "$PAPERCLIP_API_URL/api/issues/$issue_id" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-  -H 'Content-Type: application/json' \
-  --data-binary "$payload"
+helper="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../skills/paperclip/scripts/paperclip-api.py"
+printf '%s' "$payload" | python3 "$helper" PATCH "/api/issues/$issue_id" --body-stdin

@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
-import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, truncateUnicodeString, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
@@ -51,7 +51,7 @@ export type IssueContinuationSummaryDocument = {
 function truncateText(value: string, maxChars: number) {
   const trimmed = value.trim();
   if (trimmed.length <= maxChars) return trimmed;
-  return `${trimmed.slice(0, Math.max(0, maxChars - 20)).trimEnd()}\n[truncated]`;
+  return `${truncateUnicodeString(trimmed, Math.max(0, maxChars - 20)).trimEnd()}\n[truncated]`;
 }
 
 function asNonEmptyString(value: unknown) {

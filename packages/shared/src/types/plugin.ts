@@ -84,6 +84,8 @@ export interface PluginJobDeclaration {
   description?: string;
   /** Cron expression for the schedule (e.g. "star/15 star star star star" or "0 * * * *"). */
   schedule?: string;
+  /** Instance by default; company jobs run once per configured, enabled company. */
+  scope?: "instance" | "company";
 }
 
 /**
@@ -845,6 +847,8 @@ export interface PluginJobRecord {
   jobKey: string;
   /** Cron expression for the schedule. */
   schedule: string;
+  /** Scheduling scope declared by the plugin. */
+  scope: "instance" | "company";
   /** Current job status. */
   status: "active" | "paused" | "failed";
   /** Last time the job was executed. */

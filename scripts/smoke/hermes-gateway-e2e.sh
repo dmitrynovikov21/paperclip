@@ -122,17 +122,7 @@ case "${1:-}" in
     ;;
 esac
 
-AUTH_HEADERS=()
-if [[ -n "${PAPERCLIP_AUTH_HEADER:-}" ]]; then
-  AUTH_HEADERS+=(-H "Authorization: ${PAPERCLIP_AUTH_HEADER}")
-elif [[ -n "${PAPERCLIP_API_KEY:-}" ]]; then
-  AUTH_HEADERS+=(-H "Authorization: Bearer ${PAPERCLIP_API_KEY}")
-fi
-if [[ -n "${PAPERCLIP_COOKIE:-}" ]]; then
-  AUTH_HEADERS+=(-H "Cookie: ${PAPERCLIP_COOKIE}")
-  PAPERCLIP_BROWSER_ORIGIN="${PAPERCLIP_BROWSER_ORIGIN:-${PAPERCLIP_API_URL%/}}"
-  AUTH_HEADERS+=(-H "Origin: ${PAPERCLIP_BROWSER_ORIGIN}" -H "Referer: ${PAPERCLIP_BROWSER_ORIGIN}/")
-fi
+HTTP_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/operator-http.py"
 
 RESPONSE_CODE=""
 RESPONSE_BODY=""
@@ -246,9 +236,9 @@ api_request() {
   fi
 
   if [[ -n "$data" ]]; then
-    RESPONSE_CODE="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" "$url" --data "$data")"
+    RESPONSE_CODE="$(printf '%s' "$data" | OPERATOR_HTTP_URL="$url" PAPERCLIP_API_URL="$PAPERCLIP_API_URL" python3 "$HTTP_HELPER" "$method" --auth paperclip --body-stdin --output "$tmp" --status-only --allow-http-error)"
   else
-    RESPONSE_CODE="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "${AUTH_HEADERS[@]}" "$url")"
+    RESPONSE_CODE="$(OPERATOR_HTTP_URL="$url" PAPERCLIP_API_URL="$PAPERCLIP_API_URL" python3 "$HTTP_HELPER" "$method" --auth paperclip --output "$tmp" --status-only --allow-http-error)"
   fi
   RESPONSE_BODY="$(cat "$tmp")"
   rm -f "$tmp"
@@ -273,9 +263,9 @@ gateway_request() {
 
   local url="${HERMES_GATEWAY_PROBE_URL%/}${path}"
   if [[ -n "$data" ]]; then
-    RESPONSE_CODE="$(curl -s -o "$tmp" -w "%{http_code}" -X "$method" -H "Authorization: Bearer ${HERMES_GATEWAY_API_KEY}" -H "Content-Type: application/json" "$url" --data "$data" || true)"
+    RESPONSE_CODE="$(printf '%s' "$data" | OPERATOR_HTTP_URL="$url" HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" python3 "$HTTP_HELPER" "$method" --auth hermes --body-stdin --output "$tmp" --status-only --allow-http-error || true)"
   else
-    RESPONSE_CODE="$(curl -s -o "$tmp" -w "%{http_code}" -X "$method" -H "Authorization: Bearer ${HERMES_GATEWAY_API_KEY}" "$url" || true)"
+    RESPONSE_CODE="$(OPERATOR_HTTP_URL="$url" HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" python3 "$HTTP_HELPER" "$method" --auth hermes --output "$tmp" --status-only --allow-http-error || true)"
   fi
   RESPONSE_BODY="$(cat "$tmp")"
   if [[ -n "$output_file" ]]; then
@@ -290,7 +280,7 @@ wait_http_ready() {
   local started now code
   started="$(date +%s)"
   while true; do
-    code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${HERMES_GATEWAY_API_KEY}" "$url" || true)"
+    code="$(OPERATOR_HTTP_URL="$url" HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" python3 "$HTTP_HELPER" GET --auth hermes --status-only --allow-http-error || true)"
     if [[ "$code" == "200" ]]; then
       return 0
     fi
@@ -303,7 +293,7 @@ wait_http_ready() {
 }
 
 require_board_auth() {
-  if [[ ${#AUTH_HEADERS[@]} -eq 0 ]]; then
+  if [[ -z "${PAPERCLIP_AUTH_HEADER:-}${PAPERCLIP_API_KEY:-}${PAPERCLIP_COOKIE:-}" ]]; then
     fail "board/operator auth required. Set PAPERCLIP_COOKIE, PAPERCLIP_AUTH_HEADER, or a board-capable PAPERCLIP_API_KEY."
   fi
   api_request "GET" "/companies"
@@ -546,7 +536,7 @@ start_container() {
     --name "$HERMES_CONTAINER_NAME"
     -p "127.0.0.1:${HERMES_GATEWAY_PORT}:8642"
     -e API_SERVER_ENABLED=true
-    -e API_SERVER_KEY="$HERMES_GATEWAY_API_KEY"
+    -e API_SERVER_KEY
     -e API_SERVER_HOST=0.0.0.0
     -e API_SERVER_PORT=8642
     -e PAPERCLIP_API_URL="$PAPERCLIP_API_URL_FOR_HERMES"
@@ -558,7 +548,8 @@ start_container() {
   local provider_keys=()
   for provider_key in "${HERMES_PROVIDER_ENV_KEYS[@]}"; do
     if [[ -n "${!provider_key-}" ]]; then
-      args+=(-e "${provider_key}=${!provider_key}")
+      export "${provider_key:?}"
+      args+=(-e "$provider_key")
       provider_keys+=("$provider_key")
     fi
   done
@@ -576,7 +567,7 @@ start_container() {
   args+=("$HERMES_IMAGE")
 
   log "starting container ${HERMES_CONTAINER_NAME}"
-  docker "${args[@]}" >/dev/null
+  API_SERVER_KEY="$HERMES_GATEWAY_API_KEY" docker "${args[@]}" >/dev/null
 }
 
 assert_fresh_container_state() {
@@ -606,8 +597,8 @@ probe_gateway_readiness() {
   gateway_request "GET" "/health" "" "${HERMES_SMOKE_DIAG_DIR}/gateway-health.json"
   assert_status "200"
 
-  local wrong_code
-  wrong_code="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong-smoke-key" "${HERMES_GATEWAY_PROBE_URL%/}/v1/capabilities" || true)"
+  local wrong_code wrong_url="${HERMES_GATEWAY_PROBE_URL%/}/v1/capabilities"
+  wrong_code="$(OPERATOR_HTTP_URL="$wrong_url" HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" HERMES_GATEWAY_API_KEY=wrong-smoke-key python3 "$HTTP_HELPER" GET --auth hermes --status-only --allow-http-error || true)"
   if [[ "$wrong_code" == "200" ]]; then
     fail "Hermes protected endpoint accepted a wrong API key"
   fi
@@ -667,10 +658,12 @@ assert_direct_gateway_run() {
   [[ -n "$DIRECT_RUN_ID" ]] || fail "direct run creation did not return run id"
 
   local events_file="${HERMES_SMOKE_DIAG_DIR}/direct-run-${DIRECT_RUN_ID}-events.sse"
-  curl -sS --max-time "$HERMES_DIRECT_RUN_EVENTS_TIMEOUT_SEC" -N \
-    -H "Authorization: Bearer ${HERMES_GATEWAY_API_KEY}" \
-    "${HERMES_GATEWAY_PROBE_URL%/}/v1/runs/${DIRECT_RUN_ID}/events" \
-    > "${events_file}.raw" || true
+  local events_url="${HERMES_GATEWAY_PROBE_URL%/}/v1/runs/${DIRECT_RUN_ID}/events"
+  OPERATOR_HTTP_URL="$events_url" \
+    HERMES_GATEWAY_PROBE_URL="$HERMES_GATEWAY_PROBE_URL" \
+    HERMES_GATEWAY_API_KEY="$HERMES_GATEWAY_API_KEY" \
+    python3 "$HTTP_HELPER" GET --auth hermes --stream --output "${events_file}.raw" \
+      --timeout "$HERMES_DIRECT_RUN_EVENTS_TIMEOUT_SEC" || true
   redact_text "$(cat "${events_file}.raw")" > "$events_file"
   rm -f "${events_file}.raw"
   local events_seen=0
@@ -781,7 +774,7 @@ join_hermes_agent() {
 install_claimed_key_in_container() {
   log "placing newly claimed Paperclip key in container workspace"
   local key_file="${HERMES_SMOKE_STATE_DIR}/workspace/paperclip-claimed-api-key.json"
-  jq -nc --arg token "$AGENT_API_KEY" '{token:$token,apiKey:$token}' > "$key_file"
+  AGENT_API_KEY="$AGENT_API_KEY" jq -nc '{token:env.AGENT_API_KEY,apiKey:env.AGENT_API_KEY}' > "$key_file"
   # The host-created bind-mounted file must be readable by the non-root hermes
   # user inside the container. The state dir is still per-run and deleted on
   # success unless HERMES_SMOKE_KEEP=1.
@@ -946,7 +939,7 @@ scan_diagnostics_for_secret_leaks() {
     [[ "$file" == "$JOIN_OUTPUT_FILE" ]] && continue
     local secret
     for secret in "${secrets[@]}"; do
-      if grep -Fq "$secret" "$file"; then
+      if grep -Fq -f - -- "$file" <<<"$secret"; then
         fail "raw secret leaked in diagnostics file ${file}"
       fi
     done
@@ -959,6 +952,7 @@ main() {
   log "diagnostics dir: ${HERMES_SMOKE_DIAG_DIR}"
 
   require_cmd curl
+  require_cmd python3
   require_cmd docker
   require_cmd jq
 

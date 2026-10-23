@@ -64,6 +64,7 @@ import {
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  truncateUnicodeString,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -194,9 +195,6 @@ function applyStatusSideEffects(
 
   if (status === "in_progress" && !patch.startedAt) {
     patch.startedAt = new Date();
-  }
-  if (status === "done") {
-    patch.completedAt = new Date();
   }
   if (status === "cancelled") {
     patch.cancelledAt = new Date();
@@ -794,7 +792,9 @@ function chunkList<T>(values: T[], size: number): T[][] {
 function truncateInlineSummary(value: string | null | undefined, maxChars = CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS) {
   const normalized = value?.trim();
   if (!normalized) return null;
-  return normalized.length > maxChars ? `${normalized.slice(0, Math.max(0, maxChars - 15)).trimEnd()} [truncated]` : normalized;
+  return normalized.length > maxChars
+    ? `${truncateUnicodeString(normalized, Math.max(0, maxChars - 15)).trimEnd()} [truncated]`
+    : normalized;
 }
 
 function truncateByCodePoint(value: string, maxChars: number): string {
@@ -7645,6 +7645,13 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (issueData.status === "done") {
+          // Only a transition into done starts a new completion epoch. A
+          // repeated done patch must not rearm dependency wakeups.
+          patch.completedAt = receiptExisting.status === "done"
+            ? receiptExisting.completedAt
+            : new Date();
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])

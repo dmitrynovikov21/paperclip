@@ -696,6 +696,13 @@ function watchdogWakeContext(input: {
       pendingApprovals: Object.fromEntries(Object.entries(input.classification.stopSnapshot.waitsByIssueId)
         .filter(([, waits]) => waits.pendingApprovalIds.length > 0)
         .map(([issueId, waits]) => [issueId, waits.pendingApprovalIds])),
+      terminalLeafSummaries: input.classification.stoppedLeaves.map((leaf) => ({
+        id: leaf.issueId,
+        identifier: leaf.identifier,
+        title: leaf.title,
+        status: leaf.status,
+      })),
+      customInstructions: input.watchdog.instructions,
       capabilities: {
         targetScope: {
           watchedIssueId: input.sourceIssue.id,

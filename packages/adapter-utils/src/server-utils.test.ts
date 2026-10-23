@@ -12,6 +12,7 @@ import {
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
+  normalizePaperclipWakePayload,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
@@ -2023,6 +2024,61 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     fallbackFetchNeeded: false,
   };
 
+  it("reads root-level fields from watchdog wakes queued before the nested fields existed", () => {
+    const payload = {
+      ...baseWatchdogPayload,
+      taskWatchdog: { watchedIssueId: "watched-issue-1" },
+      stoppedLeaves: [{
+        issueId: "leaf-1",
+        identifier: "PAP-8004",
+        title: "QA screenshots",
+        status: "blocked",
+      }],
+      customInstructions: "Check the queued leaf.",
+    };
+
+    expect(normalizePaperclipWakePayload(payload)?.taskWatchdog).toMatchObject({
+      terminalLeafSummaries: [expect.objectContaining({ id: "leaf-1", identifier: "PAP-8004" })],
+      customInstructions: "Check the queued leaf.",
+    });
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("- PAP-8004 QA screenshots (blocked)");
+    expect(prompt).toContain("Check the queued leaf.");
+  });
+
+  it("keeps explicit empty nested fields ahead of stale root-level fields", () => {
+    const payload = {
+      ...baseWatchdogPayload,
+      taskWatchdog: {
+        watchedIssueId: "watched-issue-1",
+        terminalLeafSummaries: [],
+        customInstructions: "",
+      },
+      stoppedLeaves: [{ issueId: "stale-leaf", identifier: "PAP-9999" }],
+      customInstructions: "Stale instructions",
+    };
+
+    expect(normalizePaperclipWakePayload(payload)?.taskWatchdog).toMatchObject({
+      terminalLeafSummaries: [],
+      customInstructions: null,
+    });
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).not.toContain("Terminal / stopped leaves to verify:");
+    expect(prompt).not.toContain("Stale instructions");
+    expect(prompt).toContain("No board-supplied watchdog instructions. Apply the mandate above.");
+  });
+
+  it("does not turn unrelated root-level fields into a watchdog wake", () => {
+    const prompt = renderPaperclipWakePrompt({
+      ...baseWatchdogPayload,
+      stoppedLeaves: [{ issueId: "leaf-1", identifier: "PAP-8004" }],
+      customInstructions: "Unrelated context",
+    });
+
+    expect(prompt).not.toContain("Task Watchdog Mandate");
+    expect(prompt).not.toContain("Unrelated context");
+  });
+
   it("injects the watchdog mandate, watched-issue header, and stop fingerprint when taskWatchdog is present", () => {
     const prompt = renderPaperclipWakePrompt({
       ...baseWatchdogPayload,
@@ -2236,7 +2292,7 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).toContain("Be skeptical of QA done-claims.");
   });
 
-  it("truncates oversized custom instructions and caps terminal leaf summaries", () => {
+  it("preserves complete custom instructions and all terminal leaf summaries", () => {
     const longInstructions = "x".repeat(8_000);
     const manyLeaves = Array.from({ length: 50 }, (_, idx) => ({
       id: `leaf-${idx}`,
@@ -2260,8 +2316,12 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
       },
     });
     const parsed = JSON.parse(serialized ?? "{}");
-    expect(parsed.taskWatchdog.customInstructions.length).toBeLessThanOrEqual(4_000);
-    expect(parsed.taskWatchdog.terminalLeafSummaries.length).toBeLessThanOrEqual(25);
+    expect(parsed.taskWatchdog.customInstructions).toBe(longInstructions);
+    expect(parsed.taskWatchdog.terminalLeafSummaries).toHaveLength(50);
+    expect(parsed.taskWatchdog.terminalLeafSummaries[49]).toMatchObject({ id: "leaf-49", identifier: "PAP-9049" });
+    const prompt = renderPaperclipWakePrompt(parsed);
+    expect(prompt).toContain("- PAP-9049 Leaf 49 (done)");
+    expect(prompt).toContain(longInstructions);
   });
 });
 

@@ -89,9 +89,11 @@ For each active watchdog the tick:
 3. **Computes a stop fingerprint.** A SHA-256 hash over the stopped leaves' identifiers, statuses, blockers, pending interactions, and the current watchdog configuration. The configuration is part of the fingerprint, so changing the agent or instructions invalidates the previously reviewed state.
 4. **Compares against `lastReviewedFingerprint`.** Match → suppress (the watchdog already saw this exact stopped state). New → proceed.
 5. **Ensures a review task exists.** Creates (or reopens) one child issue with `originKind = 'task_watchdog'` and `originId = watchedIssueId`. Idempotent per watchdog — only one review task is ever live at a time.
-6. **Wakes the watchdog agent.** Sends a wake with `wakeReason = task_watchdog_stopped_subtree`, the stop fingerprint, the leaf summaries, the default mandate, and any custom instructions. The idempotency key is `(watchdogId, stopFingerprint)`, so retries cannot stack duplicate wakes.
+6. **Wakes the watchdog agent.** Sends a wake with `wakeReason = task_watchdog_stopped_subtree`, the stop fingerprint, the leaf summaries, the default mandate, and any custom instructions. The idempotency key identifies `(watchdogId, stopFingerprint)`. The scheduler does not queue another wake while a run or wake for the review task is live.
 
 When the subtree changes between scans (someone restarts work, adds a blocker, or accepts an interaction) the stop fingerprint changes too, and the watchdog will be woken again for the new state — even if the previous run already disposed of an earlier fingerprint.
+
+The scheduler records a fingerprint as reviewed only after a successful watchdog run for that review task and fingerprint, or an explicit human status decision on the review task. A cancelled or failed run does not count as review. If the review task has no live run, wake, or real blocked path, the scheduler retries the same fingerprint at most once. After two wake attempts, it blocks the review task with a board-owned action and writes an audit entry. A real blocker with an unblock owner remains in place.
 
 ---
 

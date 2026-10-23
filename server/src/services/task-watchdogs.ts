@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   approvals,
@@ -30,6 +31,7 @@ const TASK_WATCHDOG_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"]
 const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution"] as const;
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+const TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT = 2;
 // Grace window after an issue is created/assigned during which its first
 // assignment run/wake may have been enqueued but is not yet visible to a
 // watchdog evaluation (the eval can race the issue's own assignment run).
@@ -1226,11 +1228,20 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (!watchdogIssue) return false;
     if (watchdogIssue.originFingerprint !== stopFingerprint) return false;
     if (isTerminalIssueStatus(watchdogIssue.status) || watchdogIssue.status === "backlog") return false;
+    if (watchdogIssue.status === "blocked") return watchdogIssueHasBlockedPath(watchdogIssue);
     if (watchdogIssue.status === "in_review") {
       const hasPendingReviewPath = await watchdogIssueHasPendingReviewPath(watchdogIssue.companyId, watchdogIssue.id);
       return isWatchdogReviewDisposition(watchdogIssue, hasPendingReviewPath);
     }
-    return true;
+    // A todo/in_progress status is not a live path; queued/running work was
+    // already checked by hasLivePathForIssue before this call.
+    return false;
+  }
+
+  async function watchdogIssueHasBlockedPath(watchdogIssue: IssueRow) {
+    if (watchdogIssue.unblockDescriptor) return true;
+    const readiness = await issuesSvc.listDependencyReadiness(watchdogIssue.companyId, [watchdogIssue.id]);
+    return readiness.get(watchdogIssue.id)?.isDependencyReady === false;
   }
 
   async function watchdogIssueNeedsFreshWake(watchdogIssue: IssueRow) {
@@ -1267,7 +1278,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   }
 
   async function markTerminalWatchdogIssueReviewed(watchdog: IssueWatchdogRow, opts: { runId?: string | null } = {}) {
-    if (!watchdog.watchdogIssueId || !watchdog.lastObservedFingerprint) return watchdog;
+    if (!watchdog.watchdogIssueId || !watchdog.lastObservedFingerprint || !watchdog.lastTriggeredAt) return watchdog;
     const watchdogIssue = await db
       .select()
       .from(issues)
@@ -1280,6 +1291,45 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (!isWatchdogReviewDisposition(watchdogIssue, hasPendingReviewPath)) return watchdog;
     const reviewedFingerprint = reviewedFingerprintForWatchdogIssue(watchdogIssue);
     if (!reviewedFingerprint) return watchdog;
+    const [completedRun, humanDecision] = await Promise.all([
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, watchdog.companyId),
+          eq(heartbeatRuns.agentId, watchdog.watchdogAgentId),
+          eq(heartbeatRuns.status, "succeeded"),
+          gte(heartbeatRuns.createdAt, watchdog.lastTriggeredAt),
+          sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${watchdogIssue.id}
+            OR ${heartbeatRuns.contextSnapshot}->>'taskId' = ${watchdogIssue.id})`,
+          sql`${heartbeatRuns.contextSnapshot}->>'watchdogId' = ${watchdog.id}`,
+          sql`${heartbeatRuns.contextSnapshot}->'taskWatchdog'->>'stopFingerprint' = ${reviewedFingerprint}`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, watchdog.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, watchdogIssue.id),
+          eq(activityLog.action, "issue.updated"),
+          eq(activityLog.actorType, "user"),
+          gte(activityLog.createdAt, watchdog.lastTriggeredAt),
+          sql`(
+            ${activityLog.details}->'changes'->'status'->>'to' = ${watchdogIssue.status}
+            OR (
+              ${activityLog.details}->>'status' = ${watchdogIssue.status}
+              AND ${activityLog.details}->'_previous'->>'status' IS NOT NULL
+              AND ${activityLog.details}->'_previous'->>'status' <> ${watchdogIssue.status}
+            )
+          )`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+    if (!completedRun && !humanDecision) return watchdog;
     const observedSnapshot = parseStopSnapshot(watchdog.lastObservedStopSnapshot);
     const reviewedStopSnapshot = observedSnapshot?.fingerprint === reviewedFingerprint
       ? observedSnapshot
@@ -1342,6 +1392,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (fallback) {
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
+        (fallback.status === "blocked" && !await watchdogIssueHasBlockedPath(fallback)) ||
         await watchdogIssueNeedsFreshWake(fallback);
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
@@ -1500,6 +1551,62 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         classification,
         watchdogIssueId: existingWatchdogIssue!.id,
       };
+    }
+
+    // A cancelled or failed review must be retried, but a permanently failing
+    // adapter must not create an unbounded wake loop for an unchanged stop.
+    if (existingWatchdogIssue) {
+      const [attempts] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, watchdog.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, watchdog.issueId),
+          eq(activityLog.action, "issue.task_watchdog_triggered"),
+          sql`${activityLog.details}->>'watchdogId' = ${watchdog.id}`,
+          sql`${activityLog.details}->>'stopFingerprint' = ${classification.stopFingerprint}`,
+        ));
+      if ((attempts?.count ?? 0) >= TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT) {
+        if (existingWatchdogIssue.status !== "blocked" || !existingWatchdogIssue.unblockDescriptor) {
+          const unblockDescriptor = existingWatchdogIssue.unblockDescriptor ?? {
+            owner: "board" as const,
+            action: "Inspect the failed task-watchdog runs and explicitly resolve the review or change the watched subtree to start a new review.",
+          };
+          await issuesSvc.update(existingWatchdogIssue.id, {
+            status: "blocked",
+            unblockDescriptor,
+          });
+          await issuesSvc.addComment(existingWatchdogIssue.id, [
+            `Task watchdog review stopped after ${TASK_WATCHDOG_MAX_WAKE_ATTEMPTS_PER_FINGERPRINT} automatic wake attempts for this fingerprint.`,
+            "",
+            `Stopped fingerprint: \`${classification.stopFingerprint}\``,
+            `Unblock owner: board. Action: ${unblockDescriptor.action}`,
+          ].join("\n"), { runId: opts.runId ?? null }, { authorType: "system" });
+          await logActivity(db, {
+            companyId: watchdog.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: watchdog.watchdogAgentId,
+            runId: opts.runId ?? null,
+            action: "issue.task_watchdog_retry_exhausted",
+            entityType: "issue",
+            entityId: watchdog.issueId,
+            details: {
+              watchdogId: watchdog.id,
+              watchdogIssueId: existingWatchdogIssue.id,
+              stopFingerprint: classification.stopFingerprint,
+              wakeAttempts: attempts?.count ?? 0,
+              unblockDescriptor,
+            },
+          });
+        }
+        return {
+          state: "watchdog_review_open" as const,
+          classification,
+          watchdogIssueId: existingWatchdogIssue.id,
+        };
+      }
     }
 
     const watchdogIssue = await ensureReusableWatchdogIssue({

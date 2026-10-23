@@ -396,6 +396,36 @@ describe("createDurableRunLogStore", () => {
     expect((await store.read(handle)).content).toBe(raw.content);
   });
 
+  it.each([false, true])("masks UTF-8 credentials in historical PostgreSQL URLs (S3: %s)", async (fromS3) => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: "ps --dbname=postgres://worker:paࠠss@db.example.test/app?sslpassword=syntheticࠠquery complete",
+      ts: "t",
+    });
+    const raw = await store.read(handle);
+    if (fromS3) {
+      await store.finalize(handle);
+      await fs.rm(path.join(baseDir, handle.logRef));
+    }
+    const full = await store.read(handle, { redactPostgresCredentials: true });
+    let paged = "";
+    for (let offset = 0; offset < Buffer.byteLength(raw.content); offset += 7) {
+      paged += (await store.read(handle, {
+        offset,
+        limitBytes: 7,
+        redactPostgresCredentials: true,
+      })).content;
+    }
+    expect(paged).toBe(full.content);
+    expect(Buffer.byteLength(full.content)).toBe(Buffer.byteLength(raw.content));
+    expect(full.content).toMatch(/postgres:\/\/\*+@db\.example\.test\/app\?\*+ complete/);
+    expect(full.content).not.toMatch(/worker|paࠠss|syntheticࠠquery/);
+    expect((await store.read(handle)).content).toBe(raw.content);
+  });
+
   it.each([false, true])("masks historical userinfo split across NDJSON records (S3: %s)", async (fromS3) => {
     const { provider } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

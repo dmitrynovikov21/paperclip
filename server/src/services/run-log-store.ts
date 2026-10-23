@@ -33,6 +33,9 @@ type RawRunLogReadResult = { bytes: Buffer; nextOffset?: number };
 const POSTGRES_URI_READ_CONTEXT_BYTES = 256 * 1024;
 const POSTGRES_URI_SCHEME_RE = /postgres(?:ql)?:\/\//gi;
 const RUN_LOG_TRUNCATION_MARKER_RE = /^\n\[paperclip truncated run log chunk: omitted \d+ chars\]\n/;
+// Historical log bytes are scanned as Latin-1 to preserve byte offsets. A
+// UTF-8 continuation byte can look like Unicode whitespace after that decode.
+const BYTE_STREAM_WHITESPACE_RE = /[ \t\n\r\f\v]/;
 
 type MappedChunk = { text: string; starts: number[]; ends: number[] };
 
@@ -125,7 +128,7 @@ function maskPostgresCredentialsInRange(
     // so hide it through the next whitespace rather than stopping at @.
     if (sourceOffset > 0) {
       const firstScheme = stream.text.search(POSTGRES_URI_SCHEME_RE);
-      const firstBoundary = stream.text.search(/\s/);
+      const firstBoundary = stream.text.search(BYTE_STREAM_WHITESPACE_RE);
       const end = Math.min(
         firstScheme < 0 ? stream.text.length : firstScheme,
         firstBoundary < 0 ? stream.text.length : firstBoundary,
@@ -136,7 +139,7 @@ function maskPostgresCredentialsInRange(
     for (const match of stream.text.matchAll(POSTGRES_URI_SCHEME_RE)) {
       const userinfoStart = match.index + match[0].length;
       let end = userinfoStart;
-      while (end < stream.text.length && !/[@\s"`<>\\/?#]/.test(stream.text[end]!)) end += 1;
+      while (end < stream.text.length && !/[@ \t\n\r\f\v"`<>\\/?#]/.test(stream.text[end]!)) end += 1;
       // Older writers truncated a chunk after redaction, leaving a partial
       // authority before this marker even when the following tail has no @.
       const cutByMarker = RUN_LOG_TRUNCATION_MARKER_RE.test(stream.text.slice(end));
@@ -147,7 +150,7 @@ function maskPostgresCredentialsInRange(
       // Registered full URLs no longer match after userinfo is masked. Hide
       // their query too, including parameters with unrecognized secret names.
       let urlEnd = userinfoStart;
-      while (urlEnd < stream.text.length && !/[\s"`<>\\]/.test(stream.text[urlEnd]!)) urlEnd += 1;
+      while (urlEnd < stream.text.length && !/[ \t\n\r\f\v"`<>\\]/.test(stream.text[urlEnd]!)) urlEnd += 1;
       const queryStart = stream.text.indexOf("?", userinfoStart);
       if (queryStart >= 0 && queryStart < urlEnd) maskCharacters(queryStart + 1, urlEnd);
       // A historical compacted chunk can resume inside userinfo or a query
@@ -157,7 +160,7 @@ function maskPostgresCredentialsInRange(
       if (marker) {
         const tailStart = urlEnd + marker[0].length;
         let tailEnd = tailStart;
-        while (tailEnd < stream.text.length && !/\s/.test(stream.text[tailEnd]!)) tailEnd += 1;
+        while (tailEnd < stream.text.length && !BYTE_STREAM_WHITESPACE_RE.test(stream.text[tailEnd]!)) tailEnd += 1;
         maskCharacters(tailStart, tailEnd);
       }
     }

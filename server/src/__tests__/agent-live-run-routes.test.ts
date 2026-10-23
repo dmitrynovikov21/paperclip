@@ -657,6 +657,11 @@ describe("agent live run routes", () => {
         chunk: "postgres://worker:p%40ss\n[paperclip truncated run log chunk: omitted 100 chars]\nword@db.example.test/app diagnostic tail",
         ts: "test-time",
       });
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: "postgres://worker:paࠠss@db.example.test/app?token=syntheticࠠquery complete",
+        ts: "test-time",
+      });
       mockHeartbeatService.readLog.mockImplementation(async (_run, options) => ({
         runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         store: handle.store,
@@ -672,6 +677,7 @@ describe("agent live run routes", () => {
       ));
       expect(full.status).toBe(200);
       expect(full.body.content).toMatch(/postgresql:\/\/\*+@db\.example\.test\/app/);
+      expect(full.body.content).toMatch(/postgres:\/\/\*+@db\.example\.test\/app\?\*+ complete/);
       expect(full.body.content).toContain("complete");
       expect(full.body.content).not.toContain("etl_user");
       expect(full.body.content).not.toContain("p%40ssword");
@@ -680,6 +686,8 @@ describe("agent live run routes", () => {
       expect(full.body.content).not.toContain("p%40ss");
       expect(full.body.content).toContain("diagnostic tail");
       expect(full.body.content).not.toContain("word@db.example.test");
+      expect(full.body.content).not.toContain("paࠠss");
+      expect(full.body.content).not.toContain("syntheticࠠquery");
 
       const raw = await store.read(handle);
       const passwordOffset = raw.content.indexOf("p%40ssword");

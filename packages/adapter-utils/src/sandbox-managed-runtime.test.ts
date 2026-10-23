@@ -709,6 +709,113 @@ describe("sandbox managed runtime", () => {
     }
   });
 
+  it.each(["nested directory", "final file"])(
+    "refuses a Git overlay whose %s becomes a symlink after the snapshot",
+    async (swappedEntry) => {
+      const root = await mkdtemp(path.join(os.homedir(), ".paperclip-key-overlay-race-"));
+      cleanupDirs.push(root);
+      const allowedRoot = path.join(root, "workspaces");
+      const workspace = path.join(allowedRoot, "project");
+      const overlayDir = path.join(workspace, "src", "swap");
+      const secretDir = path.join(root, "private", "secrets");
+      const secretFile = path.join(secretDir, "master.key");
+      const remote = path.join(root, "remote");
+      await mkdir(overlayDir, { recursive: true });
+      await mkdir(secretDir, { recursive: true });
+      await writeFile(path.join(overlayDir, "master.key"), "harmless untracked overlay\n");
+      await writeFile(secretFile, "synthetic-key-never-upload");
+      await git(workspace, ["init"]);
+      await git(workspace, ["config", "user.name", "Paperclip Test"]);
+      await git(workspace, ["config", "user.email", "test@paperclip.dev"]);
+      await writeFile(path.join(workspace, "README.md"), "committed workspace\n");
+      await git(workspace, ["add", "README.md"]);
+      await git(workspace, ["commit", "-m", "base"]);
+      // The agent can mutate only this nested directory, not the approved root.
+      await fsPromises.chmod(path.join(workspace, "src"), 0o777);
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 1));
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", secretFile);
+      vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([allowedRoot]));
+      const client = makeFilesystemClient();
+      const syncIn = vi.fn(client.syncIn!);
+      client.syncIn = syncIn;
+      try {
+        await expect(prepareSandboxManagedRuntime({
+          spec: { transport: "sandbox", provider: "test", sandboxId: "overlay-race", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+          adapterKey: "test-adapter",
+          client,
+          workspaceLocalDir: workspace,
+          onRuntimeProgress: async (status) => {
+            if (status.message !== "Syncing workspace to sandbox") return;
+            if (swappedEntry === "nested directory") {
+              await fsPromises.rename(overlayDir, path.join(workspace, "src", "original"));
+              await symlink(secretDir, overlayDir);
+            } else {
+              await rm(path.join(overlayDir, "master.key"));
+              await symlink(secretFile, path.join(overlayDir, "master.key"));
+            }
+          },
+        })).rejects.toThrow(/ELOOP|ENOTDIR|symbolic link/i);
+        // A failure while building either tar must prevent the merged syncIn.
+        expect(syncIn).not.toHaveBeenCalled();
+        await expect(readFile(path.join(remote, "src", "swap", "master.key"))).rejects.toThrow();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it("copies the already-open Git overlay file when its final name changes during copy", async () => {
+    const root = await mkdtemp(path.join(os.homedir(), ".paperclip-key-overlay-final-race-"));
+    cleanupDirs.push(root);
+    const allowedRoot = path.join(root, "workspaces");
+    const workspace = path.join(allowedRoot, "project");
+    const overlayFile = path.join(workspace, "src", "master.key");
+    const secretFile = path.join(root, "private", "secrets", "master.key");
+    const remote = path.join(root, "remote");
+    await mkdir(path.dirname(overlayFile), { recursive: true });
+    await mkdir(path.dirname(secretFile), { recursive: true });
+    await writeFile(overlayFile, "harmless untracked overlay\n");
+    await writeFile(secretFile, "synthetic-key-never-upload");
+    await git(workspace, ["init"]);
+    await git(workspace, ["config", "user.name", "Paperclip Test"]);
+    await git(workspace, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(workspace, "README.md"), "committed workspace\n");
+    await git(workspace, ["add", "README.md"]);
+    await git(workspace, ["commit", "-m", "base"]);
+    await fsPromises.chmod(path.join(workspace, "src"), 0o777);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 0) + 1));
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", secretFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON", JSON.stringify([allowedRoot]));
+
+    const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const copyFileSpy = vi.spyOn(fsPromises, "copyFile");
+    let swapped = false;
+    copyFileSpy.mockImplementation(async (source, target, mode) => {
+      if (!swapped && String(source).startsWith("/proc/self/fd/")) {
+        swapped = true;
+        await rm(overlayFile);
+        await symlink(secretFile, overlayFile);
+      }
+      await actualFs.promises.copyFile(source, target, mode);
+    });
+    try {
+      await prepareSandboxManagedRuntime({
+        spec: { transport: "sandbox", provider: "test", sandboxId: "final-race", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+        adapterKey: "test-adapter",
+        client: makeFilesystemClient(),
+        workspaceLocalDir: workspace,
+      });
+      expect(swapped).toBe(true);
+      await expect(readFile(path.join(remote, "src", "master.key"), "utf8"))
+        .resolves.toBe("harmless untracked overlay\n");
+    } finally {
+      copyFileSpy.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("skips a referenced project replaced by a key-directory link before upload", async () => {
     const root = await mkdtemp(path.join(os.homedir(), ".paperclip-key-project-race-"));
     cleanupDirs.push(root);

@@ -986,34 +986,108 @@ export async function restoreVerifiedSnapshotArchive(input: {
   await confineFullWorkspaceExport(input.localDir, true);
 }
 
-async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string): Promise<void> {
-  const sourcePath = path.join(sourceRoot, relative);
+async function copyWorkspaceEntry(
+  sourceRoot: string,
+  targetRoot: string,
+  relative: string,
+  options: { allowMissing?: boolean; rejectSymlinks?: boolean } = {},
+): Promise<void> {
+  // The isolated runtime itself requires Linux. Keep ordinary restore mirroring
+  // available on other hosts, but fail closed for a Git overlay that needs the
+  // descriptor-relative guarantee.
+  if (process.platform !== "linux") {
+    if (options.rejectSymlinks) {
+      throw new Error("Git workspace overlay copy requires Linux descriptor-relative paths.");
+    }
+    const sourcePath = path.join(sourceRoot, relative);
+    const targetPath = path.join(targetRoot, relative);
+    const stats = await fs.lstat(sourcePath);
+    if (stats.isDirectory()) {
+      await fs.mkdir(targetPath, { recursive: true });
+      return;
+    }
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.rm(targetPath, { recursive: true, force: true });
+    if (stats.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(sourcePath), targetPath);
+      return;
+    }
+    const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
+    try {
+      await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+        await fs.copyFile(sourcePath, stagedTargetPath);
+      });
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    } finally {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
+    return;
+  }
+  // The Git snapshot only supplies names. Agent-writable directories can change
+  // after that snapshot, so resolve every component relative to an already-open
+  // directory, refusing symlinks along the way. Opening the final file before
+  // copying also prevents a replacement between lstat and copyFile.
+  const parts = relative.split("/");
+  if (parts.length === 0 || parts.some((part) => !part || part === "." || part === ".." || part.includes("\0"))) {
+    throw new Error(`Unsafe workspace entry path: ${relative}`);
+  }
   const targetPath = path.join(targetRoot, relative);
-  const stats = await fs.lstat(sourcePath);
-
-  if (stats.isDirectory()) {
-    await fs.mkdir(targetPath, { recursive: true });
-    return;
-  }
-
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
-  if (stats.isSymbolicLink()) {
-    const linkTarget = await fs.readlink(sourcePath);
-    await fs.symlink(linkTarget, targetPath);
-    return;
-  }
-
-  const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
-  await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  const directoryFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+  const entryFlags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+  const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+  let sourceResolved = false;
   try {
-    await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
-      await fs.copyFile(sourcePath, stagedTargetPath);
-    });
-    await fs.chmod(stagedTargetPath, stats.mode);
-    await fs.rename(stagedTargetPath, targetPath);
+    let directory = await fs.open(sourceRoot, directoryFlags);
+    handles.push(directory);
+    for (const part of parts.slice(0, -1)) {
+      directory = await fs.open(`/proc/self/fd/${directory.fd}/${part}`, directoryFlags);
+      handles.push(directory);
+    }
+    const sourcePath = `/proc/self/fd/${directory.fd}/${parts.at(-1)!}`;
+    let source: Awaited<ReturnType<typeof fs.open>>;
+    try {
+      source = await fs.open(sourcePath, entryFlags);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && options.allowMissing) return;
+      if ((error as NodeJS.ErrnoException).code !== "ELOOP" || options.rejectSymlinks) throw error;
+      // readlink never follows the link. A replacement can only change the link
+      // text copied to the destination; it cannot expose source file bytes.
+      const linkTarget = await fs.readlink(sourcePath);
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.rm(targetPath, { recursive: true, force: true });
+      await fs.symlink(linkTarget, targetPath);
+      return;
+    }
+    handles.push(source);
+    sourceResolved = true;
+    const stats = await source.stat();
+    if (stats.isDirectory()) {
+      await fs.mkdir(targetPath, { recursive: true });
+      return;
+    }
+    if (!stats.isFile()) {
+      throw new Error(`Unsafe workspace entry type: ${relative}`);
+    }
+
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.rm(targetPath, { recursive: true, force: true });
+    const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
+    try {
+      const anchoredSourcePath = `/proc/self/fd/${source.fd}`;
+      await fs.copyFile(anchoredSourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+        await fs.copyFile(anchoredSourcePath, stagedTargetPath);
+      });
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    } finally {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
+  } catch (error) {
+    if (!sourceResolved && (error as NodeJS.ErrnoException).code === "ENOENT" && options.allowMissing) return;
+    throw error;
   } finally {
-    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    await Promise.all(handles.map((handle) => handle.close()));
   }
 }
 
@@ -1102,7 +1176,10 @@ async function copySelectedWorkspaceEntries(input: {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
-    await copyWorkspaceEntry(sourceDir, input.targetDir, relative);
+    await copyWorkspaceEntry(sourceDir, input.targetDir, relative, {
+      allowMissing: true,
+      rejectSymlinks: process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true",
+    });
     // Do not upload the staged tree if an ancestor changed during the copy.
     await assertSourceRoot();
     await assertParentDirectory();

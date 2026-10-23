@@ -1271,6 +1271,7 @@ Required UX behaviors:
 
 - store only hashed agent API keys
 - redact secrets in logs (`adapter_config`, auth headers, env vars)
+- mask URL userinfo in workspace-operation output and API log pages, including historical local logs, without rewriting forensic files
 - CSRF protection for board session endpoints
 - rate limit auth and key-management endpoints
 - strict company boundary checks on every entity fetch/mutation

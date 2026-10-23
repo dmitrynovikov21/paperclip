@@ -4526,6 +4526,54 @@ export async function fingerprintPaperclipSkillDirectory(source: string): Promis
   }
 }
 
+/** Validate the server-selected root itself without following any path component. */
+export async function assertStrictSkillDirectory(source: string): Promise<void> {
+  const directory = await openStrictSkillDirectory(path.resolve(source));
+  await directory.close();
+}
+
+/** Copy a skill from pinned directories; no source symlink can reach the staged asset. */
+export async function copyStrictSkillDirectory(source: string, target: string): Promise<void> {
+  const directory = await openStrictSkillDirectory(path.resolve(source));
+  try {
+    await walkStrictSkillDirectory(directory, "", {
+      directory: async (relativePath) => {
+        const destination = path.join(target, relativePath);
+        await fs.mkdir(destination, { recursive: true, mode: 0o700 });
+        await fs.chmod(destination, 0o700);
+      },
+      file: async (relativePath, _mode, contents) => {
+        const destination = path.join(target, relativePath);
+        await fs.writeFile(destination, contents, { mode: 0o600 });
+        await fs.chmod(destination, 0o600);
+      },
+      other: () => {},
+    });
+  } finally {
+    await directory.close();
+  }
+}
+
+/** Read one regular file through a pinned parent and reject a raced-in symlink. */
+export async function readStrictSkillFile(source: string): Promise<Buffer> {
+  const absolute = path.resolve(source);
+  const directory = await openStrictSkillDirectory(path.dirname(absolute));
+  try {
+    const file = await fs.open(
+      `/proc/self/fd/${directory.fd}/${path.basename(absolute)}`,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+    try {
+      if (!(await file.stat()).isFile()) throw new Error("Paperclip skill entry changed while staging.");
+      return await file.readFile();
+    } finally {
+      await file.close();
+    }
+  } finally {
+    await directory.close();
+  }
+}
+
 async function materializedSkillFingerprintMatches(targetRoot: string, sourceFingerprint: string): Promise<boolean> {
   try {
     const raw = JSON.parse(

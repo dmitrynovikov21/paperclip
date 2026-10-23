@@ -1118,6 +1118,11 @@ describe("stageCodexHomeForSync", () => {
       await expect(stageCodexHomeForSync(home, {
         trustedSkillSources: [trusted, secrets],
       })).rejects.toThrow("overlaps the local secrets key");
+      const linkedSecret = path.join(root, "linked-secret");
+      await fs.symlink(secrets, linkedSecret);
+      await expect(stageCodexHomeForSync(home, {
+        trustedSkillSources: [trusted, linkedSecret],
+      })).rejects.toThrow("symbolic-link ancestor");
       await fs.rm(path.join(home, "skills", "untrusted"));
       staged = await stageCodexHomeForSync(home, { trustedSkillSources: [trusted] });
       expect(await fs.readFile(path.join(staged, "skills", "trusted", "SKILL.md"), "utf8")).toBe("# trusted");
@@ -1146,6 +1151,51 @@ describe("stageCodexHomeForSync", () => {
       await fs.chmod(path.join(home, own), 0o644);
       await expect(stageCodexHomeForSync(home, { additionalFiles: [own] })).rejects.toThrow("private regular file");
     } finally { if (staged) await fs.rm(staged, { recursive: true, force: true }); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects a nested skill file swapped for a synthetic key link before staging", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-skill-file-race-"));
+    let stagedHome: string | null = null;
+    try {
+      const home = path.join(root, "home");
+      const trusted = path.join(root, "trusted-skill");
+      const nested = path.join(trusted, "nested");
+      const skillFile = path.join(nested, "SKILL.md");
+      const key = path.join(root, "secrets", "master.key");
+      await fs.mkdir(path.join(home, "skills"), { recursive: true });
+      await fs.mkdir(nested, { recursive: true });
+      await fs.mkdir(path.dirname(key), { recursive: true });
+      await fs.writeFile(skillFile, "# safe skill\n");
+      await fs.writeFile(key, "SYNTHETIC_MASTER_KEY_RACE");
+      await fs.symlink(trusted, path.join(home, "skills", "trusted"));
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", key);
+
+      const originalMkdtemp = fs.mkdtemp.bind(fs);
+      vi.spyOn(fs, "mkdtemp").mockImplementation(async (...args) => {
+        const created = await originalMkdtemp(...args);
+        if (created.includes("paperclip-codex-home-sync-")) stagedHome = created;
+        return created;
+      });
+      const originalLstat = fs.lstat.bind(fs);
+      let swapped = false;
+      vi.spyOn(fs, "lstat").mockImplementation(async (candidate) => {
+        const stat = await originalLstat(candidate);
+        if (!swapped && String(candidate).startsWith("/proc/self/fd/") && path.basename(String(candidate)) === "SKILL.md") {
+          await fs.rename(skillFile, path.join(nested, "held-SKILL.md"));
+          await fs.symlink(key, skillFile);
+          swapped = true;
+        }
+        return stat;
+      });
+
+      await expect(stageCodexHomeForSync(home, { trustedSkillSources: [trusted] })).rejects.toThrow();
+      expect(swapped).toBe(true);
+      expect(stagedHome).not.toBeNull();
+      await expect(fs.lstat(stagedHome!)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   // Builds a fake managed CODEX_HOME containing the full allowlist (with

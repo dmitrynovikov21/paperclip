@@ -5,6 +5,7 @@ import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provid
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { isolatedHostAgentRuntimeEnabled, readHostFileForAgent } from "@paperclipai/adapter-utils/isolated-host-file";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -1181,12 +1182,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let instructionsPrefix = "";
     if (instructionsFilePath) {
       try {
-        const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+        const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
           `The above agent instructions were loaded from ${instructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
       } catch (err) {
+        if (isolatedHostAgentRuntimeEnabled()) throw err;
         const reason = err instanceof Error ? err.message : String(err);
         await onLog(
           "stdout",

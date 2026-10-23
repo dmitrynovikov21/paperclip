@@ -2,6 +2,7 @@ import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provid
 import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { cancellableSandboxStartup } from "@paperclipai/adapter-utils/acpx-engine/startup-cancellation";
 import fs from "node:fs/promises";
+import { readHostFileForAgent } from "@paperclipai/adapter-utils/isolated-host-file";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -129,7 +130,8 @@ async function stageGrokProjectAssets(input: {
   const instructionsTarget = path.join(input.cwd, "Agents.md");
   if (input.instructionsFilePath) {
     if (!await pathExists(instructionsTarget)) {
-      await fs.copyFile(input.instructionsFilePath, instructionsTarget);
+      const instructions = await readHostFileForAgent(input.instructionsFilePath);
+      await fs.writeFile(instructionsTarget, instructions, { flag: "wx", mode: 0o600 });
       ensureCleanupFile(instructionsTarget);
       stagedInstructionsPath = instructionsTarget;
     } else if (path.resolve(instructionsTarget) !== path.resolve(input.instructionsFilePath)) {
@@ -142,7 +144,8 @@ async function stageGrokProjectAssets(input: {
   } else {
     const canonicalAgents = path.join(input.cwd, "AGENTS.md");
     if (!await pathExists(instructionsTarget) && await pathExists(canonicalAgents)) {
-      await fs.copyFile(canonicalAgents, instructionsTarget);
+      const instructions = await readHostFileForAgent(canonicalAgents);
+      await fs.writeFile(instructionsTarget, instructions, { flag: "wx", mode: 0o600 });
       ensureCleanupFile(instructionsTarget);
       stagedInstructionsPath = instructionsTarget;
     }

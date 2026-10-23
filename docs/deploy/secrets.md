@@ -234,6 +234,12 @@ The source directory and every ancestor up to `/` must be immutable to
 This includes the parent of each workspace and of each referenced project;
 otherwise the agent could swap a checked pathname for a link to the key before
 the server archives or uploads it. A missing `hostAgentUid` fails closed.
+Host-side `instructionsFilePath` and Claude config seed files are read by the
+service before a run. In isolation mode they must be regular files under
+agent-immutable directory ancestors, and the files themselves must be
+agent-immutable. Move any configured instruction file out of an agent-editable
+workspace before enabling isolation. Symlinks in these sources or in the
+Claude config asset fail the run before upload.
 Git workspaces must also have agent-immutable `.git` metadata, including a
 linked worktree's private and common Git directories. The service refuses Git
 config includes and executable or unrecognized Git settings in this mode;

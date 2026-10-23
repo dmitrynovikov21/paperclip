@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
+import { isolatedHostAgentRuntimeEnabled, readHostFileForAgent } from "@paperclipai/adapter-utils/isolated-host-file";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -453,7 +454,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let instructionsPrefix = "";
   if (instructionsFilePath) {
     try {
-      const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
+      const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
       instructionsPrefix =
         `${instructionsContents}\n\n` +
         `The above agent instructions were loaded from ${instructionsFilePath}. ` +
@@ -461,6 +462,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `This base directory is authoritative for sibling instruction files such as ` +
         `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.\n\n`;
     } catch (err) {
+      if (isolatedHostAgentRuntimeEnabled()) throw err;
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
         "stdout",

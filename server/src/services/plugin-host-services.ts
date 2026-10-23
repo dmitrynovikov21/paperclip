@@ -38,6 +38,7 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
+import { projectSafeRunRow } from "./safe-run-carriers.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
@@ -1102,7 +1103,7 @@ export function buildHostServices(
       .limit(100);
 
     return rows.map((row) => ({
-      ...row,
+      ...projectSafeRunRow(row),
       startedAt: row.startedAt?.toISOString() ?? null,
       finishedAt: row.finishedAt?.toISOString() ?? null,
       createdAt: row.createdAt.toISOString(),

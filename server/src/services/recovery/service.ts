@@ -54,6 +54,7 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
+import { projectSafeError, projectSafeErrorCode, projectSafeResultJson, projectSafeRunContextSnapshot, projectSafeRunEvent, projectSafeRunLogChunk } from "../safe-run-carriers.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -1487,7 +1488,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         { store: run.logStore as "local_file", logRef: run.logRef },
         { offset, limitBytes: ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES },
       );
-      return result.content;
+      return result.content ? projectSafeRunLogChunk(result.content) : "";
     } catch (err) {
       logger.warn({ err, runId: run.id }, "failed to read stale-run watchdog evidence tail");
       return "";
@@ -1563,16 +1564,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       payload?: Record<string, unknown>;
     },
   ) {
+    const safeEvent = projectSafeRunEvent({ eventType: "lifecycle", ...event });
     await db.insert(heartbeatRunEvents).values({
       companyId: run.companyId,
       runId: run.id,
       agentId: run.agentId,
       seq: await nextRunEventSeq(run.id),
       eventType: "lifecycle",
-      stream: "system",
-      level: event.level,
-      message: event.message,
-      payload: event.payload ?? null,
+      stream: safeEvent.stream ?? "system",
+      level: safeEvent.level,
+      message: safeEvent.message,
+      payload: safeEvent.payload,
     });
   }
 
@@ -1702,7 +1704,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           finishedAt: input.now,
           error: null,
           errorCode: null,
-          resultJson,
+          resultJson: projectSafeResultJson(resultJson),
           updatedAt: input.now,
         })
         .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId), eq(heartbeatRuns.status, "running")))
@@ -3065,13 +3067,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           scheduledRetryAt: retryAt,
           scheduledRetryAttempt: 1,
           scheduledRetryReason: "provider_quota_recovery",
-          contextSnapshot: withRecoveryModelProfileHint({
+          contextSnapshot: projectSafeRunContextSnapshot(withRecoveryModelProfileHint({
             issueId: input.issue.id,
             taskId: input.issue.id,
             wakeReason: "provider_quota_recovery",
             retryReason: "provider_quota_recovery",
             providerQuotaRetryNotBefore: retryAt.toISOString(),
-          }, "normal_model"),
+          }, "normal_model")),
           updatedAt: now,
         })
         .returning()
@@ -3515,8 +3517,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     await db
       .update(heartbeatRuns)
       .set({
-        errorCode: classifiedRun.errorCode,
-        resultJson: parseObject(classifiedRun.resultJson),
+        errorCode: projectSafeErrorCode(classifiedRun.errorCode),
+        resultJson: projectSafeResultJson(classifiedRun.resultJson),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, latestRun.id));
@@ -5588,8 +5590,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .set({
         status: terminalStatus,
         finishedAt: run.finishedAt ?? now,
-        error: run.error ?? (terminalStatus === "interrupted" ? message : null),
-        errorCode: run.errorCode ?? (terminalStatus === "interrupted" ? errorCode : null),
+        error: projectSafeError(run.error ?? (terminalStatus === "interrupted" ? message : null)),
+        errorCode: projectSafeErrorCode(run.errorCode ?? (terminalStatus === "interrupted" ? errorCode : null)),
         updatedAt: now,
       })
       .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))

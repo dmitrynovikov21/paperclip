@@ -46,6 +46,7 @@ import type {
 } from "@paperclipai/shared";
 import { badRequest } from "../errors.js";
 import { PRODUCTIVITY_REVIEW_ORIGIN_KIND } from "./productivity-review.js";
+import { projectSafeRunEvent, projectSafeRunRow } from "./safe-run-carriers.js";
 import { budgetService } from "./budgets.js";
 import {
   BLOCKER_ATTENTION_MAX_DEPTH,
@@ -1727,6 +1728,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }
       }
       for (const run of failedRows) {
+        const safeRun = projectSafeRunRow(run);
+        const safeExhaustionMessage = projectSafeRunEvent({
+          eventType: "lifecycle",
+          message: run.exhaustionMessage,
+        }).message;
         const issueId = readRunIssueId(run.contextSnapshot);
         const runKey = `${run.agentId}:${issueId ?? ""}`;
         const hasNewerRun = (latestRunCreatedAtByKey.get(runKey)?.getTime() ?? 0) > run.createdAt.getTime();
@@ -1749,9 +1755,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               agentId: run.agentId,
               agentName: run.agentName,
               issueId,
-              errorCode: run.errorCode,
-              error: run.error,
-              retryExhaustedReason: run.exhaustionMessage,
+              errorCode: safeRun.errorCode,
+              error: safeRun.error,
+              retryExhaustedReason: safeExhaustionMessage,
             },
           },
           whyNow: "Run failed after automatic retries were exhausted.",
@@ -1773,7 +1779,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           detail: {
             kind: "failed_run",
             agentName: run.agentName,
-            failureReasonExcerpt: excerpt(run.error ?? run.exhaustionMessage ?? run.errorCode),
+            failureReasonExcerpt: excerpt(safeRun.error ?? safeExhaustionMessage ?? safeRun.errorCode),
             images: issueImages(failedImageMap, issueId),
           },
         }));

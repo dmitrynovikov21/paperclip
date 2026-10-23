@@ -445,6 +445,7 @@ One row per agent for aggregate runtime counters and legacy compatibility.
 - `company_id` uuid fk not null
 - `adapter_type` text not null
 - `session_id` text null
+- `session_correlation_id` uuid null (server-issued key for run grouping)
 - `state_json` jsonb not null default `{}`
 - `last_run_id` uuid fk `heartbeat_runs.id` null
 - `last_run_status` text null
@@ -468,6 +469,7 @@ One row per `(company_id, agent_id, adapter_type, task_key)` for resumable sessi
 - `task_key` text not null
 - `session_params_json` jsonb null (adapter-defined shape)
 - `session_display_id` text null (for UI/debug)
+- `session_correlation_id` uuid null (server-issued key for run grouping)
 - `last_run_id` uuid fk `heartbeat_runs.id` null
 - `last_error` text null
 - `created_at` timestamptz not null
@@ -525,6 +527,7 @@ Add fields required for result and diagnostics:
 - `result_json` jsonb null
 - `session_id_before` text null
 - `session_id_after` text null
+- `session_correlation_id` uuid null
 - `log_store` text null (`local_file|object_store|postgres`)
 - `log_ref` text null (opaque provider reference; path/key/uri/row id)
 - `log_bytes` bigint null
@@ -535,6 +538,10 @@ Add fields required for result and diagnostics:
 - `error_code` text null
 
 This keeps per-run diagnostics queryable without storing full logs in Postgres.
+New writes keep provider session IDs in the private session stores. They leave
+`session_id_before` and `session_id_after` null. Run APIs also hide these
+legacy fields on read. The server-issued correlation ID groups runs for usage
+and session rotation. Explicit resume uses private task-session parameters.
 
 ## 9.5 Log storage adapter configuration
 

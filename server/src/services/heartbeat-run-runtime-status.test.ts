@@ -29,10 +29,10 @@ describe("heartbeat run runtime status store", () => {
       updatedAt,
     });
 
-    expect(status?.message).toContain("***REDACTED***");
+    expect(status?.message).toBe("Syncing workspace configuration");
     expect(status?.message.length).toBeLessThanOrEqual(MAX_HEARTBEAT_RUN_RUNTIME_STATUS_MESSAGE_CHARS);
-    expect(status?.currentToolName).toContain("***REDACTED***");
-    expect(status?.lastAssistantSnippet).toContain("***REDACTED***");
+    expect(status?.currentToolName).toBeNull();
+    expect(status?.lastAssistantSnippet).toBeNull();
     expect(status?.lastEventAt).toEqual(new Date("2026-06-24T00:00:05.000Z"));
     expect(getHeartbeatRunRuntimeStatus("run-1", {
       companyId: "company-1",
@@ -45,8 +45,8 @@ describe("heartbeat run runtime status store", () => {
       agentId: "agent-1",
       runId: "run-1",
       phase: "config_sync",
-      currentToolName: expect.stringContaining("***REDACTED***"),
-      lastAssistantSnippet: expect.stringContaining("***REDACTED***"),
+      currentToolName: null,
+      lastAssistantSnippet: null,
       lastEventAt: new Date("2026-06-24T00:00:05.000Z"),
     });
     expect(getHeartbeatRunRuntimeStatus("run-1", { companyId: "other-company" })).toBeNull();
@@ -96,16 +96,16 @@ describe("heartbeat run runtime status store", () => {
     expect(touched).toMatchObject({
       runId: "run-1",
       phase: "run_activity",
-      message: "Using Bash",
-      currentToolName: "Bash",
-      lastAssistantSnippet: "Running the tests",
+      message: "Agent working",
+      currentToolName: null,
+      lastAssistantSnippet: null,
       updatedAt: new Date("2026-06-24T00:00:45.000Z"),
       lastEventAt: new Date("2026-06-24T00:00:45.000Z"),
     });
     expect(getHeartbeatRunRuntimeStatus("run-1", {
       companyId: "company-1",
       now: new Date("2026-06-24T00:02:00.000Z"),
-    })).toMatchObject({ message: "Using Bash" });
+    })).toMatchObject({ message: "Agent working" });
   });
 
   it("touch does not move timestamps backwards", () => {
@@ -146,7 +146,7 @@ describe("heartbeat run runtime status store", () => {
     expect(created).toMatchObject({
       runId: "run-1",
       phase: "run_activity",
-      message: "Receiving agent output",
+      message: "Agent working",
       updatedAt: new Date("2026-06-24T00:00:00.000Z"),
       lastEventAt: new Date("2026-06-24T00:00:00.000Z"),
     });
@@ -161,7 +161,7 @@ describe("heartbeat run runtime status store", () => {
     });
     expect(expiredTouch).toMatchObject({
       phase: "run_activity",
-      message: "Receiving agent output",
+      message: "Agent working",
       updatedAt: new Date("2026-06-24T00:05:00.000Z"),
     });
   });

@@ -1478,6 +1478,13 @@
       "when": 1791913296091,
       "tag": "0212_company_scoped_plugin_jobs",
       "breakpoints": true
+    },
+    {
+      "idx": 213,
+      "version": "7",
+      "when": 1792721490804,
+      "tag": "0213_warm_sunfire",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,6 @@
 packages:
+  # PR policy regenerates the lockfile artifact when this manifest changes.
+  # The tracked lockfile remains unchanged while patch hashes are refreshed.
   - packages/*
   - packages/adapters/*
   - packages/plugins/*

@@ -10,6 +10,8 @@ const mockHeartbeatService = vi.hoisted(() => ({
   buildRunOutputSilence: vi.fn(),
   decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
+  getRun: vi.fn(),
+  getRetryExhaustedReason: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
@@ -204,6 +206,7 @@ describe("agent live run routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.getRetryExhaustedReason.mockResolvedValue(null);
     mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
       ...run,
       currentStatusMessage: null,
@@ -278,6 +281,37 @@ describe("agent live run routes", () => {
     expect(res.body).not.toHaveProperty("contextSnapshot");
     expect(res.body).not.toHaveProperty("logRef");
   }, 10_000);
+
+  it("projects legacy run content before returning the run API response", async () => {
+    const marker = "unregistered-provider-output-marker";
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId: "company-1",
+      agentId: "agent-1",
+      status: "succeeded",
+      exitCode: 0,
+      error: marker,
+      resultJson: { summary: marker, inputTokens: 17 },
+      usageJson: { inputTokens: 17, outputTokens: 9 },
+      nextAction: marker,
+      livenessReason: marker,
+      stdoutExcerpt: marker,
+      stderrExcerpt: marker,
+    });
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1"),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(marker);
+    expect(res.body).toMatchObject({
+      status: "succeeded",
+      exitCode: 0,
+      usageJson: { inputTokens: 17, outputTokens: 9 },
+      nextAction: null,
+      stdoutExcerpt: null,
+    });
+  });
 
   it("ignores a stale execution run from another issue and falls back to the assignee's matching run", async () => {
     mockHeartbeatService.getRunIssueSummary.mockResolvedValue({

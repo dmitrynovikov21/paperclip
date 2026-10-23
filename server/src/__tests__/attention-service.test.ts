@@ -682,7 +682,7 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.find((item) => item.sourceKind === "failed_run")?.detail).toMatchObject({
       kind: "failed_run",
       agentName: "Worker",
-      failureReasonExcerpt: "adapter failed",
+      failureReasonExcerpt: "Run failed",
     });
     expect(feed.items.find((item) =>
       item.sourceKind === "budget_alert" && item.detail?.kind === "budget" && item.detail.observedPercent === 100

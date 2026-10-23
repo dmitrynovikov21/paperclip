@@ -406,15 +406,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
 
     const heartbeat = heartbeatService(db);
+    const consumedInteractionId = randomUUID();
     const followUpRun = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_commented",
       payload: {
         issueId,
-        interactionId: "superseded-confirmation",
+        interactionId: consumedInteractionId,
         reviewPathLost: true,
-        reviewPathConsumedRef: "superseded-confirmation",
+        reviewPathConsumedRef: consumedInteractionId,
       },
       requestedByActorType: "user",
       requestedByActorId: "responsible-user",
@@ -422,9 +423,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         issueId,
         taskId: issueId,
         wakeReason: "issue_commented",
-        interactionId: "superseded-confirmation",
+        interactionId: consumedInteractionId,
         reviewPathLost: true,
-        reviewPathConsumedRef: "superseded-confirmation",
+        reviewPathConsumedRef: consumedInteractionId,
       },
     });
     expect(followUpRun).not.toBeNull();
@@ -442,7 +443,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       status: "completed",
       payload: expect.objectContaining({
         issueId,
-        reviewPathConsumedRef: "superseded-confirmation",
+        reviewPathConsumedRef: consumedInteractionId,
         reviewPathRecoveryAttempt: 1,
         maxReviewPathRecoveryAttempts: 1,
       }),

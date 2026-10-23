@@ -543,17 +543,13 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(traces).toHaveLength(1);
     expect(traces[0]?.targetType).toBe("issue_document_revision");
     expect(traces[0]?.status).toBe("pending");
-    expect(traces[0]?.targetSummary.documentKey).toBe("plan");
-    expect(traces[0]?.targetSummary.revisionNumber).toBe(1);
     expect(traces[0]?.payloadSnapshot?.target).toMatchObject({
       type: "issue_document_revision",
       id: revisionId,
-      documentKey: "plan",
-      revisionNumber: 1,
     });
   });
 
-  it("stores a downvote reason and includes it in the trace payload", async () => {
+  it("stores a downvote reason locally and omits it from the trace payload", async () => {
     const { issueId, commentId } = await seedIssueWithAgentComment();
 
     const result = await svc.saveIssueVote({
@@ -575,7 +571,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
 
     expect(traces[0]?.payloadSnapshot?.vote).toMatchObject({
       value: "down",
-      reason: "The update missed the edge case handling.",
+      reason: null,
       sharedWithLabs: false,
     });
   });
@@ -613,12 +609,12 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(traces[0]?.feedbackVoteId).toBe(firstResult.vote.id);
     expect(traces[0]?.payloadSnapshot?.vote).toMatchObject({
       value: "down",
-      reason: "Needed concrete next steps.",
+      reason: null,
       sharedWithLabs: false,
     });
   });
 
-  it("builds a detailed sanitized shared bundle with issue and agent context", async () => {
+  it("builds a metadata-only shared bundle from a rich issue and agent", async () => {
     const { companyId, issueId, targetCommentId, runId } = await seedIssueWithRichAgentComment();
 
     await svc.saveIssueVote({
@@ -642,11 +638,6 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     const issueContext = bundle?.issueContext as Record<string, unknown> | null;
     const issueContextItems = issueContext?.items as Array<Record<string, unknown>> | undefined;
     const agentContext = bundle?.agentContext as Record<string, unknown> | null;
-    const runtime = agentContext?.runtime as Record<string, unknown> | null;
-    const sourceRun = runtime?.sourceRun as Record<string, unknown> | null;
-    const skills = agentContext?.skills as Record<string, unknown> | null;
-    const skillItems = skills?.items as Array<Record<string, unknown>> | undefined;
-    const instructions = agentContext?.instructions as Record<string, unknown> | null;
 
     expect(trace?.status).toBe("pending");
     expect(trace?.exportId).toMatch(/^fbexp_/);
@@ -654,16 +645,10 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(trace?.bundleVersion).toBe("paperclip-feedback-bundle-v2");
     expect(trace?.payloadDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(primaryContent?.createdByRunId).toBe(runId);
-    expect(String(primaryContent?.body)).toContain("[REDACTED]");
-    expect(String(primaryContent?.body)).not.toContain("secret-value");
-    expect(issueContextItems).toHaveLength(2);
-    expect(JSON.stringify(issueContextItems)).toContain("[REDACTED_EMAIL]");
-    expect(JSON.stringify(issueContextItems)).toContain("[REDACTED_PHONE]");
-    expect(sourceRun?.id).toBe(runId);
-    expect(JSON.stringify(sourceRun)).toContain("gpt-5.4");
-    expect(skillItems?.[1]?.sourceLocator).toBe("https://github.com/octo/research/tree/main/skills/public-skill");
-    expect(String(instructions?.entryBody)).toContain("[REDACTED]");
-    expect(String(instructions?.entryBody)).not.toContain("secret-value");
+    expect(primaryContent?.body).toBeNull();
+    expect(issueContextItems).toEqual([]);
+    expect(agentContext).toBeNull();
+    expect(JSON.stringify(payload)).not.toContain("secret-value");
   });
 
   it("keeps earlier local votes local when a later vote enables sharing", async () => {
@@ -717,7 +702,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(sharedTrace?.payloadVersion).toBe("paperclip-feedback-v1");
   });
 
-  it("captures Claude project session artifacts as full traces", async () => {
+  it("excludes Claude project session artifacts from trace export", async () => {
     const claudeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-feedback-claude-"));
     tempDirs.push(claudeRoot);
     const sessionId = randomUUID();
@@ -782,16 +767,13 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     const filePaths = files.map((file) => String(file.path));
     const rawAdapterTrace = bundle?.rawAdapterTrace as Record<string, unknown> | null;
 
-    expect(bundle?.captureStatus).toBe("full");
-    expect(filePaths).toContain("adapter/claude/session.jsonl");
-    expect(filePaths).toContain("adapter/claude/session/tool-results/result.txt");
-    expect(filePaths).toContain("adapter/claude/debug.txt");
-    expect(rawAdapterTrace?.projectSessionFound).toBe(true);
-    expect(rawAdapterTrace?.projectArtifactsCount).toBe(1);
-    expect(rawAdapterTrace?.debugLogFound).toBe(true);
+    expect(bundle?.captureStatus).toBe("partial");
+    expect(filePaths).toEqual(["paperclip/run.json", "paperclip/run-events.json"]);
+    expect(rawAdapterTrace).toBeNull();
+    expect(JSON.stringify(bundle)).not.toContain("secret-value");
   });
 
-  it("captures OpenCode message and part files as full traces", async () => {
+  it("excludes OpenCode message and part files from trace export", async () => {
     const opencodeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-feedback-opencode-"));
     tempDirs.push(opencodeRoot);
     const sessionId = "ses_test_feedback_trace";
@@ -911,15 +893,10 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     const filePaths = files.map((file) => String(file.path));
     const rawAdapterTrace = bundle?.rawAdapterTrace as Record<string, unknown> | null;
 
-    expect(bundle?.captureStatus).toBe("full");
-    expect(filePaths).toContain("adapter/opencode/session.json");
-    expect(filePaths).toContain("adapter/opencode/session-diff.json");
-    expect(filePaths).toContain(`adapter/opencode/messages/${userMessageId}.json`);
-    expect(filePaths).toContain(`adapter/opencode/parts/${assistantMessageId}/prt_tool.json`);
-    expect(filePaths).toContain("adapter/opencode/project.json");
-    expect(filePaths).toContain("adapter/opencode/todo.json");
-    expect(rawAdapterTrace?.messageFilesCount).toBe(2);
-    expect(rawAdapterTrace?.partFilesCount).toBe(2);
+    expect(bundle?.captureStatus).toBe("partial");
+    expect(filePaths).toEqual(["paperclip/run.json", "paperclip/run-events.json"]);
+    expect(rawAdapterTrace).toBeNull();
+    expect(JSON.stringify(bundle)).not.toContain("secret-value");
   });
 
   it("rejects feedback votes on human-authored comments", async () => {
@@ -1113,7 +1090,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(traces[0]?.status).toBe("failed");
     expect(traces[0]?.attemptCount).toBe(1);
     expect(traces[0]?.lastAttemptedAt).toBeInstanceOf(Date);
-    expect(traces[0]?.failureReason).toContain("telemetry unavailable");
+    expect(traces[0]?.failureReason).toBe("Feedback export failed");
     expect(traces[0]?.exportedAt).toBeNull();
     expect(uploadTraceBundle).toHaveBeenCalledTimes(1);
   });
@@ -1149,7 +1126,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     });
     expect(traces[0]?.status).toBe("failed");
     expect(traces[0]?.attemptCount).toBe(1);
-    expect(traces[0]?.failureReason).toBe("Feedback export backend is not configured");
+    expect(traces[0]?.failureReason).toBe("Feedback export failed");
     expect(traces[0]?.exportedAt).toBeNull();
   });
 });

@@ -22,7 +22,7 @@ import { LOW_TRUST_REVIEW_PRESET, type AgentApiKeyScope } from "@paperclipai/sha
 import { errorHandler } from "../middleware/error-handler.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { secretService } from "../services/secrets.js";
-import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { createRunSecretRedactionRegistry, safeRunContextSnapshotUpdate } from "../services/run-secret-redaction.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -246,6 +246,28 @@ describeEmbeddedPostgres("agent secret routes", () => {
       paperclipSecretRedactions: [expect.objectContaining({ fingerprintSha256: expect.any(String) })],
     });
     expect((run.contextSnapshot as { paperclipSecretRedactions: unknown[] }).paperclipSecretRedactions).toHaveLength(1);
+  });
+
+  it("keeps registered values when a stale safe context replaces run metadata", async () => {
+    const fixture = await seedAgentRun();
+    const registry = createRunSecretRedactionRegistry(db);
+    const secretValue = `synthetic-${randomUUID()}`;
+    const issueId = randomUUID();
+    const staleUpdate = safeRunContextSnapshotUpdate({ issueId, untrustedPrompt: secretValue });
+    await registry.register(fixture.companyId, fixture.heartbeatRunId, secretValue);
+
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: staleUpdate,
+    }).where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    expect(run.contextSnapshot).toMatchObject({
+      issueId,
+      paperclipSecretRedactions: [expect.objectContaining({ fingerprintSha256: expect.any(String) })],
+    });
+    expect(JSON.stringify(run.contextSnapshot)).not.toContain(secretValue);
+    expect(await registry.redactForIssue(fixture.companyId, issueId, { body: secretValue }))
+      .toEqual({ body: "***REDACTED***" });
   });
 
   it("denies low-trust, task-bridge, and skill-test callers on both routes", async () => {

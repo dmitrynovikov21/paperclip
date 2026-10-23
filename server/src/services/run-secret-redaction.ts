@@ -5,8 +5,25 @@ import { heartbeatRuns } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
+import { projectSafeRunContextSnapshot } from "./safe-run-carriers.js";
 
 const REGISTRY_KEY = "paperclipSecretRedactions";
+
+/**
+ * Keep registrations made during a run when another writer refreshes the safe
+ * context. Read the registry from the current row inside UPDATE so a secret
+ * registered after the writer built its in-memory context cannot be lost.
+ */
+export function safeRunContextSnapshotUpdate(context: unknown) {
+  const safe = projectSafeRunContextSnapshot(context);
+  return sql<Record<string, unknown>>`(
+    ${JSON.stringify(safe)}::jsonb ||
+    case when ${heartbeatRuns.contextSnapshot} ? ${REGISTRY_KEY}::text
+      then jsonb_build_object(${REGISTRY_KEY}::text, ${heartbeatRuns.contextSnapshot} -> ${REGISTRY_KEY}::text)
+      else '{}'::jsonb
+    end
+  )`;
+}
 
 type RegistryEntry = {
   fingerprintSha256: string;
@@ -110,7 +127,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
           : [];
         await tx.update(heartbeatRuns)
           .set({
-            contextSnapshot: { ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] },
+            contextSnapshot: { ...projectSafeRunContextSnapshot(contextSnapshot), [REGISTRY_KEY]: [...currentEntries, entry] },
             updatedAt: new Date(),
           })
           .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));

@@ -257,6 +257,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+  // Reject unsafe instructions before staging a workspace or starting its bridge.
+  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const resolvedInstructionsFilePath = instructionsFilePath
+    ? path.resolve(cwd, instructionsFilePath)
+    : "";
+  const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
+  let instructionsPrefix = "";
+  if (resolvedInstructionsFilePath) {
+    try {
+      const instructionsContents = await readHostFileForAgent(resolvedInstructionsFilePath, "utf8");
+      instructionsPrefix =
+        `${instructionsContents}\n\n` +
+        `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsDir}.\n\n`;
+    } catch (err) {
+      if (isolatedHostAgentRuntimeEnabled()) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      await onLog(
+        "stdout",
+        `[paperclip] Warning: could not read agent instructions file "${resolvedInstructionsFilePath}": ${reason}\n`,
+      );
+    }
+  }
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
@@ -521,29 +544,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const resolvedInstructionsFilePath = instructionsFilePath
-      ? path.resolve(cwd, instructionsFilePath)
-      : "";
-    const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
-    let instructionsPrefix = "";
-    if (resolvedInstructionsFilePath) {
-      try {
-        const instructionsContents = await readHostFileForAgent(resolvedInstructionsFilePath, "utf8");
-        instructionsPrefix =
-          `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
-          `Resolve any relative file references from ${instructionsDir}.\n\n`;
-      } catch (err) {
-        if (isolatedHostAgentRuntimeEnabled()) throw err;
-        const reason = err instanceof Error ? err.message : String(err);
-        await onLog(
-          "stdout",
-          `[paperclip] Warning: could not read agent instructions file "${resolvedInstructionsFilePath}": ${reason}\n`,
-        );
-      }
-    }
-
     const commandNotes = (() => {
       const notes = [...preparedRuntimeConfig.notes];
       if (!resolvedInstructionsFilePath) return notes;

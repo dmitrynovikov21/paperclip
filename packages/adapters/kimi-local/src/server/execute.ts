@@ -233,6 +233,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+  // Reject unsafe instructions before staging a workspace or starting its bridge.
+  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  let instructionsPrefix = "";
+  if (instructionsFilePath) {
+    try {
+      const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
+      instructionsPrefix =
+        `${instructionsContents}\n\n` +
+        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsDir}. ` +
+        `This base directory is authoritative for sibling instruction files such as ` +
+        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.\n\n`;
+    } catch (err) {
+      if (isolatedHostAgentRuntimeEnabled()) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      await onLog(
+        "stdout",
+        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
+      );
+    }
+  }
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const kimiSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredKimiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, kimiSkillEntries);
@@ -449,27 +471,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
   }
 
-  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-  const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
-  let instructionsPrefix = "";
-  if (instructionsFilePath) {
-    try {
-      const instructionsContents = await readHostFileForAgent(instructionsFilePath, "utf8");
-      instructionsPrefix =
-        `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
-        `Resolve any relative file references from ${instructionsDir}. ` +
-        `This base directory is authoritative for sibling instruction files such as ` +
-        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.\n\n`;
-    } catch (err) {
-      if (isolatedHostAgentRuntimeEnabled()) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      await onLog(
-        "stdout",
-        `[paperclip] Warning: could not read agent instructions file "${instructionsFilePath}": ${reason}\n`,
-      );
-    }
-  }
   const commandNotes = (() => {
     const notes: string[] = ["Prompt is passed to Kimi via -p for non-interactive execution."];
     notes.push("Added --output-format stream-json for structured headless output.");

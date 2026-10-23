@@ -466,6 +466,20 @@ describe("kimi_local execute", () => {
     expect(seenArgs[seenArgs.indexOf("--skills-dir") + 1]).toContain("paperclip-kimi-skills-");
   });
 
+  it.skipIf(process.platform !== "linux")("rejects unsafe instructions before remote staging", async () => {
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+    vi.stubEnv("PAPERCLIP_SECRETS_HOST_AGENT_UID", String((process.getuid?.() ?? 1000) + 1));
+    const workspace = await makeTempRoot();
+
+    await expect(execute(makeContext(workspace, {
+      config: { cwd: workspace, instructionsFilePath: path.join(workspace, "missing-AGENTS.md") },
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/sandbox/workspace" },
+    }))).rejects.toThrow();
+
+    expect(prepareRuntimeMock).not.toHaveBeenCalled();
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
   it.skipIf(process.platform !== "linux")("rejects a selected skill symlink to a synthetic key before sandbox syncIn", async () => {
     vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
     const root = await makeTempRoot();

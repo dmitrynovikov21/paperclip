@@ -60,6 +60,12 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
     const credential = "synthetic-reader:synthetic-password";
     const url = `postgresql://${credential}@db.example.test/app`;
     const incompleteUrl = `postgresql://${credential}`;
+    const slashedUrl = `postgresql://${credential}/`;
+    const longCredentialTail = "synthetic-long-password-tail";
+    const longExcerpt = (`connect postgresql://synthetic-reader:${"p".repeat(4200)}${longCredentialTail}`)
+      .slice(-4096);
+    expect(longExcerpt).toHaveLength(4096);
+    expect(longExcerpt).not.toContain("postgresql://");
     await db.insert(companies).values({ id: companyId, name: "URL privacy", issuePrefix: "URL" });
     await db.insert(projects).values({ id: projectId, companyId, name: "URL privacy" });
     await db.insert(executionWorkspaces).values({
@@ -78,7 +84,7 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       id: operationId, companyId, executionWorkspaceId, heartbeatRunId: runId,
       phase: "provision", status: "succeeded", command: `echo ${url}`,
       metadata: { connection: url }, stdoutExcerpt: `connect ${url}`,
-      stderrExcerpt: `connect ${incompleteUrl}`,
+      stderrExcerpt: longExcerpt,
       logStore: "local_file", logRef: "pending.ndjson",
     });
 
@@ -86,15 +92,18 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
     const handle = await store.begin({ companyId, operationId });
     await store.append(handle, { stream: "stdout", chunk: `connect ${url}`, ts: new Date().toISOString() });
     await store.append(handle, { stream: "stderr", chunk: `connect ${incompleteUrl}`, ts: new Date().toISOString() });
+    await store.append(handle, { stream: "stderr", chunk: `connect ${slashedUrl}`, ts: new Date().toISOString() });
     const filePath = path.join(logRoot, handle.logRef);
     const original = await fs.readFile(filePath);
     const expected = Buffer.from(original);
-    const credentialOffset = original.indexOf(credential);
-    const incompleteCredentialOffset = original.lastIndexOf(credential);
-    expect(credentialOffset).toBeGreaterThan(0);
-    expect(incompleteCredentialOffset).toBeGreaterThan(credentialOffset);
-    expected.fill(0x2a, credentialOffset, credentialOffset + Buffer.byteLength(credential));
-    expected.fill(0x2a, incompleteCredentialOffset, incompleteCredentialOffset + Buffer.byteLength(credential));
+    let credentialOffset = original.indexOf(credential);
+    let credentialCount = 0;
+    while (credentialOffset >= 0) {
+      expected.fill(0x2a, credentialOffset, credentialOffset + Buffer.byteLength(credential));
+      credentialCount += 1;
+      credentialOffset = original.indexOf(credential, credentialOffset + credential.length);
+    }
+    expect(credentialCount).toBe(3);
     await db.update(workspaceOperations).set({ logRef: handle.logRef })
       .where(eq(workspaceOperations.id, operationId));
 
@@ -105,11 +114,13 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
         run: async (reportProgress) => {
           await reportProgress({ stdout: "connect postgresql://synthetic-reader:synthetic-" });
           await reportProgress({ stdout: "password@db.example.test/app" });
+          await reportProgress({ stderr: `connect ${slashedUrl}` });
           return { status: "succeeded" };
         },
       });
     const newFile = await fs.readFile(path.join(logRoot, newOperation.logRef!), "utf8");
     expect(newFile).toContain("postgresql://[REDACTED]@db.example.test/app");
+    expect(newFile).toContain("postgresql://[REDACTED]/");
     expect(newFile).not.toContain(credential);
 
     for (const actor of [
@@ -121,8 +132,11 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
       expect(list.status).toBe(200);
       expect(list.body).toHaveLength(2);
       expect(JSON.stringify(list.body)).not.toContain(credential);
+      expect(JSON.stringify(list.body)).not.toContain(longCredentialTail);
       const historical = list.body.find((operation: { id: string }) => operation.id === operationId);
-      expect(historical?.stderrExcerpt).toBe("connect postgresql://[REDACTED]");
+      expect(historical?.stderrExcerpt).toBe("[REDACTED]");
+      const written = list.body.find((operation: { id: string }) => operation.id === newOperation.id);
+      expect(written?.stderrExcerpt).toBe("connect postgresql://[REDACTED]/");
       for (const operation of list.body) {
         expect(operation.command).toContain("postgresql://[REDACTED]@db.example.test/app");
         expect(operation.metadata.connection).toContain("postgresql://[REDACTED]@db.example.test/app");
@@ -132,8 +146,9 @@ describeWithPostgres("workspace operation URL HTTP privacy", { concurrent: false
         .get(`/api/execution-workspaces/${executionWorkspaceId}/workspace-operations`);
       expect(workspaceList.status).toBe(200);
       expect(workspaceList.body).toHaveLength(1);
-      expect(workspaceList.body[0].stderrExcerpt).toBe("connect postgresql://[REDACTED]");
+      expect(workspaceList.body[0].stderrExcerpt).toBe("[REDACTED]");
       expect(JSON.stringify(workspaceList.body)).not.toContain(credential);
+      expect(JSON.stringify(workspaceList.body)).not.toContain(longCredentialTail);
       let offset = 0;
       while (offset < original.length) {
         const page = await request(app)

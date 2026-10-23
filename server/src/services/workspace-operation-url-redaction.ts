@@ -35,8 +35,8 @@ function nextUrlPrefixBeforeBoundary(value: string, boundary: number): number | 
   const match = URL_PREFIX_RE.exec(value);
   if (match && match.index < boundary) return match.index;
   // The second slash may arrive in the next output chunk or NDJSON event.
-  if (boundary === value.length - 1 && value[boundary] === "/") {
-    const partial = /[a-z][a-z0-9+.-]{0,31}:\/$/i.exec(value);
+  if (value[boundary] === "/") {
+    const partial = /[a-z][a-z0-9+.-]{0,31}:\/$/i.exec(value.slice(0, boundary + 1));
     if (partial && partial.index < boundary) return partial.index;
   }
   return null;
@@ -48,29 +48,44 @@ function redactAuthority(authority: string, incomplete = false): string {
   return incomplete && authority ? REDACTED_USERINFO : authority;
 }
 
-/** Redact URL userinfo in operation fields and complete output strings. */
+/** A colon before a boundary may be a password delimiter, even without @ yet. */
+function mayContainUnfinishedUserInfo(authority: string): boolean {
+  return authority.includes(":");
+}
+
+/** Redact URL userinfo in operation fields, including interrupted authorities. */
 export function redactWorkspaceOperationUrlUserInfo(value: string): string {
-  return value.replace(/([a-z][a-z0-9+.-]{0,31}:\/\/)([^/?#]+)@/gi, `$1${REDACTED_USERINFO}@`);
+  const redactor = createWorkspaceOperationUrlStreamRedactor();
+  return redactor.push(value) + redactor.flush();
+}
+
+function redactUnknownLeadingAuthority(value: string): string {
+  const end = authorityEnd(value);
+  const nextUrl = nextUrlPrefixBeforeBoundary(value, end);
+  const unknownEnd = nextUrl ?? end;
+  if (unknownEnd === 0) return value;
+  // The preceding bytes were discarded, so this first token cannot be classified safely.
+  return redactAuthority(value.slice(0, unknownEnd), true) + value.slice(unknownEnd);
 }
 
 /** A bounded process capture can start inside userinfo, before the URL scheme. */
 export function redactTruncatedWorkspaceOperationOutput(value: string): string {
   const prefix = TRUNCATED_OUTPUT_PREFIX_RE.exec(value)?.[0];
   if (!prefix) return value;
-  const tail = value.slice(prefix.length);
-  const end = authorityEnd(tail);
-  const nextUrl = nextUrlPrefixBeforeBoundary(tail, end);
-  const unknownEnd = nextUrl ?? end;
-  if (unknownEnd === 0) return value;
-  // The preceding bytes were discarded, so this first token cannot be classified safely.
-  return prefix + redactAuthority(tail.slice(0, unknownEnd), true) + tail.slice(unknownEnd);
+  return prefix + redactUnknownLeadingAuthority(value.slice(prefix.length));
 }
 
 /** An old 4096-character excerpt may start in the middle of URL userinfo. */
 export function redactWorkspaceOperationExcerpt(value: string | null): string | null {
   if (value === null) return null;
   const redactor = createWorkspaceOperationUrlStreamRedactor();
-  const sanitized = redactor.push(redactTruncatedWorkspaceOperationOutput(value)) + redactor.flush();
+  const truncatedCapture = TRUNCATED_OUTPUT_PREFIX_RE.test(value);
+  // Older rows kept only the last 4096 characters. At that limit the first
+  // character may be inside userinfo, so its origin cannot be inferred.
+  const input = value.length >= 4096 && !truncatedCapture
+    ? redactUnknownLeadingAuthority(value)
+    : redactTruncatedWorkspaceOperationOutput(value);
+  const sanitized = redactor.push(input) + redactor.flush();
   const captureMarker = TRUNCATED_OUTPUT_PREFIX_RE.exec(sanitized)?.[0] ?? "";
   return captureMarker + sanitized.slice(captureMarker.length)
     .replace(/([^/]+)@(?=(?:\[[^\]\s/?#@]+\]|[^/?#\s"'<>;,}@]+)?(?::\d+)?(?:[/?#\s"'<>;,}]|$))/gi, `${REDACTED_USERINFO}@`);
@@ -98,8 +113,14 @@ export function maskWorkspaceOperationUrlUserInfoBytes(input: Buffer): Buffer {
   for (const match of text.matchAll(pattern)) {
     const userinfoStart = match.index + match[0].length;
     const suffix = text.slice(userinfoStart);
-    const separator = suffix.slice(0, authorityEnd(suffix, true)).lastIndexOf("@");
-    if (separator > 0) output.fill(0x2a, userinfoStart, userinfoStart + separator);
+    const boundary = authorityEnd(suffix, true);
+    const nextUrl = nextUrlPrefixBeforeBoundary(suffix, boundary);
+    const end = nextUrl ?? boundary;
+    const authority = suffix.slice(0, end);
+    const separator = authority.lastIndexOf("@");
+    const hiddenLength = separator > 0 ? separator
+      : (nextUrl === null && mayContainUnfinishedUserInfo(authority) ? end : 0);
+    if (hiddenLength > 0) output.fill(0x2a, userinfoStart, userinfoStart + hiddenLength);
   }
   return output;
 }
@@ -170,8 +191,11 @@ export function createWorkspaceOperationByteRangeScanner() {
       if (boundary < suffix.length) {
         const nextUrl = nextUrlPrefixBeforeBoundary(suffix, boundary);
         const end = nextUrl ?? boundary;
-        const separator = suffix.slice(0, end).lastIndexOf("@");
-        if (separator > 0) mark(state.positions.slice(userinfoStart, userinfoStart + separator));
+        const authority = suffix.slice(0, end);
+        const separator = authority.lastIndexOf("@");
+        const hiddenLength = separator > 0 ? separator
+          : (nextUrl === null && mayContainUnfinishedUserInfo(authority) ? end : 0);
+        if (hiddenLength > 0) mark(state.positions.slice(userinfoStart, userinfoStart + hiddenLength));
         const consumed = userinfoStart + end + (nextUrl === null ? 1 : 0);
         state.pending = state.pending.slice(consumed);
         state.positions = state.positions.slice(consumed);
@@ -299,7 +323,8 @@ export function createWorkspaceOperationUrlStreamRedactor() {
 
       const nextUrl = nextUrlPrefixBeforeBoundary(afterPrefix, end);
       const authorityLength = nextUrl ?? end;
-      output += prefix + redactAuthority(afterPrefix.slice(0, authorityLength));
+      const authority = afterPrefix.slice(0, authorityLength);
+      output += prefix + redactAuthority(authority, nextUrl === null && mayContainUnfinishedUserInfo(authority));
       if (nextUrl === null) output += afterPrefix[end];
       input = afterPrefix.slice(authorityLength + (nextUrl === null ? 1 : 0));
     }

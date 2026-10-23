@@ -43,6 +43,42 @@ describe("workspace operation URL redaction", () => {
       .toBe("connect postgresql://[REDACTED]");
   });
 
+  it("masks an unfinished URL whose authority ends at a slash", () => {
+    const credential = "synthetic-reader:synthetic-password";
+    const url = `postgresql://${credential}/`;
+    const redactor = createWorkspaceOperationUrlStreamRedactor();
+    const output = redactor.push(`connect postgresql://${credential.slice(0, 20)}`)
+      + redactor.push(`${credential.slice(20)}/`)
+      + redactor.flush();
+    expect(output).toBe("connect postgresql://[REDACTED]/");
+    expect(redactWorkspaceOperationExcerpt(`connect ${url}`))
+      .toBe("connect postgresql://[REDACTED]/");
+    expect(redactWorkspaceOperationUrlUserInfo(url)).toBe("postgresql://[REDACTED]/");
+    expect(redactWorkspaceOperationUrlUserInfo("https://example.test/path"))
+      .toBe("https://example.test/path");
+
+    const raw = Buffer.from(JSON.stringify({ chunk: url }));
+    const expected = Buffer.from(raw);
+    const start = raw.indexOf(credential);
+    expected.fill(0x2a, start, start + credential.length);
+    expect(maskWorkspaceOperationUrlUserInfoBytes(raw)).toEqual(expected);
+
+    const scanner = createWorkspaceOperationByteRangeScanner();
+    scanner.feed("stdout", url, 0);
+    const scanned = Buffer.from(url);
+    for (const range of scanner.finish()) scanned.fill(0x2a, range.start, range.end);
+    expect(scanned.toString()).toBe("postgresql://" + "*".repeat(credential.length) + "/");
+  });
+
+  it("masks an old 4096-character excerpt starting inside long userinfo", () => {
+    const credentialTail = "synthetic-long-password-tail";
+    const excerpt = (`connect postgresql://synthetic-reader:${"p".repeat(4200)}${credentialTail}`)
+      .slice(-4096);
+    expect(excerpt).toHaveLength(4096);
+    expect(excerpt).not.toContain("postgresql://");
+    expect(redactWorkspaceOperationExcerpt(excerpt)).toBe("[REDACTED]");
+  });
+
   it("masks a second URL after a host-only URL across output chunks", () => {
     for (const chunks of [
       ["https://example.test\npostgres://reader:pa", "ssword@db.test/app"],

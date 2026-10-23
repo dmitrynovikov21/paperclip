@@ -13968,7 +13968,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
       requestedExecutionWorkspaceMode;
-    const executionPolicy = { executionMode: resolvedInstanceSettings.general.executionMode };
+    const executionPolicy = {
+      executionMode: resolvedInstanceSettings.general.executionMode,
+      requireIsolatedAgentRuntime:
+        process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true",
+    };
     const executionForcedToKubernetes = isExecutionForcedToKubernetes(executionPolicy);
     let selectedEnvironmentId = environmentResolution.environmentId;
     if (executionForcedToKubernetes) {
@@ -14040,6 +14044,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : selectedEnvironmentId
         ? await environmentsSvc.getById(selectedEnvironmentId)
         : null;
+    if (executionPolicy.requireIsolatedAgentRuntime) {
+      const decision = evaluateExecutionAllowlist(executionPolicy, {
+        driver: selectedEnvironmentForConfig?.driver ?? "local",
+        provider: typeof selectedEnvironmentForConfig?.config?.provider === "string"
+          ? selectedEnvironmentForConfig.config.provider
+          : null,
+      });
+      if (!decision.allowed) throw new Error(decision.reason);
+    }
     const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -14772,6 +14785,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     persistedExecutionWorkspace = realizationResult.persistedExecutionWorkspace;
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
+    if (executionPolicy.requireIsolatedAgentRuntime &&
+        (executionTarget?.kind !== "remote" || executionTarget.transport !== "sandbox")) {
+      throw new Error("Isolated local secrets require a remote sandbox execution target.");
+    }
     const remoteExecution = realizationResult.remoteExecution;
     if (!executionTarget || executionTarget.kind === "local") {
       try {

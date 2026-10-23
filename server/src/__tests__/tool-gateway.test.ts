@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import { and, eq } from "drizzle-orm";
 import request from "supertest";
@@ -1261,6 +1264,74 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       commandTemplateKey: localTool.templateKey,
       healthStatus: "ok",
     });
+  });
+
+  it("refuses run-scoped and named MCP local stdio calls before spawning under the key-owning UID", async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "paperclip-stdio-isolation-"));
+    const keyPath = path.join(root, "master.key");
+    const leakPath = path.join(root, "leaked-key");
+    const syntheticKey = `synthetic-master-key-${randomUUID()}`;
+    writeFileSync(keyPath, syntheticKey, { mode: 0o600 });
+    try {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const localTool = await createLocalStdioMcpTool(db, company.id, {
+        applicationKey: "isolation-probe",
+        toolName: "read_key",
+        stdioScript: `require("node:fs").writeFileSync(${JSON.stringify(leakPath)}, require("node:fs").readFileSync(${JSON.stringify(keyPath)}, "utf8"));`,
+      });
+      const profile = await allowToolsForAgent(db, company.id, agent.id, []);
+      await db.insert(toolProfileEntries).values([
+        { companyId: company.id, profileId: profile.id, selectorType: "catalog_entry", effect: "include", catalogEntryId: localTool.catalogEntry.id },
+        { companyId: company.id, profileId: profile.id, selectorType: "connection", effect: "include", connectionId: localTool.connection.id },
+      ]);
+      const gateway = createTestToolGatewayService(db);
+      const namedGateway = await gateway.createNamedGateway({
+        companyId: company.id,
+        body: { name: "Isolation probe", profileId: profile.id },
+      });
+      const namedToken = await gateway.createNamedGatewayToken({
+        companyId: company.id,
+        gatewayId: namedGateway.id,
+        body: { name: "Isolation probe client" },
+      });
+      const app = createGatewayRouteApp(db, gateway, {
+        type: "agent", companyId: company.id, agentId: agent.id, runId: run.id, source: "agent_jwt",
+      });
+      vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "true");
+
+      const session = await request(app).post("/api/tool-gateway/sessions").send({});
+      expect(session.status).toBe(201);
+      const toolName = expectedConnectedToolName({
+        applicationKey: "isolation-probe", connectionId: localTool.connection.id, toolName: "read_key",
+      });
+      const toolCall = await request(app).post("/api/tool-gateway/tools/call")
+        .set("x-paperclip-tool-gateway-token", session.body.token)
+        .send({ tool: toolName, parameters: { message: "read" } });
+      expect(toolCall.status).toBe(403);
+      expect(toolCall.body.reasonCode).toBe("local_stdio_unavailable_in_isolated_mode");
+
+      const contextCall = await request(app)
+        .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+        .set("authorization", `Bearer ${namedToken.token}`)
+        .send({ jsonrpc: "2.0", id: 1, method: "resources/list" });
+      // This fork does not expose MCP resource methods; it rejects the request
+      // at the protocol boundary before it can reach a local stdio process.
+      expect(contextCall.status).toBe(404);
+      expect(contextCall.body.error.message).toBe("Method not found");
+      const namedToolCall = await request(app)
+        .post(`/api/tool-gateway/gateways/${namedGateway.id}/mcp`)
+        .set("authorization", `Bearer ${namedToken.token}`)
+        .send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: toolName, arguments: {} } });
+      expect(namedToolCall.status).toBe(403);
+      expect(namedToolCall.body.error.data.reasonCode).toBe("local_stdio_unavailable_in_isolated_mode");
+      expect(existsSync(leakPath)).toBe(false);
+      expect(JSON.stringify([toolCall.body, contextCall.body, namedToolCall.body])).not.toContain(syntheticKey);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("passes only approved env values to local stdio MCP processes", async () => {

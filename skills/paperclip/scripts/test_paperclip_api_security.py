@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -16,17 +17,58 @@ import uuid
 
 HELPER = Path(__file__).with_name("paperclip-api.sh")
 UPLOAD_HELPER = Path(__file__).with_name("paperclip-upload-artifact.sh")
+PYTHON_HELPER = Path(__file__).with_name("paperclip-api.py")
+
+
+def process_tree(root_pid):
+    pids = {root_pid}
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        try:
+            children = (Path("/proc") / str(pid) / "task" / str(pid) / "children").read_text().split()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for child in children:
+            child_pid = int(child)
+            if child_pid not in pids:
+                pids.add(child_pid)
+                pending.append(child_pid)
+    return pids
+
+
+def token_in_proc_argv(token, pids):
+    for pid in pids:
+        try:
+            if token in (Path("/proc") / str(pid) / "cmdline").read_bytes():
+                return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return False
+
+
+def token_in_ps_argv(token, pids):
+    result = subprocess.run(
+        ["ps", "-ww", "-p", ",".join(map(str, sorted(pids))), "-o", "args="],
+        capture_output=True, check=False,
+    )
+    return token in result.stdout
 
 
 class Recorder:
     def __init__(self):
         self.requests = []
+        self.seen = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def handle_request(self):
                 size = int(self.headers.get("Content-Length", "0"))
                 owner.requests.append((self.command, self.path, dict(self.headers), self.rfile.read(size)))
+                owner.seen.set()
+                owner.release.wait(timeout=5)
                 if self.command == "GET" and self.path == "/api/issues/x/attachments":
                     response = b"[]"
                 elif self.command == "POST" and self.path == "/api/companies/c/issues/x/attachments":
@@ -56,6 +98,7 @@ class Recorder:
         return "http://127.0.0.1:%d" % self.server.server_port
 
     def close(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -119,6 +162,13 @@ class ApiHelperSecurityTest(unittest.TestCase):
             args.append("--no-work-product")
         return subprocess.run(args, env=env, capture_output=True, text=True, timeout=15)
 
+    def call_python(self, run_id, *, method="POST"):
+        return subprocess.run(
+            [sys.executable, str(PYTHON_HELPER), method, "/api/issues/x/comments", '{"ok":true}'],
+            env=dict(self.env, PAPERCLIP_RUN_ID=run_id),
+            capture_output=True, text=True, timeout=15,
+        )
+
     def test_get_and_url_globbing_make_one_request(self):
         result = self.call('pc_api GET "$PC_TEST_PATH"', PC_TEST_PATH="/api/{one,two}")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -179,12 +229,62 @@ class ApiHelperSecurityTest(unittest.TestCase):
         self.assertEqual(self.attacker.requests, [])
 
     def test_artifact_uploader_rejects_each_header_control_before_network(self):
-        for control in ("\r", "\n", "\t", "\x1f", "\x7f"):
+        for control in ("\r", "\n", "\t", "\x1f", "\x7f", "\x85"):
             with self.subTest(control=repr(control)):
                 result = self.upload_artifact("run" + control + "id")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.victim.requests, [])
                 self.assertEqual(self.attacker.requests, [])
+
+    def test_python_helper_rejects_header_controls_before_network(self):
+        injected = 'run"\nurl = "' + self.attacker.url + '/stolen'
+        for run_id in (injected, "run\rid", "run\tid", "run\x1fid", "run\x7fid", "run\x85id"):
+            with self.subTest(run_id=repr(run_id)):
+                result = self.call_python(run_id)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PAPERCLIP_RUN_ID contains a control character", result.stderr)
+                self.assertNotIn(self.token, result.stdout + result.stderr)
+                self.assertEqual(self.victim.requests, [])
+                self.assertEqual(self.attacker.requests, [])
+
+    def test_python_helper_accepts_valid_run_id_and_json(self):
+        run_id = 'synthetic"\\run-id'
+        result = self.call_python(run_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_one_target("POST", "/api/issues/x/comments", b'{"ok": true}')
+        self.assertEqual(self.victim.requests[0][2].get("X-Paperclip-Run-Id"), run_id)
+
+    @unittest.skipUnless(Path("/proc/self/cmdline").exists(), "Linux /proc required")
+    def test_python_helper_keeps_bearer_out_of_proc_and_ps(self):
+        token = self.token.encode()
+        control = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)", self.token])
+        try:
+            self.assertTrue(token_in_proc_argv(token, process_tree(control.pid)), "RED control missed /proc argv")
+            self.assertTrue(token_in_ps_argv(token, process_tree(control.pid)), "RED control missed ps argv")
+        finally:
+            control.terminate()
+            control.wait(timeout=5)
+
+        self.victim.release.clear()
+        process = subprocess.Popen(
+            [sys.executable, str(PYTHON_HELPER), "POST", "/api/issues/x/comments", '{"ok":true}'],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertTrue(self.victim.seen.wait(timeout=5), "Python helper did not reach target")
+            self.assertFalse(token_in_proc_argv(token, process_tree(process.pid)))
+            self.assertFalse(token_in_ps_argv(token, process_tree(process.pid)))
+        finally:
+            self.victim.release.set()
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertNotIn(self.token, stdout + stderr)
+        self.assert_one_target("POST", "/api/issues/x/comments", b'{"ok": true}')
 
     def test_path_cannot_add_an_attacker_url(self):
         injected = '/api/agents/me"\nurl = "' + self.attacker.url + "/stolen"

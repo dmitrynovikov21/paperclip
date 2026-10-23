@@ -33,11 +33,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 
 DEFAULT_TIMEOUT = 90
+
+
+class InvalidRunId(ValueError):
+    pass
 
 
 def api_base(env=None) -> str:
@@ -54,6 +59,8 @@ def call(method: str, path: str, body=None, timeout: int = DEFAULT_TIMEOUT):
     if run_id:
         # Required on every mutating request so the action is attributable to
         # this heartbeat run.
+        if re.search(r"[\x00-\x1f\x7f-\x9f]", run_id):
+            raise InvalidRunId("PAPERCLIP_RUN_ID contains a control character")
         headers["X-Paperclip-Run-Id"] = run_id
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -74,7 +81,11 @@ def main(argv) -> int:
     if len(argv) > 3:
         raw = argv[3]
         body = json.loads(open(raw[1:]).read() if raw.startswith("@") else raw)
-    status, text = call(method, path, body)
+    try:
+        status, text = call(method, path, body)
+    except InvalidRunId:
+        print("PAPERCLIP_RUN_ID contains a control character", file=sys.stderr)
+        return 1
     print(status)
     print(text)
     return 0 if 200 <= status < 300 else 1

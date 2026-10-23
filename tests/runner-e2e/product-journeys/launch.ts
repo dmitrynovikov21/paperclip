@@ -15,6 +15,7 @@ import { regenerateRunnerDashboard } from "../dashboard-regenerate.js";
 import { resolveRunnerE2ESource } from "../source.js";
 import { validateRetainedRunnerResult } from "../result-validation.js";
 import { validateJourneyCollection } from "./collection.js";
+import { validateOnboardingArtifact } from "./artifact-evidence.js";
 
 const cleanupGraceMs = 600_000;
 const stopReserveMs = 20_000;
@@ -98,7 +99,7 @@ export async function launchProductJourneys(args: string[], repositoryRoot: stri
   try { sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* Packaged harnesses may not include Git metadata. */ }
   const source = resolveRunnerE2ESource({ sha, ref: null, workflowRunUrl: null });
   const definitionHash = createHash("sha256").update(JSON.stringify(productJourneys));
-  for (const name of ["catalog.ts", "task-properties.ts", "cloud-onboarding.ts", "onboarding-first-task.ts", "fixtures.ts", "launch.ts", "types.ts", "collection.ts", "local-target.ts"]) definitionHash.update(await readFile(path.join(import.meta.dirname, name)));
+  for (const name of ["catalog.ts", "task-properties.ts", "cloud-onboarding.ts", "onboarding-first-task.ts", "artifact-evidence.ts", "fixtures.ts", "launch.ts", "types.ts", "collection.ts", "local-target.ts"]) definitionHash.update(await readFile(path.join(import.meta.dirname, name)));
   const suiteDefinitionHash = definitionHash.digest("hex");
   const expected = config.journeys.map(id => `product-journeys.${config.id}.${id === "cloud-onboarding" ? config.modelProfileId : "browser"}.${config.executionEnvironment}.${id}`);
   let reportPersisted = false;
@@ -176,6 +177,8 @@ export async function launchProductJourneys(args: string[], repositoryRoot: stri
         if (id === "cloud-onboarding") {
           if (!session!.onboard) throw new JourneyError("unsupported", "target_has_no_onboarding");
           ready = await session!.onboard(evidence);
+          if (!evidence.artifact) throw new JourneyError("failed", "onboarding_artifact_evidence_missing");
+          validateOnboardingArtifact(evidence.artifact);
           fixtures!.provide(ready);
         } else {
           ready = await fixtures!.resolve(productJourneys.find(j => j.id === id)!.requires);

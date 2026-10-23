@@ -25,7 +25,7 @@ export interface EvalGatewayReceipt {
   gatewayRequestId?: string; gatewaySpanId?: string; providerRequestId?: string; braintrustParent?: string;
   endpoint?: string; cache?: string; failoverFrom?: string; failoverTo?: string; errorOrigin?: string;
   outcome: "succeeded" | "failed" | "cancelled"; errorCode?: string;
-  usageComplete: boolean; final: boolean; costUsd: string | null;
+  usageComplete: boolean; final: boolean; costUsd: string | null; clientDisconnected?: true;
   usage?: ProviderUsageReceipt;
 }
 const money = (n: bigint) => `${n / 1_000_000_000n}.${String(n % 1_000_000_000n).padStart(9, "0")}`;
@@ -108,7 +108,7 @@ export class EvalUsageStream {
 
 export async function forwardEvalRequest(input: {
   ledger: Ledger; identity: EvalChargeIdentity; route: EvalGatewayRoute; payload: unknown;
-  deadlineAt: number; signal?: AbortSignal; anthropicBeta?: string; anthropicBetaQuery?: boolean;
+  deadlineAt: number; signal?: AbortSignal; downstreamSignal?: AbortSignal; anthropicBeta?: string; anthropicBetaQuery?: boolean;
   onHeaders: (status: number, headers: Record<string, string>) => void;
   onChunk: (chunk: Uint8Array, signal: AbortSignal) => Promise<void>;
   persist: (receipt: EvalGatewayReceipt) => Promise<void>;
@@ -126,6 +126,11 @@ export async function forwardEvalRequest(input: {
   const requestId = randomUUID();
   const receipt: EvalGatewayReceipt = { requestId, route: route.mode, outcome: "failed", usageComplete: false, final: false, costUsd: null,
     ...(route.mode === "braintrust" ? { braintrustParent: braintrustGatewayRequestParent(route.projectId!, requestId, ledger.snapshot().campaignId, input.identity) } : {}) };
+  const markDisconnected = () => {
+    if (!input.downstreamSignal?.aborted || receipt.clientDisconnected) return false;
+    receipt.clientDisconnected = true; receipt.outcome = "cancelled"; receipt.errorCode ??= "client_disconnected";
+    return true;
+  };
   const usage = new ProviderUsageAccumulator(route.provider, body);
   const bound = modelReservationBound(route, reservation);
   await ledger.reserve(requestId, input.identity, reservation, bound);
@@ -203,6 +208,7 @@ export async function forwardEvalRequest(input: {
         || (observed.tokenBounds?.output ?? 0) > route.maximumOutputTokens
         || route.mode === "braintrust" && (!response || receipt.endpoint !== route.endpointName
           || receipt.cache === "HIT" || receipt.failoverFrom || receipt.failoverTo))) await ledger.invalidateBound(requestId);
+    markDisconnected();
     await input.persist(receipt);
     await ledger.observe({ observationId: `${requestId}:usage`, requestId, source: route.mode === "braintrust" ? "gateway" : "provider",
       provider: route.provider,
@@ -210,7 +216,12 @@ export async function forwardEvalRequest(input: {
       ...(validEvalLedgerId(receipt.providerRequestId) ? { providerRequestId: receipt.providerRequestId } : {}),
       currency: "USD", route: route.mode, classification: receipt.costUsd === null ? "unknown" : "estimated",
       ...(receipt.costUsd !== null ? { costUsd: receipt.costUsd, pricingVersion: route.price.version } : {}), tokens, final: observed.final });
+    if (markDisconnected()) await input.persist(receipt);
     await ledger.finish(requestId, receipt.outcome);
+    if (markDisconnected()) {
+      await input.persist(receipt);
+      await ledger.finish(requestId, receipt.outcome);
+    }
   }
   return receipt;
 }
@@ -224,11 +235,12 @@ async function requestJson(req: IncomingMessage) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-export async function startEvalGateway(input: Omit<Parameters<typeof forwardEvalRequest>[0], "payload" | "onHeaders" | "onChunk" | "signal" | "anthropicBeta" | "anthropicBetaQuery"> & {
+export async function startEvalGateway(input: Omit<Parameters<typeof forwardEvalRequest>[0], "payload" | "onHeaders" | "onChunk" | "signal" | "downstreamSignal" | "anthropicBeta" | "anthropicBetaQuery"> & {
   resolveIdentity?: () => Promise<EvalChargeIdentity>;
 }) {
-  const token = randomBytes(32).toString("hex"), pending = new Set<Promise<void>>(), controllers = new Set<AbortController>();
+  const token = randomBytes(32).toString("hex"), pending = new Set<Promise<void>>(), disconnects = new Set<() => void>();
   let closed = false, poisoned = false;
+  let closing: Promise<void> | undefined;
   const respond = (res: ServerResponse, status: number, code: string) => {
     if (res.destroyed) return;
     if (!res.headersSent) { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "eval_gateway", message: code } })); }
@@ -243,19 +255,39 @@ export async function startEvalGateway(input: Omit<Parameters<typeof forwardEval
       const paths = [`/${endpoint}`, `/v1/${endpoint}`];
       if (input.route.provider === "anthropic") paths.push("/messages?beta=true", "/v1/messages?beta=true");
       if (req.method !== "POST" || !paths.includes(req.url ?? "")) { respond(res, 404, "unqualified_endpoint"); return; }
-      const abort = new AbortController(); controllers.add(abort);
-      const onClose = () => { if (!res.writableEnded) abort.abort(); }; res.on("close", onClose);
+      const abort = new AbortController(), downstream = new AbortController();
+      let dispatched = false, drainTimer: ReturnType<typeof setTimeout> | undefined;
+      const disconnect = () => {
+        if (downstream.signal.aborted) return;
+        downstream.abort();
+        if (!dispatched) abort.abort();
+        else { drainTimer = setTimeout(() => abort.abort(), Math.max(0, Math.min(5000, input.deadlineAt - Date.now()))); drainTimer.unref(); }
+      };
+      disconnects.add(disconnect);
+      const onClose = () => { if (!res.writableEnded) disconnect(); }; res.on("close", onClose);
       try {
         let payload: unknown;
         try { payload = await requestJson(req); }
         catch { respond(res, 400, "invalid_request_body"); return; }
         const identity = input.resolveIdentity ? await input.resolveIdentity() : input.identity;
         if (identity.executionId !== input.identity.executionId || identity.attemptId !== input.identity.attemptId) throw new Error("Invalid eval request attribution");
-        const receipt = await forwardEvalRequest({ ...input, identity, payload, signal: abort.signal,
+        const receipt = await forwardEvalRequest({ ...input, identity, payload, signal: abort.signal, downstreamSignal: downstream.signal,
+          transport: (url, init) => {
+            downstream.signal.throwIfAborted();
+            init?.signal?.throwIfAborted();
+            dispatched = true;
+            return (input.transport ?? fetch)(url, init);
+          },
           anthropicBeta: typeof req.headers["anthropic-beta"] === "string" ? req.headers["anthropic-beta"] : undefined,
           anthropicBetaQuery: input.route.provider === "anthropic" && req.url?.endsWith("?beta=true"),
-          onHeaders: (status, headers) => { res.writeHead(status, headers); },
-          onChunk: async (chunk, signal) => { if (!res.write(chunk)) await once(res, "drain", { signal }); },
+          onHeaders: (status, headers) => { if (!downstream.signal.aborted && !res.destroyed) res.writeHead(status, headers); },
+          onChunk: async (chunk, signal) => {
+            if (downstream.signal.aborted || res.destroyed) return;
+            if (!res.write(chunk)) {
+              try { await once(res, "drain", { signal: AbortSignal.any([signal, downstream.signal]) }); }
+              catch (error) { if (!downstream.signal.aborted) throw error; }
+            }
+          },
         });
         if (receipt.outcome === "succeeded" || receipt.errorCode === "upstream_rejected") res.end();
         else respond(res, 502, receipt.errorCode ?? "request_failed");
@@ -263,7 +295,7 @@ export async function startEvalGateway(input: Omit<Parameters<typeof forwardEval
         if (error instanceof EvalRequestError) { respond(res, 400, "invalid_request_payload"); return; }
         if (error instanceof EvalAdmissionError) { respond(res, 429, "eval_admission_denied"); return; }
         poisoned = true; respond(res, 503, "eval_admission_or_persistence_failed");
-      } finally { controllers.delete(abort); res.off("close", onClose); }
+      } finally { clearTimeout(drainTimer); disconnects.delete(disconnect); res.off("close", onClose); }
     })();
     pending.add(operation); void operation.then(() => pending.delete(operation), () => { poisoned = true; respond(res, 503, "gateway_unavailable"); pending.delete(operation); });
   });
@@ -271,7 +303,12 @@ export async function startEvalGateway(input: Omit<Parameters<typeof forwardEval
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   const address = server.address(); if (!address || typeof address === "string") throw new Error("Eval gateway did not bind loopback");
   return { baseUrl: `http://127.0.0.1:${address.port}`, token,
-    async close() { closed = true; controllers.forEach(controller => controller.abort()); server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await Promise.allSettled([...pending]); },
+    close: () => closing ??= (async () => {
+      closed = true;
+      disconnects.forEach(disconnect => disconnect());
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      await Promise.allSettled([...pending]);
+    })(),
   };
 }

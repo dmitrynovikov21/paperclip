@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { companies, projects, projectWorkspaces, issues, executionWorkspaces, agents, heartbeatRuns, nativeRunFinalizations, workspaceRuntimeServices, executionWorkspaceRestorePoints, createDb } from "@paperclipai/db";
+import { companies, projects, projectWorkspaces, issues, executionWorkspaces, agents, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, workspaceRuntimeServices, executionWorkspaceRestorePoints, createDb } from "@paperclipai/db";
 import { markGitRestorePointExpired } from "../services/git-restore-point-storage.js";
 import { GIT_RESTORE_POINT_EXPIRED_WARNING } from "../services/execution-workspaces.js";
 import { getStorageService } from "../storage/index.js";
@@ -922,13 +922,24 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId, nativeIssueId: f.issueId, status: "scheduled_retry" });
     expect((await f.expire()).expired).toBe(false);
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
-    await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: f.issueId, phase: "terminal_failure", recoveryState: "blocked" });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: f.issueId, phase: "observed", recoveryState: "resuming_session" });
     expect((await f.expire()).expired).toBe(false);
+    await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: "native-finalizer:live" }).where(eq(nativeRunFinalizations.runId, runId)); expect((await f.expire()).expired).toBe(false);
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
     await db.insert(workspaceRuntimeServices).values({ id: randomUUID(), companyId: f.companyId, executionWorkspaceId: f.workspaceId,
       scopeType: "execution_workspace", serviceName: "Preview", status: "running", lifecycle: "persistent", provider: "local" });
     expect((await f.expire()).expired).toBe(false);
     expect(await exists(f.cwd)).toBe(true);
+  });
+
+  it("expires a closed tree whose native recovery state was left behind", async () => {
+    const f = await fixture(), agentId = randomUUID(), runIds = [randomUUID(), randomUUID()];
+    await db.insert(agents).values({ id: agentId, companyId: f.companyId, name: "Fixture", role: "engineer", adapterType: "process" });
+    await db.insert(heartbeatRuns).values(runIds.map(id => ({ id, companyId: f.companyId, agentId, nativeIssueId: f.issueId, status: "succeeded", finishedAt: new Date(Date.now() - 48 * 3_600_000) })));
+    await db.insert(nativeRunFinalizations).values([["committed", "resuming_session"], ["terminal_failure", "blocked"]].map(([phase, recoveryState], i) => ({ runId: runIds[i]!, companyId: f.companyId, issueId: f.issueId, phase, recoveryState })));
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog", ownerAgentId: agentId,
+      cause: "native_finalization_error", fingerprint: randomUUID(), nextAction: "Resume the native run.", wakePolicy: { kind: "resume_native_run", runId: runIds[0] } });
+    expect(await f.expire()).toMatchObject({ expired: true }); expect(await exists(f.cwd)).toBe(false);
   });
 
   it("skips deletion when authenticated upstream verification fails", async () => {

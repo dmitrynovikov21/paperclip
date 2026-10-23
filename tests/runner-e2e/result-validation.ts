@@ -3,6 +3,7 @@ import { connectionCheckpoints, connectionEvidencePasses, connectionRunSignals }
 import { STARTUP_REUSE_LAYERS, STARTUP_REUSE_REASONS } from "../../packages/adapter-utils/src/startup-reuse.js";
 import type { RunnerE2ECampaignAccounting, RunnerE2EResult } from "./types.js";
 import { DEPENDABLE_CELLS } from "./dependable-qualification.js";
+import { validateOnboardingArtifact } from "./product-journeys/artifact-evidence.js";
 
 type Rule = (value: unknown, at: string) => void;
 const invalid = (at: string): never => {
@@ -342,6 +343,7 @@ const fields = {
   productJourney: optional(shape({
     targetId: optional(string),
     campaignId: optional(string), attemptId: optional(string),
+    artifact: optional((value, at) => { try { validateOnboardingArtifact(value); } catch { invalid(at); } }),
     operations: optional(closedShape({ campaignId: string, attemptId: string, modelCostUsd: nullable(number), setupCostUsd: nullable(number), requestCount: integer,
       feedback: closedShape({ collection: oneOf("complete", "partial", "unavailable"), complaints: integer, suggestions: integer }), traceIds: array(string) })),
     outcome: oneOf("passed", "failed", "blocked", "unsupported"),
@@ -387,6 +389,9 @@ export function validateRetainedRunnerResult(
 ): asserts value is RunnerE2EResult {
   result(value, "result");
   const checked = value as RunnerE2EResult;
+  const artifact = checked.productJourney?.artifact;
+  if (artifact && (checked.suiteId !== "product-journeys" || checked.caseId !== "cloud-onboarding" ||
+    checked.runIds && !checked.runIds.includes(artifact.originatingRunId))) invalid("result.productJourney.artifact");
   if (checked.workerTiming !== undefined) {
     try { validateWorkerTiming(checked.workerTiming, checked); } catch { invalid("result.workerTiming"); }
   }

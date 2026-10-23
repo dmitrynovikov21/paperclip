@@ -1863,6 +1863,8 @@ export async function commitNativeStatusDecision(input: {
           decisionId,
           leaseOwner: null,
           leaseExpiresAt: null,
+          recoveryState: null,
+          recoveryRequestId: null,
           failureCode: finalizationError?.cause ?? null,
           failureDetail: finalizationError
             ? {

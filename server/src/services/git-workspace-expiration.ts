@@ -145,6 +145,11 @@ export async function isGitWorkspaceExpirationEligible(tx: Tx, workspace: Worksp
         OR coalesce(CASE WHEN status = 'done' THEN completed_at ELSE cancelled_at END, updated_at) > ${new Date(now.getTime() - DAY_MS).toISOString()}::timestamptz)
       AND NOT EXISTS (SELECT 1 FROM ${issues} WHERE company_id = ${workspace.companyId}
         AND execution_workspace_id = ${workspace.id} AND status NOT IN ('done', 'cancelled'))`;
+  const recoveryActionBlocks = idleCutoff ? sql`true` : sql`(cause = 'native_workspace_finalization_owner_unverified'
+          OR evidence->'systemRecovery'->>'state' IN ('scheduled', 'running', 'awaiting_evidence'))`;
+  const finalizationBlocks = idleCutoff
+    ? sql`(f.phase <> 'committed' OR f.lease_owner IS NOT NULL OR f.recovery_state IS NOT NULL)`
+    : sql`(f.lease_owner IS NOT NULL OR f.phase NOT IN ('committed', 'terminal_failure'))`;
   const rows = await tx.execute<{ allowed: boolean }>(sql`${expirationScope(workspace)}
     SELECT CASE WHEN
       EXISTS (SELECT 1 FROM ${executionWorkspaces} other WHERE other.id <> ${workspace.id}
@@ -158,10 +163,11 @@ export async function isGitWorkspaceExpirationEligible(tx: Tx, workspace: Worksp
       AND NOT EXISTS (SELECT 1 FROM relevant_runs WHERE status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted')
         OR finished_at IS NULL OR controller_lease_expires_at > now())
       AND NOT EXISTS (SELECT 1 FROM ${issueRecoveryActions} WHERE company_id = ${workspace.companyId}
-        AND source_issue_id IN (SELECT id FROM tree) AND status IN ('active', 'escalated'))
+        AND source_issue_id IN (SELECT id FROM tree) AND status IN ('active', 'escalated')
+        AND ${recoveryActionBlocks})
       AND NOT EXISTS (SELECT 1 FROM ${nativeRunFinalizations} f WHERE f.company_id = ${workspace.companyId}
         AND (f.issue_id IN (SELECT id FROM tree) OR f.run_id IN (SELECT id FROM relevant_runs))
-        AND (f.phase <> 'committed' OR f.lease_owner IS NOT NULL OR f.recovery_state IS NOT NULL))
+        AND ${finalizationBlocks})
       AND NOT EXISTS (SELECT 1 FROM ${environmentLeases} l WHERE l.company_id = ${workspace.companyId}
         AND (l.execution_workspace_id = ${workspace.id} OR l.heartbeat_run_id IN (SELECT id FROM relevant_runs))
         AND (l.status = 'pending_cleanup' OR l.cleanup_status = 'failed' OR l.metadata ? 'nativeWorkspaceExportResume'

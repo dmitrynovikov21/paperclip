@@ -173,6 +173,27 @@ Private request receipts retain transport IDs, response IDs, usage and cache TTL
 route/cache/failover evidence, and final accounting status without request bodies
 or credentials. Raw provider responses remain only in the normal private evidence.
 
+### Disconnects and gateway shutdown
+
+When an HTTP client disconnects, the gateway drains an already-dispatched
+provider response for at most five more seconds to retain its final usage.
+The original provider timeout and campaign deadline still apply; the grace
+period never extends either. No additional provider request or retry is made.
+An upload or identity lookup interrupted before dispatch is not sent upstream.
+Gateway shutdown immediately stops admission, disconnects clients, and waits
+for that same bounded drain. Repeated shutdown calls share the same completion.
+
+A private receipt records `clientDisconnected: true` and keeps the request
+outcome `cancelled`, even if a complete provider response arrives during drain.
+A disconnect during receipt or ledger persistence also saves the corrected
+cancellation outcome before completion.
+Final usage may then replace its existing hold with an estimate under the normal
+ledger rules. It does not change the product verdict or establish invoice
+settlement. If no complete usage arrives, the unknown hold remains. The provider
+may continue billing after an abort, so a grace timeout is not evidence of zero
+cost. Drain time belongs to launcher cleanup and can add up to five seconds per
+attempt; no historical receipt or hold is rewritten by this change.
+
 ## Provisional completion and later reconciliation
 
 Recurring campaigns may finish with provisional accounting when every pending

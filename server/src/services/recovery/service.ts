@@ -3487,17 +3487,14 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
-      const wakePolicy = parseObject(action.wakePolicy);
-      const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      if (
-        wakePolicyType !== "bounded_recovery_owner" &&
-        wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
-      ) {
-        continue;
-      }
-
       if (issue.status === "done" || issue.status === "cancelled") {
+        const systemRecoveryState = readNonEmptyString(
+          parseObject(parseObject(action.evidence).systemRecovery).state,
+        );
+        if (systemRecoveryState && ["scheduled", "running", "awaiting_evidence"].includes(systemRecoveryState)) {
+          result.skipped += 1;
+          continue;
+        }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
           sourceIssueId: action.sourceIssueId,
@@ -3510,6 +3507,16 @@ export function recoveryService(
           result.resolved += 1;
           result.issueIds.push(issue.id);
         }
+        continue;
+      }
+
+      const wakePolicy = parseObject(action.wakePolicy);
+      const wakePolicyType = readNonEmptyString(wakePolicy.type);
+      if (
+        wakePolicyType !== "bounded_recovery_owner" &&
+        wakePolicyType !== "bounded_owner_disposition_repair" &&
+        action.ownerType !== "board"
+      ) {
         continue;
       }
 

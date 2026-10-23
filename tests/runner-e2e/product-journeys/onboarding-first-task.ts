@@ -4,7 +4,8 @@ import { type createConnectionProof, verifyConnectionArtifact, verifyConnectionR
 import { connectionDelay } from "../connection-target.js";
 import { activeRuns, firstTaskCompletionSettled, type Row } from "../first-task-scoring.js";
 import { isBlockedUnstartedWake, isTerminalUnstartedWake } from "../non-execution-wake.js";
-import { JourneyError, type JourneyContext, type TargetSession } from "./types.js";
+import { JourneyError, type JourneyContext, type OnboardingArtifactEvidence, type TargetSession } from "./types.js";
+import { retainOnboardingArtifact } from "./artifact-evidence.js";
 
 export interface OnboardingFirstTaskInput {
   context: JourneyContext;
@@ -16,12 +17,13 @@ export interface OnboardingFirstTaskInput {
   deadlineAt: number;
   own: TargetSession["own"];
   observeRun(run: Row): Promise<void>;
+  onArtifact?(artifact: OnboardingArtifactEvidence): void;
 }
 export interface OnboardingFirstTaskResult {
   runIds: string[];
   onboardingIssueId: string;
   childIssueId: string;
-  artifact: { id: string; originatingRunId: string; sha256: string };
+  artifact: OnboardingArtifactEvidence;
 }
 interface Snapshot {
   tasks: Row[];
@@ -177,13 +179,16 @@ export async function onboardingFirstTask(input: OnboardingFirstTaskInput): Prom
       const bytes = await api.bytes(`/api/attachments/${artifact.id}/content`);
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       if (artifact.byteSize !== bytes.byteLength || artifact.sha256 !== sha256 || !verifyConnectionArtifact(bytes, proof.expected)) fail("artifact_independent_check_failed");
+      const retained = retainOnboardingArtifact({ id: artifact.id, originatingRunId: run.id, bytes, proof });
+      input.onArtifact?.(retained);
       if (!snapshot.documents.some(row => row.issueId === child.id && !isPlanningDocument(row) && row.updatedByAgentId === agent.id &&
         typeof row.body === "string" && row.body.includes(proof.expected.nonce) && row.body.includes("connection-proof.json"))) fail("onboarding_child_document_missing");
       if (!snapshot.comments.some(row => row.authorAgentId === agent.id && String(row.body).includes(artifact.id) &&
         (String(row.body).includes(child.id) || String(row.body).includes(child.identifier ?? child.id)))) fail("onboarding_parent_result_links_missing");
       await page.reload({ timeout: remaining() });
       await page.locator(`a[href*="/api/attachments/${artifact.id}/content"]`).first().waitFor({ state: "visible", timeout: remaining() });
-      return { runIds: [...seen.keys()], onboardingIssueId: parent.id, childIssueId: child.id, artifact: { id: artifact.id, originatingRunId: run.id, sha256 } };
+      return { runIds: [...seen.keys()], onboardingIssueId: parent.id, childIssueId: child.id,
+        artifact: retained };
     }
     await wait(); snapshot = await load(parent.id);
   }

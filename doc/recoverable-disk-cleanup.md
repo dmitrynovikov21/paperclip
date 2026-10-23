@@ -93,6 +93,64 @@ The rest of the session directory, including its control-plane state, is kept.
 Each batch that finds candidates logs them with candidate and reclaimed allocated
 bytes, cleared task sessions, and skip reasons.
 
+## Native workspace sync folders
+
+Each native run that syncs a workspace with a remote sandbox writes a folder at
+`<instance>/native-workspace-sync/<run>/` with its descriptor, manifest, and the
+workspace and git seed archives. A seed can reach more than a gigabyte. Only the
+same run reads the folder again: restart recovery, finalization export, board export
+retry, and retained workspace recovery. Later runs adopt warm workspaces from lease
+metadata and the shared `generations` cache, which this worker never touches.
+
+A retention worker on the shared delivery-work scheduler removes a run's folder once
+nothing can read it. It runs at startup and at real deadlines: the earliest settled
+run's finish (or an orphan folder's newest file) plus the retention window, a
+recheck one window later for folders it had to keep, and a 15-minute retry after a
+failure, a held finalization lock or a leftover it could not delete. With no
+folders it schedules nothing; when a run then creates its folder in this server
+process, the worker wakes and schedules that folder's deadline. A folder
+named for a run id, that is a real directory and whose newest file is older than
+the window, is removed when one of these holds:
+
+- no run with that id exists;
+- the run has no valid workspace sync reference and is settled: it `succeeded`,
+  `failed`, was `cancelled`, `timed_out` or `interrupted`, finished before the
+  window, has no live process, no live controller lease and no finalization owner
+  receipt;
+- the run is settled as above, and also:
+  - its native run finalization, if any, has no lease owner or scheduled retry and is
+    `committed`, or `terminal_failure` with no recovery state or `blocked`;
+  - no active or escalated workspace export or owner-unverified recovery action
+    names the run;
+  - no lease of the run carries `nativeWorkspaceExportResume` or a cleanup in flight;
+  - its referenced lease was destroyed, or no retained workspace recovery of the run
+    is scheduled, running, awaiting evidence, queued or recovering;
+  - historical recovery adoption has no pending work for the run.
+
+Failed native runs can keep their recorded process ID after they finish. A recorded
+process blocks removal only while it can still be the run's own process: the run has a
+local lease or no lease, and the process ID or process group still exists on this
+host with the recorded start time (or a start time that cannot be read). A process ID
+from a remote sandbox, or one the operating system reused, does not block removal.
+
+Each folder is checked in one transaction that holds the run's finalization
+ownership lock, so it never races a finalization or export of the same run. A held
+lock skips the folder. Inside that transaction the folder is renamed to
+`.expired-<UUID>`, and it is deleted after commit. The next sweep finishes an
+interrupted deletion. Each batch tries at most 50 leftovers, then checks at most 200
+folders and removes at most 50. Leftovers and folders each continue from where the
+previous batch stopped, so a leftover that cannot be deleted does not block others. Deadline discovery reads
+run state 200 folders at a time and stops when the server drains or shuts down.
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_ENABLED` | `true` | Set `false` to stop removing folders |
+| `PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_DRY_RUN` | `false` | Set `true` to report candidates without removing folders |
+| `PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_DAYS` | `7` | Days a run must be finished, and its folder untouched, before removal (minimum `1`) |
+
+Each batch that finds candidates logs them with candidate and reclaimed allocated
+bytes and skip reasons.
+
 ## Git workspace restore points
 
 Git cache expiration (`PAPERCLIP_GIT_CACHE_EXPIRATION_ENABLED=true`) normally removes a

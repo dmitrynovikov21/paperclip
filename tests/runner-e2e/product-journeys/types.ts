@@ -27,6 +27,18 @@ export interface JourneyEvidence {
   campaignId?: string;
   attemptId?: string;
   operations?: JourneyOperations;
+  artifact?: OnboardingArtifactEvidence;
+}
+export interface OnboardingArtifactEvidence {
+  schema: "paperclip.product-journey.artifact/v1";
+  id: string;
+  originatingRunId: string;
+  filename: "connection-proof.json";
+  byteSize: number;
+  sha256: string;
+  contentBase64: string;
+  input: string;
+  expected: { nonce: string; count: number; total: number; sha256: string };
 }
 /** Normalized receipt from the private, Cloud-qualified eval-operations adapter. */
 export interface JourneyOperations {

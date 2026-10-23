@@ -11,6 +11,8 @@ import { discoverReportCatalog } from "../report-catalog.js";
 import { isIncompleteFirstTaskResult, renderCaseOutcome } from "../case-outcome.js";
 import type { RunnerE2EResult } from "../types.js";
 import type { JourneyContext, JourneyEvidence, TargetSession } from "./types.js";
+import { createConnectionProof } from "../connection-evidence.js";
+import { retainOnboardingArtifact } from "./artifact-evidence.js";
 vi.mock("@playwright/test", () => ({
   expect: Object.assign(
     (locator: { textContent(): Promise<string> }) => ({ async toContainText(value: string) { expect(await locator.textContent()).toContain(value); } }),
@@ -28,6 +30,21 @@ function result(): RunnerE2EResult {
     productJourney: { outcome: "passed", startingState: "recipe", phases: [{phase: "journey", outcome: "passed"}], checks: [{id:"assignment-persisted", passed:true},{id:"no-agent-work",passed:true}], privacy: "private", resourceDisposition: "released", deployment: { kind: "self-hosted", targetId: "local-qa", origin: "http://127.0.0.1:3100", commit: "a".repeat(40), cloudRelease: null, runtimeImage: null, configurationHash: "test" } } };
 }
 describe("deployment journey contracts", () => {
+  it("validates optional historical artifact evidence without trusting extra fields or a different run", () => {
+    const retained = result();
+    retained.caseId = "cloud-onboarding";
+    retained.status = "failed";
+    expect(() => validateRetainedRunnerResult(retained)).not.toThrow();
+    const proof = createConnectionProof();
+    retained.productJourney!.artifact = retainOnboardingArtifact({ id: "artifact", originatingRunId: "artifact-run", bytes: Buffer.from(JSON.stringify(proof.expected)), proof });
+    retained.runIds = ["artifact-run"];
+    expect(() => validateRetainedRunnerResult(JSON.parse(JSON.stringify(retained)))).not.toThrow();
+    retained.runIds = ["other-run"];
+    expect(() => validateRetainedRunnerResult(retained)).toThrow("result.productJourney.artifact");
+    retained.runIds = ["artifact-run"];
+    Object.assign(retained.productJourney!.artifact, { requestHeaders: {} });
+    expect(() => validateRetainedRunnerResult(retained)).toThrow("result.productJourney.artifact");
+  });
   it("resolves only requested prerequisites, once, and unwinds on failure", async () => {
     const calls: string[] = [];
     const registry = new FixtureRegistry().register({id:"a", async setup(){calls.push("a"); return 1;}, async teardown(){calls.push("-a");}})

@@ -3,10 +3,14 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
+  agents,
   applyPendingMigrations,
+  companies,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -125,6 +129,46 @@ describe("P6-18 / MIG-01..04 native finalization migration", () => {
       await expect(db.insert(heartbeatRunEvents).values({
         companyId, runId, agentId, seq: 5, eventType: "must-conflict",
       })).rejects.toThrow();
+    } finally {
+      await temporary.cleanup();
+    }
+  }, 60_000);
+
+  it("clears recovery state left on committed, unleased finalizations", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-recovery-backfill-");
+    const migration = await readFile(
+      new URL("../../../packages/db/src/migrations/0376_clear_committed_native_recovery_state.sql", import.meta.url),
+      "utf8",
+    );
+    const db = createDb(temporary.connectionString);
+    try {
+      const [company] = await db.insert(companies).values({ name: "Backfill", issuePrefix: "BKF" }).returning();
+      const [agent] = await db.insert(agents).values({ companyId: company!.id, name: "Backfill agent" }).returning();
+      const [issue] = await db.insert(issues).values({ companyId: company!.id, title: "Backfill", status: "done" }).returning();
+      const history = [{ disposition: "resume_dead_runner" }];
+      const fixtures = [
+        { key: "committed", phase: "committed", leaseOwner: null, recoveryState: "resuming_session" },
+        { key: "leased", phase: "committed", leaseOwner: "native-finalizer:live", recoveryState: "resuming_session" },
+        { key: "observed", phase: "observed", leaseOwner: null, recoveryState: "resuming_session" },
+        { key: "terminal", phase: "terminal_failure", leaseOwner: null, recoveryState: "blocked" },
+      ];
+      const runIds = new Map<string, string>();
+      for (const fixture of fixtures) {
+        const [run] = await db.insert(heartbeatRuns).values({
+          companyId: company!.id, agentId: agent!.id, status: "succeeded", runtimeMode: "native", nativeIssueId: issue!.id,
+        }).returning();
+        runIds.set(fixture.key, run!.id);
+        await db.insert(nativeRunFinalizations).values({
+          runId: run!.id, companyId: company!.id, issueId: issue!.id, phase: fixture.phase, leaseOwner: fixture.leaseOwner,
+          recoveryState: fixture.recoveryState, recoveryRequestId: "restart-request", recoveryHistory: history,
+        });
+      }
+      for (const statement of migration.split("--> statement-breakpoint")) await db.execute(sql.raw(statement));
+      const rows = new Map((await db.select().from(nativeRunFinalizations)).map((row) => [row.runId, row]));
+      expect(rows.get(runIds.get("committed")!)).toMatchObject({ recoveryState: null, recoveryRequestId: null, recoveryHistory: history });
+      expect(rows.get(runIds.get("leased")!)).toMatchObject({ recoveryState: "resuming_session", recoveryRequestId: "restart-request" });
+      expect(rows.get(runIds.get("observed")!)).toMatchObject({ recoveryState: "resuming_session", recoveryRequestId: "restart-request" });
+      expect(rows.get(runIds.get("terminal")!)).toMatchObject({ recoveryState: "blocked", recoveryRequestId: "restart-request" });
     } finally {
       await temporary.cleanup();
     }

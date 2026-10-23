@@ -222,6 +222,8 @@ async function claimCoordinator(input: {
               ? "arbitrating"
               : "workspace_finalizing"
             : coordinator.phase,
+        recoveryState: null,
+        recoveryRequestId: null,
         failureCode: null,
         failureDetail: null,
         nextAttemptAt: null,

@@ -3,12 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createConnectionProof } from "../connection-evidence.js";
 import { connectionDelay } from "../connection-target.js";
 import { onboardingFirstTask, type OnboardingFirstTaskInput } from "./onboarding-first-task.js";
+import { validateOnboardingArtifact } from "./artifact-evidence.js";
 
 vi.mock("../connection-target.js", () => ({ connectionDelay: vi.fn(async () => {}) }));
 type Row = { id: string; [key: string]: any };
 type Options = {
   plan?: boolean;
   wrongProof?: boolean;
+  readbackFailure?: "reload" | "download-link";
   mutate?(phase: string, state: { tasks: Row[]; runs: Row[]; interactions: Row[]; documents: Row[]; attachments: Row[]; comments: Row[] }): void;
 };
 
@@ -70,14 +72,14 @@ function fixture(options: Options = {}) {
     },
     async check() { events.push(`check:${name}`); },
     async fill(text: string) { expect(text).toContain(title); events.push("fill:request"); },
-    async waitFor() { events.push("visible:download"); expect(phase).toBe("accepted"); },
+    async waitFor() { events.push("visible:download"); expect(phase).toBe("accepted"); if (options.readbackFailure === "download-link") throw Error("synthetic download-link failure"); },
   });
   const page = {
     getByRole(_role: string, { name }: { name: string }) { return locator(name); },
     getByTestId(name: string) { return locator(name); },
     locator(selector: string) { expect(selector).toContain("/api/attachments/artifact/content"); return locator(selector); },
     async goto(url: string) { expect(url).toBe("https://qa.example.test/QA/issues/QA-1"); events.push("open:parent"); },
-    async reload() { events.push("reload:parent"); },
+    async reload() { events.push("reload:parent"); if (options.readbackFailure === "reload") throw Error("synthetic reload failure"); },
   };
   const own = vi.fn(async (resource: { name: string; id?: string }) => { events.push(`own:${resource.id ?? resource.name}`); });
   const observeRun = vi.fn(async (row: Row) => { events.push(`run:${row.id}`); });
@@ -90,6 +92,30 @@ function fixture(options: Options = {}) {
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(connectionDelay).mockReset().mockResolvedValue(undefined); });
 
 describe("Cloud canonical onboarding first task", () => {
+  it.each(["reload", "download-link"] as const)("retains the independently verified download when later %s fails", async readbackFailure => {
+    const f = fixture({ readbackFailure });
+    const capture = vi.fn();
+    f.input.onArtifact = capture;
+    await expect(onboardingFirstTask(f.input)).rejects.toThrow(`synthetic ${readbackFailure} failure`);
+    expect(capture).toHaveBeenCalledOnce();
+    const retained = JSON.parse(JSON.stringify(capture.mock.calls[0]![0]));
+    expect(() => validateOnboardingArtifact(retained)).not.toThrow();
+    expect(JSON.parse(Buffer.from(retained.contentBase64, "base64").toString("utf8"))).toEqual(f.input.proof.expected);
+    expect(retained.input).toBe(f.input.proof.input);
+    expect(retained.originatingRunId).toBe("child-run");
+  });
+  it("retains the original download and independently generated expectation after JSON serialization", async () => {
+    const f = fixture();
+    const result = await onboardingFirstTask(f.input);
+    const retained = JSON.parse(JSON.stringify({ productJourney: { artifact: result.artifact } })).productJourney.artifact;
+    const bytes = Buffer.from(retained.contentBase64, "base64");
+    expect(bytes.toString("utf8")).toBe(JSON.stringify(f.input.proof.expected));
+    expect(retained.byteSize).toBe(bytes.byteLength);
+    expect(retained.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+    expect(retained.input).toBe(f.input.proof.input);
+    expect(retained.expected).toEqual(f.input.proof.expected);
+    expect(retained.expected.sha256).toBe(createHash("sha256").update(retained.input).digest("hex"));
+  });
   it.each([false, true])("answers the opening and approves one child, including plan mode %s", async plan => {
     const f = fixture({ plan });
     const result = await onboardingFirstTask(f.input);

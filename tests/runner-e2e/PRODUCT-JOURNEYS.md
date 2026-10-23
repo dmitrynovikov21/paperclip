@@ -81,6 +81,20 @@ prerequisite remains failed at that boundary; every dependent selection receives
 a blocked result. Unsupported target capabilities are distinct from failures.
 Deployment/configuration drift during a journey fails its result.
 
+New onboarding attempts retain a bounded `productJourney.artifact` receipt in
+the existing private `normalized-results.json`, before disposable cleanup. It
+includes the exact downloaded `connection-proof.json` bytes as base64, attachment
+and originating-run IDs, byte count and SHA-256, plus the harness-generated input
+and independent expected result. Reinspection can decode the original bytes,
+recompute their checksum, and recompute the expected nonce, count, sum, and input
+checksum after the workspace is deleted. Only this exact four-field synthetic
+fixture is admitted, with a 4 KiB download limit and a closed receipt schema;
+arbitrary agent output is excluded. Capture follows attribution and independent
+download verification. The receipt survives later document, link, reload, or
+trace failures without turning those failed journey steps into passes.
+Historical attempts without it remain readable and do not gain retained-artifact
+proof retroactively. Descendant stories reuse context without copying the receipt.
+
 Collection must finish within the campaign deadline. Cleanup and evidence
 publication then share a separate ten-minute grace period, with the last thirty
 seconds reserved for a twenty-second stop-only fallback and ten-second browser

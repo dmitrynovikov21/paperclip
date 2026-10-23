@@ -93,6 +93,7 @@ export const secretsLocalEncryptedConfigSchema = z.object({
   // from the host agent UID and dispatch agents only to isolated sandboxes.
   requireIsolatedAgentRuntime: z.boolean().optional(),
   hostAgentUid: z.number().int().nonnegative().optional(),
+  allowedWorkspaceRoots: z.array(z.string().min(1)).optional(),
 }).passthrough();
 
 export const secretsConfigSchema = z.object({

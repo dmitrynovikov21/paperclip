@@ -51,6 +51,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { assertIsolatedWorkspaceSyncAllowed } from "./isolated-workspace-guard.js";
 import {
   scheduleSyncOperations,
   SYNC_OPERATION_CONCURRENCY_LIMIT,
@@ -1281,6 +1282,9 @@ export async function prepareSandboxManagedRuntime(input: {
         throw error;
       },
     ));
+  const approvedWorkspaceLocalDir = syncWorkspace
+    ? await assertIsolatedWorkspaceSyncAllowed(input.workspaceLocalDir)
+    : input.workspaceLocalDir;
   const workspaceInboundMode = input.workspaceInboundMode ?? "host_current";
   const stageWorkspace =
     syncWorkspace && workspaceInboundMode !== "adopt_remote";
@@ -1318,7 +1322,7 @@ export async function prepareSandboxManagedRuntime(input: {
   // Resolve an existing workspace alias once, before reading its snapshot.
   // All subsequent work uses that root, so retargeting the alias cannot select
   // another repository. Staging also verifies the captured directory identity.
-  const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(input.workspaceLocalDir)) : null;
+  const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(approvedWorkspaceLocalDir)) : null;
   if (workspaceRoot) input = { ...input, workspaceLocalDir: workspaceRoot.sourceDir };
 
   // The git enumeration (`git status --ignored`, the HEAD diffs, `ls-files`).
@@ -1824,6 +1828,7 @@ export async function prepareSandboxManagedRuntime(input: {
           const { localPath, projectId, ignoreResolution } = source;
           const label = `project-${projectId}`;
           try {
+            const approvedLocalPath = await assertIsolatedWorkspaceSyncAllowed(localPath);
             if (!path.posix.isAbsolute(localPath)) {
               throw new Error(`additional source localPath is not an absolute path: ${localPath}`);
             }
@@ -1849,13 +1854,13 @@ export async function prepareSandboxManagedRuntime(input: {
             await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to environment");
             await stageConfinedSyncIn({
               files: [{
-                sourcePath: localPath,
+                sourcePath: approvedLocalPath,
                 targetPath: remoteProjectDir,
                 kind: "directory",
                 exclude,
                 access: "ro",
               }],
-              sourceRoots: [localPath],
+              sourceRoots: [approvedLocalPath],
               targetRoots: [remoteProjectDir],
               progressLabel: label,
               statusPhase: "config_sync",
@@ -1908,7 +1913,7 @@ export async function prepareSandboxManagedRuntime(input: {
 
   return {
     spec: input.spec,
-    workspaceLocalDir: input.workspaceLocalDir,
+    workspaceLocalDir,
     workspaceRemoteDir,
     runtimeRootDir,
     assetDirs,

@@ -207,7 +207,11 @@ Set the following in the **server's** config after the host boundary is ready:
     "localEncrypted": {
       "keyFilePath": "/srv/paperclip-private/secrets/master.key",
       "requireIsolatedAgentRuntime": true,
-      "hostAgentUid": 1001
+      "hostAgentUid": 1001,
+      "allowedWorkspaceRoots": [
+        "/srv/paperclip-workspaces/projects",
+        "/srv/paperclip-workspaces/agents"
+      ]
     }
   }
 }
@@ -216,7 +220,18 @@ Set the following in the **server's** config after the host boundary is ready:
 `hostAgentUid` is the unprivileged host identity used for agents and must differ
 from the server UID. Environment overrides are
 `PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME` and
-`PAPERCLIP_SECRETS_HOST_AGENT_UID`. Inline
+`PAPERCLIP_SECRETS_HOST_AGENT_UID`. The optional override
+`PAPERCLIP_SECRETS_ALLOWED_WORKSPACE_ROOTS_JSON` is a JSON array of absolute
+operator-approved host directories. Configure roots for every project and
+fallback agent workspace the server must copy into a pod. With no roots, sync
+fails closed. Roots must exist and must not overlap the master-key directory;
+stored workspaces are checked again before every archive or upload, including
+referenced projects. Agent API keys cannot set a project workspace `cwd` in
+this mode; an operator must select the host path. Keep the approved roots
+separate from the service's key, database, backups, and other private data.
+Host-local Git clone URLs (including `file://`) are also refused before
+materializing a managed checkout; use a remote Git URL instead.
+Inline
 `PAPERCLIP_SECRETS_MASTER_KEY` is refused. Startup refuses a missing, linked,
 group-readable, or agent-owned key and a writable/untrusted ancestor directory.
 The CLI and provider will not generate a replacement key in isolation mode.

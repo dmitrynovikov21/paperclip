@@ -19,6 +19,7 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 import { localRepositoryPath } from "../local-repository-path.js";
+import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -449,6 +450,10 @@ export async function ensureManagedProjectWorkspace(input: {
   /** Optional git credential source for cloning private repos; null/absent preserves ambient behavior. */
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+      input.repoUrl && !isRemoteGitRepositoryUrl(input.repoUrl)) {
+    throw new Error("Isolated local secrets forbid host-local Git clone sources.");
+  }
   const defaultCwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
     projectId: input.projectId,

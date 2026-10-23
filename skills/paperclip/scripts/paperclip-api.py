@@ -28,6 +28,9 @@ Prints the HTTP status on the first line and the response body after it.
 Retry policy: GET/HEAD may be retried freely. A mutation that fails with a
 transport error may already be queued server side -- retrying it creates
 duplicates, so surface the failure instead.
+
+Redirect policy: return the 30x response without following it. A redirect to
+another origin must never receive the bearer credential or run ID.
 """
 from __future__ import annotations
 
@@ -43,6 +46,11 @@ DEFAULT_TIMEOUT = 90
 
 class InvalidRunId(ValueError):
     pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def api_base(env=None) -> str:
@@ -66,7 +74,7 @@ def call(method: str, path: str, body=None, timeout: int = DEFAULT_TIMEOUT):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(api_base() + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(_NoRedirectHandler()).open(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode()

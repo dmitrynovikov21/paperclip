@@ -70,6 +70,7 @@ def token_in_ps_argv(token, pids):
 class Recorder:
     def __init__(self):
         self.requests = []
+        self.redirect_to = None
         self.seen = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -81,6 +82,12 @@ class Recorder:
                 owner.requests.append((self.command, self.path, dict(self.headers), self.rfile.read(size)))
                 owner.seen.set()
                 owner.release.wait(timeout=5)
+                if self.command == "GET" and self.path == "/api/redirect" and owner.redirect_to:
+                    self.send_response(302)
+                    self.send_header("Location", owner.redirect_to)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.command == "GET" and self.path == "/api/issues/x/attachments":
                     response = b"[]"
                 elif self.command == "POST" and self.path == "/api/companies/c/issues/x/attachments":
@@ -265,6 +272,27 @@ class ApiHelperSecurityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_one_target("POST", "/api/issues/x/comments", b'{"ok": true}')
         self.assertEqual(self.victim.requests[0][2].get("X-Paperclip-Run-Id"), run_id)
+
+    def test_python_helper_does_not_follow_cross_origin_redirect(self):
+        direct = subprocess.run(
+            [sys.executable, str(PYTHON_HELPER), "GET", "/api/agents/me"],
+            env=self.env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertTrue(direct.stdout.startswith("200\n"), direct.stdout)
+        self.assert_one_target("GET", "/api/agents/me")
+
+        self.victim.requests.clear()
+        self.victim.redirect_to = self.attacker.url + "/stolen"
+        redirected = subprocess.run(
+            [sys.executable, str(PYTHON_HELPER), "GET", "/api/redirect"],
+            env=self.env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(redirected.returncode, 1, redirected.stderr)
+        self.assertTrue(redirected.stdout.startswith("302\n"), redirected.stdout)
+        self.assert_one_target("GET", "/api/redirect")
+        self.assertEqual(self.victim.requests[0][2].get("X-Paperclip-Run-Id"), "synthetic-run-id")
+        self.assertNotIn(self.token, redirected.stdout + redirected.stderr)
 
     @unittest.skipUnless(Path("/proc/self/cmdline").exists(), "Linux /proc required")
     def test_python_helper_keeps_bearer_out_of_proc_and_ps(self):

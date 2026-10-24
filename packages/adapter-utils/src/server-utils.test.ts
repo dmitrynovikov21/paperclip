@@ -2239,6 +2239,13 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(prompt).toContain("Watched issue: PAP-8000 Ship onboarding flow");
     expect(prompt).toContain("Stop fingerprint: stop:sha256:abc123");
     expect(prompt).toContain("Your mission is to keep the watched issue tree moving by verifying stopped work");
+    expect(prompt).toContain("Record review evidence and progress on the reusable watchdog issue.");
+    expect(prompt).toContain("Outside it, you may only add review-evidence comments to the reusable watchdog issue or set its status to `done`, `in_review`, or `blocked` with supporting evidence.");
+    expect(prompt).not.toContain("Outside it, you may update the reusable watchdog issue");
+    expect(prompt).toContain("Put any further explanation on the reusable watchdog issue, not in a separate watched-subtree comment.");
+    expect(prompt).toContain("If the server returns 409, stop source mutations");
+    expect(prompt).toContain("The heartbeat-run watchdog-decisions endpoint controls silent active-run reviews");
+    expect(prompt).toContain("the reviewed fingerprint suppresses another wake for that state.");
     expect(prompt).toContain("Server-derived watchdog capability metadata:");
     expect(prompt).toContain("Target scope: PAP-8000 plus non-watchdog descendants.");
     expect(prompt).toContain("Reusable watchdog issue: watchdog-issue-1.");

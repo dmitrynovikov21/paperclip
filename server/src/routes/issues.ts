@@ -4057,8 +4057,11 @@ export function issueRoutes(
 
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
     const requestedIssueId = req.params.id;
-    if (scope.kind !== "watchdog" || typeof requestedIssueId !== "string"
-      || scope.watchdogIssueId?.toLowerCase() !== requestedIssueId.toLowerCase()) return next();
+    if (scope.kind !== "watchdog" || !scope.watchdogIssueId || typeof requestedIssueId !== "string") return next();
+    // Resolve the target exactly as the PATCH handler does. A URL may spell the
+    // same issue as an identifier or a UUID with different case or whitespace.
+    const targetIssue = await svc.getById(requestedIssueId);
+    if (targetIssue?.id !== scope.watchdogIssueId) return next();
     res.status(403).json({
       error: "Task-watchdog runs may only update the reusable watchdog issue with a comment or status done, in_review, or blocked.",
     });
@@ -8445,9 +8448,9 @@ export function issueRoutes(
   );
 
   router.patch("/issues/:id", rejectTaskWatchdogReusableIssuePatch, validate(updateIssueRouteSchema), async (req, res) => {
-    const id = req.params.id as string;
-    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!existing) return;
+    const id = existing.id;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({

@@ -473,15 +473,18 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       expect(deniedWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
     }
     const uppercaseWatchdogIssueId = watchdogIssueId.toUpperCase();
-    for (const body of [
-      { title: "Changed reusable issue title through uppercase UUID" },
-      { status: "cancelled" },
-    ]) {
-      const deniedUppercaseWatchdogIssuePatch = await request(app)
-        .patch(`/api/issues/${uppercaseWatchdogIssueId}`)
-        .send(body);
-      expect(deniedUppercaseWatchdogIssuePatch.status, JSON.stringify(deniedUppercaseWatchdogIssuePatch.body)).toBe(403);
-      expect(deniedUppercaseWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
+    const paddedUppercaseWatchdogIssueId = `%20${uppercaseWatchdogIssueId}%20`;
+    for (const routeId of [uppercaseWatchdogIssueId, paddedUppercaseWatchdogIssueId]) {
+      for (const body of [
+        { title: "Changed reusable issue title through alternate UUID spelling" },
+        { status: "cancelled" },
+      ]) {
+        const deniedAlternateWatchdogIssuePatch = await request(app)
+          .patch(`/api/issues/${routeId}`)
+          .send(body);
+        expect(deniedAlternateWatchdogIssuePatch.status, JSON.stringify(deniedAlternateWatchdogIssuePatch.body)).toBe(403);
+        expect(deniedAlternateWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
+      }
     }
     const [unchangedWatchdogIssue] = await db.select().from(issues).where(eq(issues.id, watchdogIssueId));
     expect(unchangedWatchdogIssue).toMatchObject({
@@ -562,7 +565,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     expect(evidencePatch.body.status).toBe("todo");
 
     const dispositionPatch = await request(app)
-      .patch(`/api/issues/${uppercaseWatchdogIssueId}`)
+      .patch(`/api/issues/${paddedUppercaseWatchdogIssueId}`)
       .send({ status: "done", comment: "The watchdog decision is complete." });
     expect(dispositionPatch.status, JSON.stringify(dispositionPatch.body)).toBe(200);
     expect(dispositionPatch.body.status).toBe("done");

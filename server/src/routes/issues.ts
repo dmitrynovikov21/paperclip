@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
@@ -4037,6 +4037,34 @@ export function issueRoutes(
       },
     });
     return false;
+  }
+
+  async function rejectTaskWatchdogReusableIssuePatch(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) {
+    if (req.actor.type !== "agent") return next();
+    // Check the raw body before Zod strips unknown keys. The reusable issue is
+    // outside the source subtree, so its scoped grant covers only disposition
+    // and evidence, never general issue edits or cancellation.
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) return next();
+    const body = req.body as Record<string, unknown>;
+    const disallowedFields = Object.keys(body).filter((key) => key !== "comment" && key !== "status");
+    const disallowedStatus = Object.hasOwn(body, "status")
+      && body.status !== "done" && body.status !== "in_review" && body.status !== "blocked";
+    if (disallowedFields.length === 0 && !disallowedStatus) return next();
+
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    const requestedIssueId = req.params.id;
+    if (scope.kind !== "watchdog" || !scope.watchdogIssueId || typeof requestedIssueId !== "string") return next();
+    // Resolve the target exactly as the PATCH handler does. A URL may spell the
+    // same issue as an identifier or a UUID with different case or whitespace.
+    const targetIssue = await svc.getById(requestedIssueId);
+    if (targetIssue?.id !== scope.watchdogIssueId) return next();
+    res.status(403).json({
+      error: "Task-watchdog runs may only update the reusable watchdog issue with a comment or status done, in_review, or blocked.",
+    });
   }
 
   async function rejectTaskWatchdogInteractionMutation(
@@ -8419,10 +8447,10 @@ export function issueRoutes(
     },
   );
 
-  router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
-    const id = req.params.id as string;
-    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+  router.patch("/issues/:id", rejectTaskWatchdogReusableIssuePatch, validate(updateIssueRouteSchema), async (req, res) => {
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!existing) return;
+    const id = existing.id;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({

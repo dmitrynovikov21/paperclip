@@ -547,10 +547,12 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("PAPERCLIP_API_KEY");
     expect(prompt).toContain("PAPERCLIP_WAKE_PAYLOAD_JSON");
     expect(prompt).toContain("Paperclip API access note:");
-    expect(prompt).toContain('PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"');
-    expect(prompt).toContain("$PAPERCLIP_API_BASE/api/agents/me");
-    expect(prompt).toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
-    expect(prompt).toContain("X-Paperclip-Run-Id");
+    expect(prompt).toContain("scripts/paperclip-api.py");
+    expect(prompt).toContain("GET /api/agents/me");
+    expect(prompt).toContain('POST "/api/issues/$PAPERCLIP_TASK_ID/comments" --body-stdin');
+    expect(prompt).toContain("reads PAPERCLIP_API_KEY from env in memory");
+    expect(prompt).toContain("never put bearer headers or JSON bodies in command arguments");
+    expect(prompt).not.toContain("Authorization: Bearer");
     expect(prompt).not.toContain("$PAPERCLIP_API_URL/api/");
     expect(prompt).not.toContain("/api/issues/{id}");
     expect(prompt).not.toContain("-d '{...}'");
@@ -567,7 +569,7 @@ describe("shared ACPX engine runtime behavior", () => {
     const prompt = String(meta[0]?.prompt ?? "");
     expect(prompt).toContain("Paperclip API access note:");
     expect(prompt).toContain("Use a real issue id from the current context before making issue write requests.");
-    expect(prompt).not.toContain("$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID");
+    expect(prompt).not.toContain('POST "/api/issues/$PAPERCLIP_TASK_ID/comments"');
   });
 
   it("emits ACP text deltas as stdout transcript records", async () => {

@@ -226,7 +226,7 @@ describe("normalizeIssueAttachmentMaxBytes", () => {
 });
 
 describe("issue attachment routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -260,6 +260,11 @@ describe("issue attachment routes", () => {
     mockWorkProductService.createForIssue.mockReset();
     mockWorkProductService.getById.mockReset();
     mockWorkProductService.update.mockReset();
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("accepts zip uploads for issue attachments", async () => {

@@ -1,3 +1,4 @@
+export * from "./provider-session-isolation.js";
 export type {
   AdapterAgent,
   AdapterRuntime,

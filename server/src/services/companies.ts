@@ -1,3 +1,5 @@
+import { invalidateProviderStateInTx, providerStateBroker } from "./provider-state-broker.js";
+import { conflict } from "../errors.js";
 import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -99,14 +101,17 @@ export function companyService(db: Db) {
         isNull(agentWakeupRequests.runId),
       ));
 
-    return { agentsPaused: pausedAgentRows.length, activeRunIds };
+    const providerStateLeaseIds = await invalidateProviderStateInTx(tx, { companyId: id }, "company_archived");
+    return { agentsPaused: pausedAgentRows.length, activeRunIds, providerStateLeaseIds };
   }
 
   async function finalizeArchive(
     id: string,
     actor: CompanyActivityActor,
-    cascade: { agentsPaused: number; activeRunIds: string[] },
+    cascade: { agentsPaused: number; activeRunIds: string[]; providerStateLeaseIds: string[] },
   ) {
+    const broker = providerStateBroker(db);
+    for (const leaseId of cascade.providerStateLeaseIds) await broker.retryCleanup(leaseId);
     for (const runId of cascade.activeRunIds) {
       await heartbeat.cancelRun(runId, "Cancelled because the company was archived");
     }
@@ -430,8 +435,13 @@ export function companyService(db: Db) {
       return result.company;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
+    remove: async (id: string) => {
+      await companyService(db).archive(id);
+      const cleanup = await providerStateBroker(db).destroy({ companyId: id }, "company_deleted");
+      if (cleanup.some((result) => result.status !== "destroyed")) {
+        throw conflict("Provider state cleanup must finish before company deletion", { code: "provider_state_cleanup_pending" });
+      }
+      return db.transaction(async (tx) => {
         // Delete from child tables in dependency order
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
@@ -478,7 +488,8 @@ export function companyService(db: Db) {
           .where(eq(companies.id, id))
           .returning();
         return rows[0] ?? null;
-      }),
+      });
+    },
 
     stats: () =>
       Promise.all([

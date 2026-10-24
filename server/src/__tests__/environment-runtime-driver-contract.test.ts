@@ -57,7 +57,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
 
   beforeAll(async () => {
     const started = await startEmbeddedPostgresTestDatabase("environment-runtime-contract");
-    stopDb = started.stop;
+    stopDb = started.cleanup;
     db = createDb(started.connectionString);
   });
 

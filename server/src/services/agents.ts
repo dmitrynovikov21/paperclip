@@ -1,3 +1,4 @@
+import { invalidateProviderStateInTx, providerStateBroker } from "./provider-state-broker.js";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -715,23 +716,14 @@ export function agentService(db: Db) {
     terminate: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
-
-      await db
-        .update(agents)
-        .set({
-          status: "terminated",
-          pauseReason: null,
-          pausedAt: null,
-          errorReason: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id));
-
-      await db
-        .update(agentApiKeys)
-        .set({ revokedAt: new Date() })
-        .where(eq(agentApiKeys.agentId, id));
-
+      const ids = await db.transaction(async (tx) => {
+        await tx.update(agents).set({ status: "terminated", pauseReason: null,
+          pausedAt: null, errorReason: null, updatedAt: new Date() }).where(eq(agents.id, id));
+        await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.agentId, id));
+        return await invalidateProviderStateInTx(tx, { companyId: existing.companyId, agentId: id }, "agent_deleted");
+      });
+      const broker = providerStateBroker(db);
+      for (const leaseId of ids) await broker.retryCleanup(leaseId);
       return getById(id);
     },
 
@@ -747,6 +739,11 @@ export function agentService(db: Db) {
         });
       }
 
+      await agentService(db).terminate(id);
+      const cleanup = await providerStateBroker(db).destroy({ companyId: existing.companyId, agentId: id }, "agent_deleted");
+      if (cleanup.some((result) => result.status !== "destroyed")) {
+        throw conflict("Provider state cleanup must finish before agent deletion", { code: "provider_state_cleanup_pending" });
+      }
       return db.transaction(async (tx) => {
         await tx
           .select({ id: agents.id })

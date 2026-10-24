@@ -190,7 +190,7 @@ function makeClosedWorkspace() {
 }
 
 describe.sequential("closed isolated workspace issue routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -208,6 +208,11 @@ describe.sequential("closed isolated workspace issue routes", () => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockExecutionWorkspaceService.getById.mockResolvedValue(makeClosedWorkspace());
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("rejects new issue comments when the linked isolated workspace is closed", async () => {

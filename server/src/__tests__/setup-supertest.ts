@@ -24,6 +24,10 @@ type SupertestTestConstructor = {
 const require = createRequire(import.meta.url);
 const SupertestTest = require("supertest/lib/test.js") as SupertestTestConstructor;
 
+// Legacy control-plane suites use the explicit pre-migration rollout phase.
+// Isolation suites pass their own host mode, including the fail-closed default.
+process.env.PAPERCLIP_PROVIDER_STATE_MODE ??= "observe";
+
 if (!process.env.CODEX_HOME) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-codex-home-"));
   fs.writeFileSync(path.join(codexHome, "auth.json"), '{"OPENAI_API_KEY":"sk-vitest"}\n', { mode: 0o600 });

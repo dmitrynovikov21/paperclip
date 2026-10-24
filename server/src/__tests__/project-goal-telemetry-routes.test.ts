@@ -104,7 +104,7 @@ async function createApp(routeType: "project" | "goal") {
 }
 
 describe("project and goal telemetry routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../telemetry.js");
     vi.doUnmock("../services/index.js");
@@ -141,6 +141,12 @@ describe("project and goal telemetry routes", () => {
       status: "planned",
     });
     mockLogActivity.mockResolvedValue(undefined);
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/projects.js"),
+      vi.importActual("../routes/goals.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("emits telemetry when a project is created", async () => {

@@ -36,6 +36,7 @@ const mockAgentService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDestroyReusableSandboxLeases = vi.hoisted(() => vi.fn(async () => []));
 const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues })));
 const mockTx = vi.hoisted(() => ({
@@ -105,6 +106,12 @@ vi.mock("../services/access.js", () => ({
 
 vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
+}));
+
+vi.mock("../services/environment-runtime.js", () => ({
+  environmentRuntimeService: () => ({
+    destroyReusableSandboxLeases: mockDestroyReusableSandboxLeases,
+  }),
 }));
 
 vi.mock("../services/agents.js", () => ({
@@ -231,6 +238,17 @@ function makeIssue(status: "backlog" | "todo" | "done" | "blocked" | "cancelled"
   };
 }
 
+// Keep the decision transaction assertion separate from provider teardown.
+function expectTerminalProviderCleanup(issue: { id: string; companyId: string }) {
+  expect(mockDestroyReusableSandboxLeases).toHaveBeenCalledTimes(1);
+  expect(mockDestroyReusableSandboxLeases).toHaveBeenCalledWith({
+    companyId: issue.companyId,
+    issueId: issue.id,
+    executionWorkspaceId: null,
+    failureReason: "issue_terminal_done",
+  });
+}
+
 function makeIssueUpdateReceipt(
   existing: ReturnType<typeof makeIssue>,
   patch: Record<string, unknown>,
@@ -261,7 +279,7 @@ async function waitForWakeup(assertion: () => void) {
 }
 
 describe.sequential("issue comment reopen routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
@@ -422,6 +440,11 @@ describe.sequential("issue comment reopen routes", () => {
         agent: { id: reference },
       };
     });
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("treats reopen=true as a no-op when the issue is already open", async () => {
@@ -2297,6 +2320,7 @@ describe.sequential("issue comment reopen routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expectTerminalProviderCleanup(issue);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
@@ -2390,6 +2414,7 @@ describe.sequential("issue comment reopen routes", () => {
       body: reviewBody,
     });
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expectTerminalProviderCleanup(issue);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
@@ -2475,6 +2500,7 @@ describe.sequential("issue comment reopen routes", () => {
       body: reviewBody,
     });
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expectTerminalProviderCleanup(issue);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
@@ -3093,6 +3119,7 @@ describe.sequential("issue comment reopen routes", () => {
 
       expect(res.status).toBe(201);
       expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expectTerminalProviderCleanup(issue);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         "11111111-1111-4111-8111-111111111111",
         expect.objectContaining({ status: "done" }),
@@ -3172,6 +3199,7 @@ describe.sequential("issue comment reopen routes", () => {
     // rolls back when the status update fails.
     expect(res.status).toBe(422);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockDestroyReusableSandboxLeases).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       reviewBody,
@@ -3242,6 +3270,7 @@ describe.sequential("issue comment reopen routes", () => {
     // so the comment cannot survive when the status update finds no issue.
     expect(res.status).toBe(404);
     expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockDestroyReusableSandboxLeases).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       reviewBody,

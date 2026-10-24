@@ -110,7 +110,7 @@ async function createAgentApp(options: { runId?: string; contextSnapshot?: Recor
 }
 
 describe("approval routes idempotent retries", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/approvals.js");
@@ -142,6 +142,11 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockLogActivity.mockResolvedValue(undefined);
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/approvals.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("does not emit duplicate approval side effects when approve is already resolved", async () => {

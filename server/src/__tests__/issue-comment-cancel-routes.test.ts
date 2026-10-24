@@ -208,7 +208,7 @@ function makeComment(overrides: Record<string, unknown> = {}) {
 }
 
 describe.sequential("issue comment cancel routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -276,6 +276,11 @@ describe.sequential("issue comment cancel routes", () => {
     mockIssueReferenceService.deleteCommentSource.mockResolvedValue(undefined);
     mockIssueReferenceService.syncComment.mockResolvedValue(undefined);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("cancels a queued comment from its author and restores the deleted body", async () => {

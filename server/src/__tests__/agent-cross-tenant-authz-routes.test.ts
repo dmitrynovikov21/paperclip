@@ -342,8 +342,10 @@ function resetMockDefaults() {
 }
 
 describe.sequential("agent cross-tenant route authorization", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     resetMockDefaults();
+    // Load cold route modules under the setup timeout, before request assertions.
+    await loadRouteModules();
   });
 
   it("enforces company boundaries before mutating or reading agent keys", async () => {

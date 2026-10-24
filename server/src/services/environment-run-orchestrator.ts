@@ -206,6 +206,7 @@ export function environmentRunOrchestrator(
     persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
     adapterType: string | null;
+    taskScopeId?: string | null;
   }): Promise<EnvironmentRuntimeLeaseRecord> {
     try {
       return await environmentRuntime.acquireRunLease(input);
@@ -266,6 +267,7 @@ export function environmentRunOrchestrator(
     agentId: string;
     persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
+    taskScopeId?: string | null;
   }): Promise<EnvironmentAcquisitionResult> {
     // Step 1: Resolve environment
     const environment = await resolveEnvironment({
@@ -284,6 +286,7 @@ export function environmentRunOrchestrator(
       persistedExecutionWorkspace: input.persistedExecutionWorkspace,
       executionWorkspaceSettings: input.executionWorkspaceSettings,
       adapterType: input.adapterType ?? null,
+      taskScopeId: input.taskScopeId ?? null,
     });
 
     // Step 3: Log lease acquisition activity

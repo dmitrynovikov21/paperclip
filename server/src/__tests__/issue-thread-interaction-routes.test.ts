@@ -196,7 +196,7 @@ async function createApp(actor: Record<string, unknown> = {
 }
 
 describe.sequential("issue thread interaction routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -417,6 +417,11 @@ describe.sequential("issue thread interaction routes", () => {
       }),
     }));
     mockReviewTransition.value = null;
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("lists and creates board-authored interactions", async () => {

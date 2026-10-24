@@ -170,7 +170,12 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const run = await heartbeat.getRun(runId);
-      if (run && !["queued", "running"].includes(run.status)) return run;
+      if (run && !["queued", "running"].includes(run.status)) {
+        // Retry creation and lock transfer follow the terminal status write.
+        // Await finalization before assertions inspect those side effects.
+        await heartbeat.drainActiveRunExecutions();
+        return await heartbeat.getRun(runId);
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return await heartbeat.getRun(runId);

@@ -88,24 +88,22 @@ vi.mock("./context/CompanyContext", () => ({
   CompanyProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
+let root: ReturnType<typeof createRoot> | undefined;
+
 async function renderAppAt(container: HTMLElement, path: string) {
-  const root = createRoot(container);
+  root = createRoot(container);
+  const mountedRoot = root;
   flushSync(() => {
-    root.render(
+    mountedRoot.render(
       <MemoryRouter initialEntries={[path]}>
         <App />
       </MemoryRouter>,
     );
   });
-  return root;
 }
 
 async function waitForRoute(container: HTMLElement, text: string) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (container.textContent?.includes(text)) return;
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  expect(container.textContent).toContain(text);
+  await vi.waitFor(() => expect(container.textContent).toContain(text));
 }
 
 describe("App Cases routing (PAP-13002)", () => {
@@ -117,22 +115,23 @@ describe("App Cases routing (PAP-13002)", () => {
   });
 
   afterEach(() => {
+    const mountedRoot = root;
+    if (mountedRoot) flushSync(() => mountedRoot.unmount());
+    root = undefined;
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
   it("redirects unprefixed /cases to the company-prefixed list page", async () => {
-    const root = await renderAppAt(container, "/cases");
+    await renderAppAt(container, "/cases");
     await waitForRoute(container, "CASES_LIST_PAGE");
     expect(container.textContent).not.toContain("No company matches prefix");
-    flushSync(() => root.unmount());
   });
 
   it("redirects unprefixed /cases/:id to the company-prefixed detail page", async () => {
-    const root = await renderAppAt(container, "/cases/PAP-C5");
+    await renderAppAt(container, "/cases/PAP-C5");
     await waitForRoute(container, "CASE_DETAIL_PAGE");
     expect(container.textContent).not.toContain("No company matches prefix");
-    flushSync(() => root.unmount());
   });
 });

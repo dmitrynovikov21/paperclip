@@ -12809,7 +12809,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     // Release the stale holder and promote the already parked wake in the same
     // issue-row transaction. Suppress unrelated recovery wakes for this stale run.
-    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+      deferDispatchUntilAgentLockReleased: true,
+    });
 
     return cancelled;
   }

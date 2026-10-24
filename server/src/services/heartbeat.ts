@@ -12270,7 +12270,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+      deferDispatchUntilAgentLockReleased: true,
+    });
 
     return cancelled;
   }
@@ -12796,28 +12799,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
-
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
       message: staleness.reason,
       payload: staleness.details,
+    });
+
+    // Release the stale holder and promote the already parked wake in the same
+    // issue-row transaction. Suppress unrelated recovery wakes for this stale run.
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+      deferDispatchUntilAgentLockReleased: true,
     });
 
     return cancelled;
@@ -16395,12 +16389,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
   }
 
+  type DeferredReviewWakeReconcile = {
+    companyId: string;
+    issueId: string;
+    wakeId: string;
+    expectedHolderRunId: string;
+    expectedStageId: string;
+  };
+
   async function releaseIssueExecutionAndPromote(
     run: typeof heartbeatRuns.$inferSelect,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      reconcile?: DeferredReviewWakeReconcile;
+      deferDispatchUntilAgentLockReleased?: boolean;
+    } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
+    if (options.reconcile && (
+      run.id !== options.reconcile.expectedHolderRunId ||
+      run.companyId !== options.reconcile.companyId ||
+      contextIssueId !== options.reconcile.issueId
+    )) {
+      throw conflict("Expected holder does not belong to this issue");
+    }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
@@ -16414,7 +16427,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
-      // Lock the context issue (if any) AND every issue that still references this run.
+      // Normal finalization locks the context issue (if any) AND every issue
+      // that still references this run. Board reconciliation locks only its
+      // named issue and never repairs sibling locks as a side effect.
       //
       // A single run can hold execution locks on multiple issues: the caller's context
       // issue (set via svc.checkout) plus any additional issues stamped by
@@ -16427,8 +16442,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // finalizations, which keeps deadlock risk independent of PostgreSQL's plan
       // choice when multiple issues match.
       await tx.execute(
-        contextIssueId
+        options.reconcile
           ? sql`
+              select id from issues
+              where company_id = ${options.reconcile.companyId}
+                and id = ${options.reconcile.issueId}
+              for update
+            `
+          : contextIssueId
+            ? sql`
               select id from issues
               where company_id = ${run.companyId}
                 and (
@@ -16439,7 +16461,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               order by id
               for update
             `
-          : sql`
+            : sql`
               select id from issues
               where company_id = ${run.companyId}
                 and (execution_run_id = ${run.id} or checkout_run_id = ${run.id})
@@ -16454,16 +16476,120 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(
           and(
             eq(issues.companyId, run.companyId),
-            contextIssueId
-              ? or(
+            options.reconcile
+              ? eq(issues.id, options.reconcile.issueId)
+              : contextIssueId
+                ? or(
                   eq(issues.id, contextIssueId),
                   eq(issues.executionRunId, run.id),
                   eq(issues.checkoutRunId, run.id),
                 )
-              : or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
+                : or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
           ),
         )
         .orderBy(asc(issues.id));
+
+      if (options.reconcile) {
+        const expected = options.reconcile;
+        const target = candidateIssues.find((candidate) => candidate.id === expected.issueId);
+        if (!target) throw conflict("Issue no longer belongs to the expected holder");
+        const currentHolder = await tx
+          .select({
+            status: heartbeatRuns.status,
+            createdAt: heartbeatRuns.createdAt,
+            finishedAt: heartbeatRuns.finishedAt,
+          })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, target.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (!currentHolder || !isHeartbeatRunTerminalStatus(currentHolder.status)) {
+          throw conflict("Expected holder is not terminal");
+        }
+
+        const stage = parseIssueExecutionState(target.executionState);
+        const participant = stage?.currentParticipant;
+        const wake = await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.id, expected.wakeId),
+            eq(agentWakeupRequests.companyId, target.companyId),
+          ))
+          .then((rows) => rows[0] ?? null);
+        const wakePayload = parseObject(wake?.payload);
+        const wakeContext = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
+        const wakeStage = parseObject(wakeContext.executionStage);
+        const wakeParticipant = parseObject(wakeStage.currentParticipant);
+        if (
+          target.status !== "in_review" ||
+          stage?.status !== "pending" ||
+          stage.currentStageType !== "review" ||
+          stage.currentStageId !== expected.expectedStageId ||
+          participant?.type !== "agent" ||
+          !participant.agentId ||
+          target.assigneeAgentId !== participant.agentId ||
+          target.assigneeUserId ||
+          !wake ||
+          readNonEmptyString(wakePayload.issueId) !== target.id ||
+          wake.agentId !== participant.agentId ||
+          !currentHolder.finishedAt ||
+          new Date(wake.requestedAt).getTime() < new Date(currentHolder.createdAt).getTime() ||
+          new Date(wake.requestedAt).getTime() > new Date(currentHolder.finishedAt).getTime() ||
+          readNonEmptyString(wakeContext.wakeReason) !== "execution_review_requested" ||
+          readNonEmptyString(wakeStage.stageId) !== expected.expectedStageId ||
+          readNonEmptyString(wakeStage.stageType) !== "review" ||
+          readNonEmptyString(wakeParticipant.agentId) !== participant.agentId
+        ) {
+          throw conflict("Deferred reviewer wake no longer matches the expected review stage");
+        }
+
+        // A second request can arrive after the first committed and the reviewer
+        // run has already started. Return the original linkage, never enqueue again.
+        if (wake.runId) {
+          if (wake.reason !== "issue_execution_promoted") {
+            throw conflict("Wake was not promoted from deferred issue execution");
+          }
+          const linkedRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.id, wake.runId), eq(heartbeatRuns.companyId, target.companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (!linkedRun || linkedRun.wakeupRequestId !== wake.id ||
+              readNonEmptyString(parseObject(linkedRun.contextSnapshot).issueId) !== target.id) {
+            throw conflict("Wake has an inconsistent run linkage");
+          }
+          return { kind: "already_promoted" as const, run: linkedRun };
+        }
+        if (wake.status !== "deferred_issue_execution" || target.executionRunId || target.checkoutRunId) {
+          throw conflict("Wake is not parked on an unlocked issue");
+        }
+        const reviewer = await tx
+          .select()
+          .from(agents)
+          .where(and(eq(agents.id, wake.agentId), eq(agents.companyId, target.companyId)))
+          .then((rows) => rows[0] ?? null);
+        const companyAgents = await tx
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            reportsTo: agents.reportsTo,
+            status: agents.status,
+          })
+          .from(agents)
+          .where(eq(agents.companyId, target.companyId));
+        if (!reviewer || !evaluateAgentInvokability(reviewer, companyAgents).invokable) {
+          throw conflict("Current reviewer is not invokable");
+        }
+        const budgetBlock = await budgets.getInvocationBlock(target.companyId, reviewer.id, {
+          issueId: target.id,
+          projectId: target.projectId,
+        });
+        if (budgetBlock) throw conflict("Reviewer invocation is paused by a budget gate");
+        if (await treeControlSvc.getActivePauseHoldGate(target.companyId, target.id)) {
+          throw conflict("Issue is held by an active subtree pause hold");
+        }
+      }
 
       // Clear orphaned execution-lock columns that still point at this finalizing
       // run, across every sibling issue in one statement so it scales with N
@@ -16476,31 +16602,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // run to the retry run while leaving `checkoutRunId` pinned at this run.
       // Only the checkout column should be released in that case; the execution
       // column now belongs to the retry.
-      const promotionUpdateTimestamp = new Date();
-      await tx
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)),
-        );
-      // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
-      // extended to all siblings: covers paths where the issue's assignee or
-      // status changed between checkout and termination, which
-      // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
-      await tx
-        .update(issues)
-        .set({
-          checkoutRunId: null,
-          updatedAt: promotionUpdateTimestamp,
-        })
-        .where(
-          and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
-        );
+      if (!options.reconcile) {
+        const promotionUpdateTimestamp = new Date();
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)),
+          );
+        // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
+        // extended to all siblings: covers paths where the issue's assignee or
+        // status changed between checkout and termination, which
+        // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
+        await tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            updatedAt: promotionUpdateTimestamp,
+          })
+          .where(
+            and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
+          );
+      }
 
       // Deferred-wake promotion is bound to a single primary issue: the run's context
       // issue when present, otherwise the first candidate we found (preserves the
@@ -16512,6 +16640,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
+
+      const competingIssueRun = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          ne(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (competingIssueRun) {
+        if (options.reconcile) throw conflict("Another active run already owns this issue");
+        return { kind: "released" as const };
+      }
 
       // Workspace-validation recovery: if the finalizing run failed workspace
       // validation, surface the primary issue for the blocked-recovery comment path.
@@ -16547,6 +16691,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              options.reconcile ? eq(agentWakeupRequests.id, options.reconcile.wakeId) : undefined,
             ),
           )
           .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -16579,6 +16724,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : evaluateAgentInvokability(null, companyAgents);
 
         if (!deferredAgent || deferredAgent.companyId !== issue.companyId || !deferredInvokability.invokable) {
+          if (options.reconcile) throw conflict("Current reviewer is not invokable");
           await tx
             .update(agentWakeupRequests)
             .set({
@@ -16593,6 +16739,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const deferredPayload = parseObject(deferred.payload);
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+        if (readNonEmptyString(deferredContextSeed.wakeReason) === "execution_review_requested") {
+          const reviewState = parseIssueExecutionState(issue.executionState);
+          const deferredStage = parseObject(deferredContextSeed.executionStage);
+          const currentReviewer = reviewState?.currentParticipant;
+          if (
+            issue.status !== "in_review" ||
+            reviewState?.status !== "pending" ||
+            reviewState.currentStageType !== "review" ||
+            readNonEmptyString(deferredStage.stageId) !== reviewState.currentStageId ||
+            currentReviewer?.type !== "agent" ||
+            currentReviewer.agentId !== deferred.agentId ||
+            issue.assigneeAgentId !== deferred.agentId
+          ) {
+            if (options.reconcile) throw conflict("Deferred reviewer wake no longer matches the current stage");
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "failed",
+                finishedAt: new Date(),
+                error: "Deferred reviewer wake no longer matches the current review stage",
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, deferred.id));
+            continue;
+          }
+        }
         const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id);
         const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(tx, {
           companyId: issue.companyId,
@@ -16603,6 +16775,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: deferred.requestedByActorId,
         });
         if (activePauseHold && !treeHoldInteractionWake) {
+          if (options.reconcile) throw conflict("Issue is held by an active subtree pause hold");
           await tx
             .update(agentWakeupRequests)
             .set({
@@ -17111,6 +17284,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     });
 
+    if (promotionResult?.kind === "already_promoted") {
+      return {
+        outcome: "already_promoted" as const,
+        issueId: options.reconcile!.issueId,
+        wakeId: options.reconcile!.wakeId,
+        holderRunId: run.id,
+        stageId: options.reconcile!.expectedStageId,
+        runId: promotionResult.run.id,
+        runStatus: promotionResult.run.status,
+        newWakeRequests: 0 as const,
+      };
+    }
+
     if (promotionResult?.kind === "blocked") {
       await recovery.escalateStrandedAssignedIssue({
         issue: promotionResult.issue,
@@ -17140,7 +17326,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const promotedRun = promotionResult?.run ?? null;
-    if (!promotedRun) return;
+    if (!promotedRun) {
+      if (options.reconcile) throw conflict("Deferred reviewer wake was not promoted");
+      return;
+    }
 
     if (promotionResult?.kind === "promoted" && promotionResult.reopenedActivity) {
       await logActivity(db, promotionResult.reopenedActivity);
@@ -17158,7 +17347,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
-    await startNextQueuedRunForAgent(promotedRun.agentId);
+    if (options.deferDispatchUntilAgentLockReleased) {
+      // Stale queued cancellation may run inside this agent's start lock. A
+      // promoted wake for that same agent must wait until the caller releases
+      // the lock, or an awaited nested start would deadlock for 30 seconds.
+      const dispatch = startNextQueuedRunForAgent(promotedRun.agentId);
+      activeWakeupPromises.add(dispatch);
+      void dispatch.catch((error) => {
+        logger.error({ err: error, runId: promotedRun.id }, "promoted deferred wake dispatch failed");
+      }).finally(() => {
+        activeWakeupPromises.delete(dispatch);
+      });
+    } else {
+      await startNextQueuedRunForAgent(promotedRun.agentId);
+    }
+    if (options.reconcile) {
+      return {
+        outcome: "promoted" as const,
+        issueId: options.reconcile.issueId,
+        wakeId: options.reconcile.wakeId,
+        holderRunId: run.id,
+        stageId: options.reconcile.expectedStageId,
+        runId: promotedRun.id,
+        runStatus: "queued" as const,
+        newWakeRequests: 0 as const,
+      };
+    }
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
@@ -19091,6 +19305,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         enqueued: enqueued + issueMonitors.triggered,
         skipped: skipped + issueMonitors.skipped,
       };
+    },
+
+    reconcileDeferredReviewWake: async (input: DeferredReviewWakeReconcile) => {
+      const holder = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, input.expectedHolderRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!holder) throw conflict("Expected holder run was not found in this company");
+      const result = await releaseIssueExecutionAndPromote(holder, {
+        suppressImmediateRecovery: true,
+        reconcile: input,
+        deferDispatchUntilAgentLockReleased: true,
+      });
+      if (!result) throw conflict("Deferred reviewer wake was not promoted");
+      return result;
     },
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),

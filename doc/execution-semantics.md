@@ -144,6 +144,12 @@ The active-lock lifecycle is part of the checkout contract:
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
+### Deferred reviewer wake behind a stale queued holder
+
+When a queued issue run is cancelled by the staleness gate, its terminal transition releases the issue lock and promotes the oldest eligible `deferred_issue_execution` wake in one issue-row transaction. Promotion updates that wake row to `queued`, creates one run with `heartbeatRuns.wakeupRequestId` pointing to the existing wake ID, and stores the new run ID on the issue. A reviewer wake whose saved stage or participant no longer matches the pending review stage is failed instead of being dispatched with stale review context. This path does not change the execution policy, review decision, current stage, or return assignee, and it does not open an unrelated recovery wake.
+
+For a previously stranded reviewer wake, a board operator may call `POST /api/issues/:issueId/deferred-wakes/:wakeId/reconcile` with `expectedHolderRunId` and `expectedStageId` UUIDs. The endpoint requires the original wake to belong to the issue and current reviewer, to have been parked during the specified holder's lifetime, and to match the pending review stage. The holder must be terminal; both issue locks must be empty; the reviewer must be invokable and free of a budget pause; no other issue run or subtree pause hold may be active. Under the issue-row lock, a successful request promotes that same wake and returns `{ outcome: "promoted", issueId, wakeId, holderRunId, stageId, runId, runStatus: "queued", newWakeRequests: 0 }`. A repeat returns `outcome: "already_promoted"` and the original run ID. Changed preconditions return `409`; an agent caller receives `403`. The endpoint does not record a review decision or advance the stage.
+
 ### Pre-dispatch configuration validation
 
 Pre-dispatch configuration validation is a distinct gate that runs after ownership and checkout are resolved but before the control plane actually dispatches a run.

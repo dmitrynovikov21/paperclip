@@ -10121,6 +10121,45 @@ export function issueRoutes(
     res.json(result);
   });
 
+  router.post(
+    "/issues/:id/deferred-wakes/:wakeId/reconcile",
+    validate(z.object({
+      expectedHolderRunId: z.string().uuid(),
+      expectedStageId: z.string().uuid(),
+    }).strict()),
+    async (req, res) => {
+      assertBoard(req);
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      const wakeId = req.params.wakeId as string;
+      if (!isUuidLike(wakeId)) throw badRequest("wakeId must be a UUID");
+
+      const receipt = await heartbeat.reconcileDeferredReviewWake({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        wakeId,
+        expectedHolderRunId: req.body.expectedHolderRunId,
+        expectedStageId: req.body.expectedStageId,
+      });
+      if (receipt.outcome === "promoted") {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.deferred_review_wake_reconciled",
+          entityType: "issue",
+          entityId: issue.id,
+          details: receipt,
+        });
+      }
+      res.json(receipt);
+    },
+  );
+
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");

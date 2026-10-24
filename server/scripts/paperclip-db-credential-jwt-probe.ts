@@ -9,7 +9,6 @@ import {
 import { runChildProcess } from "../../packages/adapter-utils/src/server-utils.js";
 import {
   agents,
-  closeRegisteredClients,
   companies,
   createDb,
   heartbeatRuns,
@@ -194,5 +193,5 @@ try {
   }
   console.log("Run-scoped JWT issuance with file-backed DB source passed");
 } finally {
-  await closeRegisteredClients(dbUrl);
+  await db.$client.end();
 }

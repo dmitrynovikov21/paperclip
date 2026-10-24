@@ -144,7 +144,7 @@ async function createApp(actor: Record<string, unknown>) {
 }
 
 describe("issue feedback trace routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -177,6 +177,11 @@ describe("issue feedback trace routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("flushes a newly shared feedback trace immediately after saving the vote", async () => {

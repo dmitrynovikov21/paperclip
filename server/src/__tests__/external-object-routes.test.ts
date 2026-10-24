@@ -158,7 +158,7 @@ function peerActor(): Express.Request["actor"] {
 }
 
 describe("external object routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../services/index.js");
@@ -187,6 +187,11 @@ describe("external object routes", () => {
     mockInstanceSettingsService.getExperimental.mockResolvedValue({
       enableExternalObjects: true,
     });
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("enforces company access on read routes", async () => {

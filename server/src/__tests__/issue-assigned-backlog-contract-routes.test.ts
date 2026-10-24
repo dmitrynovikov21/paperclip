@@ -168,7 +168,7 @@ function expectClearAssignedStatusValidation(res: request.Response) {
 }
 
 describe("assigned backlog creation contract", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue({
       id: "parent-1",
@@ -196,6 +196,11 @@ describe("assigned backlog creation contract", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("does not silently create a top-level assigned issue as backlog when status is omitted", async () => {

@@ -106,7 +106,7 @@ async function createApp() {
 }
 
 describe("POST /companies/:companyId/invites", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/access.js");
@@ -115,6 +115,11 @@ describe("POST /companies/:companyId/invites", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     logActivityMock.mockReset();
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/access.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("returns an absolute invite URL using the request base URL", async () => {

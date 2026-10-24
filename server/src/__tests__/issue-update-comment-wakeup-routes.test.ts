@@ -219,7 +219,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 }
 
 describe("issue update comment wakeups", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -232,6 +232,11 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {

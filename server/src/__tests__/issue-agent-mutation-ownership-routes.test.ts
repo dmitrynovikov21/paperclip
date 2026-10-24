@@ -375,7 +375,7 @@ function boardActor() {
 }
 
 describe("agent issue mutation checkout ownership", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -699,6 +699,11 @@ describe("agent issue mutation checkout ownership", () => {
       contentLength: 6,
     });
     mockStorageService.deleteObject.mockResolvedValue(undefined);
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("denies company-wide issue list routes for task bridge keys", async () => {

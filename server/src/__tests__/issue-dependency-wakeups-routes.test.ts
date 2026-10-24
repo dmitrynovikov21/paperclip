@@ -141,7 +141,7 @@ async function createApp() {
 }
 
 describe("issue dependency wakeups in issue routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
@@ -168,6 +168,11 @@ describe("issue dependency wakeups in issue routes", () => {
     });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    // Load cold route modules under the setup timeout, before request assertions.
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {

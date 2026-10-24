@@ -279,6 +279,8 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -1501,6 +1503,10 @@ export async function ensureManagedProjectWorkspace(input: {
   /** Optional git credential source for cloning private repos; null/absent preserves ambient behavior. */
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<{ cwd: string; warning: string | null }> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+      input.repoUrl && !isRemoteGitRepositoryUrl(input.repoUrl)) {
+    throw new Error("Isolated local secrets forbid host-local Git clone sources.");
+  }
   const cwd = resolveManagedProjectWorkspaceDir({
     companyId: input.companyId,
     projectId: input.projectId,
@@ -1557,10 +1563,12 @@ async function materializeManagedProjectWorkspace(
   // materialization (another process, or a run racing this one) can neither adopt a broken
   // checkout nor lose its own completed one.
   const auth = input.resolveGitAuth ? await input.resolveGitAuth(input.repoUrl) : null;
-  const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
+  let cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
-    await execFile("git", [...(auth?.configArgs ?? []), "clone", input.repoUrl, cloneTmpDir], {
-      env: {
+    cloneTmpDir = await assertHostGitWorkspaceAllowed(cloneTmpDir);
+    const git = prepareHostGitInvocation(
+      [...(auth?.configArgs ?? []), "clone", "--", input.repoUrl, cloneTmpDir],
+      {
         // Spread order matters: the sanitizer strips PAPERCLIP_*, which would remove the
         // credential-helper token env if it came first. GIT_TERMINAL_PROMPT=0 fails a
         // credential-less private clone immediately instead of hanging on a prompt until
@@ -1569,6 +1577,9 @@ async function materializeManagedProjectWorkspace(
         GIT_TERMINAL_PROMPT: "0",
         ...(auth?.env ?? {}),
       },
+    );
+    await execFile("git", git.args, {
+      env: git.env,
       timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
     });
   } catch (error) {
@@ -1827,7 +1838,9 @@ async function hasGitMetadata(cwd: string | null | undefined) {
 async function isGitCheckout(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  return execFile("git", ["rev-parse", "--show-toplevel"], { cwd: normalized })
+  const guardedCwd = await assertHostGitWorkspaceAllowed(normalized);
+  const git = prepareHostGitInvocation(["rev-parse", "--show-toplevel"]);
+  return execFile("git", git.args, { cwd: guardedCwd, env: git.env })
     .then((result) => Boolean(readNonEmptyString(result.stdout)))
     .catch(() => false);
 }
@@ -1842,7 +1855,9 @@ function sameResolvedPath(left: string | null | undefined, right: string | null 
 async function hasGitPushRemote(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
-  const remoteNames = await execFile("git", ["remote"], { cwd: normalized })
+  const guardedCwd = await assertHostGitWorkspaceAllowed(normalized);
+  const remoteGit = prepareHostGitInvocation(["remote"]);
+  const remoteNames = await execFile("git", remoteGit.args, { cwd: guardedCwd, env: remoteGit.env })
     .then((result) =>
       result.stdout
         .split(/\r?\n/)
@@ -1852,7 +1867,8 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     .catch(() => []);
 
   for (const remoteName of remoteNames) {
-    const pushUrl = await execFile("git", ["remote", "get-url", "--push", remoteName], { cwd: normalized })
+    const git = prepareHostGitInvocation(["remote", "get-url", "--push", remoteName]);
+    const pushUrl = await execFile("git", git.args, { cwd: guardedCwd, env: git.env })
       .then((result) => readNonEmptyString(result.stdout))
       .catch(() => null);
     if (pushUrl) return true;
@@ -13973,7 +13989,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
       requestedExecutionWorkspaceMode;
-    const executionPolicy = { executionMode: resolvedInstanceSettings.general.executionMode };
+    const executionPolicy = {
+      executionMode: resolvedInstanceSettings.general.executionMode,
+      requireIsolatedAgentRuntime:
+        process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true",
+    };
     const executionForcedToKubernetes = isExecutionForcedToKubernetes(executionPolicy);
     let selectedEnvironmentId = environmentResolution.environmentId;
     if (executionForcedToKubernetes) {
@@ -14045,6 +14065,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : selectedEnvironmentId
         ? await environmentsSvc.getById(selectedEnvironmentId)
         : null;
+    if (executionPolicy.requireIsolatedAgentRuntime) {
+      const decision = evaluateExecutionAllowlist(executionPolicy, {
+        driver: selectedEnvironmentForConfig?.driver ?? "local",
+        provider: typeof selectedEnvironmentForConfig?.config?.provider === "string"
+          ? selectedEnvironmentForConfig.config.provider
+          : null,
+      });
+      if (!decision.allowed) throw new Error(decision.reason);
+    }
     const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -14777,6 +14806,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     persistedExecutionWorkspace = realizationResult.persistedExecutionWorkspace;
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
+    if (executionPolicy.requireIsolatedAgentRuntime &&
+        (executionTarget?.kind !== "remote" || executionTarget.transport !== "sandbox")) {
+      throw new Error("Isolated local secrets require a remote sandbox execution target.");
+    }
     const remoteExecution = realizationResult.remoteExecution;
     if (!executionTarget || executionTarget.kind === "local") {
       try {

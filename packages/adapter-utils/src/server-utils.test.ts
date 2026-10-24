@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildPersistentSkillSnapshot,
   buildRuntimeMountedSkillSnapshot,
   buildInvocationEnvForLogs,
+  buildPaperclipRuntimeSkillsAssetDir,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
   normalizePaperclipWakePayload,
@@ -229,6 +230,115 @@ describe("sanitizeInheritedPaperclipEnv", () => {
 });
 
 describe("materializePaperclipSkillCopy", () => {
+  it("rejects a nested directory swapped for a synthetic key link after validation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-directory-race-"));
+    const source = path.join(root, "skill");
+    const nested = path.join(source, "nested");
+    const secretDirectory = path.join(root, "protected");
+    const target = path.join(root, "staged");
+    const syntheticKey = "synthetic-master-key-race-test\n";
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(secretDirectory);
+    await fs.writeFile(path.join(nested, "SKILL.md"), "# safe skill\n");
+    await fs.writeFile(path.join(secretDirectory, "master.key"), syntheticKey);
+
+    const originalLstat = fs.lstat.bind(fs);
+    let nestedChecks = 0;
+    let swapped = false;
+    const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (candidate) => {
+      const stat = await originalLstat(candidate);
+      if (path.basename(String(candidate)) === "nested" && ++nestedChecks === 2) {
+        await fs.rename(nested, path.join(root, "held-nested"));
+        await fs.symlink(secretDirectory, nested);
+        swapped = true;
+      }
+      return stat;
+    });
+    try {
+      await expect(materializePaperclipSkillCopy(source, target, { rejectSymlinks: true }))
+        .rejects.toThrow();
+      expect(swapped).toBe(true);
+      await expect(fs.lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await fs.readdir(root)).some((entry) => entry.startsWith("staged.tmp-"))).toBe(false);
+      await expect(fs.readFile(path.join(secretDirectory, "master.key"), "utf8"))
+        .resolves.toBe(syntheticKey);
+    } finally {
+      lstatSpy.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a nested link to a synthetic key before building a sandbox skills asset", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-asset-test-"));
+    try {
+      const source = path.join(root, "skill");
+      const key = path.join(root, "synthetic-master.key");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# safe skill\n");
+      await fs.writeFile(key, "synthetic-key-bytes\n");
+      await fs.symlink(key, path.join(source, "leak"));
+
+      await expect(buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-skill-asset-reject-",
+      )).rejects.toThrow(/symbolic link/);
+      await expect(fs.readFile(key, "utf8")).resolves.toBe("synthetic-key-bytes\n");
+
+      await fs.rm(path.join(source, "leak"));
+      const staged = await buildPaperclipRuntimeSkillsAssetDir(
+        [{ key: "company/skill", runtimeName: "skill", source }],
+        "paperclip-skill-asset-allow-",
+      );
+      try {
+        await expect(fs.readFile(path.join(staged, "skill", "SKILL.md"), "utf8"))
+          .resolves.toBe("# safe skill\n");
+        expect((await fs.lstat(path.join(staged, "skill"))).isDirectory()).toBe(true);
+      } finally {
+        await fs.rm(path.dirname(staged), { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a skill source reached through a symlinked parent", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-parent-link-"));
+    try {
+      const source = path.join(root, "real", "skill");
+      await fs.mkdir(source, { recursive: true });
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      await fs.symlink(path.join(root, "real"), path.join(root, "linked"));
+
+      await expect(materializePaperclipSkillCopy(
+        path.join(root, "linked", "skill"),
+        path.join(root, "staged"),
+        { rejectSymlinks: true },
+      )).rejects.toThrow(/symbolic-link ancestor/);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuilds a cached strict skill copy if a symlink appears in the target", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-target-link-"));
+    try {
+      const source = path.join(root, "source");
+      const target = path.join(root, "target");
+      const key = path.join(root, "synthetic-master.key");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      await fs.writeFile(key, "synthetic-key-bytes\n");
+      await materializePaperclipSkillCopy(source, target, { rejectSymlinks: true });
+      await fs.symlink(key, path.join(target, "leak"));
+
+      await materializePaperclipSkillCopy(source, target, { rejectSymlinks: true });
+      await expect(fs.lstat(path.join(target, "leak"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.readFile(path.join(target, "SKILL.md"), "utf8")).resolves.toBe("# skill\n");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to materialize into an ancestor of the source", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-copy-"));
     try {

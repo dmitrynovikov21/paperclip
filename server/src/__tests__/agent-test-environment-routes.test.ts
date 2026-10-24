@@ -101,7 +101,7 @@ const externalAdapter: ServerAdapterModule = {
   testEnvironment: testEnvironmentSpy,
 };
 
-async function createApp() {
+async function createApp(asAgent = false) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -109,13 +109,15 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = asAgent
+      ? { type: "agent", agentId: "agent-1", companyId: "company-1" }
+      : {
+          type: "board",
+          userId: "local-board",
+          companyIds: ["company-1"],
+          source: "local_implicit",
+          isInstanceAdmin: false,
+        };
     next();
   });
   app.use("/api", agentRoutes({} as any));
@@ -187,6 +189,61 @@ describe("agent test-environment route", () => {
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
+  });
+
+  it("denies host, local, SSH, and unresolved probes in isolated mode before invoking an adapter", async () => {
+    const scratch = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-isolated-probe-"));
+    const marker = path.join(scratch, "probe-ran");
+    const fixture = path.join(scratch, "codex");
+    const previousIsolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+    try {
+      await writeFile(fixture, `#!/bin/sh\nprintf launched > "${marker}"\n`, { mode: 0o700 });
+      process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = "true";
+      mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+      testEnvironmentSpy.mockImplementation(async () => {
+        await writeFile(marker, "launched");
+        return { adapterType: "external_test", status: "pass", checks: [], testedAt: new Date(0).toISOString() };
+      });
+      const app = await createApp(true);
+      const url = "/api/companies/company-1/adapters/external_test/test-environment";
+      const payload = { adapterConfig: { command: fixture } };
+
+      const host = await request(app).post(url).send(payload);
+      expect(host.status, host.text).toBe(403);
+
+      mockEnvironmentService.getById.mockResolvedValueOnce({
+        id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", name: "Local", driver: "local", config: {},
+      });
+      const local = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(local.status, local.text).toBe(403);
+
+      mockEnvironmentService.getById.mockResolvedValueOnce({
+        id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", name: "SSH", driver: "ssh", config: {},
+      });
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({ kind: "remote", transport: "ssh" });
+      const ssh = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(ssh.status, ssh.text).toBe(403);
+
+      const unresolved = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(unresolved.status, unresolved.text).toBe(403);
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(mockReleaseRunLease).toHaveBeenCalledWith(expect.objectContaining({ status: "failed" }));
+
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+        kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace", providerKey: "fake-plugin",
+        runner: { execute: vi.fn() },
+      });
+      const sandbox = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(sandbox.status, sandbox.text).toBe(200);
+      expect(testEnvironmentSpy).toHaveBeenCalledTimes(1);
+      expect(await readFile(marker, "utf8")).toBe("launched");
+      expect(mockReleaseRunLease).toHaveBeenCalledWith(expect.objectContaining({ status: "released" }));
+    } finally {
+      if (previousIsolated === undefined) delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      else process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = previousIsolated;
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 
   it(CODEX_AUTH_RACE_TEST, async () => {

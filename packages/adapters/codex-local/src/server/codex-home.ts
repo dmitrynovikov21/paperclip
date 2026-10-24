@@ -127,6 +127,20 @@ export function resolveManagedCodexHomeDir(
     : path.resolve(instanceRoot, "codex-home");
 }
 
+/** Service-selected home for an agent when the local secrets key is isolated. */
+export function resolveIsolatedCodexAgentHomeDir(
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+  agentId: string,
+): string {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
+    instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
+    env,
+  });
+  return path.resolve(instanceRoot, "companies", companyId, "agents", agentId, "codex-home");
+}
+
 /**
  * True when `homePath` lives under the Paperclip-managed company tree
  * (`<instanceRoot>/companies/<companyId>/...`). This covers both the shared
@@ -357,19 +371,75 @@ export interface StageCodexHomeForSyncOptions {
   authSourcePaths?: readonly string[];
   /** Selected, server-resolved skill sources. Unlisted home entries are never staged. */
   skillSources?: readonly { name: string; source: string }[];
+  /** All server-selected runtime names and roots, including unselected skills. */
+  trustedSkillSources?: readonly { name: string; source: string }[];
+}
+
+function isPathInside(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function assertSkillName(name: string): void {
+  if (!name || name === "." || name === ".." || name.includes("/") ||
+      name.includes("\\") || name.includes("\0") || path.basename(name) !== name) {
+    throw new Error("Invalid selected Codex skill name");
+  }
+}
+
+/** Reject dangerous home entries before provider config or skill injection reads the home. */
+export async function assertIsolatedCodexHomeEntries(home: string): Promise<void> {
+  const sourceHome = await openDirectoryNoFollow(home).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!sourceHome) return;
+  try {
+    for (const entry of CODEX_SYNC_ALLOWLIST) {
+      const stat = await lstatChild(sourceHome, entry);
+      if (!stat) continue;
+      if (entry === "auth.json" && stat.isSymbolicLink()) {
+        const linked = await readChildLink(sourceHome, entry);
+        const expected = path.join(resolveSharedCodexHomeDir(process.env), "auth.json");
+        if (!linked || path.resolve(home, linked) !== path.resolve(expected)) {
+          throw new Error("Isolated Codex home contains an untrusted symlink.");
+        }
+        const source = await openPathNoFollow(expected);
+        if (!source) throw new Error("Isolated Codex auth source must be a regular file.");
+        try {
+          if (!(await source.stat()).isFile()) throw new Error("Isolated Codex auth source must be a regular file.");
+        } finally {
+          await source.close();
+        }
+        continue;
+      }
+      if (stat.isSymbolicLink()) throw new Error("Isolated Codex home contains an untrusted symlink.");
+      if (entry === "skills" ? !stat.isDirectory() : !stat.isFile()) {
+        throw new Error("Isolated Codex home contains an invalid entry type.");
+      }
+    }
+  } finally {
+    await sourceHome.close();
+  }
 }
 
 /** Copy bytes from an already-open inode. An agent replacing its path cannot
  * redirect the service read after this point. */
-async function stagePinnedEntry(source: SafeHandle, target: string, preserveExecutable = false): Promise<void> {
+async function stagePinnedEntry(source: SafeHandle, target: string, preserveExecutable = false, isolated = false): Promise<void> {
   const stat = await source.stat();
   if (stat.isDirectory()) {
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
     for (const name of await listPinnedDirectory(source)) {
+      if (isolated && (await lstatChild(source, name))?.isSymbolicLink()) {
+        throw new Error("Isolated Codex skill source contains a symlink.");
+      }
       const child = await openChildNoFollow(source, name);
-      if (!child) continue; // Never follow nested links, including directory aliases.
+      if (!child) {
+        if (isolated) throw new Error("Isolated Codex skill source changed during staging.");
+        continue; // Never follow nested links, including directory aliases.
+      }
       try {
-        await stagePinnedEntry(child, path.join(target, name), preserveExecutable);
+        await stagePinnedEntry(child, path.join(target, name), preserveExecutable, isolated);
       } finally {
         await child.close();
       }
@@ -378,8 +448,10 @@ async function stagePinnedEntry(source: SafeHandle, target: string, preserveExec
     const mode = preserveExecutable && (stat.mode & 0o111) !== 0 ? 0o700 : 0o600;
     await fs.writeFile(target, await source.readFile(), { mode });
     await fs.chmod(target, mode);
+  } else if (isolated) {
+    throw new Error("Isolated Codex skill source contains an invalid entry type.");
   }
-  // Sockets, devices and nonblocking FIFOs are not staging inputs.
+  // In normal mode sockets, devices and nonblocking FIFOs are not staging inputs.
 }
 
 async function readBoundAuthSource(sources: readonly string[], index = 0): Promise<Buffer | null> {
@@ -424,7 +496,14 @@ async function stageCodexHomeEntry(
   options: StageCodexHomeForSyncOptions,
 ): Promise<void> {
   const stat = await lstatChild(sourceHome, entry);
-  if (!stat) return;
+  if (!stat) {
+    if (entry === "skills" &&
+        process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+        (options.skillSources?.length ?? 0) > 0) {
+      throw new Error("Selected Codex skills directory is missing in isolated mode.");
+    }
+    return;
+  }
   const target = path.join(stagedHome, entry);
 
   if (entry === "skills") {
@@ -434,22 +513,48 @@ async function stageCodexHomeEntry(
     try {
       if (!(await skills.stat()).isDirectory()) throw new Error("Codex skills entry changed type");
       await fs.mkdir(target, { recursive: true, mode: 0o700 });
+      const isolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
+      const trusted = new Map<string, string>();
+      for (const skill of options.trustedSkillSources ?? []) {
+        assertSkillName(skill.name);
+        if (trusted.has(skill.name)) throw new Error("Duplicate trusted Codex skill name");
+        trusted.set(skill.name, path.resolve(skill.source));
+      }
+      if (isolated) {
+        // Validate every existing external link, including skills not selected for this run.
+        // The link is never followed for staging; selected roots are opened by descriptor.
+        for (const name of await listPinnedDirectory(skills)) {
+          const stat = await lstatChild(skills, name);
+          if (!stat?.isSymbolicLink()) continue;
+          const linked = await readChildLink(skills, name);
+          if (!linked || path.resolve(sourceHomePath, "skills", linked) !== trusted.get(name)) {
+            throw new Error("Isolated Codex home contains an untrusted skill source.");
+          }
+        }
+      }
       if (options.skillSources) {
         const seen = new Set<string>();
         for (const skill of options.skillSources) {
-          if (skill.name === "." || skill.name === ".." || path.basename(skill.name) !== skill.name || seen.has(skill.name)) {
+          assertSkillName(skill.name);
+          if (seen.has(skill.name)) {
             throw new Error("Invalid selected Codex skill name");
           }
           seen.add(skill.name);
+          if (isolated && trusted.get(skill.name) !== path.resolve(skill.source)) {
+            throw new Error("Selected Codex skill source is not trusted.");
+          }
           const source = await openPathNoFollow(skill.source);
           if (!source) throw new Error("Selected Codex skill source is missing or linked");
           try {
-            await stagePinnedEntry(source, path.join(target, skill.name), true);
+            await stagePinnedEntry(source, path.join(target, skill.name), true, isolated);
           } finally {
             await source.close();
           }
         }
       } else {
+        if (isolated) {
+          throw new Error("Isolated Codex staging requires an explicit selected skill subset.");
+        }
         // Standalone staging callers can carry regular files/dirs; links are
         // always skipped. Production callers provide the exact selected set.
         for (const name of await listPinnedDirectory(skills)) {
@@ -516,6 +621,26 @@ export async function stageCodexHomeForSync(
   effectiveCodexHome: string,
   options: StageCodexHomeForSyncOptions = {},
 ): Promise<string> {
+  const isolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true";
+  if (isolated) {
+    await assertIsolatedCodexHomeEntries(effectiveCodexHome);
+  }
+  const trustedSkillRoots = (options.trustedSkillSources ?? []).map((entry) => path.resolve(entry.source));
+  if (isolated) {
+    for (const [envName, label] of [
+      ["PAPERCLIP_SECRETS_MASTER_KEY_FILE", "local secrets key"],
+      ["PAPERCLIP_DATABASE_URL_FILE", "database credential"],
+    ] as const) {
+      const secretPath = nonEmpty(process.env[envName]);
+      if (!secretPath) continue;
+      const candidates = [path.resolve(secretPath)];
+      const resolved = await fs.realpath(secretPath).catch(() => null);
+      if (resolved) candidates.push(resolved);
+      if (trustedSkillRoots.some((root) => candidates.some((candidate) => isPathInside(candidate, root)))) {
+        throw new Error(`Isolated Codex skill source overlaps the ${label}.`);
+      }
+    }
+  }
   const runIdPart = nonEmpty(options.runId ?? undefined);
   const stagedHome = await fs.mkdtemp(
     path.join(os.tmpdir(), `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`),

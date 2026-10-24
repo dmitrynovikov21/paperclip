@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /**
  * Bundled plugin auto-provisioning.
@@ -112,6 +113,87 @@ export function resolveBundledCatalogRoot(
   return override ? override : DEFAULT_BUNDLED_CATALOG_ROOT;
 }
 
+/**
+ * A path in the release catalog is not proof that its code is release-owned.
+ * Check the entire bundle, including symlink targets used by node_modules,
+ * before a manifest can be imported or a worker can run as the service UID.
+ * Requiring service/root ownership and no group/other write also covers POSIX
+ * ACL write grants (their effective mask is reflected in the group mode bits).
+ */
+function isReleaseOwnedBundleTree(bundlePath: string): boolean {
+  const serviceUid = process.getuid?.();
+  if (process.platform !== "linux" || serviceUid === undefined || serviceUid === 0) return false;
+
+  const checkedPaths = new Set<string>();
+  const visitedDirectories = new Set<string>();
+  const pending = [bundlePath];
+  while (pending.length > 0) {
+    // Follow aliases once, then use only the canonical path. A safe parent
+    // prevents an agent from replacing a symlink after this check.
+    const actual = fs.realpathSync(pending.pop()!);
+    for (let current = actual; !checkedPaths.has(current); current = path.dirname(current)) {
+      const entry = fs.lstatSync(current);
+      if ((entry.uid !== serviceUid && entry.uid !== 0) || (entry.mode & 0o022) !== 0) return false;
+      checkedPaths.add(current);
+      if (current === path.dirname(current)) break;
+    }
+
+    const entry = fs.lstatSync(actual);
+    if (entry.isFile()) continue;
+    if (!entry.isDirectory()) return false;
+    if (visitedDirectories.has(actual)) continue;
+    visitedDirectories.add(actual);
+    for (const name of fs.readdirSync(actual)) pending.push(path.join(actual, name));
+  }
+  return true;
+}
+
+/** Return the canonical path and identity of a release-owned built-in bundle. */
+export function trustedBundledPluginPath(
+  packagePath: string,
+  env: Record<string, string | undefined> = process.env,
+): { packagePath: string; pluginKey: string } | null {
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../../packages/plugins",
+  );
+  try {
+    const actual = fs.realpathSync(packagePath);
+    for (const entry of BUNDLED_PLUGIN_CATALOG) {
+      for (const root of [repoRoot, resolveBundledCatalogRoot(env)]) {
+        try {
+          if (actual === fs.realpathSync(path.join(root, entry.relativePath)) &&
+              isReleaseOwnedBundleTree(actual)) {
+            return { packagePath: actual, pluginKey: entry.pluginKey };
+          }
+        } catch { /* This bundle is absent in the current deployment. */ }
+      }
+    }
+  } catch {
+    // A removed path must never fall back to npm.
+  }
+  return null;
+}
+
+/** Return the canonical Kubernetes bundle path, never a caller's alias. */
+export function trustedBundledKubernetesProviderPath(
+  packagePath: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const trusted = trustedBundledPluginPath(packagePath, env);
+  return trusted?.pluginKey === "paperclip.kubernetes-sandbox-provider" ? trusted.packagePath : null;
+}
+
+/** Registry metadata is not proof that an npm artifact is the bundled provider. */
+export function isTrustedBundledKubernetesProvider(
+  plugin: { pluginKey: string; packageName: string; packagePath: string | null },
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return plugin.pluginKey === "paperclip.kubernetes-sandbox-provider" &&
+    plugin.packageName === "@paperclipai/plugin-kubernetes" &&
+    !!plugin.packagePath && !!trustedBundledKubernetesProviderPath(plugin.packagePath, env);
+}
+
 export interface ResolvedBundledPlugin {
   key: string;
   pluginKey: string;
@@ -173,9 +255,19 @@ export function resolveBundledPluginInstalls(
     const override = entry.pathOverrideEnvVar
       ? opts.env[entry.pathOverrideEnvVar]?.trim()
       : undefined;
-    const localPath = override
+    let localPath = override
       ? path.resolve(override)
       : path.resolve(opts.catalogRoot, entry.relativePath);
+    if (entry.key === "kubernetes" && opts.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+      const trustedPath = trustedBundledKubernetesProviderPath(localPath, {
+        ...opts.env,
+        [BUNDLED_CATALOG_ROOT_ENV_VAR]: opts.catalogRoot,
+      });
+      if (!trustedPath) {
+        throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider; refusing to start");
+      }
+      localPath = trustedPath;
+    }
     if (opts.enforceCatalogRoot && !isInsideRoot(canonicalize(localPath), canonicalRoot)) {
       throw new Error(
         `bundled plugin "${key}" resolves to "${localPath}", outside the bundled catalog root "${opts.catalogRoot}"; refusing to start`,

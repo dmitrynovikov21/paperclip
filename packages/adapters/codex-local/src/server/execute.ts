@@ -65,11 +65,13 @@ import {
   isCodexUnknownSessionError,
 } from "./parse.js";
 import {
+  assertIsolatedCodexHomeEntries,
   codexHomeHasUsableAuth,
   evaluateCodexCredentialReadiness,
   isManagedCodexHomePath,
   pathExists,
   prepareManagedCodexHome,
+  resolveIsolatedCodexAgentHomeDir,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
@@ -539,6 +541,30 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    const { id: agentId, companyId } = ctx.agent;
+    if (!agentId || !companyId) {
+      throw new Error("Isolated Codex execution requires an agent identity.");
+    }
+    const expectedHome = resolveIsolatedCodexAgentHomeDir(process.env, companyId, agentId);
+    const env = parseObject(ctx.config.env);
+    const requestedHome = env.CODEX_HOME;
+    if (
+      requestedHome !== undefined &&
+      (typeof requestedHome !== "string" || path.resolve(requestedHome.trim()) !== expectedHome)
+    ) {
+      throw new Error("Isolated Codex execution refuses an untrusted CODEX_HOME.");
+    }
+    await assertIsolatedCodexHomeEntries(expectedHome);
+    // Both the CLI and ACP paths need the same operator-managed credential
+    // source. ACP treats an explicit CODEX_HOME as already prepared, so seed it
+    // here before either engine can read or upload home assets.
+    await seedManagedCodexHome(expectedHome, process.env, ctx.onLog, {
+      apiKey: typeof env.OPENAI_API_KEY === "string" ? env.OPENAI_API_KEY : null,
+    });
+    await assertIsolatedCodexHomeEntries(expectedHome);
+    ctx = { ...ctx, config: { ...ctx.config, env: { ...env, CODEX_HOME: expectedHome } } };
+  }
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.engine === "acp") {
     try {
@@ -760,12 +786,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // drops the large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
           const selectedSkills = new Set(desiredSkillNames);
+          const trustedSkills = codexSkillEntries.map((entry) => ({
+            name: entry.runtimeName,
+            source: entry.source,
+          }));
           stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
             runId,
             authSourcePaths: [path.join(resolveSharedCodexHomeDir(process.env), "auth.json")],
             skillSources: codexSkillEntries
               .filter((entry) => selectedSkills.has(entry.key))
               .map((entry) => ({ name: entry.runtimeName, source: entry.source })),
+            trustedSkillSources: trustedSkills,
           });
           return await prepareAdapterExecutionTargetRuntime({
             runId,

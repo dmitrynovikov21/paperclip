@@ -27,6 +27,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { assertIsolatedWorkspaceSyncAllowed } from "./isolated-workspace-guard.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 
 const execFile = promisify(execFileCallback);
@@ -519,34 +520,108 @@ async function walkDirectory(root: string, relative = ""): Promise<string[]> {
   return out.sort((left, right) => right.length - left.length);
 }
 
-async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relative: string): Promise<void> {
-  const sourcePath = path.join(sourceRoot, relative);
+async function copyWorkspaceEntry(
+  sourceRoot: string,
+  targetRoot: string,
+  relative: string,
+  options: { allowMissing?: boolean; rejectSymlinks?: boolean } = {},
+): Promise<void> {
+  // The isolated runtime itself requires Linux. Keep ordinary restore mirroring
+  // available on other hosts, but fail closed for a Git overlay that needs the
+  // descriptor-relative guarantee.
+  if (process.platform !== "linux") {
+    if (options.rejectSymlinks) {
+      throw new Error("Git workspace overlay copy requires Linux descriptor-relative paths.");
+    }
+    const sourcePath = path.join(sourceRoot, relative);
+    const targetPath = path.join(targetRoot, relative);
+    const stats = await fs.lstat(sourcePath);
+    if (stats.isDirectory()) {
+      await fs.mkdir(targetPath, { recursive: true });
+      return;
+    }
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.rm(targetPath, { recursive: true, force: true });
+    if (stats.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(sourcePath), targetPath);
+      return;
+    }
+    const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
+    try {
+      await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+        await fs.copyFile(sourcePath, stagedTargetPath);
+      });
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    } finally {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
+    return;
+  }
+  // The Git snapshot only supplies names. Agent-writable directories can change
+  // after that snapshot, so resolve every component relative to an already-open
+  // directory, refusing symlinks along the way. Opening the final file before
+  // copying also prevents a replacement between lstat and copyFile.
+  const parts = relative.split("/");
+  if (parts.length === 0 || parts.some((part) => !part || part === "." || part === ".." || part.includes("\0"))) {
+    throw new Error(`Unsafe workspace entry path: ${relative}`);
+  }
   const targetPath = path.join(targetRoot, relative);
-  const stats = await fs.lstat(sourcePath);
-
-  if (stats.isDirectory()) {
-    await fs.mkdir(targetPath, { recursive: true });
-    return;
-  }
-
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
-  if (stats.isSymbolicLink()) {
-    const linkTarget = await fs.readlink(sourcePath);
-    await fs.symlink(linkTarget, targetPath);
-    return;
-  }
-
-  const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
-  await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  const directoryFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+  const entryFlags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+  const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+  let sourceResolved = false;
   try {
-    await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
-      await fs.copyFile(sourcePath, stagedTargetPath);
-    });
-    await fs.chmod(stagedTargetPath, stats.mode);
-    await fs.rename(stagedTargetPath, targetPath);
+    let directory = await fs.open(sourceRoot, directoryFlags);
+    handles.push(directory);
+    for (const part of parts.slice(0, -1)) {
+      directory = await fs.open(`/proc/self/fd/${directory.fd}/${part}`, directoryFlags);
+      handles.push(directory);
+    }
+    const sourcePath = `/proc/self/fd/${directory.fd}/${parts.at(-1)!}`;
+    let source: Awaited<ReturnType<typeof fs.open>>;
+    try {
+      source = await fs.open(sourcePath, entryFlags);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && options.allowMissing) return;
+      if ((error as NodeJS.ErrnoException).code !== "ELOOP" || options.rejectSymlinks) throw error;
+      // readlink never follows the link. A replacement can only change the link
+      // text copied to the destination; it cannot expose source file bytes.
+      const linkTarget = await fs.readlink(sourcePath);
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.rm(targetPath, { recursive: true, force: true });
+      await fs.symlink(linkTarget, targetPath);
+      return;
+    }
+    handles.push(source);
+    sourceResolved = true;
+    const stats = await source.stat();
+    if (stats.isDirectory()) {
+      await fs.mkdir(targetPath, { recursive: true });
+      return;
+    }
+    if (!stats.isFile()) {
+      throw new Error(`Unsafe workspace entry type: ${relative}`);
+    }
+
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.rm(targetPath, { recursive: true, force: true });
+    const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
+    try {
+      const anchoredSourcePath = `/proc/self/fd/${source.fd}`;
+      await fs.copyFile(anchoredSourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+        await fs.copyFile(anchoredSourcePath, stagedTargetPath);
+      });
+      await fs.chmod(stagedTargetPath, stats.mode);
+      await fs.rename(stagedTargetPath, targetPath);
+    } finally {
+      await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    }
+  } catch (error) {
+    if (!sourceResolved && (error as NodeJS.ErrnoException).code === "ENOENT" && options.allowMissing) return;
+    throw error;
   } finally {
-    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+    await Promise.all(handles.map((handle) => handle.close()));
   }
 }
 
@@ -584,9 +659,10 @@ async function copySelectedWorkspaceEntries(input: {
   await fs.mkdir(input.targetDir, { recursive: true });
   for (const relative of input.relativePaths) {
     if (shouldExcludePath(relative, input.exclude)) continue;
-    const sourceStats = await fs.lstat(path.join(input.sourceDir, relative)).catch(() => null);
-    if (!sourceStats) continue;
-    await copyWorkspaceEntry(input.sourceDir, input.targetDir, relative);
+    await copyWorkspaceEntry(input.sourceDir, input.targetDir, relative, {
+      allowMissing: true,
+      rejectSymlinks: true,
+    });
   }
 }
 
@@ -714,7 +790,10 @@ export async function prepareSandboxManagedRuntime(input: {
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
   const syncWorkspace = input.syncWorkspace !== false;
-  const gitSnapshot = syncWorkspace ? await readGitWorkspaceSnapshot(input.workspaceLocalDir) : null;
+  const workspaceLocalDir = syncWorkspace
+    ? await assertIsolatedWorkspaceSyncAllowed(input.workspaceLocalDir)
+    : input.workspaceLocalDir;
+  const gitSnapshot = syncWorkspace ? await readGitWorkspaceSnapshot(workspaceLocalDir) : null;
   const gitIgnoredExcludes = gitSnapshot?.ignoredPaths;
   const workspaceArchiveExclude = mergeExcludes(
     SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
@@ -731,7 +810,7 @@ export async function prepareSandboxManagedRuntime(input: {
     gitIgnoredExcludes,
   );
   const baselineSnapshot = syncWorkspace
-    ? await captureDirectorySnapshot(input.workspaceLocalDir, { exclude: restoreExclude })
+    ? await captureDirectorySnapshot(workspaceLocalDir, { exclude: restoreExclude })
     : null;
 
   // Every inbound staging step delegates to the provider through `client.syncIn`:
@@ -858,10 +937,13 @@ export async function prepareSandboxManagedRuntime(input: {
         //    which sits under `.paperclip-runtime`, survives to run its own extract.
         if (gitSnapshot) {
           await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to sandbox");
+          if (await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+            throw new Error("Isolated workspace source changed before archive staging.");
+          }
           const gitTarPath = path.join(tempDir, "git-workspace.tar");
           const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
           await withShallowGitWorkspaceClone({
-            localDir: input.workspaceLocalDir,
+            localDir: workspaceLocalDir,
             snapshot: gitSnapshot,
           }, async (cloneDir) => {
             await createTarballFromDirectory({
@@ -885,11 +967,14 @@ export async function prepareSandboxManagedRuntime(input: {
         //    extracted git tree (no wipe); a plain workspace wipes every child except
         //    the preserved names first. The extract runs AFTER the git extract.
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
+        if (await assertIsolatedWorkspaceSyncAllowed(workspaceLocalDir) !== workspaceLocalDir) {
+          throw new Error("Isolated workspace source changed before archive staging.");
+        }
         const workspaceTarPath = path.join(tempDir, "workspace.tar");
-        const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : input.workspaceLocalDir;
+        const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : workspaceLocalDir;
         if (gitSnapshot) {
           await copySelectedWorkspaceEntries({
-            sourceDir: input.workspaceLocalDir,
+            sourceDir: workspaceLocalDir,
             targetDir: workspaceArchiveDir,
             relativePaths: gitSnapshot.overlayPaths,
             exclude: workspaceArchiveExclude,
@@ -1007,6 +1092,7 @@ export async function prepareSandboxManagedRuntime(input: {
       const { localPath, projectId } = source;
       const label = `project-${projectId}`;
       try {
+        const canonicalLocalPath = await assertIsolatedWorkspaceSyncAllowed(localPath);
         if (!path.posix.isAbsolute(localPath)) {
           throw new Error(`additional source localPath is not an absolute path: ${localPath}`);
         }
@@ -1020,15 +1106,18 @@ export async function prepareSandboxManagedRuntime(input: {
         }
         const remoteProjectDir = path.posix.join(runtimeRootDir, label);
         await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to sandbox");
+        if (await assertIsolatedWorkspaceSyncAllowed(canonicalLocalPath) !== canonicalLocalPath) {
+          throw new Error("Isolated referenced project source changed before upload.");
+        }
         await stageConfinedSyncIn({
           files: [{
-            sourcePath: localPath,
+            sourcePath: canonicalLocalPath,
             targetPath: remoteProjectDir,
             kind: "directory",
             exclude: additionalSourceExclude,
             access: "ro",
           }],
-          sourceRoots: [localPath],
+          sourceRoots: [canonicalLocalPath],
           targetRoots: [remoteProjectDir],
           progressLabel: label,
           statusPhase: "config_sync",
@@ -1053,7 +1142,7 @@ export async function prepareSandboxManagedRuntime(input: {
 
   return {
     spec: input.spec,
-    workspaceLocalDir: input.workspaceLocalDir,
+    workspaceLocalDir,
     workspaceRemoteDir,
     runtimeRootDir,
     assetDirs,
@@ -1122,7 +1211,7 @@ export async function prepareSandboxManagedRuntime(input: {
               }
               await fs.writeFile(localBundlePath, bundleBuffer);
               return fetchGitBundleIntoLocalRef({
-                localDir: input.workspaceLocalDir,
+                localDir: workspaceLocalDir,
                 bundlePath: localBundlePath,
                 exportRef,
                 importedRef: importedRef!,
@@ -1201,11 +1290,11 @@ export async function prepareSandboxManagedRuntime(input: {
           await mergeDirectoryWithBaseline({
             baseline: baselineSnapshot!,
             sourceDir: extractedDir,
-            targetDir: input.workspaceLocalDir,
+            targetDir: workspaceLocalDir,
             beforeApply: gitHeadToIntegrate
               ? async () => {
                   await integrateImportedGitHead({
-                    localDir: input.workspaceLocalDir,
+                    localDir: workspaceLocalDir,
                     importedHead: gitHeadToIntegrate,
                   });
                 }
@@ -1213,7 +1302,7 @@ export async function prepareSandboxManagedRuntime(input: {
             afterApply: gitSnapshot
               ? async () => {
                   await resetLocalGitIndexToHead({
-                    localDir: input.workspaceLocalDir,
+                    localDir: workspaceLocalDir,
                     checkWorkingTreeClean: remoteWorkspaceStatus === "clean",
                   });
                 }
@@ -1233,7 +1322,7 @@ export async function prepareSandboxManagedRuntime(input: {
         } finally {
           await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing sandbox workspace");
           if (importedRef) {
-            await deleteLocalGitRef({ localDir: input.workspaceLocalDir, ref: importedRef });
+            await deleteLocalGitRef({ localDir: workspaceLocalDir, ref: importedRef });
           }
         }
       });

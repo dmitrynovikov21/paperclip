@@ -27,6 +27,7 @@ import {
 } from "../services/workspace-runtime.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
+  assertNoAgentHostWorkspacePathMutation,
   collectProjectExecutionWorkspaceCommandPaths,
   collectProjectWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
@@ -158,6 +159,7 @@ export function projectRoutes(db: Db) {
     };
 
     const { workspace, ...projectData } = req.body as CreateProjectPayload;
+    assertNoAgentHostWorkspacePathMutation(req, workspace);
     await assertProjectEnvironmentSelection(
       companyId,
       readProjectPolicyEnvironmentId(projectData.executionWorkspacePolicy),
@@ -290,6 +292,7 @@ export function projectRoutes(db: Db) {
       req,
       collectProjectWorkspaceCommandPaths(req.body),
     );
+    assertNoAgentHostWorkspacePathMutation(req, req.body);
     const workspace = await svc.createWorkspace(id, req.body);
     if (!workspace) {
       res.status(422).json({ error: "Invalid project workspace payload" });
@@ -328,6 +331,7 @@ export function projectRoutes(db: Db) {
         req,
         collectProjectWorkspaceCommandPaths(req.body),
       );
+      assertNoAgentHostWorkspacePathMutation(req, req.body);
       const workspaceExists = (await svc.listWorkspaces(id)).some((workspace) => workspace.id === workspaceId);
       if (!workspaceExists) {
         res.status(404).json({ error: "Project workspace not found" });

@@ -59,6 +59,7 @@ import {
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
+import { isTrustedBundledKubernetesProvider } from "./bundled-plugins.js";
 
 export function buildEnvironmentLeaseContext(input: {
   persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
@@ -868,6 +869,10 @@ function createSandboxEnvironmentDriver(
           throw new Error(
             `Sandbox provider "${parsed.config.provider}" is installed, but sandbox plugin workers are unavailable in this server process.`,
           );
+        }
+        if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+            !isTrustedBundledKubernetesProvider(pluginProvider.resolved.plugin)) {
+          throw new Error("Isolated local secrets require the bundled Kubernetes sandbox provider.");
         }
 
         const workerConfig = stripSandboxProviderEnvelope(parsed.config);

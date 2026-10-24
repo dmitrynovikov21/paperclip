@@ -172,7 +172,7 @@ describe("cursor remote execution", () => {
     expect(syncDirectoryToSsh).toHaveBeenCalledTimes(1);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: `${managedRemoteWorkspace}/.paperclip-runtime/cursor/skills`,
-      followSymlinks: true,
+      followSymlinks: false,
     }));
     expect(runSshCommand).toHaveBeenCalledWith(
       expect.anything(),

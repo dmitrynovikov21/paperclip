@@ -190,18 +190,22 @@ async function prepareCodexRemoteManagedHome(
   // The host managed Codex home the engine seeded and set on env.CODEX_HOME.
   const effectiveCodexHome = env.CODEX_HOME;
   if (!effectiveCodexHome) {
+    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+      throw new Error("Isolated Codex ACP execution requires a managed CODEX_HOME.");
+    }
     // No managed home resolved (e.g. custom CODEX_HOME cleared) — stage the
     // workspace with no home asset, identical to the no-seam fallback.
     return { stagedRuntime: await input.stage([]) };
   }
   const selectedNames = new Set(input.selectedSkillNames);
-  const selectedSkills = (await readPaperclipRuntimeSkillEntries(input.config, moduleDir))
-    .filter((entry) => selectedNames.has(entry.runtimeName))
+  const trustedSkills = (await readPaperclipRuntimeSkillEntries(input.config, moduleDir))
     .map((entry) => ({ name: entry.runtimeName, source: entry.source }));
+  const selectedSkills = trustedSkills.filter((entry) => selectedNames.has(entry.name));
   const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
     runId,
     authSourcePaths: [path.join(resolveSharedCodexHomeDir(process.env), "auth.json")],
     skillSources: selectedSkills,
+    trustedSkillSources: trustedSkills,
   });
   let stagedRuntime;
   try {

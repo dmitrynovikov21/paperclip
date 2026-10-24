@@ -1342,6 +1342,12 @@ export function agentRoutes(
   ): Record<string, unknown> {
     if (adapterType !== "codex_local") return adapterConfig;
     const existingEnv = asRecord(adapterConfig.env);
+    if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+      return {
+        ...adapterConfig,
+        env: { ...existingEnv, CODEX_HOME: codexLocalAgentHome(companyId, agentId) },
+      };
+    }
     if (!existingEnv) return adapterConfig;
     if (!codexLocalEnvKeyConfigured(existingEnv.OPENAI_API_KEY)) return adapterConfig;
     if (codexLocalEnvKeyConfigured(existingEnv.CODEX_HOME)) return adapterConfig;
@@ -1573,6 +1579,13 @@ export function agentRoutes(
       if (protectedPaths.length > 0) {
         throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${protectedPaths.join(", ")})`);
       }
+    }
+    if (
+      req.actor.type === "agent" &&
+      process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+      Object.prototype.hasOwnProperty.call(asRecord(adapterConfig.env) ?? {}, "CODEX_HOME")
+    ) {
+      throw forbidden(`Agent-authenticated callers cannot select ${path}.env.CODEX_HOME in isolated mode.`);
     }
     assertNoAgentHostWorkspaceCommandMutation(
       req,
@@ -1911,6 +1924,15 @@ export function agentRoutes(
 
       let releaseStatus: "released" | "failed" = "released";
       try {
+        // Prospective adapter tests bypass heartbeat dispatch. In isolated mode
+        // they must never fall back to a host or SSH process under the service UID.
+        if (
+          process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+          (executionTarget?.kind !== "remote" || executionTarget.transport !== "sandbox")
+        ) {
+          releaseStatus = "failed";
+          throw forbidden("Adapter tests require a remote sandbox in isolated secrets mode.");
+        }
         // Mirror the run path (resolveExecutionRunAdapterConfig): the selected
         // environment's envVars are the base env layer and the agent's
         // adapterConfig.env wins on key conflicts. Without this merge the probe

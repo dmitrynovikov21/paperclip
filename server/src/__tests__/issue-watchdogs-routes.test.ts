@@ -472,6 +472,17 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       expect(deniedWatchdogIssuePatch.status, JSON.stringify(deniedWatchdogIssuePatch.body)).toBe(403);
       expect(deniedWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
     }
+    const uppercaseWatchdogIssueId = watchdogIssueId.toUpperCase();
+    for (const body of [
+      { title: "Changed reusable issue title through uppercase UUID" },
+      { status: "cancelled" },
+    ]) {
+      const deniedUppercaseWatchdogIssuePatch = await request(app)
+        .patch(`/api/issues/${uppercaseWatchdogIssueId}`)
+        .send(body);
+      expect(deniedUppercaseWatchdogIssuePatch.status, JSON.stringify(deniedUppercaseWatchdogIssuePatch.body)).toBe(403);
+      expect(deniedUppercaseWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
+    }
     const [unchangedWatchdogIssue] = await db.select().from(issues).where(eq(issues.id, watchdogIssueId));
     expect(unchangedWatchdogIssue).toMatchObject({
       title: "Reusable watchdog issue",
@@ -551,7 +562,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     expect(evidencePatch.body.status).toBe("todo");
 
     const dispositionPatch = await request(app)
-      .patch(`/api/issues/${watchdogIssueId}`)
+      .patch(`/api/issues/${uppercaseWatchdogIssueId}`)
       .send({ status: "done", comment: "The watchdog decision is complete." });
     expect(dispositionPatch.status, JSON.stringify(dispositionPatch.body)).toBe(200);
     expect(dispositionPatch.body.status).toBe("done");

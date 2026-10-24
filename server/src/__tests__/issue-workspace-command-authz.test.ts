@@ -315,4 +315,90 @@ describe("issue workspace command authorization", () => {
     expect(res.body.error).toContain("host-executed workspace commands");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
+
+  it("rejects an agent-authenticated issue override of the Bubblewrap launcher", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .patch("/api/issues/issue-1")
+      .send({
+        assigneeAdapterOverrides: {
+          adapterConfig: { filesystemSandboxCommand: "/workspace/fake-bwrap" },
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("assigneeAdapterOverrides.adapterConfig.filesystemSandboxCommand");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects CODEX_HOME overrides in every agent-authenticated issue write path with file-backed DB", async () => {
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/private/database-url");
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: "agent-1" }));
+      const app = await createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      });
+      const override = { adapterConfig: { env: { CODEX_HOME: "/private/other-agent" } } };
+      const responses = [
+        await request(app).post("/api/companies/company-1/issues").send({
+          title: "Injected create", assigneeAdapterOverrides: override,
+        }),
+        await request(app).post("/api/issues/issue-1/children").send({
+          title: "Injected child", assigneeAdapterOverrides: override,
+        }),
+        await request(app).post("/api/issues/issue-1/accepted-plan-decompositions").send({
+          acceptedPlanRevisionId: "11111111-1111-4111-8111-111111111111",
+          children: [{ title: "Injected decomposition child", assigneeAdapterOverrides: override }],
+        }),
+        await request(app).patch("/api/issues/issue-1").send({ assigneeAdapterOverrides: override }),
+      ];
+      for (const response of responses) {
+        expect(response.status, JSON.stringify(response.body)).toBe(403);
+        expect(response.body.error).toContain("assigneeAdapterOverrides.adapterConfig.env.CODEX_HOME");
+      }
+      expect(mockIssueService.create).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("rejects the other issue override authentication selectors for agent callers", async () => {
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "/private/database-url");
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: "agent-1" }));
+      const app = await createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      });
+      for (const [key, value] of [
+        ["paperclipConnectorSkillDigest", "other-digest"],
+        ["managedAiConnection", { id: "other-connection" }],
+      ] as const) {
+        const response = await request(app).patch("/api/issues/issue-1").send({
+          assigneeAdapterOverrides: { adapterConfig: { [key]: value } },
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(403);
+        expect(response.body.error).toContain(`assigneeAdapterOverrides.adapterConfig.${key}`);
+      }
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

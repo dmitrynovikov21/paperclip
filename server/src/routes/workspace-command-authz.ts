@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import { forbidden } from "../errors.js";
+import { collectFileBackedIssueAuthSourcePaths } from "../lib/adapter-auth-source.js";
 import { isRemoteGitRepositoryUrl } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -72,10 +73,15 @@ export function collectAgentAdapterWorkspaceCommandPaths(
   prefix = "adapterConfig",
 ): string[] {
   if (!isRecord(adapterConfig)) return [];
-  return collectWorkspaceStrategyCommandPaths(
-    adapterConfig.workspaceStrategy,
-    `${prefix}.workspaceStrategy`,
-  );
+  return [
+    ...collectWorkspaceStrategyCommandPaths(
+      adapterConfig.workspaceStrategy,
+      `${prefix}.workspaceStrategy`,
+    ),
+    ...(hasOwn(adapterConfig, "filesystemSandboxCommand")
+      ? [`${prefix}.filesystemSandboxCommand`]
+      : []),
+  ];
 }
 
 export function collectProjectExecutionWorkspaceCommandPaths(policy: unknown): string[] {
@@ -111,16 +117,24 @@ export function collectIssueWorkspaceCommandPaths(input: {
   }
   if (isRecord(input.assigneeAdapterOverrides)) {
     const adapterConfig = input.assigneeAdapterOverrides.adapterConfig;
-    if (isRecord(adapterConfig)) {
-      paths.push(
-        ...collectWorkspaceStrategyCommandPaths(
-          adapterConfig.workspaceStrategy,
-          "assigneeAdapterOverrides.adapterConfig.workspaceStrategy",
-        ),
-      );
-    }
+    paths.push(...collectAgentAdapterWorkspaceCommandPaths(
+      adapterConfig,
+      "assigneeAdapterOverrides.adapterConfig",
+    ));
   }
   return paths;
+}
+
+export function assertNoAgentIssueConfigMutation(req: Request, input: {
+  executionWorkspaceSettings?: unknown;
+  assigneeAdapterOverrides?: unknown;
+}) {
+  assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(input));
+  if (req.actor.type !== "agent" || !process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) return;
+  const paths = collectFileBackedIssueAuthSourcePaths(input.assigneeAdapterOverrides);
+  if (paths.length > 0) {
+    throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${paths.join(", ")})`);
+  }
 }
 
 export function collectExecutionWorkspaceCommandPaths(input: {

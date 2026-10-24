@@ -24,7 +24,11 @@ import { parseCodexJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { codexHomeDir, readCodexAuthInfo } from "./quota.js";
 import { buildCodexExecArgs } from "./codex-args.js";
-import { prepareManagedCodexHome } from "./codex-home.js";
+import {
+  prepareManagedCodexHome,
+  resolveSharedCodexHomeDir,
+  stageCodexHomeForSync,
+} from "./codex-home.js";
 import { resolveCodexExecutionEngineForRun, testCodexAcpEnvironment } from "./acp.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
@@ -97,70 +101,65 @@ async function prepareCodexHelloProbe(input: {
       apiKey: null,
     });
 
-    // Upload only the credential/config files the login probe needs, not the
-    // entire managed CODEX_HOME. A real managed home accumulates hundreds of MB
-    // of session/state history (`sessions/`, `state_*.sqlite`, …); tarring and
-    // streaming all of it into the sandbox made the environment Test probe take
-    // many minutes and look like it hung. The hello probe only needs auth.
-    probeHomeLocalDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), `paperclip-codex-probe-home-${input.runId}-`),
-    );
-    let seededAuth = false;
-    for (const file of ["auth.json", "config.toml"]) {
-      // `fs.readFile` follows the managed home's `auth.json` symlink into the
-      // host's `~/.codex`, so we copy the resolved bytes as a plain file.
-      const contents = await fs.readFile(path.join(managedHome, file)).catch(() => null);
-      if (contents) {
-        await fs.writeFile(path.join(probeHomeLocalDir, file), contents);
-        if (file === "auth.json") seededAuth = true;
-      }
-    }
+    try {
+      // Use the same pinned, no-follow staging as normal remote runs. The
+      // managed home is writable by a local agent, so reading its auth path
+      // directly could follow a swapped link to a service-only credential.
+      probeHomeLocalDir = await stageCodexHomeForSync(managedHome, {
+        runId: input.runId,
+        entries: ["auth.json", "config.toml"],
+        authSourcePaths: [path.join(resolveSharedCodexHomeDir(process.env), "auth.json")],
+      });
+      const seededAuth = await fs.stat(path.join(probeHomeLocalDir, "auth.json"))
+        .then((stat) => stat.isFile())
+        .catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        });
 
-    // When the host has no Codex credentials to seed, don't override CODEX_HOME.
-    // Pointing Codex at an empty uploaded home would mask any login already
-    // baked into the sandbox (e.g. a captured custom-image snapshot); leaving
-    // CODEX_HOME unset lets the probe exercise that in-sandbox login instead.
-    if (!seededAuth) {
+      // An empty host auth must not hide a login already baked into the sandbox.
+      if (!seededAuth) {
+        return {
+          command: input.command,
+          args: input.args,
+          env: { ...input.env },
+          cleanup,
+        };
+      }
+
+      preparedRuntimeWorkspaceLocalDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), `paperclip-codex-envtest-${input.runId}-`),
+      );
+      preparedRuntime = await prepareAdapterExecutionTargetRuntime({
+        runId: input.runId,
+        target: input.target,
+        adapterKey: "codex",
+        workspaceLocalDir: preparedRuntimeWorkspaceLocalDir,
+        // The runtime appends `.paperclip-runtime/runs/<runId>/workspace`.
+        workspaceRemoteDir: input.cwd,
+        installCommand: SANDBOX_INSTALL_COMMAND,
+        detectCommand: input.command,
+        assets: [
+          {
+            key: "home",
+            localDir: probeHomeLocalDir,
+            followSymlinks: true,
+          },
+        ],
+      });
+
       return {
         command: input.command,
         args: input.args,
-        env: { ...input.env },
+        env: preparedRuntime.assetDirs.home
+          ? { ...input.env, CODEX_HOME: preparedRuntime.assetDirs.home }
+          : { ...input.env },
         cleanup,
       };
+    } catch (error) {
+      await cleanup();
+      throw error;
     }
-
-    preparedRuntimeWorkspaceLocalDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), `paperclip-codex-envtest-${input.runId}-`),
-    );
-    preparedRuntime = await prepareAdapterExecutionTargetRuntime({
-      runId: input.runId,
-      target: input.target,
-      adapterKey: "codex",
-      workspaceLocalDir: preparedRuntimeWorkspaceLocalDir,
-      // Pass `input.cwd` as the base (not a pre-built per-run subdir).
-      // `prepareRemoteManagedRuntime` itself appends
-      // `.paperclip-runtime/runs/<runId>/workspace` to whatever it gets, so
-      // pre-building a per-run path here would double-nest the run ID.
-      workspaceRemoteDir: input.cwd,
-      installCommand: SANDBOX_INSTALL_COMMAND,
-      detectCommand: input.command,
-      assets: [
-        {
-          key: "home",
-          localDir: probeHomeLocalDir,
-          followSymlinks: true,
-        },
-      ],
-    });
-
-    return {
-      command: input.command,
-      args: input.args,
-      env: preparedRuntime.assetDirs.home
-        ? { ...input.env, CODEX_HOME: preparedRuntime.assetDirs.home }
-        : { ...input.env },
-      cleanup,
-    };
   }
 
   if (input.probeApiKey) {

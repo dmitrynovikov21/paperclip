@@ -1,4 +1,7 @@
 import express from "express";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
@@ -42,6 +45,7 @@ const mockEnvironmentRuntime = vi.hoisted(() => ({
 }));
 
 const mockResolveEnvironmentExecutionTarget = vi.hoisted(() => vi.fn());
+const CODEX_AUTH_RACE_TEST = "keeps a swapped Codex auth link out of the remote asset and HTTP response";
 const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
 }));
@@ -97,7 +101,7 @@ const externalAdapter: ServerAdapterModule = {
   testEnvironment: testEnvironmentSpy,
 };
 
-async function createApp() {
+async function createApp(asAgent = false) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -105,13 +109,15 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = asAgent
+      ? { type: "agent", agentId: "agent-1", companyId: "company-1" }
+      : {
+          type: "board",
+          userId: "local-board",
+          companyIds: ["company-1"],
+          source: "local_implicit",
+          isInstanceAdmin: false,
+        };
     next();
   });
   app.use("/api", agentRoutes({} as any));
@@ -125,7 +131,7 @@ async function unregisterTestAdapter(type: string) {
 }
 
 describe("agent test-environment route", () => {
-  beforeEach(async () => {
+  beforeEach(async (context) => {
     vi.resetModules();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
@@ -174,14 +180,258 @@ describe("agent test-environment route", () => {
       ],
       testedAt: new Date(0).toISOString(),
     });
-    await unregisterTestAdapter("external_test");
-    const { registerServerAdapter } = await import("../adapters/index.js");
-    registerServerAdapter(externalAdapter);
+    if (context.task.name !== CODEX_AUTH_RACE_TEST) {
+      await unregisterTestAdapter("external_test");
+      const { registerServerAdapter } = await import("../adapters/index.js");
+      registerServerAdapter(externalAdapter);
+    }
   });
 
   afterEach(async () => {
     await unregisterTestAdapter("external_test");
   });
+
+  it("denies host, local, SSH, and unresolved probes in isolated mode before invoking an adapter", async () => {
+    const scratch = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-isolated-probe-"));
+    const marker = path.join(scratch, "probe-ran");
+    const fixture = path.join(scratch, "codex");
+    const previousIsolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+    try {
+      await writeFile(fixture, `#!/bin/sh\nprintf launched > "${marker}"\n`, { mode: 0o700 });
+      process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = "true";
+      mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+      testEnvironmentSpy.mockImplementation(async () => {
+        await writeFile(marker, "launched");
+        return { adapterType: "external_test", status: "pass", checks: [], testedAt: new Date(0).toISOString() };
+      });
+      const app = await createApp(true);
+      const url = "/api/companies/company-1/adapters/external_test/test-environment";
+      const payload = { adapterConfig: { command: fixture } };
+
+      const host = await request(app).post(url).send(payload);
+      expect(host.status, host.text).toBe(403);
+
+      mockEnvironmentService.getById.mockResolvedValueOnce({
+        id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", name: "Local", driver: "local", config: {},
+      });
+      const local = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(local.status, local.text).toBe(403);
+
+      mockEnvironmentService.getById.mockResolvedValueOnce({
+        id: "11111111-1111-4111-8111-111111111111", companyId: "company-1", name: "SSH", driver: "ssh", config: {},
+      });
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({ kind: "remote", transport: "ssh" });
+      const ssh = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(ssh.status, ssh.text).toBe(403);
+
+      const unresolved = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(unresolved.status, unresolved.text).toBe(403);
+      expect(testEnvironmentSpy).not.toHaveBeenCalled();
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(mockReleaseRunLease).toHaveBeenCalledWith(expect.objectContaining({ status: "failed" }));
+
+      mockResolveEnvironmentExecutionTarget.mockResolvedValueOnce({
+        kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace", providerKey: "fake-plugin",
+        runner: { execute: vi.fn() },
+      });
+      const sandbox = await request(app).post(url).send({ ...payload, environmentId: "11111111-1111-4111-8111-111111111111" });
+      expect(sandbox.status, sandbox.text).toBe(200);
+      expect(testEnvironmentSpy).toHaveBeenCalledTimes(1);
+      expect(await readFile(marker, "utf8")).toBe("launched");
+      expect(mockReleaseRunLease).toHaveBeenCalledWith(expect.objectContaining({ status: "released" }));
+    } finally {
+      if (previousIsolated === undefined) delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      else process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = previousIsolated;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it(CODEX_AUTH_RACE_TEST, async () => {
+    const scratch = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-codex-route-"));
+    const sharedHome = path.join(scratch, "shared-codex");
+    const serviceCredential = path.join(scratch, "service-db-url");
+    const syntheticCredential = "postgres://fixture:synthetic-only@localhost/fixture";
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousDatabaseSource = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    let swapAfterPrepare = false;
+    let uploadedAuth: string | null = null;
+    const prepareRuntime = vi.fn(async (input: { assets?: Array<{ key: string; localDir: string }> }) => {
+      const home = input.assets?.find((asset) => asset.key === "home");
+      if (home) uploadedAuth = await readFile(path.join(home.localDir, "auth.json"), "utf8");
+      return {
+        assetDirs: { home: "/remote/probe-home" },
+        restoreWorkspace: async () => {},
+      };
+    });
+    const runProbe = vi.fn(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}',
+      stderr: "",
+      pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+
+    vi.doMock("@paperclipai/adapter-utils/execution-target", async () => ({
+      ...(await vi.importActual<typeof import("@paperclipai/adapter-utils/execution-target")>(
+        "@paperclipai/adapter-utils/execution-target",
+      )),
+      ensureAdapterExecutionTargetDirectory: vi.fn(async () => {}),
+      ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
+      maybeRunSandboxInstallCommand: vi.fn(async () => null),
+      prepareAdapterExecutionTargetRuntime: prepareRuntime,
+      runAdapterExecutionTargetProcess: runProbe,
+    }));
+    vi.doMock("../../../packages/adapters/codex-local/src/server/codex-home.js", async () => {
+      const actual = await vi.importActual<typeof import("../../../packages/adapters/codex-local/src/server/codex-home.js")>(
+        "../../../packages/adapters/codex-local/src/server/codex-home.js",
+      );
+      return {
+        ...actual,
+        prepareManagedCodexHome: async (...args: Parameters<typeof actual.prepareManagedCodexHome>) => {
+          const managedHome = await actual.prepareManagedCodexHome(...args);
+          if (swapAfterPrepare) {
+            await unlink(path.join(managedHome, "auth.json"));
+            await symlink(serviceCredential, path.join(managedHome, "auth.json"));
+          }
+          return managedHome;
+        },
+      };
+    });
+
+    try {
+      await mkdir(sharedHome);
+      await writeFile(path.join(sharedHome, "auth.json"), '{"OPENAI_API_KEY":"sk-bound"}');
+      await writeFile(serviceCredential, syntheticCredential);
+      process.env.PAPERCLIP_HOME = path.join(scratch, "paperclip-home");
+      process.env.CODEX_HOME = sharedHome;
+      process.env.PAPERCLIP_DATABASE_URL_FILE = serviceCredential;
+      mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fixture",
+        remoteCwd: "/remote/workspace",
+        runner: { execute: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      });
+      const app = await createApp();
+      const url = "/api/companies/company-1/adapters/codex_local/test-environment";
+      const payload = {
+        adapterConfig: { engine: "cli", command: "codex" },
+        environmentId: "11111111-1111-4111-8111-111111111111",
+      };
+
+      const valid = await request(app).post(url).send(payload);
+      expect(valid.status, valid.text).toBe(200);
+      expect(valid.body.status).toBe("pass");
+      expect(valid.body.checks.map((check: { code: string }) => check.code).join(", ")).toContain("codex_hello_probe_passed");
+      expect(uploadedAuth).toBe('{"OPENAI_API_KEY":"sk-bound"}');
+      expect(JSON.stringify(valid.body)).not.toContain(syntheticCredential);
+
+      swapAfterPrepare = true;
+      const attacked = await request(app).post(url).send(payload);
+      expect(attacked.status).toBeGreaterThanOrEqual(400);
+      expect(attacked.text).not.toContain(syntheticCredential);
+      expect(uploadedAuth).not.toContain(syntheticCredential);
+      expect(prepareRuntime).toHaveBeenCalledTimes(1);
+      expect(runProbe).toHaveBeenCalledTimes(1);
+      const remoteOutput = await runProbe.mock.results[0]?.value;
+      expect(`${remoteOutput?.stdout ?? ""}\n${remoteOutput?.stderr ?? ""}`).not.toContain(syntheticCredential);
+    } finally {
+      vi.doUnmock("@paperclipai/adapter-utils/execution-target");
+      vi.doUnmock("../../../packages/adapters/codex-local/src/server/codex-home.js");
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousDatabaseSource === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousDatabaseSource;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it.each(["opencode_local", "pi_local"] as const)(
+    "does not launch %s discovery under the service UID with a file-backed DB source",
+    async (adapterType) => {
+      const scratch = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-discovery-"));
+      const credentialFile = path.join(scratch, "database-url");
+      const command = path.join(scratch, "model-command");
+      const marker = path.join(scratch, "command-launched");
+      const syntheticCredential = "postgres://fixture:synthetic-only@localhost/fixture";
+      const previousSource = process.env.PAPERCLIP_DATABASE_URL_FILE;
+      try {
+        await writeFile(credentialFile, syntheticCredential, { mode: 0o600 });
+        await chmod(credentialFile, 0o600);
+        await writeFile(command, `#!/bin/sh
+printf launched > "$MARKER_PATH"
+if [ -n "\${TEST_CREDENTIAL_PATH:-}" ]; then
+  cat "$TEST_CREDENTIAL_PATH"
+  exit 7
+fi
+case "$1" in
+  models) printf 'fixture/model\\n' ;;
+  --list-models) printf 'provider  model  context\\nfixture  model  0\\n' ;;
+esac
+`, { mode: 0o700 });
+        await chmod(command, 0o700);
+        process.env.PAPERCLIP_DATABASE_URL_FILE = credentialFile;
+
+        const app = await createApp();
+        const res = await request(app)
+          .post(`/api/companies/company-1/adapters/${adapterType}/test-environment`)
+          .send({ adapterConfig: {
+            command,
+            cwd: scratch,
+            model: "fixture/model",
+            env: { MARKER_PATH: marker, TEST_CREDENTIAL_PATH: credentialFile },
+          } });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(res.body.status).toBe("fail");
+        expect(res.body.checks).toEqual([expect.objectContaining({
+          code: `${adapterType}_requires_isolation`,
+          level: "error",
+        })]);
+        expect(JSON.stringify(res.body)).not.toContain(syntheticCredential);
+        expect(JSON.stringify(res.body)).not.toContain(credentialFile);
+        await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+        // Direct callers of discovery must be guarded too, including a
+        // caller-supplied env that runChildProcess would otherwise re-merge.
+        const discover = adapterType === "opencode_local"
+          ? (await import("@paperclipai/adapter-opencode-local/server")).discoverOpenCodeModels
+          : (await import("@paperclipai/adapter-pi-local/server")).discoverPiModels;
+        const discoverCached = adapterType === "opencode_local"
+          ? (await import("../../../packages/adapters/opencode-local/src/server/models.js")).discoverOpenCodeModelsCached
+          : (await import("../../../packages/adapters/pi-local/src/server/models.js")).discoverPiModelsCached;
+        await expect(discover({ command, cwd: scratch, env: {
+          MARKER_PATH: marker, TEST_CREDENTIAL_PATH: credentialFile,
+        } })).rejects.toThrow("requires an isolated environment");
+        await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+        delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+        await expect(discover({ command, cwd: scratch, env: {
+          MARKER_PATH: marker, PAPERCLIP_DATABASE_URL_FILE: credentialFile,
+        } })).rejects.toThrow("requires an isolated environment");
+        await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+        // Positive control: ordinary discovery still launches and parses the
+        // same command when the service has no file-backed DB source.
+        const models = await discoverCached({ command, cwd: scratch, env: { MARKER_PATH: marker } });
+        expect(models).toEqual([{ id: "fixture/model", label: "fixture/model" }]);
+        expect(await readFile(marker, "utf8")).toBe("launched");
+        await rm(marker);
+        process.env.PAPERCLIP_DATABASE_URL_FILE = credentialFile;
+        await expect(discoverCached({ command, cwd: scratch, env: { MARKER_PATH: marker } }))
+          .rejects.toThrow("requires an isolated environment");
+        await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        if (previousSource === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+        else process.env.PAPERCLIP_DATABASE_URL_FILE = previousSource;
+        await rm(scratch, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("does not fall back to a host probe when a requested environment cannot produce an execution target", async () => {
     const app = await createApp();

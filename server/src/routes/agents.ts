@@ -63,6 +63,7 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import { collectFileBackedAdapterAuthSourcePaths } from "../lib/adapter-auth-source.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
@@ -983,6 +984,17 @@ export function agentRoutes(
     return adapterType;
   }
 
+  function assertFileBackedDbAdapterTypeAllowed(adapterType: string): void {
+    if (!process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) return;
+    const label = adapterType === "process" ? "Process adapter"
+      : adapterType === "hermes_local" ? "Hermes local adapter" : null;
+    if (!label) return;
+    throw unprocessable(
+      `${label} cannot run with file-backed database credentials; select an isolated adapter.`,
+      { code: adapterType === "process" ? "process_adapter_requires_isolation" : "hermes_local_requires_isolation" },
+    );
+  }
+
   async function assertAgentDefaultEnvironmentSelection(
     companyId: string,
     environmentId: string | null | undefined,
@@ -1562,6 +1574,12 @@ export function agentRoutes(
     path = "adapterConfig",
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    if (req.actor.type === "agent" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+      const protectedPaths = collectFileBackedAdapterAuthSourcePaths(adapterConfig, path);
+      if (protectedPaths.length > 0) {
+        throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${protectedPaths.join(", ")})`);
+      }
+    }
     if (
       req.actor.type === "agent" &&
       process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
@@ -1906,6 +1924,15 @@ export function agentRoutes(
 
       let releaseStatus: "released" | "failed" = "released";
       try {
+        // Prospective adapter tests bypass heartbeat dispatch. In isolated mode
+        // they must never fall back to a host or SSH process under the service UID.
+        if (
+          process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true" &&
+          (executionTarget?.kind !== "remote" || executionTarget.transport !== "sandbox")
+        ) {
+          releaseStatus = "failed";
+          throw forbidden("Adapter tests require a remote sandbox in isolated secrets mode.");
+        }
         // Mirror the run path (resolveExecutionRunAdapterConfig): the selected
         // environment's envVars are the base env layer and the agent's
         // adapterConfig.env wins on key conflicts. Without this merge the probe
@@ -2541,6 +2568,7 @@ export function agentRoutes(
       ...hireInput
     } = req.body;
     hireInput.adapterType = assertKnownAdapterType(hireInput.adapterType);
+    assertFileBackedDbAdapterTypeAllowed(hireInput.adapterType);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       hireInput.adapterType,
@@ -2737,6 +2765,7 @@ export function agentRoutes(
       ...createInput
     } = req.body;
     createInput.adapterType = assertKnownAdapterType(createInput.adapterType);
+    assertFileBackedDbAdapterTypeAllowed(createInput.adapterType);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertNoNewAgentLegacyPromptTemplate(
       createInput.adapterType,
@@ -3165,6 +3194,7 @@ export function agentRoutes(
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
     if (touchesAdapterConfiguration) {
+      assertFileBackedDbAdapterTypeAllowed(requestedAdapterType);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
       const changingAdapterType =
         typeof patchData.adapterType === "string" && patchData.adapterType !== existing.adapterType;

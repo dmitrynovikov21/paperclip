@@ -50,6 +50,7 @@ export type {
   EarlyUpstreamReprobeFacts,
   EarlyUpstreamReprobeDecision,
 } from "./domain/policy.js";
+export { EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS } from "./domain/policy.js";
 export type {
   PostCommitEffect,
   PromoteScheduledRetryOutcome,

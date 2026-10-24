@@ -21,12 +21,19 @@ export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const TRANSIENT_FAILURE_RETRY_REASON = "transient_failure";
 /**
- * The bounded backoff a transient-upstream failure retries on. `heartbeat.ts`
- * schedules against it; `policy.ts` derives the early re-probe threshold from
- * its ceiling, so both read the same array rather than two copies that could
- * drift apart.
+ * The bounded backoff a transient-upstream failure retries on. The heartbeat
+ * retry scheduler takes its attempt count and base steps from it; `policy.ts`
+ * derives the early re-probe threshold from its ceiling, so both read the same
+ * array rather than two copies that could drift apart.
  */
 export const BOUNDED_TRANSIENT_RETRY_DELAYS_MS = [30_000, 60_000] as const;
+/**
+ * How far the scheduler's jitter can stretch a base step
+ * (`infrastructureRetryDelayMs` draws ×0.8–×1.2). The domain cannot import that
+ * service, so the bound is restated here, and the scheduler's own test fails if
+ * a jittered step ever lands past the early re-probe threshold built from it.
+ */
+export const BOUNDED_TRANSIENT_RETRY_MAX_JITTER_MULTIPLIER = 1.2;
 /**
  * The error codes the transient retry scheduler (`readHeartbeatRunErrorFamily`)
  * maps to an upstream error family when a failed run stored none. The early

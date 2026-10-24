@@ -8,6 +8,7 @@
 
 import {
   BOUNDED_TRANSIENT_RETRY_DELAYS_MS,
+  BOUNDED_TRANSIENT_RETRY_MAX_JITTER_MULTIPLIER,
   TRANSIENT_FAILURE_RETRY_REASON,
 } from "./wake-context.js";
 
@@ -178,9 +179,11 @@ export type QueuedRunFacts = {
  * (retryNotBefore — e.g. a weekly-quota reset hours away) as its
  * scheduledRetryAt. Only pins beyond the bounded backoff ceiling qualify for an
  * early re-probe, so a normally scheduled transient backoff is never disturbed.
+ * The ceiling is the longest base step stretched by the scheduler's jitter: a
+ * last step drawn at the top of that range is still a normal backoff.
  */
-export const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.max(
-  ...BOUNDED_TRANSIENT_RETRY_DELAYS_MS,
+export const EARLY_UPSTREAM_REPROBE_MIN_REMAINING_PIN_MS = Math.round(
+  Math.max(...BOUNDED_TRANSIENT_RETRY_DELAYS_MS) * BOUNDED_TRANSIENT_RETRY_MAX_JITTER_MULTIPLIER,
 );
 /** How recent a successful run must be to still count as proof the upstream is serving. */
 export const EARLY_UPSTREAM_REPROBE_GREEN_LOOKBACK_MS = 30 * 60 * 1000;

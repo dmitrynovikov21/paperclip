@@ -117,9 +117,9 @@ export interface HeartbeatRetryDependencies {
   applyRunDispatchPostCommitEffects: (effects: PostCommitEffect[]) => void;
 }
 
-// The run-dispatch domain owns this backoff: its early upstream re-probe
-// derives its far-future pin threshold from the same ceiling this scheduler
-// backs off to, so the two can never drift apart.
+// The run-dispatch domain owns these steps: its early upstream re-probe
+// derives its far-future pin threshold from their jittered ceiling, and
+// retries.test.ts fails if a step scheduled here ever lands past it.
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = BOUNDED_TRANSIENT_RETRY_DELAYS_MS;
 
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";

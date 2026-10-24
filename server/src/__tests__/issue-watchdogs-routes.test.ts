@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRelations,
+  issueThreadInteractions,
   issueWatchdogs,
   issues,
   principalPermissionGrants,
@@ -84,6 +85,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issueRelations);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueWatchdogs);
     await db.delete(issues);
     await db.delete(agents);
@@ -453,11 +455,36 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       runId,
       source: "agent_jwt",
     });
+    const initialWatchdogComments = await db.select({ id: issueComments.id })
+      .from(issueComments).where(eq(issueComments.issueId, watchdogIssueId));
 
-    const watchdogIssuePatch = await request(app)
-      .patch(`/api/issues/${watchdogIssueId}`)
-      .send({ title: "Reusable watchdog issue completed" });
-    expect(watchdogIssuePatch.status, JSON.stringify(watchdogIssuePatch.body)).toBe(200);
+    for (const body of [
+      { title: "Changed reusable issue title" },
+      { description: "Changed reusable issue description" },
+      { parentId: unrelatedRootId },
+      { status: "cancelled" },
+      { unknownField: "Zod must not strip this before the scope check" },
+      { title: "Changed title", comment: "This comment must not be saved" },
+    ]) {
+      const deniedWatchdogIssuePatch = await request(app)
+        .patch(`/api/issues/${watchdogIssueId}`)
+        .send(body);
+      expect(deniedWatchdogIssuePatch.status, JSON.stringify(deniedWatchdogIssuePatch.body)).toBe(403);
+      expect(deniedWatchdogIssuePatch.body.error).toContain("may only update the reusable watchdog issue");
+    }
+    const [unchangedWatchdogIssue] = await db.select().from(issues).where(eq(issues.id, watchdogIssueId));
+    expect(unchangedWatchdogIssue).toMatchObject({
+      title: "Reusable watchdog issue",
+      parentId: watchedRootId,
+      status: "todo",
+      description: null,
+    });
+    const commentsAfterDeniedPatches = await db.select({ id: issueComments.id })
+      .from(issueComments).where(eq(issueComments.issueId, watchdogIssueId));
+    expect(commentsAfterDeniedPatches).toEqual(initialWatchdogComments);
+    const [watchdogRunAfterDeniedPatches] = await db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(watchdogRunAfterDeniedPatches.status).toBe("running");
 
     const deniedWatchdogDescendantPatch = await request(app)
       .patch(`/api/issues/${watchdogIssueChildId}`)
@@ -516,6 +543,83 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       .send({ title: "Allowed watched child" });
     expect(allowedChild.status, JSON.stringify(allowedChild.body)).toBe(201);
     expect(allowedChild.body.parentId).toBe(watchedChildId);
+
+    const evidencePatch = await request(app)
+      .patch(`/api/issues/${watchdogIssueId}`)
+      .send({ comment: "Reviewed the watched subtree; recovery path is live." });
+    expect(evidencePatch.status, JSON.stringify(evidencePatch.body)).toBe(200);
+    expect(evidencePatch.body.status).toBe("todo");
+
+    const dispositionPatch = await request(app)
+      .patch(`/api/issues/${watchdogIssueId}`)
+      .send({ status: "done", comment: "The watchdog decision is complete." });
+    expect(dispositionPatch.status, JSON.stringify(dispositionPatch.body)).toBe(200);
+    expect(dispositionPatch.body.status).toBe("done");
+    const evidence = await db.select({ body: issueComments.body })
+      .from(issueComments).where(eq(issueComments.issueId, watchdogIssueId));
+    expect(evidence.map((row) => row.body)).toEqual(expect.arrayContaining([
+      "Reviewed the watched subtree; recovery path is live.",
+      "The watchdog decision is complete.",
+    ]));
+  });
+
+  it("accepts in_review and blocked dispositions with evidence under normal transition guards", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId);
+    const watchedRootId = await seedIssue(companyId, { title: "Watched root" });
+    const blockerId = await seedIssue(companyId, { title: "Unresolved blocker" });
+    const watchdogIssueId = await seedIssue(companyId, {
+      title: "Reusable watchdog issue",
+      parentId: watchedRootId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedRootId,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: watchdogIssueId,
+      type: "blocks",
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId: watchedRootId,
+      watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: watchdogIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { version: 1, prompt: "Confirm the watchdog findings." },
+      createdByAgentId: watchdogAgentId,
+      sourceRunId: runId,
+    });
+
+    const reviewPatch = await request(app)
+      .patch(`/api/issues/${watchdogIssueId}`)
+      .send({ status: "in_review", comment: "Review the watchdog findings." });
+    expect(reviewPatch.status, JSON.stringify(reviewPatch.body)).toBe(200);
+    expect(reviewPatch.body.status).toBe("in_review");
+
+    await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+
+    const blockedPatch = await request(app)
+      .patch(`/api/issues/${watchdogIssueId}`)
+      .send({ status: "blocked", comment: "The unresolved blocker needs action." });
+    expect(blockedPatch.status, JSON.stringify(blockedPatch.body)).toBe(200);
+    expect(blockedPatch.body.status).toBe("blocked");
   });
 
   it("routes watchdog-discovered product bugs outside the watched source tree with evidence links", async () => {

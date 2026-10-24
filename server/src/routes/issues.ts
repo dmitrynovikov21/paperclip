@@ -4056,7 +4056,9 @@ export function issueRoutes(
     if (disallowedFields.length === 0 && !disallowedStatus) return next();
 
     const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
-    if (scope.kind !== "watchdog" || scope.watchdogIssueId !== req.params.id) return next();
+    const requestedIssueId = req.params.id;
+    if (scope.kind !== "watchdog" || typeof requestedIssueId !== "string"
+      || scope.watchdogIssueId?.toLowerCase() !== requestedIssueId.toLowerCase()) return next();
     res.status(403).json({
       error: "Task-watchdog runs may only update the reusable watchdog issue with a comment or status done, in_review, or blocked.",
     });

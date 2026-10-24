@@ -182,7 +182,7 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
@@ -248,6 +248,11 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("rejects an agent-authored in_review transition without a review path", async () => {

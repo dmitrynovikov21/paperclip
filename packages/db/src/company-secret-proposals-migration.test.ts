@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { applyPendingMigrations } from "./client.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./test-embedded-postgres.js";
@@ -22,14 +22,19 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describeEmbeddedPostgres("company secret proposals migration", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let sql: ReturnType<typeof postgres>;
+
+  beforeEach(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-secret-proposals-migration-");
+    cleanups.push(database.cleanup);
+    sql = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => sql.end());
+  });
+
   afterEach(async () => Promise.all(cleanups.splice(0).map((cleanup) => cleanup())));
 
   it("can be reapplied after its migration journal entry is removed", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-secret-proposals-migration-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
-
     await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
 
     await expect(applyPendingMigrations(database.connectionString)).resolves.toBeUndefined();

@@ -184,7 +184,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
 }
 
 describe("issue activity event routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
@@ -226,6 +226,11 @@ describe("issue activity event routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("returns a field-change receipt and omits a requested no-op field", async () => {

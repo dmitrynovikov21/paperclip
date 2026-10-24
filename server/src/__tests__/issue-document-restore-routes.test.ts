@@ -197,7 +197,7 @@ async function createApp(
 }
 
 describe("issue document revision routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
@@ -282,6 +282,11 @@ describe("issue document revision routes", () => {
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue([companyId]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/issues.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it("returns revision snapshots including title and format", async () => {

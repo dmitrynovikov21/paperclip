@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { afterEach, describe, it } from "vitest";
+import { afterEach, beforeEach, describe, it } from "vitest";
 import postgres from "postgres";
 import {
   getEmbeddedPostgresTestSupport,
@@ -18,16 +18,20 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 describeEmbeddedPostgres("status card migrations", () => {
+  let sql: ReturnType<typeof postgres>;
+
+  beforeEach(async () => {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-status-card-migrations-");
+    cleanups.push(database.cleanup);
+    sql = postgres(database.connectionString, { max: 1 });
+    cleanups.push(async () => sql.end());
+  });
+
   afterEach(async () => {
     await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
   });
 
   it("can be reapplied after the schema already exists", async () => {
-    const database = await startEmbeddedPostgresTestDatabase("paperclip-status-card-migrations-");
-    cleanups.push(database.cleanup);
-    const sql = postgres(database.connectionString, { max: 1 });
-    cleanups.push(async () => sql.end());
-
     for (const migrationFile of MIGRATION_FILES) {
       const migrationSql = await fs.promises.readFile(
         new URL(`./migrations/${migrationFile}`, import.meta.url),

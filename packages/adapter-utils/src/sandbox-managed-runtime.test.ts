@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetLocalGitIndexToHead } from "./git-workspace-sync.js";
 
 import {
@@ -438,149 +438,157 @@ describe("sandbox managed runtime", () => {
     expect(runtimeStatuses.at(-1)).toBe("finalize:Finalizing sandbox workspace");
   });
 
-  it("syncs git-backed workspaces through a shallow standalone clone and keeps .git out of archives", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-git-"));
-    cleanupDirs.push(rootDir);
-    const sourceRepoDir = path.join(rootDir, "source-repo");
-    const localWorkspaceDir = path.join(rootDir, "local-worktree");
-    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+  describe("git-backed workspace round trip", () => {
+    let rootDir: string;
+    let localWorkspaceDir: string;
+    let remoteWorkspaceDir: string;
 
-    await mkdir(sourceRepoDir, { recursive: true });
-    await git(sourceRepoDir, ["init"]);
-    await git(sourceRepoDir, ["checkout", "-b", "main"]);
-    await git(sourceRepoDir, ["config", "user.name", "Paperclip Test"]);
-    await git(sourceRepoDir, ["config", "user.email", "test@paperclip.dev"]);
-    await writeFile(path.join(sourceRepoDir, ".gitignore"), "node_modules/\n", "utf8");
-    await writeFile(path.join(sourceRepoDir, "tracked.txt"), "base\n", "utf8");
-    await writeFile(path.join(sourceRepoDir, "clean.txt"), "from git\n", "utf8");
-    await writeFile(path.join(sourceRepoDir, "deleted.txt"), "delete me\n", "utf8");
-    await git(sourceRepoDir, ["add", ".gitignore", "tracked.txt", "clean.txt", "deleted.txt"]);
-    await git(sourceRepoDir, ["commit", "-m", "base"]);
-    await git(sourceRepoDir, ["worktree", "add", "-b", "work", localWorkspaceDir, "HEAD"]);
+    beforeEach(async () => {
+      rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-git-"));
+      cleanupDirs.push(rootDir);
+      const sourceRepoDir = path.join(rootDir, "source-repo");
+      localWorkspaceDir = path.join(rootDir, "local-worktree");
+      remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
 
-    expect((await lstat(path.join(localWorkspaceDir, ".git"))).isFile()).toBe(true);
-    await mkdir(path.join(localWorkspaceDir, "node_modules"), { recursive: true });
-    await writeFile(path.join(localWorkspaceDir, "tracked.txt"), "dirty local\n", "utf8");
-    await writeFile(path.join(localWorkspaceDir, "untracked.txt"), "from local\n", "utf8");
-    await writeFile(path.join(localWorkspaceDir, "node_modules", "cache.bin"), "do not upload\n", "utf8");
-    await rm(path.join(localWorkspaceDir, "deleted.txt"));
+      await mkdir(sourceRepoDir, { recursive: true });
+      await git(sourceRepoDir, ["init"]);
+      await git(sourceRepoDir, ["checkout", "-b", "main"]);
+      await git(sourceRepoDir, ["config", "user.name", "Paperclip Test"]);
+      await git(sourceRepoDir, ["config", "user.email", "test@paperclip.dev"]);
+      await writeFile(path.join(sourceRepoDir, ".gitignore"), "node_modules/\n", "utf8");
+      await writeFile(path.join(sourceRepoDir, "tracked.txt"), "base\n", "utf8");
+      await writeFile(path.join(sourceRepoDir, "clean.txt"), "from git\n", "utf8");
+      await writeFile(path.join(sourceRepoDir, "deleted.txt"), "delete me\n", "utf8");
+      await git(sourceRepoDir, ["add", ".gitignore", "tracked.txt", "clean.txt", "deleted.txt"]);
+      await git(sourceRepoDir, ["commit", "-m", "base"]);
+      await git(sourceRepoDir, ["worktree", "add", "-b", "work", localWorkspaceDir, "HEAD"]);
 
-    const uploadedTars: { remotePath: string; bytes: Buffer }[] = [];
-    const downloadedTars: { remotePath: string; bytes: Buffer }[] = [];
-    const driveProgress = async (
-      total: number,
-      onProgress: ((done: number, total: number | null) => void | Promise<void>) | undefined,
-    ) => {
-      if (!onProgress) return;
-      await onProgress(Math.max(1, Math.floor(total / 2)), total);
-      await onProgress(total, total);
-    };
-    const client: SandboxManagedRuntimeClient = {
-      makeDir: async (remotePath) => {
-        await mkdir(remotePath, { recursive: true });
-      },
-      writeFile: async (remotePath, bytes, options) => {
-        await mkdir(path.dirname(remotePath), { recursive: true });
-        const buffer = Buffer.from(bytes);
-        if (remotePath.endsWith("-upload.tar")) uploadedTars.push({ remotePath, bytes: buffer });
-        await writeFile(remotePath, buffer);
-        await driveProgress(buffer.byteLength, options?.onProgress);
-      },
-      readFile: async (remotePath, options) => {
-        const buffer = await readFile(remotePath);
-        if (remotePath.endsWith("workspace-download.tar")) downloadedTars.push({ remotePath, bytes: buffer });
-        await driveProgress(buffer.byteLength, options?.onProgress);
-        return buffer;
-      },
-      listFiles: async () => [],
-      remove: async (remotePath) => {
-        await rm(remotePath, { recursive: true, force: true });
-      },
-      run: async (command) => {
-        await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
-      },
-    };
-    const runtimeStatuses: Array<{ phase: string; message: string }> = [];
-
-    attachFallbackSyncIn(client);
-    const prepared = await prepareSandboxManagedRuntime({
-      spec: {
-        transport: "sandbox",
-        provider: "test",
-        sandboxId: "sandbox-1",
-        remoteCwd: remoteWorkspaceDir,
-        timeoutMs: 30_000,
-        apiKey: null,
-      },
-      adapterKey: "test-adapter",
-      client,
-      workspaceLocalDir: localWorkspaceDir,
-      onRuntimeProgress: async (status) => {
-        runtimeStatuses.push({ phase: status.phase, message: status.message });
-      },
+      await mkdir(path.join(localWorkspaceDir, "node_modules"), { recursive: true });
+      await writeFile(path.join(localWorkspaceDir, "tracked.txt"), "dirty local\n", "utf8");
+      await writeFile(path.join(localWorkspaceDir, "untracked.txt"), "from local\n", "utf8");
+      await writeFile(path.join(localWorkspaceDir, "node_modules", "cache.bin"), "do not upload\n", "utf8");
+      await rm(path.join(localWorkspaceDir, "deleted.txt"));
     });
 
-    expect((await lstat(path.join(remoteWorkspaceDir, ".git"))).isDirectory()).toBe(true);
-    await expect(readFile(path.join(remoteWorkspaceDir, ".git", "shallow"), "utf8")).resolves.toContain(
-      await git(localWorkspaceDir, ["rev-parse", "HEAD"]),
-    );
-    expect(await git(remoteWorkspaceDir, ["rev-list", "--count", "HEAD"])).toBe("1");
-    expect(await git(remoteWorkspaceDir, ["status", "--short"])).toContain("M tracked.txt");
-    expect(await git(remoteWorkspaceDir, ["status", "--short"])).toContain("?? untracked.txt");
-    await expect(readFile(path.join(remoteWorkspaceDir, "deleted.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    it("syncs git-backed workspaces through a shallow standalone clone and keeps .git out of archives", async () => {
+      expect((await lstat(path.join(localWorkspaceDir, ".git"))).isFile()).toBe(true);
+      const uploadedTars: { remotePath: string; bytes: Buffer }[] = [];
+      const downloadedTars: { remotePath: string; bytes: Buffer }[] = [];
+      const driveProgress = async (
+        total: number,
+        onProgress: ((done: number, total: number | null) => void | Promise<void>) | undefined,
+      ) => {
+        if (!onProgress) return;
+        await onProgress(Math.max(1, Math.floor(total / 2)), total);
+        await onProgress(total, total);
+      };
+      const client: SandboxManagedRuntimeClient = {
+        makeDir: async (remotePath) => {
+          await mkdir(remotePath, { recursive: true });
+        },
+        writeFile: async (remotePath, bytes, options) => {
+          await mkdir(path.dirname(remotePath), { recursive: true });
+          const buffer = Buffer.from(bytes);
+          if (remotePath.endsWith("-upload.tar")) uploadedTars.push({ remotePath, bytes: buffer });
+          await writeFile(remotePath, buffer);
+          await driveProgress(buffer.byteLength, options?.onProgress);
+        },
+        readFile: async (remotePath, options) => {
+          const buffer = await readFile(remotePath);
+          if (remotePath.endsWith("workspace-download.tar")) downloadedTars.push({ remotePath, bytes: buffer });
+          await driveProgress(buffer.byteLength, options?.onProgress);
+          return buffer;
+        },
+        listFiles: async () => [],
+        remove: async (remotePath) => {
+          await rm(remotePath, { recursive: true, force: true });
+        },
+        run: async (command) => {
+          await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
+        },
+      };
+      const runtimeStatuses: Array<{ phase: string; message: string }> = [];
 
-    const gitUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "git-workspace-upload.tar");
-    const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
-    expect(gitUpload).toBeDefined();
-    expect(workspaceUpload).toBeDefined();
-    const gitMembers = await listTarMembers(rootDir, "git-upload-list.tar", gitUpload!.bytes);
-    const workspaceMembers = await listTarMembers(rootDir, "workspace-upload-list.tar", workspaceUpload!.bytes);
-    expect(gitMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(true);
-    expect(workspaceMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
-    expect(workspaceMembers).toContain("tracked.txt");
-    expect(workspaceMembers).toContain("untracked.txt");
-    expect(workspaceMembers).not.toContain("clean.txt");
-    expect(workspaceMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
+      attachFallbackSyncIn(client);
+      const prepared = await prepareSandboxManagedRuntime({
+        spec: {
+          transport: "sandbox",
+          provider: "test",
+          sandboxId: "sandbox-1",
+          remoteCwd: remoteWorkspaceDir,
+          timeoutMs: 30_000,
+          apiKey: null,
+        },
+        adapterKey: "test-adapter",
+        client,
+        workspaceLocalDir: localWorkspaceDir,
+        onRuntimeProgress: async (status) => {
+          runtimeStatuses.push({ phase: status.phase, message: status.message });
+        },
+      });
 
-    await git(remoteWorkspaceDir, ["config", "user.name", "Paperclip Sandbox"]);
-    await git(remoteWorkspaceDir, ["config", "user.email", "sandbox@paperclip.dev"]);
-    await git(remoteWorkspaceDir, ["add", "-A"]);
-    await git(remoteWorkspaceDir, ["commit", "-m", "sandbox update"]);
-    await writeFile(path.join(remoteWorkspaceDir, "tracked.txt"), "remote dirty\n", "utf8");
-    await writeFile(path.join(remoteWorkspaceDir, "remote-only.txt"), "from sandbox\n", "utf8");
+      expect((await lstat(path.join(remoteWorkspaceDir, ".git"))).isDirectory()).toBe(true);
+      await expect(readFile(path.join(remoteWorkspaceDir, ".git", "shallow"), "utf8")).resolves.toContain(
+        await git(localWorkspaceDir, ["rev-parse", "HEAD"]),
+      );
+      expect(await git(remoteWorkspaceDir, ["rev-list", "--count", "HEAD"])).toBe("1");
+      expect(await git(remoteWorkspaceDir, ["status", "--short"])).toContain("M tracked.txt");
+      expect(await git(remoteWorkspaceDir, ["status", "--short"])).toContain("?? untracked.txt");
+      await expect(readFile(path.join(remoteWorkspaceDir, "deleted.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
-    await prepared.restoreWorkspace();
+      const gitUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "git-workspace-upload.tar");
+      const workspaceUpload = uploadedTars.find((entry) => path.posix.basename(entry.remotePath) === "workspace-upload.tar");
+      expect(gitUpload).toBeDefined();
+      expect(workspaceUpload).toBeDefined();
+      const gitMembers = await listTarMembers(rootDir, "git-upload-list.tar", gitUpload!.bytes);
+      const workspaceMembers = await listTarMembers(rootDir, "workspace-upload-list.tar", workspaceUpload!.bytes);
+      expect(gitMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(true);
+      expect(workspaceMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
+      expect(workspaceMembers).toContain("tracked.txt");
+      expect(workspaceMembers).toContain("untracked.txt");
+      expect(workspaceMembers).not.toContain("clean.txt");
+      expect(workspaceMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
 
-    expect((await lstat(path.join(localWorkspaceDir, ".git"))).isFile()).toBe(true);
-    expect(await git(localWorkspaceDir, ["log", "-1", "--pretty=%s"])).toBe("sandbox update");
-    await expect(readFile(path.join(localWorkspaceDir, "tracked.txt"), "utf8")).resolves.toBe("remote dirty\n");
-    await expect(readFile(path.join(localWorkspaceDir, "remote-only.txt"), "utf8")).resolves.toBe("from sandbox\n");
-    await expect(readFile(path.join(localWorkspaceDir, "deleted.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(path.join(localWorkspaceDir, "node_modules", "cache.bin"), "utf8")).resolves.toBe("do not upload\n");
+      await git(remoteWorkspaceDir, ["config", "user.name", "Paperclip Sandbox"]);
+      await git(remoteWorkspaceDir, ["config", "user.email", "sandbox@paperclip.dev"]);
+      await git(remoteWorkspaceDir, ["add", "-A"]);
+      await git(remoteWorkspaceDir, ["commit", "-m", "sandbox update"]);
+      await writeFile(path.join(remoteWorkspaceDir, "tracked.txt"), "remote dirty\n", "utf8");
+      await writeFile(path.join(remoteWorkspaceDir, "remote-only.txt"), "from sandbox\n", "utf8");
 
-    expect(downloadedTars).toHaveLength(1);
-    const downloadMembers = await listTarMembers(rootDir, "workspace-download-list.tar", downloadedTars[0]!.bytes);
-    expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
-    expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
-    expect(runtimeStatuses.map((status) => status.phase)).toEqual(expect.arrayContaining([
-      "git_sync",
-      "config_sync",
-      "export",
-      "restore",
-      "finalize",
-    ]));
-    // Git history and workspace overlay sync as ONE merged operation, so a single
-    // transfer-progress event rides the config_sync (workspace) phase. The git_sync
-    // phase still emits its plain status message (asserted by the arrayContaining
-    // check above).
-    expect(runtimeStatuses.some((status) => (
-      status.phase === "config_sync" &&
-      /^Syncing workspace to sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
-    ))).toBe(true);
-    expect(runtimeStatuses.some((status) => (
-      status.phase === "export" &&
-      /^Exporting git history from sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
-    ))).toBe(true);
+      await prepared.restoreWorkspace();
+
+      expect((await lstat(path.join(localWorkspaceDir, ".git"))).isFile()).toBe(true);
+      expect(await git(localWorkspaceDir, ["log", "-1", "--pretty=%s"])).toBe("sandbox update");
+      await expect(readFile(path.join(localWorkspaceDir, "tracked.txt"), "utf8")).resolves.toBe("remote dirty\n");
+      await expect(readFile(path.join(localWorkspaceDir, "remote-only.txt"), "utf8")).resolves.toBe("from sandbox\n");
+      await expect(readFile(path.join(localWorkspaceDir, "deleted.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(path.join(localWorkspaceDir, "node_modules", "cache.bin"), "utf8")).resolves.toBe("do not upload\n");
+
+      expect(downloadedTars).toHaveLength(1);
+      const downloadMembers = await listTarMembers(rootDir, "workspace-download-list.tar", downloadedTars[0]!.bytes);
+      expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
+      expect(downloadMembers.some((entry) => entry === "node_modules" || entry.startsWith("node_modules/"))).toBe(false);
+      expect(runtimeStatuses.map((status) => status.phase)).toEqual(expect.arrayContaining([
+        "git_sync",
+        "config_sync",
+        "export",
+        "restore",
+        "finalize",
+      ]));
+      // Git history and workspace overlay sync as ONE merged operation, so a single
+      // transfer-progress event rides the config_sync (workspace) phase. The git_sync
+      // phase still emits its plain status message (asserted by the arrayContaining
+      // check above).
+      expect(runtimeStatuses.some((status) => (
+        status.phase === "config_sync" &&
+        /^Syncing workspace to sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
+      ))).toBe(true);
+      expect(runtimeStatuses.some((status) => (
+        status.phase === "export" &&
+        /^Exporting git history from sandbox: 100% \(\d+\.\d\/\d+\.\d MB\)$/.test(status.message)
+      ))).toBe(true);
+    });
   });
 
   it("repairs stale host index deletions when the sandbox restores a clean git worktree", async () => {

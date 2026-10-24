@@ -91,7 +91,7 @@ async function createApp(actor: any, db: any = {} as any) {
 }
 
 describe.sequential("cli auth routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/authz.js");
@@ -99,6 +99,11 @@ describe.sequential("cli auth routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.resetAllMocks();
+    // Compile the route graph during setup; keep request assertions on the 5s test budget.
+    await Promise.all([
+      vi.importActual("../routes/access.js"),
+      vi.importActual("../middleware/index.js"),
+    ]);
   });
 
   it.sequential("creates a CLI auth challenge with approval metadata", async () => {

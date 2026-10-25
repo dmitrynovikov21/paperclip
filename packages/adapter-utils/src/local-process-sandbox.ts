@@ -90,11 +90,18 @@ function isWithinPath(parent: string, candidate: string): boolean {
 }
 
 async function realpathOrMissing(candidate: string): Promise<string> {
-  try {
-    return await fs.realpath(candidate);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return path.resolve(candidate);
+  let current = path.resolve(candidate);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return path.join(await fs.realpath(current), ...missingSegments.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      missingSegments.push(path.basename(current));
+      current = parent;
+    }
   }
 }
 

@@ -201,6 +201,47 @@ describe("local process sandbox", () => {
     }
   });
 
+  it.runIf(process.platform === "linux")("rejects a private instance mount through a symlinked home before keys are created", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-home-alias-"));
+    cleanup.push(root);
+    const realHome = path.join(root, "real-home");
+    const homeAlias = path.join(root, "home-alias");
+    const instanceRoot = path.join(realHome, "instances", "default");
+    const workspace = path.join(root, "workspace");
+    const dbFile = path.join(root, "database-url");
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await fs.mkdir(workspace);
+    await fs.symlink(realHome, homeAlias, "dir");
+    await fs.writeFile(dbFile, "synthetic", { mode: 0o600 });
+    const previous = {
+      db: process.env.PAPERCLIP_DATABASE_URL_FILE,
+      home: process.env.PAPERCLIP_HOME,
+      instance: process.env.PAPERCLIP_INSTANCE_ID,
+    };
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = dbFile;
+      process.env.PAPERCLIP_HOME = homeAlias;
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: instanceRoot, access: "ro" }],
+        },
+      })).rejects.toThrow("mount would expose service secrets");
+    } finally {
+      if (previous.db === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous.db;
+      if (previous.home === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previous.home;
+      if (previous.instance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previous.instance;
+    }
+  });
+
   it("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
     cleanup.push(root);

@@ -1718,14 +1718,19 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const issueId = randomUUID();
       await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
       const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+      const evidenceFinishedAt = new Date(NOW.getTime() - 60_000);
+      const evidenceRunId = await seedSucceededRun({ companyId, agentId, finishedAt: evidenceFinishedAt });
 
       const adapter = createPostgresRunDispatchAdapter(db);
       const advanceInput = {
         runId,
         companyId,
+        agentId,
+        adapterType: "codex_local",
         now: NOW,
         originalScheduledRetryAt: FAR_FUTURE_PIN,
-        evidenceRunId: "green-run",
+        evidenceRunId,
+        evidenceFinishedAt,
       };
       expect(await adapter.advanceScheduledRetryPin(advanceInput)).toEqual({ advanced: true });
 
@@ -1742,7 +1747,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(event?.message).toContain("re-probed early");
       expect(event?.payload).toMatchObject({
         originalScheduledRetryAt: FAR_FUTURE_PIN.toISOString(),
-        upstreamRecoveryEvidenceRunId: "green-run",
+        upstreamRecoveryEvidenceRunId: evidenceRunId,
       });
 
       // The pin is no longer in the future, so a second sweep is a no-op.
@@ -1762,9 +1767,12 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(await createPostgresRunDispatchAdapter(db).advanceScheduledRetryPin({
         runId,
         companyId,
+        agentId,
+        adapterType: "codex_local",
         now: NOW,
         originalScheduledRetryAt: FAR_FUTURE_PIN,
         evidenceRunId: "green-run",
+        evidenceFinishedAt: new Date(NOW.getTime() - 60_000),
       })).toEqual({ advanced: false });
       const [row] = await db.select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
         .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -1802,6 +1810,55 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId));
       expect(promoted?.status).toBe("queued");
+    });
+
+    it("keeps the second pin when a new upstream failure is saved during the same page", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueIds = [randomUUID(), randomUUID()];
+      const runIds: string[] = [];
+      for (const issueId of issueIds) {
+        await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+        const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+        await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+        runIds.push(runId);
+      }
+      await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 2 * 60_000) });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      let insertedFailure = false;
+      const runDispatch = createRunDispatch(db, { adapter: {
+        ...adapter,
+        async promoteOrCancelDueRetry(input) {
+          const result = await adapter.promoteOrCancelDueRetry(input);
+          if (!insertedFailure) {
+            expect(result.outcome).toBe("promoted");
+            insertedFailure = true;
+            await seedFailedRun({
+              companyId,
+              agentId,
+              finishedAt: new Date(NOW.getTime() - 60_000),
+              errorCode: "provider_quota",
+            });
+          }
+          return result;
+        },
+      } });
+
+      const result = await runDispatch.promoteEarlyUpstreamRecoveryRetries({
+        now: NOW, cutoff: null, scope: { companyId, agentId, adapterType: "codex_local" },
+      });
+      expect(insertedFailure).toBe(true);
+      expect(result).toMatchObject({ promoted: 1, runIds: [runIds.sort()[0]] });
+      const heldRunId = runIds[1]!;
+      const [held] = await db.select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, heldRunId));
+      expect(held).toEqual({ status: "scheduled_retry", scheduledRetryAt: FAR_FUTURE_PIN });
+
+      // A later success is new evidence and may release the remaining pin.
+      await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 30_000) });
+      expect(await createRunDispatch(db).promoteEarlyUpstreamRecoveryRetries({
+        now: NOW, cutoff: null, scope: { companyId, agentId, adapterType: "codex_local" },
+      })).toMatchObject({ promoted: 1, runIds: [heldRunId] });
     });
 
     it("reads only the same agent and adapter's latest upstream failure since the success", async () => {

@@ -1001,9 +1001,11 @@ Accounting signals the shared delivery coordinator after committing the success;
 the coordinator re-probes that scope and retains failed work for retry. Native
 reconciliation uses the same accounting signal. Startup traverses saved
 far-future pins once in bounded pages, so recent recovery evidence survives a
-restart. A later upstream failure keeps the pin. The periodic pass does not
-query far-future pins while the server is idle. Early release still uses the
-normal promotion gate.
+restart. A later upstream failure keeps the pin. Each pin update checks for
+newly saved failures after the recovery evidence, including failures saved
+while earlier pins in the same page are being processed. The periodic pass
+does not query far-future pins while the server is idle. Early release still
+uses the normal promotion gate.
 
 Native finalization reconciliation (part of native recovery and the orphan
 reap) skips settled committed finalizations in unscoped passes: the run is

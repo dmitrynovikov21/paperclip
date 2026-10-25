@@ -2,7 +2,8 @@ import { hasConversationContinuationPolicy } from "../../../services/conversatio
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, desc, eq, gt, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, lte, notExists, or, sql } from "drizzle-orm";
+import type { AnyColumn } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
@@ -155,6 +156,17 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
  */
 export const JS_TRIM_WHITESPACE_CHARACTERS =
   "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+
+/** Match the retry scheduler's error-family precedence in both evidence reads and pin updates. */
+function isUpstreamFailure(run: { resultJson: AnyColumn; errorCode: AnyColumn }) {
+  return sql`(case
+    when jsonb_typeof(${run.resultJson} -> 'errorFamily') = 'string'
+      and btrim(${run.resultJson} ->> 'errorFamily', ${JS_TRIM_WHITESPACE_CHARACTERS}) <> ''
+      then ${run.resultJson} ->> 'errorFamily'
+    when ${run.errorCode} = ${PROVIDER_QUOTA_ERROR_CODE} then 'provider_quota'
+    when ${inArray(run.errorCode, [...TRANSIENT_UPSTREAM_ERROR_CODES])} then 'transient_upstream'
+  end) in ('provider_quota', 'transient_upstream')`;
+}
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -661,13 +673,7 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "failed"),
           sql`${heartbeatRuns.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
           gte(heartbeatRuns.finishedAt, input.since),
-          sql`(case
-            when jsonb_typeof(${heartbeatRuns.resultJson} -> 'errorFamily') = 'string'
-              and btrim(${heartbeatRuns.resultJson} ->> 'errorFamily', ${JS_TRIM_WHITESPACE_CHARACTERS}) <> ''
-              then ${heartbeatRuns.resultJson} ->> 'errorFamily'
-            when ${heartbeatRuns.errorCode} = ${PROVIDER_QUOTA_ERROR_CODE} then 'provider_quota'
-            when ${inArray(heartbeatRuns.errorCode, [...TRANSIENT_UPSTREAM_ERROR_CODES])} then 'transient_upstream'
-          end) in ('provider_quota', 'transient_upstream')`,
+          isUpstreamFailure(heartbeatRuns),
         ),
       )
       .orderBy(desc(heartbeatRuns.finishedAt))
@@ -680,8 +686,9 @@ export function createPostgresRunDispatchAdapter(
   async function advanceScheduledRetryPin(
     input: AdvanceScheduledRetryPinInput,
   ): Promise<AdvanceScheduledRetryPinOutcome> {
-    // Guarded on the pin still being in the future, so a retry another writer
-    // already released or promoted is never re-pinned by this sweep.
+    // A page-level evidence read can become stale while earlier pins are being
+    // promoted. Recheck failures in the UPDATE statement that releases this pin.
+    const laterFailure = alias(heartbeatRuns, "early_reprobe_later_failure");
     const [row] = await db
       .update(heartbeatRuns)
       .set({ scheduledRetryAt: input.now, updatedAt: input.now })
@@ -689,12 +696,21 @@ export function createPostgresRunDispatchAdapter(
         and(
           eq(heartbeatRuns.id, input.runId),
           eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
           eq(heartbeatRuns.status, "scheduled_retry"),
           eq(heartbeatRuns.scheduledRetryReason, TRANSIENT_FAILURE_RETRY_REASON),
           input.originalScheduledRetryAt
             ? eq(heartbeatRuns.scheduledRetryAt, input.originalScheduledRetryAt)
             : sql`false`,
           gt(heartbeatRuns.scheduledRetryAt, input.now),
+          notExists(db.select({ id: laterFailure.id }).from(laterFailure).where(and(
+            eq(laterFailure.companyId, input.companyId),
+            eq(laterFailure.agentId, input.agentId),
+            eq(laterFailure.status, "failed"),
+            sql`${laterFailure.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
+            gte(laterFailure.finishedAt, input.evidenceFinishedAt),
+            isUpstreamFailure(laterFailure),
+          ))),
         ),
       )
       .returning();

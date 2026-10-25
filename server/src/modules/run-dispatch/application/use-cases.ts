@@ -108,14 +108,17 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
         },
         now,
       );
-      if (!decision.reprobe) continue;
+      if (!decision.reprobe || !upstreamState.recoveryEvidence) continue;
 
       const advanced = await deps.writer.advanceScheduledRetryPin({
         runId: candidate.runId,
         companyId: candidate.companyId,
+        agentId: candidate.agentId,
+        adapterType: candidate.adapterType,
         now,
         originalScheduledRetryAt: candidate.scheduledRetryAt,
         evidenceRunId: decision.evidenceRunId,
+        evidenceFinishedAt: upstreamState.recoveryEvidence.finishedAt,
       });
       if (!advanced.advanced) continue;
 

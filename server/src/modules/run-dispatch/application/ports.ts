@@ -101,11 +101,15 @@ export type PromoteOrCancelDueRetryInput = {
 export type AdvanceScheduledRetryPinInput = {
   runId: string;
   companyId: string;
+  agentId: string;
+  adapterType: string;
   now: Date;
   /** The pin being replaced, recorded on the run's lifecycle event. */
   originalScheduledRetryAt: Date | null;
   /** The successful run that proved the upstream recovered. */
   evidenceRunId: string;
+  /** The success timestamp bounds a fresh failure check in the pin update. */
+  evidenceFinishedAt: Date;
 };
 
 export type AdvanceScheduledRetryPinOutcome = { advanced: true } | { advanced: false };
@@ -132,7 +136,7 @@ export type DispatchResolvedInteractionOutcome<T> =
 /** Semantic database operations; persistence rows and transaction handles stay inside the adapter. */
 export interface RunDispatchWriter {
   promoteOrCancelDueRetry(input: PromoteOrCancelDueRetryInput): Promise<PromoteScheduledRetryOutcome>;
-  /** Pulls a still-future retry pin forward to `now`; a lost race leaves the pin untouched. */
+  /** Pulls a still-future retry pin forward only if no later upstream failure was committed. */
   advanceScheduledRetryPin(
     input: AdvanceScheduledRetryPinInput,
   ): Promise<AdvanceScheduledRetryPinOutcome>;

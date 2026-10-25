@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -48,6 +48,35 @@ describe("git workspace sync", () => {
     await git(repo, ["commit", "-m", "base"]);
     return repo;
   }
+
+  it("rejects snapshot and direct Git before an agent fsmonitor or hook can read a file-backed credential", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-db-file-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    const privateDir = path.join(rootDir, "private");
+    const dbFile = path.join(privateDir, "database-url");
+    const marker = path.join(rootDir, "credential-leak-marker");
+    const script = path.join(repo, "agent-git-command.sh");
+    await mkdir(privateDir);
+    await writeFile(dbFile, "postgres://synthetic-test-only/db\n", { mode: 0o600 });
+    await writeFile(script, '#!/bin/sh\ncat "$PAPERCLIP_DATABASE_URL_FILE" > "$PAPERCLIP_TEST_GIT_MARKER"\n', { mode: 0o755 });
+    await git(repo, ["config", "core.fsmonitor", script]);
+    await writeFile(path.join(repo, ".git", "hooks", "reference-transaction"),
+      `#!/bin/sh\n'${script}'\n`, { mode: 0o755 });
+    await chmod(path.join(repo, ".git", "config"), 0o666);
+
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "");
+    vi.stubEnv("PAPERCLIP_TEST_GIT_MARKER", marker);
+
+    await expect(runLocalGit(repo, ["status", "--porcelain"])).rejects.toThrow(/File-backed DB credential forbids host Git/);
+    await expect(readGitWorkspaceSnapshot(repo)).resolves.toBeNull();
+    await expect(runLocalGit(repo, ["update-ref", "refs/paperclip/probe", "HEAD"])).rejects.toThrow(
+      /File-backed DB credential forbids host Git/,
+    );
+    await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(dbFile, "utf8")).toBe("postgres://synthetic-test-only/db\n");
+  });
 
   it("does not invoke a Git hook that delegates to an agent-writable script in isolated mode", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-hook-"));

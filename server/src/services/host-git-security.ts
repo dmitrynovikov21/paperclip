@@ -2,8 +2,18 @@ import os from "node:os";
 import path from "node:path";
 import { assertIsolatedWorkspaceSyncAllowed } from "@paperclipai/adapter-utils/isolated-workspace-guard";
 
+function assertNoFileBackedDbHostGit(): void {
+  // The local workspace and its Git metadata can be changed by an agent that
+  // shares the service UID. Git config can launch arbitrary commands (not just
+  // fsmonitor/hooks), so argv and environment sanitization cannot contain it.
+  if (process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+    throw new Error("File-backed DB credential forbids host Git on execution workspaces.");
+  }
+}
+
 /** Git must not read agent-controlled metadata before the sandbox sync guard runs. */
 export async function assertHostGitWorkspaceAllowed(cwd: string): Promise<string> {
+  assertNoFileBackedDbHostGit();
   if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") return cwd;
   // Git must use this canonical path. The original cwd may cross an alias in an
   // agent-writable directory that can be retargeted after the guard returns.
@@ -15,6 +25,7 @@ export function prepareHostGitInvocation(
   args: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): { args: string[]; env: NodeJS.ProcessEnv } {
+  assertNoFileBackedDbHostGit();
   if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME !== "true") {
     return { args, env };
   }

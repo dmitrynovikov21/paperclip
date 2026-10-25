@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
-import { readSanitizedOriginRemoteUrl } from "./git-workspace-sync.js";
+import { readSanitizedOriginRemoteUrl, runLocalGit as runGuardedLocalGit } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -330,7 +330,7 @@ async function runLocalGit(
     maxBuffer?: number;
   } = {},
 ): Promise<SshCommandResult> {
-  return await execFileText("git", ["-C", localDir, ...args], options);
+  return await runGuardedLocalGit(localDir, args, options);
 }
 
 async function commandExists(command: string): Promise<boolean> {

@@ -31,6 +31,12 @@ export async function runLocalGit(
     maxBuffer?: number;
   } = {},
 ): Promise<GitCommandResult> {
+  // A local or SSH workspace may have agent-writable Git config. In file-backed
+  // DB mode the service UID can read the credential file, so even a sanitized
+  // Git environment cannot make executable repository config safe.
+  if (process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+    throw new Error("File-backed DB credential forbids host Git on execution workspaces.");
+  }
   // Do not let an ambient Git environment redirect repository discovery or
   // load executable config from a path outside the checked repository when
   // the service process holds the local master key.

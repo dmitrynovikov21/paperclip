@@ -66,7 +66,7 @@ import type { AppendHeartbeatRunEventInput } from "../heartbeat-run-events.js";
 import type { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
-import type { createRunDispatch, PostCommitEffect } from "../../modules/run-dispatch/index.js";
+import type { createRunDispatch, PostCommitEffect, UpstreamReprobeScope } from "../../modules/run-dispatch/index.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type HeartbeatRunState = ReturnType<typeof createHeartbeatRunState>;
@@ -81,7 +81,7 @@ type PlanApprovalResumeFailure = {
 export interface HeartbeatRetryDependencies {
   hasCaseHandoffForRun: (run: Pick<HeartbeatRun, "id" | "companyId">) => Promise<boolean>;
   runDispatch: Pick<ReturnType<typeof createRunDispatch>,
-    "evaluateScheduledRetryGate" | "promoteDueScheduledRetries" | "promoteScheduledRetry">;
+    "evaluateScheduledRetryGate" | "promoteDueScheduledRetries" | "promoteEarlyUpstreamRecoveryRetries" | "promoteScheduledRetry">;
   getAgent: (agentId: string) => Promise<typeof agents.$inferSelect | null | undefined>;
   getRun: (
     runId: string,
@@ -1650,6 +1650,23 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     return { promoted: result.promoted, runIds: result.runIds };
   }
 
+  /** Only a saved success or startup recovery calls this; an idle tick never probes candidates. */
+  async function promoteEarlyUpstreamRecoveryRetries(
+    scope?: UpstreamReprobeScope,
+    now = new Date(),
+  ) {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const runIds: string[] = [];
+    let after: Awaited<ReturnType<typeof runDispatch.promoteEarlyUpstreamRecoveryRetries>>["nextCursor"] = null;
+    do {
+      const result = await runDispatch.promoteEarlyUpstreamRecoveryRetries({ now, cutoff, after, scope });
+      applyRunDispatchPostCommitEffects(result.postCommitEffects);
+      runIds.push(...result.runIds);
+      after = result.nextCursor;
+    } while (after);
+    return { promoted: runIds.length, runIds };
+  }
+
   async function getIssueRetryRun(
     companyId: string,
     issueId: string,
@@ -1898,6 +1915,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     finalizeAiConnectionBusyDeferral,
     finalizeWorkspaceBusyDeferral,
     promoteDueScheduledRetries,
+    promoteEarlyUpstreamRecoveryRetries,
     retryScheduledRetryNow,
 
     scheduleBoundedRetry: async (

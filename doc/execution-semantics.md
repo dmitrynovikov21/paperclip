@@ -993,6 +993,15 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 
 The stranded-work pass closes the gap where issue state survives a crash but the wake/run path does not. The silent-run scan covers the separate case where a live process exists but has stopped producing observable output.
 
+A retry whose deadline has passed uses the normal scheduled-retry promotion
+gate at startup and on the existing periodic pass. A transient retry pinned
+beyond the bounded backoff ceiling can also be released early after a run by
+the same company, agent, and adapter succeeds. That success must be saved
+before the re-probe reads it. A later upstream failure keeps the pin. Startup
+traverses the saved far-future pins once in bounded pages, so recent recovery
+evidence survives a restart. The periodic pass does not query far-future pins
+while the server is idle. Early release still uses the normal promotion gate.
+
 Native finalization reconciliation (part of native recovery and the orphan
 reap) skips settled committed finalizations in unscoped passes: the run is
 succeeded, failed, cancelled or timed out, it finished more than an hour ago,

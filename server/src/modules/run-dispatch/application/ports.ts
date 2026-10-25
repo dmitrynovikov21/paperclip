@@ -38,11 +38,19 @@ export type EarlyUpstreamReprobeCursor = {
   runId: string;
 };
 
+export type UpstreamReprobeScope = {
+  companyId: string;
+  agentId: string;
+  adapterType: string;
+};
+
 export type ListEarlyUpstreamReprobeCandidatesInput = {
   now: Date;
   cutoff: Date | null;
   limit: number;
   after?: EarlyUpstreamReprobeCursor | null;
+  /** A successful run limits the event-driven probe to its own upstream. */
+  scope?: UpstreamReprobeScope;
 };
 
 export type FindUpstreamRecoveryEvidenceInput = {

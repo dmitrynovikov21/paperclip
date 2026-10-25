@@ -1622,6 +1622,25 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       ]);
     });
 
+    it("limits a successful run's candidate query to its company, agent and adapter", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const otherCompany = await seedCompanyAndAgent();
+      const otherAgentId = randomUUID();
+      await seedAgent({ id: otherAgentId, companyId, name: "Other" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const own = await seedPinnedTransientRetry({ companyId, agentId, issueId });
+      await seedPinnedTransientRetry({ companyId, agentId, issueId, adapterType: "claude_local" });
+      await seedPinnedTransientRetry({ companyId, agentId: otherAgentId, issueId });
+      await seedPinnedTransientRetry({ companyId: otherCompany.companyId, agentId: otherCompany.agentId, issueId });
+
+      const rows = await createPostgresRunDispatchAdapter(db).listEarlyUpstreamReprobeCandidates({
+        now: NOW, cutoff: null, limit: 50,
+        scope: { companyId, agentId, adapterType: "codex_local" },
+      });
+      expect(rows.map(({ runId }) => runId)).toEqual([own]);
+    });
+
     it("reads only the same agent and adapter's latest success inside the lookback window", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const other = await seedCompanyAndAgent();
@@ -1755,9 +1774,10 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
       const runDispatch = createRunDispatch(db);
+      const scope = { companyId, agentId, adapterType: "codex_local" };
 
       // No green run yet: the reset pin is preserved exactly.
-      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+      expect(await runDispatch.promoteEarlyUpstreamRecoveryRetries({ now: NOW, cutoff: null, scope })).toMatchObject({
         promoted: 0,
         runIds: [],
       });
@@ -1769,7 +1789,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
 
       // A success after the pin proves the upstream is serving again.
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 60_000) });
-      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+      expect(await runDispatch.promoteEarlyUpstreamRecoveryRetries({ now: NOW, cutoff: null, scope })).toMatchObject({
         promoted: 1,
         runIds: [runId],
       });
@@ -1872,6 +1892,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const runId = await seedPinnedTransientRetry({ companyId, agentId, issueId });
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
       const runDispatch = createRunDispatch(db);
+      const scope = { companyId, agentId, adapterType: "codex_local" };
 
       // The success proved recovery for a moment. The quota failure after it,
       // stored with a non-string family so its code decides, says the limit is back.
@@ -1883,7 +1904,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         errorCode: "provider_quota",
         resultJson: { errorFamily: 42 },
       });
-      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+      expect(await runDispatch.promoteEarlyUpstreamRecoveryRetries({ now: NOW, cutoff: null, scope })).toMatchObject({
         promoted: 0,
         runIds: [],
       });
@@ -1895,7 +1916,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
 
       // A success after that failure is the latest word again.
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 30_000) });
-      expect(await runDispatch.promoteDueScheduledRetries({ now: NOW, cutoff: null })).toMatchObject({
+      expect(await runDispatch.promoteEarlyUpstreamRecoveryRetries({ now: NOW, cutoff: null, scope })).toMatchObject({
         promoted: 1,
         runIds: [runId],
       });

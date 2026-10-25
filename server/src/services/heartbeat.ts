@@ -981,6 +981,7 @@ export function heartbeatService(
     finalizeAiConnectionBusyDeferral,
     finalizeWorkspaceBusyDeferral,
     promoteDueScheduledRetries,
+    promoteEarlyUpstreamRecoveryRetries,
     retryScheduledRetryNow,
     scheduleBoundedRetry,
   } = createHeartbeatRetries(db, {
@@ -1736,6 +1737,7 @@ export function heartbeatService(
     scheduleBoundedRetryForRun,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     timerClaimWasFirstHeartbeat,
+    promoteEarlyUpstreamRecoveryRetries,
     releaseIssueExecutionAndPromote,
     finalizeAgentStatus,
     enqueueWakeup,
@@ -4088,6 +4090,7 @@ export function heartbeatService(
     applyTaskDrain,
 
     promoteDueScheduledRetries,
+    promoteEarlyUpstreamRecoveryRetries,
     retryScheduledRetryNow,
 
     resumeQueuedRuns,

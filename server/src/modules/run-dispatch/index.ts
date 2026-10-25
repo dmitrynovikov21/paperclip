@@ -56,6 +56,7 @@ export type {
   PromoteScheduledRetryOutcome,
   CancelStaleQueuedRunOutcome,
 } from "./application/types.js";
+export type { UpstreamReprobeScope } from "./application/ports.js";
 export { RunDispatchApplicationError } from "./application/types.js";
 
 export type RunDispatchDeps = {
@@ -75,6 +76,11 @@ export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
   const promoteScheduledRetry = createPromoteScheduledRetry({
     writer: adapter,
   });
+  const promoteEarlyUpstreamRecoveryRetries = createPromoteEarlyUpstreamRecoveryRetries({
+    reader: adapter,
+    writer: adapter,
+    promoteScheduledRetry,
+  });
 
   return {
     evaluateScheduledRetryGate: createEvaluateScheduledRetryGate({ reader: adapter }),
@@ -82,12 +88,8 @@ export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
     promoteDueScheduledRetries: createPromoteDueScheduledRetries({
       reader: adapter,
       promoteScheduledRetry,
-      promoteEarlyUpstreamRecoveryRetries: createPromoteEarlyUpstreamRecoveryRetries({
-        reader: adapter,
-        writer: adapter,
-        promoteScheduledRetry,
-      }),
     }),
+    promoteEarlyUpstreamRecoveryRetries,
     cancelStaleQueuedRun: createCancelStaleQueuedRun({
       writer: adapter,
     }),

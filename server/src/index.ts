@@ -1683,6 +1683,7 @@ async function startServerWithDatabaseTeardown(
         }
 
         const promotion = await timeStartupRecovery("scheduled_retries", () => heartbeat.promoteDueScheduledRetries());
+        const earlyPromotion = await timeStartupRecovery("early_upstream_reprobe", () => heartbeat.promoteEarlyUpstreamRecoveryRetries());
         await timeStartupRecovery("queued_runs", () => heartbeat.resumeQueuedRuns());
         const recoveredGoalActions = await timeStartupRecovery("goal_actions", () => heartbeat.recoverPendingSessionGoalActions());
         if (
@@ -1704,6 +1705,7 @@ async function startServerWithDatabaseTeardown(
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
+          earlyPromotion.promoted > 0 ||
           reconciled.assignmentDispatched > 0 ||
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
@@ -1712,7 +1714,8 @@ async function startServerWithDatabaseTeardown(
           reconciled.escalated > 0
         ) {
           logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds,
+              earlyUpstreamReprobes: earlyPromotion.promoted, earlyUpstreamReprobeRunIds: earlyPromotion.runIds, ...reconciled },
             "startup heartbeat recovery changed assigned issue state",
           );
         }

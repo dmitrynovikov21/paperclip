@@ -579,6 +579,9 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "scheduled_retry"),
           eq(heartbeatRuns.scheduledRetryReason, TRANSIENT_FAILURE_RETRY_REASON),
           gt(heartbeatRuns.scheduledRetryAt, reprobeThreshold),
+          input.scope ? eq(heartbeatRuns.companyId, input.scope.companyId) : undefined,
+          input.scope ? eq(heartbeatRuns.agentId, input.scope.agentId) : undefined,
+          input.scope ? sql`${predecessor.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.scope.adapterType}` : undefined,
           input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
           input.after ? or(
             gt(heartbeatRuns.scheduledRetryAt, input.after.scheduledRetryAt),

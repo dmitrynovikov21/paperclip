@@ -62,7 +62,13 @@ function fakeReader(
       return dueRuns;
     },
     async listEarlyUpstreamReprobeCandidates(input) {
-      const candidates = reprobe.candidates ?? [];
+      const candidates = (reprobe.candidates ?? []).filter((candidate) =>
+        !input.scope || (
+          candidate.companyId === input.scope.companyId &&
+          candidate.agentId === input.scope.agentId &&
+          candidate.adapterType === input.scope.adapterType
+        ),
+      );
       const afterIndex = input.after
         ? candidates.findIndex((candidate) => candidate.runId === input.after?.runId) + 1
         : 0;
@@ -122,11 +128,6 @@ function buildPromoters(
   return createPromoteDueScheduledRetries({
     reader,
     promoteScheduledRetry,
-    promoteEarlyUpstreamRecoveryRetries: createPromoteEarlyUpstreamRecoveryRetries({
-      reader,
-      writer,
-      promoteScheduledRetry,
-    }),
   });
 }
 
@@ -200,35 +201,17 @@ describe("createPromoteDueScheduledRetries", () => {
     expect(result.runIds).toEqual(dueRuns.slice(0, 50).map(({ runId }) => runId));
   });
 
-  it("reports early re-probed runs in the same sweep as the due ones", async () => {
+  it("leaves far-future candidates untouched during a due sweep", async () => {
     const reader = fakeReader([{ runId: "due-run", companyId: "company-1" }], {
       candidates: [reprobeCandidate()],
       evidence: RECOVERY_EVIDENCE,
     });
+    const listCandidates = vi.spyOn(reader, "listEarlyUpstreamReprobeCandidates");
     const writer = fakeWriter();
     const result = await buildPromoters(reader, writer)({ now: REPROBE_NOW, cutoff: null });
 
-    expect(result).toMatchObject({ promoted: 2, runIds: ["due-run", "pinned-run"] });
-    expect(writer.advanceCalls).toEqual([
-      {
-        runId: "pinned-run",
-        companyId: "company-1",
-        now: REPROBE_NOW,
-        originalScheduledRetryAt: FAR_FUTURE_PIN,
-        evidenceRunId: "green-run",
-      },
-    ]);
-  });
-
-  it("never re-probes a run the due path already promoted this sweep", async () => {
-    const reader = fakeReader([{ runId: "pinned-run", companyId: "company-1" }], {
-      candidates: [reprobeCandidate()],
-      evidence: RECOVERY_EVIDENCE,
-    });
-    const writer = fakeWriter();
-    const result = await buildPromoters(reader, writer)({ now: REPROBE_NOW, cutoff: null });
-
-    expect(result).toMatchObject({ promoted: 1, runIds: ["pinned-run"] });
+    expect(result).toMatchObject({ promoted: 1, runIds: ["due-run"] });
+    expect(listCandidates).not.toHaveBeenCalled();
     expect(writer.advanceCalls).toEqual([]);
   });
 });
@@ -320,7 +303,7 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     ]);
   });
 
-  it("checks one page per sweep and reaches every candidate across sweeps", async () => {
+  it("returns a cursor after each full page and reaches every candidate", async () => {
     // One agent per candidate defeats the per-scope cache: every candidate costs one evidence read.
     const candidates = Array.from({ length: 120 }, (_, index) =>
       reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
@@ -332,21 +315,24 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     const writer = fakeWriter();
     const promote = buildEarlyPromoter(reader, writer);
 
-    const evidenceReadsPerSweep: number[] = [];
-    const promotedPerSweep: string[][] = [];
-    for (let sweep = 0; sweep < 3; sweep += 1) {
+    const evidenceReadsPerPage: number[] = [];
+    const promotedPerPage: string[][] = [];
+    let after: Awaited<ReturnType<typeof promote>>["nextCursor"] = null;
+    for (let page = 0; page < 3; page += 1) {
       const readsBefore = reader.evidenceCalls.length;
-      const result = await promote({ now: REPROBE_NOW, cutoff: null });
-      evidenceReadsPerSweep.push(reader.evidenceCalls.length - readsBefore);
-      promotedPerSweep.push(result.runIds);
+      const result = await promote({ now: REPROBE_NOW, cutoff: null, after });
+      evidenceReadsPerPage.push(reader.evidenceCalls.length - readsBefore);
+      promotedPerPage.push(result.runIds);
+      after = result.nextCursor;
     }
 
-    expect(evidenceReadsPerSweep).toEqual([50, 50, 20]);
-    expect(promotedPerSweep).toEqual([[], [], ["pinned-119"]]);
+    expect(evidenceReadsPerPage).toEqual([50, 50, 20]);
+    expect(promotedPerPage).toEqual([[], [], ["pinned-119"]]);
+    expect(after).toBeNull();
     expect(writer.advanceCalls).toHaveLength(1);
   });
 
-  it("wraps back to the first page after a short page", async () => {
+  it("starts each event from the first page", async () => {
     const candidates = Array.from({ length: 60 }, (_, index) =>
       reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
     );
@@ -354,9 +340,9 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     const listCandidates = vi.spyOn(reader, "listEarlyUpstreamReprobeCandidates");
     const promote = buildEarlyPromoter(reader, fakeWriter());
 
-    for (let sweep = 0; sweep < 3; sweep += 1) {
-      await promote({ now: REPROBE_NOW, cutoff: null });
-    }
+    const first = await promote({ now: REPROBE_NOW, cutoff: null });
+    await promote({ now: REPROBE_NOW, cutoff: null, after: first.nextCursor });
+    await promote({ now: REPROBE_NOW, cutoff: null });
 
     expect(listCandidates.mock.calls.map(([input]) => input.after?.runId ?? null)).toEqual([
       null,
@@ -365,23 +351,22 @@ describe("createPromoteEarlyUpstreamRecoveryRetries", () => {
     ]);
   });
 
-  it("moves past a page whose processing throws", async () => {
-    const candidates = Array.from({ length: 51 }, (_, index) =>
-      reprobeCandidate({ runId: `pinned-${index}`, agentId: `agent-${index}` }),
-    );
+  it("retries the same page after a transient evidence-read failure", async () => {
+    let fails = true;
     const reader = fakeReader([], {
-      candidates,
-      evidenceFor: ({ agentId }) => {
-        if (agentId === "agent-0") throw new Error("evidence read failed");
-        return agentId === "agent-50" ? RECOVERY_EVIDENCE : null;
+      candidates: [reprobeCandidate()],
+      evidenceFor: () => {
+        if (fails) throw new Error("evidence read failed");
+        return RECOVERY_EVIDENCE;
       },
     });
     const promote = buildEarlyPromoter(reader, fakeWriter());
 
     await expect(promote({ now: REPROBE_NOW, cutoff: null })).rejects.toThrow("evidence read failed");
+    fails = false;
     const result = await promote({ now: REPROBE_NOW, cutoff: null });
 
-    expect(result.runIds).toEqual(["pinned-50"]);
+    expect(result.runIds).toEqual(["pinned-run"]);
   });
 
   it("keeps a retry pinned when the predecessor's adapter is unknown", async () => {

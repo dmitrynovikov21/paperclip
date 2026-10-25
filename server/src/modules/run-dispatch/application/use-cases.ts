@@ -1,6 +1,6 @@
 import { decideEarlyUpstreamReprobe } from "../domain/policy.js";
 import type { UpstreamFailureEvidence, UpstreamRecoveryEvidence } from "../domain/policy.js";
-import type { EarlyUpstreamReprobeCandidate, EarlyUpstreamReprobeCursor, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type { EarlyUpstreamReprobeCandidate, EarlyUpstreamReprobeCursor, RunDispatchWriter, ScheduledRetryReader, UpstreamReprobeScope } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -26,7 +26,7 @@ export function createPromoteScheduledRetry(deps: { writer: RunDispatchWriter })
 }
 
 const MAX_DUE_RETRIES_PER_SWEEP = 50;
-const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
+const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_PAGE = 50;
 
 /**
  * Releases transient-upstream retries whose far-future pin (typically a
@@ -35,23 +35,19 @@ const MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP = 50;
  * forward to `now`, then flows through the same promotion path — and therefore
  * the same gates — as a retry that became due on its own.
  *
- * Each sweep reads one bounded page of candidates. The cursor carries the walk
- * across sweeps and wraps to the start after a short page, so every candidate
- * is re-checked within ceil(candidates / page) sweeps while no single sweep
- * does more than one page of work.
+ * One invocation handles one bounded page. Event and startup callers continue
+ * with nextCursor until the durable candidate set has been traversed.
  */
 export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
   reader: ScheduledRetryReader;
   writer: RunDispatchWriter;
   promoteScheduledRetry: ReturnType<typeof createPromoteScheduledRetry>;
 }) {
-  let after: EarlyUpstreamReprobeCursor | null = null;
-
   return async function promoteEarlyUpstreamRecoveryRetries(input: {
     now?: Date;
     cutoff: Date | null;
-    /** Runs the caller already promoted on the due path this sweep. */
-    skipRunIds?: ReadonlySet<string>;
+    after?: EarlyUpstreamReprobeCursor | null;
+    scope?: UpstreamReprobeScope;
   }) {
     const now = input.now ?? new Date();
     const runIds: string[] = [];
@@ -60,17 +56,15 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
       await deps.reader.listEarlyUpstreamReprobeCandidates({
         now,
         cutoff: input.cutoff,
-        limit: MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP,
-        after,
+        limit: MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_PAGE,
+        after: input.after ?? null,
+        scope: input.scope,
       })
-    ).slice(0, MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP);
+    ).slice(0, MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_PAGE);
 
-    // Move the cursor before any candidate is processed: an overlapping sweep
-    // reads the next page, and a candidate that throws cannot hold the walk on
-    // its page.
     const last = candidates[candidates.length - 1];
-    after =
-      candidates.length === MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_SWEEP && last?.scheduledRetryAt
+    const nextCursor =
+      candidates.length === MAX_EARLY_UPSTREAM_REPROBE_CANDIDATES_PER_PAGE && last?.scheduledRetryAt
         ? { scheduledRetryAt: last.scheduledRetryAt, createdAt: last.createdAt, runId: last.runId }
         : null;
 
@@ -81,7 +75,7 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
       latestUpstreamFailure: UpstreamFailureEvidence | null;
     }>();
     for (const candidate of candidates) {
-      if (input.skipRunIds?.has(candidate.runId) || !candidate.adapterType) continue;
+      if (!candidate.adapterType) continue;
       const scope = `${candidate.companyId}:${candidate.agentId}:${candidate.adapterType}`;
       let upstreamState = upstreamStateByScope.get(scope);
       if (!upstreamState) {
@@ -135,16 +129,13 @@ export function createPromoteEarlyUpstreamRecoveryRetries(deps: {
       postCommitEffects.push(...result.postCommitEffects);
     }
 
-    return { promoted: runIds.length, runIds, postCommitEffects };
+    return { promoted: runIds.length, runIds, postCommitEffects, nextCursor };
   };
 }
 
 export function createPromoteDueScheduledRetries(deps: {
   reader: ScheduledRetryReader;
   promoteScheduledRetry: ReturnType<typeof createPromoteScheduledRetry>;
-  promoteEarlyUpstreamRecoveryRetries: ReturnType<
-    typeof createPromoteEarlyUpstreamRecoveryRetries
-  >;
 }) {
   return async function promoteDueScheduledRetries(input: { now?: Date; cutoff: Date | null }) {
     const now = input.now ?? new Date();
@@ -160,16 +151,6 @@ export function createPromoteDueScheduledRetries(deps: {
       runIds.push(dueRun.runId);
       postCommitEffects.push(...result.postCommitEffects);
     }
-
-    // Beyond the runs whose pin came due on its own, release the ones still
-    // pinned to an outage that has demonstrably ended.
-    const earlyReprobed = await deps.promoteEarlyUpstreamRecoveryRetries({
-      now,
-      cutoff: input.cutoff,
-      skipRunIds: new Set(dueRuns.map((dueRun) => dueRun.runId)),
-    });
-    runIds.push(...earlyReprobed.runIds);
-    postCommitEffects.push(...earlyReprobed.postCommitEffects);
 
     return { promoted: runIds.length, runIds, postCommitEffects };
   };

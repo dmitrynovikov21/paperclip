@@ -873,6 +873,55 @@ describeEmbeddedPostgres("workspace file resources", () => {
     expect(changedPage.body.truncated).toBe(true);
   });
 
+  it("keeps changed-files route from running agent-controlled fsmonitor with a file-backed DB", async () => {
+    const { root, projectRoot, executionRoot } = await makeWorkspace();
+    const graph = await seedGraph(db, { projectRoot, executionRoot });
+    const dbFile = path.join(root, "synthetic-database-url");
+    const marker = path.join(root, "fsmonitor-marker");
+    const script = path.join(projectRoot, "agent-fsmonitor.sh");
+    const syntheticCredential = "postgres://synthetic-only@localhost/test\n";
+    await execFileAsync("git", ["-C", projectRoot, "init"]);
+    await fs.writeFile(path.join(projectRoot, "README.md"), "test\n");
+    await fs.writeFile(dbFile, syntheticCredential, { mode: 0o600 });
+    await fs.writeFile(script, '#!/bin/sh\ncat "${PAPERCLIP_DATABASE_URL_FILE:-$PAPERCLIP_TEST_SYNTHETIC_DB_FILE}" > "$PAPERCLIP_TEST_FSMONITOR_MARKER"\n', { mode: 0o755 });
+    await execFileAsync("git", ["-C", projectRoot, "config", "core.fsmonitor", script]);
+
+    const app = createApp(db, {
+      type: "board",
+      userId: "board-user",
+      companyIds: [graph.companyId],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "");
+    vi.stubEnv("PAPERCLIP_TEST_SYNTHETIC_DB_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_TEST_FSMONITOR_MARKER", marker);
+    try {
+      const blocked = await request(app)
+        .get(`/api/issues/${graph.issueId}/file-resources/list`)
+        .query({ workspace: "project", mode: "changed" });
+      expect(blocked.status).toBe(200);
+      expect(blocked.body.state).toBe("unavailable");
+      expect(blocked.body.unavailableReason).toBe("changed_unavailable");
+      await expect(fs.access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+      vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "");
+      const allowed = await request(app)
+        .get(`/api/issues/${graph.issueId}/file-resources/list`)
+        .query({ workspace: "project", mode: "changed" });
+      expect(allowed.status).toBe(200);
+      expect(allowed.body.state).toBe("available");
+      expect(allowed.body.items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ relativePath: "README.md" }),
+      ]));
+      expect(await fs.readFile(marker, "utf8")).toBe(syntheticCredential);
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects overlong list searches and redacts the raw query from denial audit details", async () => {
     const { projectRoot, executionRoot } = await makeWorkspace();
     const graph = await seedGraph(db, { projectRoot, executionRoot });

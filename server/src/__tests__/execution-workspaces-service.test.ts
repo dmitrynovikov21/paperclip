@@ -407,6 +407,42 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, identifier, repoRoot, worktreePath, headSha };
   }
 
+  it("does not run agent-controlled fsmonitor during workspace list or close-readiness with a file-backed DB", async () => {
+    const seeded = await seedTerminalWorkspace();
+    const privateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-git-private-"));
+    tempDirs.add(privateRoot);
+    const dbFile = path.join(privateRoot, "database-url");
+    const marker = path.join(privateRoot, "fsmonitor-marker");
+    const script = path.join(seeded.worktreePath, "agent-fsmonitor.sh");
+    const syntheticCredential = "postgres://synthetic-only@localhost/test\n";
+    await fs.writeFile(dbFile, syntheticCredential, { mode: 0o600 });
+    await fs.writeFile(script, '#!/bin/sh\ncat "${PAPERCLIP_DATABASE_URL_FILE:-$PAPERCLIP_TEST_SYNTHETIC_DB_FILE}" > "$PAPERCLIP_TEST_FSMONITOR_MARKER"\n', { mode: 0o755 });
+    await runGit(seeded.worktreePath, ["config", "core.fsmonitor", script]);
+
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "");
+    vi.stubEnv("PAPERCLIP_TEST_SYNTHETIC_DB_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_TEST_FSMONITOR_MARKER", marker);
+    try {
+      const listed = await svc.list(seeded.companyId);
+      const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+
+      expect(listed).toHaveLength(1);
+      expect(listed[0]?.deliveryState).toBe("unknown");
+      expect(readiness?.git?.repoRoot).toBeNull();
+      await expect(fs.access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+      vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", "");
+      const allowed = await svc.list(seeded.companyId);
+      expect(allowed).toHaveLength(1);
+      const allowedReadiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+      expect(allowedReadiness?.git?.repoRoot).toBe(seeded.worktreePath);
+      expect(await fs.readFile(marker, "utf8")).toBe(syntheticCredential);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {
     const repoRoot = await createTempRepo();
     tempDirs.add(repoRoot);

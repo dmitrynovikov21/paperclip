@@ -996,11 +996,14 @@ The stranded-work pass closes the gap where issue state survives a crash but the
 A retry whose deadline has passed uses the normal scheduled-retry promotion
 gate at startup and on the existing periodic pass. A transient retry pinned
 beyond the bounded backoff ceiling can also be released early after a run by
-the same company, agent, and adapter succeeds. That success must be saved
-before the re-probe reads it. A later upstream failure keeps the pin. Startup
-traverses the saved far-future pins once in bounded pages, so recent recovery
-evidence survives a restart. The periodic pass does not query far-future pins
-while the server is idle. Early release still uses the normal promotion gate.
+the same company, agent, and adapter succeeds and its cost accounting clears.
+Accounting signals the shared delivery coordinator after committing the success;
+the coordinator re-probes that scope and retains failed work for retry. Native
+reconciliation uses the same accounting signal. Startup traverses saved
+far-future pins once in bounded pages, so recent recovery evidence survives a
+restart. A later upstream failure keeps the pin. The periodic pass does not
+query far-future pins while the server is idle. Early release still uses the
+normal promotion gate.
 
 Native finalization reconciliation (part of native recovery and the orphan
 reap) skips settled committed finalizations in unscoped passes: the run is

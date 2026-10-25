@@ -1737,7 +1737,6 @@ export function heartbeatService(
     scheduleBoundedRetryForRun,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     timerClaimWasFirstHeartbeat,
-    promoteEarlyUpstreamRecoveryRetries,
     releaseIssueExecutionAndPromote,
     finalizeAgentStatus,
     enqueueWakeup,

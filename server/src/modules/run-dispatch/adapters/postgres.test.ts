@@ -1538,7 +1538,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       return runId;
     }
 
-    async function seedSucceededRun(input: { companyId: string; agentId: string; finishedAt: Date; adapterType?: string }) {
+    async function seedSucceededRun(input: { companyId: string; agentId: string; finishedAt: Date; adapterType?: string; costAccountingPending?: boolean }) {
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({
         id: runId,
@@ -1546,6 +1546,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         agentId: input.agentId,
         invocationSource: "assignment",
         status: "succeeded",
+        costAccountingPending: input.costAccountingPending ?? false,
         finishedAt: input.finishedAt,
         runnerProfileJson: { adapterDispatch: { adapterType: input.adapterType ?? "codex_local" } },
         contextSnapshot: {},
@@ -1652,6 +1653,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 45 * 60_000) });
       await seedSucceededRun({ companyId, agentId: otherAgentId, finishedAt: new Date(NOW.getTime() - 30_000) });
       await seedSucceededRun({ companyId, agentId, adapterType: "claude_local", finishedAt: new Date(NOW.getTime() - 30_000) });
+      expect(await adapter.findUpstreamRecoveryEvidence(scope)).toBeNull();
+
+      await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 15_000), costAccountingPending: true });
       expect(await adapter.findUpstreamRecoveryEvidence(scope)).toBeNull();
 
       await seedSucceededRun({ companyId, agentId, finishedAt: new Date(NOW.getTime() - 10 * 60_000) });

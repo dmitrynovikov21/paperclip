@@ -632,6 +632,7 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.companyId, input.companyId),
           eq(heartbeatRuns.agentId, input.agentId),
           eq(heartbeatRuns.status, "succeeded"),
+          eq(heartbeatRuns.costAccountingPending, false),
           sql`${heartbeatRuns.runnerProfileJson} #>> '{adapterDispatch,adapterType}' = ${input.adapterType}`,
           gt(heartbeatRuns.finishedAt, lookbackFloor),
         ),

@@ -66,7 +66,7 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
     "finalizeIssueCommentPolicy" | "handleIssueReviewPathDisposition" | "handleRunLivenessContinuation" |
     "handleSuccessfulRunHandoff" | "updateRuntimeState">,
   Pick<ReturnType<typeof createHeartbeatRetries>,
-    "scheduleBoundedRetryForRun" | "scheduleInteractionContinuationInfrastructureRetryIfEligible" | "timerClaimWasFirstHeartbeat" | "promoteEarlyUpstreamRecoveryRetries">,
+    "scheduleBoundedRetryForRun" | "scheduleInteractionContinuationInfrastructureRetryIfEligible" | "timerClaimWasFirstHeartbeat">,
   Pick<ReturnType<typeof createHeartbeatRunControl>, "releaseIssueExecutionAndPromote">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus">,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
@@ -370,7 +370,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     scheduleBoundedRetryForRun,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     timerClaimWasFirstHeartbeat,
-    promoteEarlyUpstreamRecoveryRetries,
     releaseIssueExecutionAndPromote,
     finalizeAgentStatus,
     enqueueWakeup,
@@ -383,22 +382,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     processRunCancellationSettlements,
     failedProcessRunCancellations,
   } = dependencies;
-
-  async function reprobeAfterSuccessfulRun(finalizedRun: Run) {
-    if (finalizedRun.status !== "succeeded") return;
-    const dispatch = parseObject(parseObject(finalizedRun.runnerProfileJson).adapterDispatch);
-    const adapterType = readNonEmptyString(dispatch.adapterType);
-    if (!adapterType) return;
-    try {
-      await promoteEarlyUpstreamRecoveryRetries({
-        companyId: finalizedRun.companyId,
-        agentId: finalizedRun.agentId,
-        adapterType,
-      });
-    } catch (err) {
-      logger.warn({ err, runId: finalizedRun.id }, "failed to re-probe upstream retries after successful run");
-    }
-  }
 
   async function completeRun(input: CompleteHeartbeatRunInput) {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
@@ -718,9 +701,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         return;
       }
     }
-    // The success row is durable now. Probe before unrelated presentation or
-    // cleanup work can fail and lose this recovery signal.
-    if (persistedRun) await reprobeAfterSuccessfulRun(persistedRun);
     if (persistedRun) {
       // Accounting recovery is independent of workspace or issue finalization.
       await measureRunPhase("completion.cost", () => accountRunCost(db, persistedRun!.id, budgetHooks)).catch((err) => {

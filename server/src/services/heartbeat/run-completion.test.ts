@@ -16,6 +16,7 @@ import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js"
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -53,7 +54,6 @@ function callbacks(db: Db) {
     updateRuntimeState: vi.fn<Dependencies["updateRuntimeState"]>(),
     scheduleBoundedRetryForRun: vi.fn<Dependencies["scheduleBoundedRetryForRun"]>(),
     scheduleInteractionContinuationInfrastructureRetryIfEligible: vi.fn<Dependencies["scheduleInteractionContinuationInfrastructureRetryIfEligible"]>(async () => null),
-    promoteEarlyUpstreamRecoveryRetries: vi.fn<Dependencies["promoteEarlyUpstreamRecoveryRetries"]>(async () => ({ promoted: 0, runIds: [] })),
     timerClaimWasFirstHeartbeat: vi.fn<Dependencies["timerClaimWasFirstHeartbeat"]>(() => undefined),
     releaseIssueExecutionAndPromote: vi.fn<Dependencies["releaseIssueExecutionAndPromote"]>(async () => undefined),
     finalizeAgentStatus: vi.fn<Dependencies["finalizeAgentStatus"]>(async () => undefined),
@@ -140,7 +140,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const [settledAgent] = await db.select().from(agents).where(eq(agents.id, f.agent.id));
     expect(settledAgent).toMatchObject({ status: operation === "completeRun" ? "idle" : "error", lastHeartbeatAt: expect.any(Date) });
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
-    expect(f.deps.promoteEarlyUpstreamRecoveryRetries).toHaveBeenCalledTimes(operation === "completeRun" ? 1 : 0);
     expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), { suppressImmediateRecovery: true });
     expect(f.deps.handleSuccessfulRunHandoff).not.toHaveBeenCalled();
     expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
@@ -149,12 +148,10 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
 
   it("persists usage, accounting, final logs, presentation and the next task session", async () => {
     const f = await fixture();
-    f.deps.promoteEarlyUpstreamRecoveryRetries.mockImplementationOnce(async () => {
-      expect((await read(f.run.id)).status).toBe("succeeded");
-      expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
-      return { promoted: 0, runIds: [] };
-    });
+    const reprobeSignal = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.upstreamRecoveryReprobe, reprobeSignal);
     await f.completion.completeRun(f.input);
+    unsubscribe();
     expect(await read(f.run.id)).toMatchObject({ status: "succeeded", sessionIdAfter: "provider-session", logBytes: 123, logSha256: "log-hash", logCompressed: true, stdoutExcerpt: "answer", costAccountingPending: false, costAccountedAt: expect.any(Date), usageJson: { inputTokens: 20, cachedInputTokens: 5, outputTokens: 8, usageSource: "per_run", configFreshness: { version: 1 } }, resultJson: { presentationDecision: { commentAction: "none" } } });
     expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, f.run.id))).toHaveLength(1);
     expect((await f.deps.getTaskSession(f.agent.companyId, f.agent.id, f.agent.adapterType, "completion-task"))?.sessionDisplayId).toBe("provider-session");
@@ -163,23 +160,18 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.setWakeupStatus).toHaveBeenCalledWith(f.wake.id, "completed", expect.any(Object));
     expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "succeeded", null, expect.any(Object));
-    expect(f.deps.promoteEarlyUpstreamRecoveryRetries).toHaveBeenCalledWith({ companyId: f.run.companyId, agentId: f.run.agentId, adapterType: "process" });
-  });
-
-  it("keeps the saved successful outcome when the re-probe fails", async () => {
-    const f = await fixture();
-    f.deps.promoteEarlyUpstreamRecoveryRetries.mockRejectedValueOnce(new Error("probe unavailable"));
-    await f.completion.completeRun(f.input);
-    expect((await read(f.run.id)).status).toBe("succeeded");
-    expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
+    expect(reprobeSignal).toHaveBeenCalledOnce();
   });
 
   it("does not lose the saved success signal when a later completion step fails", async () => {
     const f = await fixture();
+    const reprobeSignal = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.upstreamRecoveryReprobe, reprobeSignal);
     f.deps.setWakeupStatus.mockRejectedValueOnce(new Error("wakeup write failed"));
     await expect(f.completion.completeRun(f.input)).rejects.toThrow("wakeup write failed");
+    unsubscribe();
     expect((await read(f.run.id)).status).toBe("succeeded");
-    expect(f.deps.promoteEarlyUpstreamRecoveryRetries).toHaveBeenCalledOnce();
+    expect(reprobeSignal).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -192,7 +184,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     await f.completion.completeRun(f.input);
     expect(await read(f.run.id)).toMatchObject({ status: expected, errorCode: result.errorCode });
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, expected, expect.any(String), expect.objectContaining({ keepIdleOnFailure: result.errorCode === "provider_quota" }));
-    expect(f.deps.promoteEarlyUpstreamRecoveryRetries).not.toHaveBeenCalled();
   });
 
   it.each(["completeRun", "failRun"] as const)("waits for an owned Stop before %s can write a competing outcome", async operation => {
@@ -276,7 +267,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.updateRuntimeState).not.toHaveBeenCalled();
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
-    expect(f.deps.promoteEarlyUpstreamRecoveryRetries).not.toHaveBeenCalled();
   });
 
   it("retains native completion metadata when reconciliation already committed the same terminal status", async () => {

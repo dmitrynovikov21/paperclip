@@ -14,6 +14,7 @@ export const DELIVERY_QUEUES = {
   localLoginCleanup: "local-login-cleanup",
   budgetEnforcement: "budget-enforcement",
   accounting: "cost-accounting",
+  upstreamRecoveryReprobe: "upstream-recovery-reprobe",
   agentLifecycle: "agent-lifecycle",
   chatBoardMessages: "chat-board-messages",
   chatTaskStarts: "chat-task-starts",

@@ -60,6 +60,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
+  assertNoAgentFilesystemExtraPathsMutation,
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
@@ -1574,6 +1575,7 @@ export function agentRoutes(
     path = "adapterConfig",
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentFilesystemExtraPathsMutation(req, adapterConfig, path);
     if (req.actor.type === "agent" && process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
       const protectedPaths = collectFileBackedAdapterAuthSourcePaths(adapterConfig, path);
       if (protectedPaths.length > 0) {

@@ -84,6 +84,17 @@ export function collectAgentAdapterWorkspaceCommandPaths(
   ];
 }
 
+/** File-backed service credentials must never be reachable through agent-selected mounts. */
+export function assertNoAgentFilesystemExtraPathsMutation(
+  req: Request,
+  adapterConfig: unknown,
+  prefix = "adapterConfig",
+) {
+  if (req.actor.type !== "agent" || !process.env.PAPERCLIP_DATABASE_URL_FILE?.trim() ||
+      !isRecord(adapterConfig) || !hasOwn(adapterConfig, "filesystemExtraPaths")) return;
+  throw forbidden(`Agent-authenticated callers cannot modify ${prefix}.filesystemExtraPaths with file-backed database credentials.`);
+}
+
 export function collectProjectExecutionWorkspaceCommandPaths(policy: unknown): string[] {
   if (!isRecord(policy)) return [];
   return collectWorkspaceStrategyCommandPaths(
@@ -131,6 +142,13 @@ export function assertNoAgentIssueConfigMutation(req: Request, input: {
 }) {
   assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(input));
   if (req.actor.type !== "agent" || !process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) return;
+  if (isRecord(input.assigneeAdapterOverrides)) {
+    assertNoAgentFilesystemExtraPathsMutation(
+      req,
+      input.assigneeAdapterOverrides.adapterConfig,
+      "assigneeAdapterOverrides.adapterConfig",
+    );
+  }
   const paths = collectFileBackedIssueAuthSourcePaths(input.assigneeAdapterOverrides);
   if (paths.length > 0) {
     throw forbidden(`Agent-authenticated callers cannot modify connector authentication sources (${paths.join(", ")})`);

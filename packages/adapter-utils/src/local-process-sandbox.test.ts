@@ -134,6 +134,73 @@ describe("local process sandbox", () => {
     }
   });
 
+  it.runIf(process.platform === "linux")("rejects mounts of service keys and config separate from the DB credential", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-private-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const databaseFile = path.join(root, "database", "database-url");
+    const masterKey = path.join(root, "private-group", "..private-keys", "master.key");
+    const instanceRoot = path.join(root, "paperclip-home", "instances", "default");
+    const signingKey = path.join(instanceRoot, "secrets", "decision-signing.key");
+    const config = path.join(instanceRoot, "config.json");
+    const environment = path.join(instanceRoot, ".env");
+    await Promise.all([
+      fs.mkdir(workspace), fs.mkdir(path.dirname(databaseFile)), fs.mkdir(path.dirname(masterKey), { recursive: true }),
+      fs.mkdir(path.dirname(signingKey), { recursive: true }),
+    ]);
+    for (const file of [databaseFile, masterKey, signingKey, config, environment]) {
+      await fs.writeFile(file, "synthetic", { mode: 0o600 });
+    }
+    const previous = {
+      db: process.env.PAPERCLIP_DATABASE_URL_FILE,
+      key: process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE,
+      home: process.env.PAPERCLIP_HOME,
+      instance: process.env.PAPERCLIP_INSTANCE_ID,
+    };
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = databaseFile;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = masterKey;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      for (const [source, reason] of [
+        [masterKey, "service secrets"],
+        [path.dirname(masterKey), "service secrets"],
+        [path.join(root, "private-group"), "service secrets"],
+        [signingKey, "service secrets"],
+        [config, "service configuration"],
+        [environment, "service environment"],
+      ] as const) {
+        await expect(buildLocalProcessSandboxSpawnTarget({
+          executable: process.execPath,
+          args: [],
+          cwd: workspace,
+          options: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            extraPaths: [{ path: source, access: "ro" }],
+          },
+        })).rejects.toThrow(`mount would expose ${reason}`);
+      }
+      const allowed = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace" },
+      });
+      expect(allowed.command).toBe("bwrap");
+      await allowed.cleanup?.();
+    } finally {
+      if (previous.db === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous.db;
+      if (previous.key === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previous.key;
+      if (previous.home === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previous.home;
+      if (previous.instance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previous.instance;
+    }
+  });
+
   it("binds a confined absolute alias to the synchronized workspace", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-"));
     cleanup.push(root);

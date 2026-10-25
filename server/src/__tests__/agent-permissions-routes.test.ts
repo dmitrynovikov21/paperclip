@@ -826,6 +826,32 @@ describe.sequential("agent permission routes", () => {
     }
   });
 
+  it("blocks agent-selected extra mounts in agent and runtime-profile config with file-backed credentials", async () => {
+    const previous = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    process.env.PAPERCLIP_DATABASE_URL_FILE = "/synthetic/service/database-url";
+    try {
+      const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+      const direct = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { filesystemExtraPaths: ["/synthetic/service/secrets/master.key"] } }));
+      expect(direct.status).toBe(403);
+      expect(direct.body.error).toContain("adapterConfig.filesystemExtraPaths");
+
+      const profile = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { modelProfiles: { cheap: {
+          enabled: true,
+          adapterConfig: { filesystemExtraPaths: ["/synthetic/service/secrets/master.key"] },
+        } } } }));
+      expect(profile.status).toBe(403);
+      expect(profile.body.error).toContain("runtimeConfig.modelProfiles.cheap.adapterConfig.filesystemExtraPaths");
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous;
+    }
+  });
+
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
     const app = await createApp({
       type: "agent",

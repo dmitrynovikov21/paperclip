@@ -4,6 +4,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { resolveDefaultSecretsKeyFilePath, resolvePaperclipInstanceRoot } from "@paperclipai/shared/home-paths";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -81,6 +82,20 @@ function normalizeAbsolutePath(candidate: string, label: string): string {
 
 async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
+}
+
+function isWithinPath(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function realpathOrMissing(candidate: string): Promise<string> {
+  try {
+    return await fs.realpath(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return path.resolve(candidate);
+  }
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -398,12 +413,44 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     try {
       const rejectServiceCredentialMount = async (source: string) => {
         const credentialPath = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim();
-        if (credentialPath) {
-          const realSource = await fs.realpath(source);
-          const realCredential = await fs.realpath(credentialPath).catch(() => path.resolve(credentialPath));
-          const relativeCredential = path.relative(realSource, realCredential);
-          if (!relativeCredential || (!relativeCredential.startsWith("..") && !path.isAbsolute(relativeCredential))) {
-            throw new Error("Local filesystem sandbox mount would expose the service database credential.");
+        if (!credentialPath) return;
+        const instanceRoot = resolvePaperclipInstanceRoot();
+        const defaultSecretsDir = path.dirname(resolveDefaultSecretsKeyFilePath());
+        const configuredKeyPath = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE?.trim();
+        const configuredConfigPath = process.env.PAPERCLIP_CONFIG?.trim();
+        let activeConfigPath = configuredConfigPath ? path.resolve(configuredConfigPath) : path.join(instanceRoot, "config.json");
+        if (!configuredConfigPath) {
+          for (let directory = process.cwd(); ; directory = path.dirname(directory)) {
+            const candidate = path.join(directory, ".paperclip", "config.json");
+            if (await pathExists(candidate)) {
+              activeConfigPath = candidate;
+              break;
+            }
+            if (directory === path.dirname(directory)) break;
+          }
+        }
+        const protectedPaths = [
+          { path: credentialPath, directory: false, label: "the service database credential" },
+          { path: defaultSecretsDir, directory: true, label: "service secrets" },
+          { path: path.join(instanceRoot, "db"), directory: true, label: "service database files" },
+          { path: path.join(instanceRoot, "data"), directory: true, label: "service data" },
+          { path: path.join(instanceRoot, "logs"), directory: true, label: "service logs" },
+          { path: path.join(instanceRoot, "config.json"), directory: false, label: "service configuration" },
+          { path: path.join(instanceRoot, ".env"), directory: false, label: "service environment" },
+          { path: activeConfigPath, directory: false, label: "service configuration" },
+          { path: path.join(path.dirname(activeConfigPath), ".env"), directory: false, label: "service environment" },
+          { path: path.resolve(process.cwd(), ".env"), directory: false, label: "service environment" },
+          ...(configuredKeyPath
+            ? [{ path: path.dirname(path.resolve(configuredKeyPath)), directory: true, label: "service secrets" }]
+            : []),
+        ];
+        const realSource = await fs.realpath(source);
+        for (const protectedPath of protectedPaths) {
+          const realProtectedPath = await realpathOrMissing(protectedPath.path);
+          const sourceContainsProtected = isWithinPath(realSource, realProtectedPath);
+          const sourceInsideProtected = protectedPath.directory && isWithinPath(realProtectedPath, realSource);
+          if (sourceContainsProtected || sourceInsideProtected) {
+            throw new Error(`Local filesystem sandbox mount would expose ${protectedPath.label}.`);
           }
         }
       };

@@ -122,8 +122,16 @@ env -i PATH="$PATH" HOME="$scratch/home" \
   PAPERCLIP_HOME="$scratch/home" PAPERCLIP_CONFIG="$scratch/config.json" \
   PAPERCLIP_DATABASE_URL_FILE="$scratch/database-url" \
   PAPERCLIP_AGENT_JWT_SECRET=synthetic-jwt-signing-key-for-e2e-only \
+  PAPERCLIP_E2E_REMOTE_CONTROL_IMAGE=paperclip-db-credential-e2e:local \
+  "$repo_root/server/node_modules/.bin/tsx" \
+  "$repo_root/server/scripts/paperclip-db-credential-host-runtime-probe.ts" \
+  "$agent_api_url" "$scratch"
+env -i PATH="$PATH" HOME="$scratch/home" \
+  PAPERCLIP_HOME="$scratch/home" PAPERCLIP_CONFIG="$scratch/config.json" \
+  PAPERCLIP_DATABASE_URL_FILE="$scratch/database-url" \
+  PAPERCLIP_AGENT_JWT_SECRET=synthetic-jwt-signing-key-for-e2e-only \
   PAPERCLIP_E2E_DOCKER_NETWORK="$network" \
   "$repo_root/server/node_modules/.bin/tsx" \
   "$repo_root/server/scripts/paperclip-db-credential-jwt-probe.ts" \
   "$agent_api_url" "$scratch" "$repo_root"
-echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, pg_dump/psql restore 2 checks, log credential leak 0, Docker UID and remote sandbox 6 checks, local bwrap 6 denials + substituted launcher denial + PATH/loader denial + JWT API pass + CODEX_HOME leaf and directory alias staging denials + bound auth/skills pass + alias race denial"
+echo "Paperclip file-backed DB smoke passed: /api/health HTTP $code, host runtime HTTP run/start denials + provision/teardown marker 0, pg_dump/psql restore 2 checks, log credential leak 0, Docker UID and remote sandbox 6 checks, local bwrap 6 denials + substituted launcher denial + PATH/loader denial + JWT API pass + CODEX_HOME leaf and directory alias staging denials + bound auth/skills pass + alias race denial"

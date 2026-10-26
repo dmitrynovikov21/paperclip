@@ -40,6 +40,7 @@ import {
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
+  runWorkspaceJobForControl,
   sanitizeRuntimeServiceBaseEnv,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -384,6 +385,111 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.npm_config_tailscale_auth).toBeUndefined();
     expect(sanitized.npm_config_authenticated_private).toBeUndefined();
     expect(sanitized.HOST).toBe("0.0.0.0");
+  });
+});
+
+describe("file-backed database host execution boundary", () => {
+  it("rejects jobs, runtime provision/start, and teardown before reading a synthetic credential", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-file-backed-host-"));
+    const credential = path.join(root, "synthetic-database-url");
+    const marker = path.join(root, "credential-read-marker");
+    const provisionMarker = path.join(root, "provision-marker");
+    const controlMarker = path.join(root, "control-marker");
+    const priorFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    const priorIsolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+    const workspace = buildWorkspace(root);
+    const actor = { id: "agent-1", name: "Synthetic agent", companyId: "company-1" };
+    const readCredentialCommand = `cat '${credential}' > '${marker}'`;
+
+    try {
+      await fs.writeFile(credential, "postgres://synthetic:fixture@127.0.0.1:1/paperclip\n", { mode: 0o600 });
+      delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      await runWorkspaceJobForControl({
+        actor, issue: null, workspace,
+        command: { name: "allowed control", command: `printf ok > '${controlMarker}'` },
+      });
+      expect(await fs.readFile(controlMarker, "utf8")).toBe("ok");
+
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(runWorkspaceJobForControl({
+        actor, issue: null, workspace,
+        command: { name: "read credential", command: readCredentialCommand },
+      })).rejects.toThrow("File-backed database credentials forbid host workspace commands.");
+
+      await expect(startRuntimeServicesForWorkspaceControl({
+        actor, issue: null, workspace, executionWorkspaceId: "file-backed-workspace",
+        config: {
+          runtimeProvisionCommand: `touch '${provisionMarker}'`,
+          workspaceRuntime: { services: [{ name: "read credential", command: readCredentialCommand }] },
+        },
+        adapterEnv: {},
+      })).rejects.toThrow("File-backed database credentials forbid host runtime services.");
+
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        workspace: {
+          id: "file-backed-workspace", cwd: root, providerType: "local_fs", providerRef: root,
+          branchName: null, repoUrl: null, baseRef: null, projectId: null,
+          projectWorkspaceId: null, sourceIssueId: null,
+        },
+        teardownCommand: readCredentialCommand,
+      });
+      expect(cleanup.warnings).toContain("File-backed database credentials forbid host workspace commands.");
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(provisionMarker)).toBe(false);
+    } finally {
+      if (priorFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = priorFile;
+      if (priorIsolated === undefined) delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      else process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = priorIsolated;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses reuse of a local service after file-backed mode is enabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-file-backed-reuse-"));
+    const credential = path.join(root, "synthetic-database-url");
+    const priorFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    const priorIsolated = process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+    const executionWorkspaceId = randomUUID();
+    const actor = { id: "agent-1", name: "Synthetic agent", companyId: "company-1" };
+    const workspace = buildWorkspace(root);
+    const config = {
+      workspaceRuntime: {
+        services: [{
+          name: "long-running control",
+          command: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+          lifecycle: "shared",
+          reuseScope: "execution_workspace",
+        }],
+      },
+    };
+
+    try {
+      delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      const started = await startRuntimeServicesForWorkspaceControl({
+        actor, issue: null, workspace, executionWorkspaceId, config, adapterEnv: {},
+      });
+      expect(started).toHaveLength(1);
+
+      await fs.writeFile(credential, "postgres://synthetic:fixture@127.0.0.1:1/paperclip\n", { mode: 0o600 });
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(startRuntimeServicesForWorkspaceControl({
+        actor, issue: null, workspace, executionWorkspaceId, config, adapterEnv: {},
+      })).rejects.toThrow("File-backed database credentials forbid host runtime services.");
+      await expect(ensureRuntimeServicesForRun({
+        runId: randomUUID(), agent: actor, issue: null, workspace, executionWorkspaceId,
+        config, adapterEnv: {},
+      })).rejects.toThrow("File-backed database credentials forbid host runtime services.");
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({ executionWorkspaceId, workspaceCwd: root });
+      if (priorFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = priorFile;
+      if (priorIsolated === undefined) delete process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME;
+      else process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME = priorIsolated;
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 

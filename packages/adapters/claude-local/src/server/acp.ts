@@ -43,6 +43,7 @@ import {
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
+  prepareManagedClaudeConfigSeed,
   prepareSandboxClaudeProbeRuntime,
 } from "./claude-config.js";
 import {
@@ -268,11 +269,13 @@ async function prepareClaudeRemoteManagedHome(
     );
   }
 
-  // Content-addressed sanitized seed (managed cache under the instance root, not
-  // a temp dir — reused across runs, so no teardown cleanup).
-  const claudeConfigSeedDir = input.config.managedAiConnection
-    ? explicitClaudeConfigDir
-    : await prepareClaudeConfigSeed(process.env, onLog, input.companyId);
+  // Shared settings use a sanitized cache; a managed AI home gets a disposable
+  // allowlisted copy so its auth files never enter the persistent seed cache.
+  const managedClaudeSeed = input.config.managedAiConnection
+    ? await prepareManagedClaudeConfigSeed(explicitClaudeConfigDir)
+    : null;
+  const claudeConfigSeedDir = managedClaudeSeed?.dir ??
+    await prepareClaudeConfigSeed(process.env, onLog, input.companyId);
   // Ship the per-run skill bundle, staged only when the run selected at
   // least one skill. The bundle directory holds a plain copy of each
   // selected skill's files (`materializePaperclipSkillCopy` never copies a
@@ -283,12 +286,17 @@ async function prepareClaudeRemoteManagedHome(
   // concurrent writer) from pulling an arbitrary host file into the sandbox.
   // The engine rewrites the prompt onto the in-sandbox copy once this asset
   // is staged.
-  const stagedRuntime = await input.stage([
-    { key: "config-seed", localDir: claudeConfigSeedDir, followSymlinks: true },
-    ...(input.skillsBundleDir
-      ? [{ key: "skills", localDir: input.skillsBundleDir, followSymlinks: false }]
-      : []),
-  ]);
+  let stagedRuntime: Awaited<ReturnType<typeof input.stage>>;
+  try {
+    stagedRuntime = await input.stage([
+      { key: "config-seed", localDir: claudeConfigSeedDir, followSymlinks: false },
+      ...(input.skillsBundleDir
+        ? [{ key: "skills", localDir: input.skillsBundleDir, followSymlinks: false }]
+        : []),
+    ]);
+  } finally {
+    await managedClaudeSeed?.cleanup();
+  }
 
   const remoteClaudeRuntimeRoot =
     stagedRuntime.runtimeRootDir ??

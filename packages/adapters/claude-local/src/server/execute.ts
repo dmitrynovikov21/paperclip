@@ -83,6 +83,7 @@ import {
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
+  prepareManagedClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
@@ -619,45 +620,52 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote &&
     adapterExecutionTargetUsesManagedHome(executionTarget) &&
     (!hasExplicitClaudeConfigDir || Boolean(config.managedAiConnection));
+  const managedClaudeSeed = useManagedRemoteClaudeConfig && config.managedAiConnection
+    ? await prepareManagedClaudeConfigSeed(sharedClaudeConfigDir)
+    : null;
   const claudeConfigSeedDir = useManagedRemoteClaudeConfig
-    ? config.managedAiConnection ? sharedClaudeConfigDir : await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
+    ? managedClaudeSeed?.dir ?? await prepareClaudeConfigSeed(process.env, onLog, agent.companyId)
     : null;
   const preparedExecutionTargetRuntime = executionTargetIsRemote
     ? await (async () => {
-        await onLog(
-          "stdout",
-          `[paperclip] Syncing workspace and Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-        );
-        return await prepareAdapterExecutionTargetRuntime({
-          runId,
-          target: executionTarget,
-          adapterKey: "claude",
-          timeoutSec,
-          workspaceLocalDir: cwd,
-          installCommand: SANDBOX_INSTALL_COMMAND,
-          detectCommand: command,
-          onProgress: (line) => onLog("stdout", line),
-          onRuntimeProgress: ctx.onRuntimeProgress,
-          assets: [
-            {
-              key: "skills",
-              localDir: promptBundle.addDir,
-              followSymlinks: true,
-            },
-            {
-              key: "mcp-config",
-              localDir: localMcpConfigDir,
-              followSymlinks: true,
-            },
-            ...(claudeConfigSeedDir
-              ? [{
-                key: "config-seed",
-                localDir: claudeConfigSeedDir,
+        try {
+          await onLog(
+            "stdout",
+            `[paperclip] Syncing workspace and Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+          );
+          return await prepareAdapterExecutionTargetRuntime({
+            runId,
+            target: executionTarget,
+            adapterKey: "claude",
+            timeoutSec,
+            workspaceLocalDir: cwd,
+            installCommand: SANDBOX_INSTALL_COMMAND,
+            detectCommand: command,
+            onProgress: (line) => onLog("stdout", line),
+            onRuntimeProgress: ctx.onRuntimeProgress,
+            assets: [
+              {
+                key: "skills",
+                localDir: promptBundle.addDir,
                 followSymlinks: true,
-              }]
-              : []),
-          ],
-        });
+              },
+              {
+                key: "mcp-config",
+                localDir: localMcpConfigDir,
+                followSymlinks: true,
+              },
+              ...(claudeConfigSeedDir
+                ? [{
+                  key: "config-seed",
+                  localDir: claudeConfigSeedDir,
+                  followSymlinks: false,
+                }]
+                : []),
+            ],
+          });
+        } finally {
+          await managedClaudeSeed?.cleanup();
+        }
       })()
     : null;
   if (preparedExecutionTargetRuntime?.workspaceRemoteDir) {

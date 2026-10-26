@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,10 +21,12 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { classifyThrownErrorClass, logSandboxProbeDiagnostic } from "./probe-diagnostics.js";
 
 const SEEDED_SHARED_FILES = ["settings.json", "CLAUDE.md"] as const;
+const SEEDED_MANAGED_FILES = [...SEEDED_SHARED_FILES, ".credentials.json", "credentials.json"] as const;
+const fdRoot = process.platform === "linux" ? "/proc/self/fd" :
+  process.platform === "darwin" ? "/dev/fd" : null;
 
 interface SeedFile {
   name: string;
-  sourcePath: string;
   contents: Buffer;
 }
 
@@ -62,16 +65,77 @@ function sanitizeRemoteClaudeSettings(raw: string): string {
   return JSON.stringify(settings);
 }
 
-async function collectSeedFiles(sourceDir: string): Promise<SeedFile[]> {
+async function collectSeedFiles(sourceDir: string, managed: boolean, fileBacked: boolean): Promise<SeedFile[]> {
+  if (!path.isAbsolute(sourceDir)) throw new Error("Claude config source must be absolute");
+  if (!fdRoot && fileBacked) {
+    throw new Error("File-backed database credentials require descriptor-based Claude config staging");
+  }
+  // Pin every ancestor. A local agent can replace its writable config directory
+  // between a pathname check and a later service-side read.
+  let directory: Awaited<ReturnType<typeof fs.open>> | null = null;
+  if (fdRoot) {
+    const root = path.parse(sourceDir).root;
+    const parts = path.resolve(sourceDir).slice(root.length).split(path.sep).filter(Boolean);
+    directory = await fs.open(root, constants.O_RDONLY | constants.O_DIRECTORY);
+    try {
+      for (const part of parts) {
+        const next = await fs.open(
+          path.join(fdRoot, String(directory.fd), part),
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+        await directory.close();
+        directory = next;
+      }
+    } catch (error) {
+      await directory.close();
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw new Error("Claude config source contains an unsafe directory alias");
+    }
+  } else {
+    // This fallback is used only when no service database credential file is
+    // present. File-backed mode fails closed on platforms without fd paths.
+    const stat = await fs.lstat(sourceDir).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat) return [];
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("Claude config source contains an unsafe directory alias");
+    }
+  }
+
   const files: SeedFile[] = [];
-  for (const name of SEEDED_SHARED_FILES) {
-    const sourcePath = path.join(sourceDir, name);
-    if (!(await pathExists(sourcePath))) continue;
-    const rawContents = await fs.readFile(sourcePath);
-    const contents = name === "settings.json"
-      ? Buffer.from(sanitizeRemoteClaudeSettings(rawContents.toString("utf8")), "utf8")
-      : rawContents;
-    files.push({ name, sourcePath, contents });
+  try {
+    for (const name of managed ? SEEDED_MANAGED_FILES : SEEDED_SHARED_FILES) {
+      const sourcePath = directory && fdRoot
+        ? path.join(fdRoot, String(directory.fd), name)
+        : path.join(sourceDir, name);
+      let file: Awaited<ReturnType<typeof fs.open>>;
+      try {
+        file = await fs.open(
+          sourcePath,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw new Error("Claude config seed contains an unsafe file entry");
+      }
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.nlink !== 1) {
+          throw new Error("Claude config seed contains an unsafe file entry");
+        }
+        const rawContents = await file.readFile();
+        const contents = name === "settings.json" && !managed
+          ? Buffer.from(sanitizeRemoteClaudeSettings(rawContents.toString("utf8")), "utf8")
+          : rawContents;
+        files.push({ name, contents });
+      } finally {
+        await file.close();
+      }
+    }
+  } finally {
+    await directory?.close();
   }
   return files;
 }
@@ -102,7 +166,7 @@ async function materializeSeedSnapshot(input: {
   const stagingDir = await fs.mkdtemp(path.join(input.rootDir, ".tmp-"));
   try {
     for (const file of input.files) {
-      await fs.writeFile(path.join(stagingDir, file.name), file.contents);
+      await fs.writeFile(path.join(stagingDir, file.name), file.contents, { mode: 0o600, flag: "wx" });
     }
     try {
       await fs.rename(stagingDir, targetDir);
@@ -191,11 +255,18 @@ export async function prepareClaudeConfigSeed(
   const sourceDir = resolveSharedClaudeConfigDir(env);
   const targetRootDir = resolveManagedClaudeConfigSeedDir(env, companyId);
 
-  if (path.resolve(sourceDir) === path.resolve(targetRootDir)) {
-    return targetRootDir;
+  const relative = path.relative(sourceDir, targetRootDir);
+  const reverseRelative = path.relative(targetRootDir, sourceDir);
+  if (!relative || (!relative.startsWith("..") && !path.isAbsolute(relative)) ||
+    (!reverseRelative.startsWith("..") && !path.isAbsolute(reverseRelative))) {
+    throw new Error("Claude config source overlaps its seed cache");
   }
 
-  const copiedFiles = await collectSeedFiles(sourceDir);
+  const copiedFiles = await collectSeedFiles(
+    sourceDir,
+    false,
+    Boolean(env.PAPERCLIP_DATABASE_URL_FILE?.trim() || process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()),
+  );
   const snapshotKey = await buildSeedSnapshotKey(copiedFiles);
   const targetDir = await materializeSeedSnapshot({
     rootDir: targetRootDir,
@@ -216,6 +287,25 @@ export async function prepareClaudeConfigSeed(
   }
 
   return targetDir;
+}
+
+/** The managed AI home is run-scoped, so its allowlisted auth files stay in a
+ * disposable private copy rather than the persistent shared-config cache. */
+export async function prepareManagedClaudeConfigSeed(sourceDir: string): Promise<{
+  dir: string;
+  cleanup: () => Promise<void>;
+}> {
+  const files = await collectSeedFiles(sourceDir, true, Boolean(process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-seed-"));
+  try {
+    for (const file of files) {
+      await fs.writeFile(path.join(dir, file.name), file.contents, { mode: 0o600, flag: "wx" });
+    }
+    return { dir, cleanup: () => fs.rm(dir, { recursive: true, force: true }) };
+  } catch (error) {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export function buildRemoteClaudeConfigMaterializationCommand(input: {
@@ -300,8 +390,12 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
   ) {
     let tempWorkspaceDir: string | null = null;
     let preparedRuntime: Awaited<ReturnType<typeof prepareAdapterExecutionTargetRuntime>> | null = null;
+    let managedSeed: Awaited<ReturnType<typeof prepareManagedClaudeConfigSeed>> | null = null;
     try {
-      const seedDir = input.managedAiConnection ? input.env.CLAUDE_CONFIG_DIR : await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId);
+      managedSeed = input.managedAiConnection
+        ? await prepareManagedClaudeConfigSeed(input.env.CLAUDE_CONFIG_DIR)
+        : null;
+      const seedDir = managedSeed?.dir ?? await prepareClaudeConfigSeed(process.env, async () => {}, input.companyId);
       const managedRemoteCwd =
         input.target?.kind === "remote" ? input.target.remoteCwd : input.cwd;
       tempWorkspaceDir = await fs.mkdtemp(
@@ -320,7 +414,7 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
           {
             key: "config-seed",
             localDir: seedDir,
-            followSymlinks: true,
+            followSymlinks: false,
           },
         ],
       });
@@ -367,6 +461,7 @@ export async function prepareSandboxClaudeProbeRuntime(input: {
         hint: "Retry the Test. If the failure repeats, check the server log for the redacted diagnostic.",
       });
     } finally {
+      await managedSeed?.cleanup();
       await preparedRuntime?.restoreWorkspace().catch(() => undefined);
       if (tempWorkspaceDir) {
         await fs.rm(tempWorkspaceDir, { recursive: true, force: true }).catch(() => undefined);

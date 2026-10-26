@@ -84,6 +84,7 @@ const originalEnv: Record<string, string | undefined> = {
   PAPERCLIP_HOME: process.env.PAPERCLIP_HOME,
   PAPERCLIP_INSTANCE_ID: process.env.PAPERCLIP_INSTANCE_ID,
   CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+  PAPERCLIP_DATABASE_URL_FILE: process.env.PAPERCLIP_DATABASE_URL_FILE,
 };
 
 function setNodeVersion(version: string): void {
@@ -914,6 +915,52 @@ describe("claude_local ACP lane", () => {
     );
     // C4 — no XDG_* variable is introduced for in-sandbox credential discovery.
     expect(Object.keys(meta[0]?.env ?? {}).filter((key) => key.startsWith("XDG_"))).toEqual([]);
+  });
+
+  it.each([false, true])("refuses an agent-planted config link before remote ACP staging (managed AI: %s)", async (managedAi) => {
+    vi.mocked(prepareAdapterExecutionTargetRuntime).mockClear();
+    const root = await makeTempRoot("paperclip-claude-acp-config-link-");
+    const localCwd = path.join(root, "worktree");
+    const sourceDir = path.join(root, "shared-claude-config");
+    const serviceCredential = path.join(root, "service-db-credential");
+    const credentialBytes = "postgresql://service:synthetic-secret@localhost/paperclip_test";
+    await fs.mkdir(localCwd);
+    await fs.mkdir(sourceDir);
+    await fs.writeFile(serviceCredential, credentialBytes, { mode: 0o600 });
+    await fs.symlink(serviceCredential, path.join(sourceDir, "CLAUDE.md"));
+    process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test";
+    process.env.CLAUDE_CONFIG_DIR = sourceDir;
+    process.env.PAPERCLIP_DATABASE_URL_FILE = serviceCredential;
+    const logs: string[] = [];
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    await expect(execute(buildContext(localCwd, {
+      config: {
+        engine: "acp",
+        cwd: localCwd,
+        agentCommand: "node ./fake-acp.js",
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+        ...(managedAi ? {
+          managedAiConnection: { provider: "anthropic", method: "api_key" },
+          env: { CLAUDE_CONFIG_DIR: sourceDir, ANTHROPIC_API_KEY: "synthetic-provider-key" },
+        } : {}),
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+        remoteCwd: "/remote/workspace",
+        runner: createLocalSandboxRunner(),
+      } as never,
+      onLog: async (_stream, message) => { logs.push(message); },
+    }))).rejects.toThrow("unsafe file entry");
+
+    expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+    expect(logs.join("\n")).not.toContain(credentialBytes);
   });
 
   it("test_claude_acp_seam_registers_workspace_sync_back", async () => {

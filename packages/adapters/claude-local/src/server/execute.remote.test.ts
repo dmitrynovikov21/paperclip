@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -74,9 +74,11 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   return {
     ...actual,
     startAdapterExecutionTargetPaperclipBridge,
+    prepareAdapterExecutionTargetRuntime: vi.fn(actual.prepareAdapterExecutionTargetRuntime),
   };
 });
 
+import { prepareAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
@@ -229,6 +231,108 @@ describe("claude remote execution", () => {
       localDir: workspaceDir,
       remoteDir: managedRemoteWorkspace,
     }));
+  });
+
+  it.each([false, true])("refuses an agent-planted config link before remote CLI dispatch (managed AI: %s)", async (managedAi) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-config-link-"));
+    cleanupDirs.push(root);
+    const workspaceDir = path.join(root, "workspace");
+    const sourceDir = path.join(root, "shared-claude-config");
+    const serviceCredential = path.join(root, "service-db-credential");
+    const credentialBytes = "postgresql://service:synthetic-secret@localhost/paperclip_test";
+    await mkdir(workspaceDir);
+    await mkdir(sourceDir);
+    await writeFile(serviceCredential, credentialBytes, { mode: 0o600 });
+    await symlink(serviceCredential, path.join(sourceDir, "CLAUDE.md"));
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test");
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", serviceCredential);
+    vi.stubEnv("CLAUDE_CONFIG_DIR", sourceDir);
+    const logs: string[] = [];
+
+    await expect(execute({
+      runId: "run-1",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli",
+        command: "claude",
+        cwd: workspaceDir,
+        ...(managedAi ? {
+          managedAiConnection: { provider: "anthropic", method: "api_key" },
+          env: { CLAUDE_CONFIG_DIR: sourceDir, ANTHROPIC_API_KEY: "synthetic-provider-key" },
+        } : {}),
+      },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_workspace", workspaceId: "workspace-1" },
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+        remoteCwd: "/remote/workspace",
+        runner: { execute: async () => ({ exitCode: 0, signal: null, stdout: "", stderr: "" }) },
+      } as never,
+      onLog: async (_stream, message) => { logs.push(message); },
+    })).rejects.toThrow("unsafe file entry");
+
+    expect(prepareAdapterExecutionTargetRuntime).not.toHaveBeenCalled();
+    expect(runChildProcess.mock.calls.filter((call) => !call[2].includes("--version"))).toHaveLength(0);
+    expect(logs.join("\n")).not.toContain(credentialBytes);
+  });
+
+  it("stages an ordinary regular CLAUDE.md from the shared config", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-config-safe-"));
+    cleanupDirs.push(root);
+    const workspaceDir = path.join(root, "workspace");
+    const sourceDir = path.join(root, "shared-claude-config");
+    const serviceCredential = path.join(root, "service-db-credential");
+    await mkdir(workspaceDir);
+    await mkdir(sourceDir);
+    await writeFile(path.join(sourceDir, "CLAUDE.md"), "safe shared guidance");
+    await writeFile(serviceCredential, "synthetic-service-only", { mode: 0o600 });
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test");
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", serviceCredential);
+    vi.stubEnv("CLAUDE_CONFIG_DIR", sourceDir);
+    vi.mocked(prepareAdapterExecutionTargetRuntime).mockImplementationOnce(async (input) => {
+      const asset = input.assets?.find((entry) => entry.key === "config-seed");
+      expect(asset).toMatchObject({ followSymlinks: false });
+      expect(asset?.localDir).not.toBe(sourceDir);
+      await expect(readFile(path.join(asset!.localDir, "CLAUDE.md"), "utf8"))
+        .resolves.toBe("safe shared guidance");
+      throw new Error("seed inspected before remote transfer");
+    });
+
+    await expect(execute({
+      runId: "run-1",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude", cwd: workspaceDir },
+      context: {
+        paperclipWorkspace: { cwd: workspaceDir, source: "project_workspace", workspaceId: "workspace-1" },
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "fake-plugin",
+        remoteCwd: "/remote/workspace",
+        runner: { execute: async () => ({ exitCode: 0, signal: null, stdout: "", stderr: "" }) },
+      } as never,
+      onLog: async () => {},
+    })).rejects.toThrow("seed inspected before remote transfer");
   });
 
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {

@@ -22,7 +22,12 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { prepareClaudeConfigSeed, prepareSandboxClaudeProbeRuntime } from "./claude-config.js";
+import {
+  prepareClaudeConfigSeed,
+  prepareManagedClaudeConfigSeed,
+  prepareSandboxClaudeProbeRuntime,
+  resolveManagedClaudeConfigSeedDir,
+} from "./claude-config.js";
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -127,6 +132,67 @@ describe("prepareClaudeConfigSeed", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readFile(path.join(seedDir, "CLAUDE.md"), "utf8"))
       .resolves.toBe("local instructions");
+  });
+
+  it("refuses an agent-planted Claude config link before creating a remote seed", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-link-"));
+    cleanupDirs.push(root);
+    const sourceDir = path.join(root, "claude-source");
+    const serviceCredential = path.join(root, "service-db-credential");
+    const credentialBytes = "postgresql://service:synthetic-secret@localhost/paperclip_test";
+    await fs.mkdir(sourceDir);
+    await fs.writeFile(serviceCredential, credentialBytes, { mode: 0o600 });
+    // The preceding local Claude run can write this entry in its shared mount.
+    await fs.symlink(serviceCredential, path.join(sourceDir, "CLAUDE.md"));
+    const env = { ...createEnv(root, sourceDir), PAPERCLIP_DATABASE_URL_FILE: serviceCredential };
+    const onLog = vi.fn(async () => {});
+
+    await expect(prepareClaudeConfigSeed(env, onLog, "company-1"))
+      .rejects.toThrow("unsafe file entry");
+    expect(onLog).not.toHaveBeenCalled();
+    await expect(fs.access(resolveManagedClaudeConfigSeedDir(env, "company-1")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses a mutable source directory alias and managed auth link", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-config-alias-"));
+    cleanupDirs.push(root);
+    const sourceDir = path.join(root, "claude-source");
+    const aliasDir = path.join(root, "alias");
+    const serviceCredential = path.join(root, "service-db-credential");
+    await fs.mkdir(sourceDir);
+    await fs.writeFile(serviceCredential, "synthetic-service-only", { mode: 0o600 });
+    await fs.symlink(sourceDir, aliasDir);
+    await fs.symlink(serviceCredential, path.join(sourceDir, ".credentials.json"));
+
+    const env = { ...createEnv(root, aliasDir), PAPERCLIP_DATABASE_URL_FILE: serviceCredential };
+    await expect(prepareClaudeConfigSeed(env, async () => {}, "company-1"))
+      .rejects.toThrow("unsafe directory alias");
+    await expect(prepareManagedClaudeConfigSeed(sourceDir))
+      .rejects.toThrow("unsafe file entry");
+  });
+
+  it("copies only safe managed Claude config files into a disposable seed", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-managed-seed-"));
+    cleanupDirs.push(root);
+    const sourceDir = path.join(root, "provider");
+    await fs.mkdir(sourceDir);
+    await fs.writeFile(path.join(sourceDir, "CLAUDE.md"), "safe instructions");
+    await fs.writeFile(path.join(sourceDir, ".credentials.json"), "synthetic login");
+    await fs.writeFile(path.join(sourceDir, "unrelated.json"), "do not copy");
+
+    const seed = await prepareManagedClaudeConfigSeed(sourceDir);
+    try {
+      await expect(fs.readFile(path.join(seed.dir, "CLAUDE.md"), "utf8"))
+        .resolves.toBe("safe instructions");
+      await expect(fs.readFile(path.join(seed.dir, ".credentials.json"), "utf8"))
+        .resolves.toBe("synthetic login");
+      await expect(fs.access(path.join(seed.dir, "unrelated.json")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await seed.cleanup();
+    }
+    await expect(fs.access(seed.dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

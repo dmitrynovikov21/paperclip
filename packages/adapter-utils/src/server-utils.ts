@@ -3525,16 +3525,27 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// These are source-instance credentials, not run-scoped agent credentials.
+// Some callers pre-merge process.env into their explicit launch env, so the
+// child-process boundary must remove them from both inputs.
+const CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS = new Set([
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "PAPERCLIP_AUTH_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
+]);
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
-    // Better Auth uses this host secret to sign human sessions. It can also
-    // sign agent JWTs when PAPERCLIP_AGENT_JWT_SECRET is unset. A local agent
-    // must receive only its minted run token, never either signing source.
-    if (key.toUpperCase() === "BETTER_AUTH_SECRET") {
+    if (CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) {
       delete env[key];
       continue;
     }
@@ -4957,9 +4968,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    const runEnv = { ...opts.env };
+    for (const key of Object.keys(runEnv)) {
+      if (CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) delete runEnv[key];
+    }
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...runEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -4983,13 +4998,15 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? runEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
-          if (value === undefined) delete childEnv[key];
+          if (value === undefined || CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) {
+            delete childEnv[key];
+          }
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,

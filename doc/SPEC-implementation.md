@@ -946,6 +946,7 @@ instances return `404`.
 - `POST /issues/:issueId/checkout`
 - `POST /issues/:issueId/release`
 - `POST /issues/:issueId/admin/force-release` (board-only lock recovery)
+- `POST /issues/:issueId/deferred-wakes/:wakeId/reconcile` (board-only promotion of an existing parked reviewer wake)
 - `POST /issues/:issueId/comments`
 - `GET /issues/:issueId/comments`
 - `POST /companies/:companyId/issues/:issueId/attachments` (multipart upload)
@@ -971,6 +972,8 @@ Server behavior:
 3. successful checkout sets `assignee_agent_id`, `status = in_progress`, and `started_at`
 
 `POST /issues/:issueId/admin/force-release` is an operator recovery endpoint for stale harness locks. It requires board access to the issue company, clears checkout and execution run lock fields, and may clear the agent assignee when `clearAssignee=true` is passed. The route must write an `issue.admin_force_release` activity log entry containing the previous checkout and execution run IDs.
+
+`POST /issues/:issueId/deferred-wakes/:wakeId/reconcile` accepts `{ "expectedHolderRunId": "uuid", "expectedStageId": "uuid" }`. It is limited to a board actor for the issue company. The server verifies the terminal holder, pending reviewer stage, saved wake context, empty issue locks, invokable reviewer, absence of another active issue run, and absence of a subtree pause hold under an issue-row lock. It promotes the named wake without inserting another wake request and returns its wake/run linkage; retries return the same run ID. Mismatched preconditions return `409`. See `doc/execution-semantics.md` §5.
 
 ## 10.5 Projects
 

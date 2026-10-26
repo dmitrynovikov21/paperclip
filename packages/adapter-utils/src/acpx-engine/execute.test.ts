@@ -547,10 +547,11 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("PAPERCLIP_API_KEY");
     expect(prompt).toContain("PAPERCLIP_WAKE_PAYLOAD_JSON");
     expect(prompt).toContain("Paperclip API access note:");
-    expect(prompt).toContain('$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py');
-    expect(prompt).toContain("GET /api/agents/me");
-    expect(prompt).toContain('POST "/api/issues/$PAPERCLIP_TASK_ID/comments" --body-stdin');
+    expect(prompt).toContain("The client reads PAPERCLIP_API_KEY from env in memory");
+    expect(prompt).toContain('python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET /api/agents/me');
+    expect(prompt).toContain('python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/issues/$PAPERCLIP_TASK_ID/comments" --body-stdin');
     expect(prompt).toContain("never put bearer headers or JSON bodies in command arguments");
+    expect(prompt).not.toContain("Authorization: Bearer");
     expect(prompt).not.toContain("$PAPERCLIP_API_URL/api/");
     expect(prompt).not.toContain("/api/issues/{id}");
     expect(prompt).not.toContain("-d '{...}'");

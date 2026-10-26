@@ -1,3 +1,4 @@
+import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import {
   persistActivity,
   publishActivity,
@@ -229,7 +230,7 @@ export async function prepareConversationTurn(
               and coalesce(completed.context_snapshot->>'wakeCommentId', completed.context_snapshot->>'commentId') = issue_comments.id::text
               and (exists (select 1 from issue_comments reply where reply.company_id = ${run.companyId}::uuid
                 and reply.issue_id = ${issueId}::uuid and reply.created_by_run_id = completed.id
-                and reply.author_agent_id = ${issue.conversationAgentId}::uuid and reply.deleted_at is null)
+                and reply.origin = 'comment' and reply.author_agent_id = ${issue.conversationAgentId}::uuid and reply.deleted_at is null)
                 or exists (select 1 from issue_thread_interactions question where question.company_id = ${run.companyId}::uuid
                   and question.issue_id = ${issueId}::uuid and question.source_run_id = completed.id
                   and question.created_by_agent_id = ${issue.conversationAgentId}::uuid)))`,
@@ -281,7 +282,7 @@ export async function prepareConversationTurn(
 /** Finalizers only park a turn with a durable response, interaction, or processed /new. */
 export async function settleConversationTurn(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
 ) {
   if (run.status !== "succeeded") return false;
   const context = run.contextSnapshot ?? {};
@@ -290,7 +291,12 @@ export async function settleConversationTurn(
   let publication: ActivityPublication | null = null;
   const settled = await db.transaction(async (tx) => {
     const [issue] = await tx
-      .select()
+      .select({
+        id: issues.id, companyId: issues.companyId, status: issues.status,
+        conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
+        conversationState: issues.conversationState, conversationSessionGeneration: issues.conversationSessionGeneration,
+        executionRunId: issues.executionRunId,
+      })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .for("update");
@@ -306,6 +312,7 @@ export async function settleConversationTurn(
         and(
           eq(issueComments.issueId, issueId),
           eq(issueComments.createdByRunId, run.id),
+          eq(issueComments.origin, "comment"),
           eq(issueComments.authorAgentId, issue.conversationAgentId!),
           isNull(issueComments.deletedAt),
         ),
@@ -342,7 +349,7 @@ export async function settleConversationTurn(
     const [wake] =
       typeof wakeId === "string"
         ? await tx
-            .select()
+            .select({ id: issueComments.id })
             .from(issueComments)
             .where(eq(issueComments.id, wakeId))
         : [];
@@ -405,6 +412,26 @@ export async function settleConversationTurn(
   return settled;
 }
 
+export async function settleConversationTurnForRun(
+  db: Db,
+  companyId: string,
+  runId: string,
+) {
+  const [run] = await db.select({
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
+    contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then jsonb_build_object(
+        'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+        'conversationReset', ${heartbeatRuns.contextSnapshot}->'conversationReset',
+        'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
+        'conversationReplyBoundaryCommentId', ${heartbeatRuns.contextSnapshot}->'conversationReplyBoundaryCommentId',
+        'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+        'commentId', ${heartbeatRuns.contextSnapshot}->'commentId'
+      ) else null end`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+  return run ? settleConversationTurn(db, run) : false;
+}
+
 /** Fresh provider context uses only messages in this session, up to this turn. */
 export async function conversationReplay(
   db: Db,
@@ -456,12 +483,12 @@ export async function conversationReplay(
     )
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
     .limit(40);
-  return rows
+  return FAST_RESPONSE_AGENT_GUIDANCE + "\n" + rows
     .reverse()
     .map((row) =>
       JSON.stringify({
-        author: row.authorAgentId ? "agent" : "user",
-        body: sanitizeQuarantinedCommentForHigherTrust(row).body.slice(0, 8000),
+        author: row.origin === "fast_response" ? "paperclip_receipt" : row.authorAgentId ? "agent" : "user",
+        body: fastResponseHistoryBody(sanitizeQuarantinedCommentForHigherTrust(row)).slice(0, 8000),
       }),
     )
     .join("\n");

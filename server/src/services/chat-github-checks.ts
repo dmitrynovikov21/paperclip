@@ -171,14 +171,14 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
           let run = review?.runId
             ? (
                 await db
-                  .select()
+                  .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
                   .from(heartbeatRuns)
                   .where(eq(heartbeatRuns.id, review.runId))
               )[0]
             : undefined;
           if (review && !run) {
             const [sourceRun] = await db
-              .select({ run: heartbeatRuns })
+              .select({ run: { id: heartbeatRuns.id, status: heartbeatRuns.status } })
               .from(chatDeliveries)
               .innerJoin(
                 chatMessageLinks,
@@ -240,6 +240,11 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
               : state === "queued"
                 ? "queued"
                 : "completed";
+          const policy = review?.policySnapshot ?? {
+            ...source.configuration.defaults,
+            ...source.configuration.repositories[event.repositoryId],
+          };
+          const conclusion = policy.ratingThreshold === null ? "neutral" : "action_required";
           const title =
             state === "manual_required"
               ? "Authorized manual review required"
@@ -337,7 +342,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                   ...(detailsUrl ? { details_url: detailsUrl } : {}),
                   status,
                   ...(status === "completed"
-                    ? { conclusion: "action_required" }
+                    ? { conclusion }
                     : {}),
                   output: {
                     title,
@@ -356,7 +361,7 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
                     checkId: String(posted.id),
                     checkUrl: posted.html_url,
                     ...(terminal
-                      ? { conclusion: "action_required" as const }
+                      ? { conclusion }
                       : {}),
                     updatedAt: new Date(),
                   })
@@ -422,19 +427,24 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
         and(
           inArray(chatGitHubReviews.state, ["queued", "running"]),
           isNull(chatGitHubReviews.assessment),
-          sql`exists (
-        select 1 from ${chatActions} action
-        join ${chatDeliveries} delivery
-          on delivery.id::text = ${chatGitHubReviews.deliveryId}
+          sql`${chatGitHubReviews.deliveryId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`,
+          sql`(
+        select action.id from ${chatActions} action
         where action.company_id = ${chatGitHubReviews.companyId}
           and action.endpoint_id = ${chatGitHubReviews.endpointId}
-          and delivery.endpoint_id = action.endpoint_id
           and action.kind = 'github_review_check'
           and action.status = 'cancelled'
           and action.result->>'code' = 'stale_head'
-          and action.payload->'event'->>'deliveryId' =
-            delivery.normalized_event->'githubAutomatic'->'context'->>'deliveryId'
-      )`,
+          and action.payload->'event'->>'deliveryId' = (
+            select delivery.normalized_event->'githubAutomatic'->'context'->>'deliveryId'
+            from ${chatDeliveries} delivery
+            where delivery.id = case
+              when ${chatGitHubReviews.deliveryId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              then ${chatGitHubReviews.deliveryId}::uuid end
+              and delivery.endpoint_id = ${chatGitHubReviews.endpointId}
+          )
+        limit 1
+      ) is not null`,
         ),
       );
     const rows = await db

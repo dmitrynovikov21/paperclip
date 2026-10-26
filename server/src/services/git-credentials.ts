@@ -1,6 +1,7 @@
 import {
   companySecrets,
   heartbeatRuns,
+  issues,
   companyMemberships,
   connectionGrantDelegations,
   connectionGrants,
@@ -9,7 +10,7 @@ import {
   userSecretDefinitions,
   type Db,
 } from "@paperclipai/db";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
@@ -207,6 +208,19 @@ type GitCredentialSecretsDeps = {
  * provider instance so one run performs at most one secret resolution (and writes at most
  * one audit event) no matter how many git operations it authenticates.
  */
+export function createIssueGitRemoteAuthProvider(db: Db, companyId: string, issueId: string,
+  create: typeof createGitRemoteAuthProvider = createGitRemoteAuthProvider): GitRemoteAuthProvider {
+  let provider: Promise<GitRemoteAuthProvider> | null = null;
+  return async (remoteUrl: string) => {
+    provider ??= db.select({ responsibleUserId: issues.responsibleUserId, assigneeAgentId: issues.assigneeAgentId }).from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then(([issue]) => create(db, companyId, {
+        issueId, responsibleUserId: issue?.responsibleUserId ?? null, agentId: issue?.assigneeAgentId ?? null,
+      }));
+    return (await provider)(remoteUrl);
+  };
+}
+
 export function createGitRemoteAuthProvider(
   db: Db,
   companyId: string,
@@ -310,6 +324,10 @@ export async function resolveManagedGitHubIdentitySelection(
 }> {
   const connections = await db.select().from(toolConnections).where(and(
     eq(toolConnections.companyId, companyId),
+    or(
+      sql`${toolConnections.config}->'sourceTemplateKey' = '"github"'::jsonb`,
+      sql`${toolConnections.transportConfig}->'sourceTemplateKey' = '"github"'::jsonb`,
+    ),
   ));
   const githubConnections = connections.filter((connection) => {
     const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};

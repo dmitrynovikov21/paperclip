@@ -28,6 +28,9 @@ import {
 } from "../../attachment-types.js";
 import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
+import { loadConfig } from "../../config.js";
+import { HttpError } from "../../errors.js";
+import { voiceSessionStore, type VoiceTransaction } from "../voice/voice-session-store.js";
 import { issueService } from "../issues.js";
 import { boundExternalChatProvider } from "./external-chat-provider.js";
 import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
@@ -108,6 +111,17 @@ export type ExternalChatResponseWaitAuthorization =
   | "not_applicable";
 
 type AuthorizationLockMode = "blocking" | "nonblocking" | "read";
+
+type AuthorizationEndpoint = Pick<typeof chatEndpoints.$inferSelect,
+  "id" | "companyId" | "provider" | "providerAccountId" | "status" | "setup"
+  | "allowDirectMessages" | "allowGroupChats" | "allowUnlinkedPeople" | "sponsorUserId"
+>;
+type AuthorizationConversation = Pick<typeof chatConversations.$inferSelect,
+  "id" | "resourceId" | "isDirectMessage"
+>;
+type AuthorizationResource = Pick<typeof chatEndpointResources.$inferSelect,
+  "availability" | "type" | "enabled"
+>;
 
 class ExternalChatWaitAuthorizationContentionError extends Error {
   constructor() {
@@ -264,9 +278,9 @@ function decodeListCursor(
 }
 
 function destinationAllowed(
-  endpoint: typeof chatEndpoints.$inferSelect,
-  conversation: typeof chatConversations.$inferSelect,
-  resource: typeof chatEndpointResources.$inferSelect | null,
+  endpoint: AuthorizationEndpoint,
+  conversation: AuthorizationConversation,
+  resource: AuthorizationResource | null,
 ): boolean {
   if (conversation.isDirectMessage) return endpoint.allowDirectMessages;
   if (!resource || resource.availability !== "available") return false;
@@ -280,7 +294,7 @@ function destinationAllowed(
 }
 
 function currentSetupTestAcceptsBoundDeliveries(
-  endpoint: typeof chatEndpoints.$inferSelect,
+  endpoint: AuthorizationEndpoint,
   deliveries: Array<{
     normalizedEvent: unknown;
     processedAt: Date | null;
@@ -323,7 +337,7 @@ function currentSetupTestAcceptsBoundDeliveries(
 
 async function principalAuthorized(
   tx: Db,
-  endpoint: typeof chatEndpoints.$inferSelect,
+  endpoint: AuthorizationEndpoint,
   principalId: string,
   lockMode: AuthorizationLockMode = "blocking",
 ): Promise<boolean> {
@@ -340,7 +354,7 @@ async function principalAuthorized(
     }
   }
   const principalQuery = tx
-    .select({ id: chatExternalPrincipals.id })
+    .select({ id: chatExternalPrincipals.id, externalId: chatExternalPrincipals.externalId })
     .from(chatExternalPrincipals)
     .where(
       and(
@@ -359,6 +373,16 @@ async function principalAuthorized(
       ? principalQuery.for("update", { noWait: true }).limit(1)
       : principalQuery.for("update").limit(1));
   if (!principal) return false;
+  if (endpoint.provider === "speko") {
+    try {
+      await voiceSessionStore(tx, { allowLocalBoard: loadConfig().deploymentMode === "local_trusted", nonblockingAuthority: lockMode === "nonblocking" })
+        .authorizePrincipal(tx as unknown as VoiceTransaction, endpoint.companyId, endpoint.id, principal.externalId);
+      return true;
+    } catch (error) {
+      if (error instanceof HttpError && [403, 404].includes(error.status)) return false;
+      throw error;
+    }
+  }
   const linkQuery = tx
     .select({
       status: chatIdentityLinks.status,
@@ -432,10 +456,32 @@ export async function authorizeChatConversationForBoundRun(
   const linksQuery = tx
     .select({
       commentId: chatMessageLinks.commentId,
-      conversation: chatConversations,
-      endpoint: chatEndpoints,
+      conversation: {
+        id: chatConversations.id,
+        resourceId: chatConversations.resourceId,
+        isDirectMessage: chatConversations.isDirectMessage,
+      },
+      endpoint: {
+        id: chatEndpoints.id,
+        companyId: chatEndpoints.companyId,
+        provider: chatEndpoints.provider,
+        providerAccountId: chatEndpoints.providerAccountId,
+        status: chatEndpoints.status,
+        allowDirectMessages: chatEndpoints.allowDirectMessages,
+        allowGroupChats: chatEndpoints.allowGroupChats,
+        allowUnlinkedPeople: chatEndpoints.allowUnlinkedPeople,
+        sponsorUserId: chatEndpoints.sponsorUserId,
+        setup: sql<AuthorizationEndpoint["setup"]>`jsonb_build_object(
+          'step', ${chatEndpoints.setup}->'step',
+          'testStartedAt', ${chatEndpoints.setup}->'testStartedAt',
+          'runtimeGeneration', ${chatEndpoints.setup}->'runtimeGeneration'
+        )`,
+      },
       principalId: chatDeliveries.principalId,
-      normalizedEvent: chatDeliveries.normalizedEvent,
+      normalizedEvent: sql<unknown>`jsonb_build_object('runtimeContext', jsonb_build_object(
+        'generation', ${chatDeliveries.normalizedEvent}->'runtimeContext'->'generation',
+        'credentialFingerprint', ${chatDeliveries.normalizedEvent}->'runtimeContext'->'credentialFingerprint'
+      ))`,
       processedAt: chatDeliveries.processedAt,
       receivedAt: chatDeliveries.receivedAt,
     })
@@ -505,7 +551,11 @@ export async function authorizeChatConversationForBoundRun(
   const resource = conversation.resourceId
     ? await (() => {
         const query = tx
-          .select()
+          .select({
+            availability: chatEndpointResources.availability,
+            type: chatEndpointResources.type,
+            enabled: chatEndpointResources.enabled,
+          })
           .from(chatEndpointResources)
           .where(
             and(

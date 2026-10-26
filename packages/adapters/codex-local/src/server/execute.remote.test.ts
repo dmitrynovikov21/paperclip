@@ -394,7 +394,7 @@ describe("codex remote execution", () => {
 
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
-    expect(call?.[2]).toEqual([
+    expect(call?.[2].slice(call[2].indexOf("exec"))).toEqual([
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
@@ -467,7 +467,7 @@ describe("codex remote execution", () => {
 
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
-    expect(call?.[2]).toEqual([
+    expect(call?.[2].slice(call[2].indexOf("exec"))).toEqual([
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",
@@ -548,7 +548,7 @@ describe("codex remote execution", () => {
     const call = runChildProcess.mock.calls[0] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
-    expect(call?.[2]).toEqual([
+    expect(call?.[2].slice(call[2].indexOf("exec"))).toEqual([
       "exec",
       "--json",
       "--dangerously-bypass-approvals-and-sandbox",

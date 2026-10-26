@@ -2,6 +2,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { SandboxManagedRuntimeAssetProvision } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
+import { shellQuote } from "@paperclipai/adapter-utils/ssh";
+import { buildCodexAuthInboundProvision, CODEX_AUTH_MERGE_EXTRACT_SCRIPT_NAME } from "./codex-auth-merge-scripts.js";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId, resolveCodexAuthCacheDir } from "./codex-auth-cache.js";
 import {
@@ -38,6 +41,43 @@ export const CODEX_SYNC_ALLOWLIST = [
   ...SYMLINKED_SHARED_FILES,
   "skills",
 ] as const;
+
+/** Refresh only managed entries; remote conversation files never leave their home.
+ * The staging lease and provider retirement precede this provisioning command. */
+export function buildCodexHomeRefreshProvision(options: { mergeAuth: boolean }): SandboxManagedRuntimeAssetProvision {
+  const auth = options.mergeAuth ? buildCodexAuthInboundProvision() : undefined;
+  return {
+    stageFiles: auth?.stageFiles,
+    postUploadCommand: ({ assetDir, assetTarPath, runtimeRootDir }) => {
+      const prepare = options.mergeAuth
+        ? `if [ -f "$home/auth.json" ]; then cp "$home/auth.json" "$incoming/auth.json"; fi
+sh "$runtime_root/${CODEX_AUTH_MERGE_EXTRACT_SCRIPT_NAME}" "$incoming" "$asset_tar"`
+        : 'tar -xf "$asset_tar" -C "$incoming"\nrm -f "$asset_tar"';
+      // Paths arrive confined by the runtime staging layer. Only fixed managed
+      // names are replaced; sessions, archived sessions and native indexes stay.
+      const script = `set -eu
+umask 077
+home=$1
+asset_tar=$2
+runtime_root=$3
+mkdir -p "$home"
+chmod 700 "$home"
+incoming=$(mktemp -d "$home/.paperclip-home-refresh.XXXXXX")
+trap 'rm -rf -- "$incoming"' EXIT
+trap 'exit 1' HUP INT TERM
+${prepare}
+for name in ${CODEX_SYNC_ALLOWLIST.map(shellQuote).join(" ")}; do
+  if [ -e "$incoming/$name" ] || [ -L "$incoming/$name" ]; then
+    if [ -d "$home/$name" ] || [ -L "$home/$name" ]; then rm -rf -- "$home/$name"; fi
+    mv -f -- "$incoming/$name" "$home/$name"
+  else
+    rm -rf -- "$home/$name"
+  fi
+done`;
+      return `sh -c ${shellQuote(script)} -- ${shellQuote(assetDir)} ${shellQuote(assetTarPath)} ${shellQuote(runtimeRootDir)}`;
+    },
+  };
+}
 
 export type ManagedCodexMcpGateway = {
   name: string;
@@ -193,6 +233,13 @@ export async function assertTrustedConnectorAuthSourceHome(input: {
   const cacheRoot = resolveCodexAuthCacheDir(env, companyId);
   const isCacheEntry = path.dirname(source) === cacheRoot && path.basename(source) !== ".";
   if ([resolveSharedCodexHomeDir(env), companyHome, agentHome].some((home) => source === path.resolve(home)) || isCacheEntry) {
+    // A server-selected home may be created later in this run. If it exists,
+    // reject every directory alias before any credential/config read.
+    const pinned = await openDirectoryNoFollow(source).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    await pinned?.close();
     return;
   }
   // A managed AI connection gets a short-lived credential home created by the
@@ -205,23 +252,25 @@ export async function assertTrustedConnectorAuthSourceHome(input: {
       const [rootStat, sourceStat] = await Promise.all([fs.lstat(sessionHome), fs.lstat(source)]);
       if (rootStat.isDirectory() && sourceStat.isDirectory()
         && rootStat.uid === serviceUid && sourceStat.uid === serviceUid
-        && (rootStat.mode & 0o077) === 0 && (sourceStat.mode & 0o077) === 0) return;
+        && (rootStat.mode & 0o077) === 0 && (sourceStat.mode & 0o077) === 0) {
+        const pinned = await openDirectoryNoFollow(source);
+        await pinned.close();
+        return;
+      }
     }
   }
   throw new Error("Connector CODEX_HOME is not a trusted auth source in file-backed database mode");
 }
 
-/**
- * True when the Codex home has a usable `auth.json`. Uses `fs.access` (follows
- * symlinks), so a dangling auth symlink whose source has been removed counts as
- * no usable credentials.
- */
-export async function codexHomeHasUsableAuth(home: string): Promise<boolean> {
+/** A file-backed service reads only a bound auth chain, never an arbitrary link. */
+export async function codexHomeHasUsableAuth(home: string, authSourcePaths?: readonly string[]): Promise<boolean> {
   const authPath = path.join(home, "auth.json");
-  if (!(await pathExists(authPath))) return false;
   try {
-    const raw = await fs.readFile(authPath, "utf8");
-    const parsed = JSON.parse(raw);
+    const raw = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()
+      ? await readBoundAuthSource(authSourcePaths ?? [authPath, path.join(resolveSharedCodexHomeDir(process.env), "auth.json")])
+      : await fs.readFile(authPath);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw.toString("utf8"));
     return hasUsableAuthPayload(parsed);
   } catch {
     return false;
@@ -233,8 +282,11 @@ async function codexHomeHasMatchingApiKeyAuth(home: string, apiKey: string): Pro
   const existing = await fs.lstat(authPath).catch(() => null);
   if (!existing || existing.isSymbolicLink()) return false;
   try {
-    const raw = await fs.readFile(authPath, "utf8");
-    const parsed = JSON.parse(raw);
+    const raw = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()
+      ? await readRegularFileNoFollow(authPath)
+      : await fs.readFile(authPath);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw.toString("utf8"));
     return readApiKeyFromAuthPayload(parsed) === apiKey.trim();
   } catch {
     return false;
@@ -410,6 +462,7 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
 }
 
 export interface StageCodexHomeForSyncOptions {
+  additionalFiles?: readonly string[];
   /** Run id, used only to make the staged temp-dir name traceable in logs. */
   runId?: string;
   /** Exact trusted chain for a managed auth.json symlink, ending at a regular file. */
@@ -441,7 +494,7 @@ async function stagePinnedEntry(source: SafeHandle, target: string, preserveExec
   // Sockets, devices and nonblocking FIFOs are not staging inputs.
 }
 
-async function readBoundAuthSource(sources: readonly string[], index = 0): Promise<Buffer | null> {
+export async function readBoundAuthSource(sources: readonly string[], index = 0): Promise<Buffer | null> {
   const source = sources[index];
   if (!source) throw new Error("Unbound Codex auth symlink");
   const dir = await openDirectoryNoFollow(path.dirname(source)).catch((error) => {
@@ -582,6 +635,24 @@ export async function stageCodexHomeForSync(
   try {
     const sourceHome = await openDirectoryNoFollow(effectiveCodexHome);
     try {
+      for (const filename of options.additionalFiles ?? []) {
+        if (!/^paperclip-observability-[A-Za-z0-9_-]+\.config\.toml$/.test(filename)) {
+          throw new Error("Invalid managed observability profile");
+        }
+        const profile = await openChildNoFollow(sourceHome, filename);
+        if (!profile) throw new Error("Managed observability profile must be an owned private regular file");
+        try {
+          const stat = await profile.stat();
+          if (!stat.isFile() || stat.nlink !== 1 ||
+            (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+            (stat.mode & 0o077) !== 0) {
+            throw new Error("Managed observability profile must be an owned private regular file");
+          }
+          await fs.writeFile(path.join(stagedHome, filename), await profile.readFile(), { mode: 0o600, flag: "wx" });
+        } finally {
+          await profile.close();
+        }
+      }
       for (const entry of CODEX_SYNC_ALLOWLIST) {
         await stageCodexHomeEntry(sourceHome, effectiveCodexHome, stagedHome, entry, options);
       }
@@ -872,6 +943,8 @@ export interface CodexCredentialReadinessInput {
   configuredCodexHome: string | null | undefined;
   /** Resolved `config.env.OPENAI_API_KEY` value (after secret resolution). */
   configuredApiKey: string | null | undefined;
+  /** Exact server-selected chain for a generated home's auth symlinks. */
+  authSourcePaths?: readonly string[];
 }
 
 export interface CodexCredentialReadiness {
@@ -930,7 +1003,7 @@ export async function evaluateCodexCredentialReadiness(
   }
 
   const ready =
-    (await codexHomeHasUsableAuth(effectiveHome)) ||
+    (await codexHomeHasUsableAuth(effectiveHome, input.authSourcePaths)) ||
     (await codexHomeHasUsableAuth(sharedSourceHome));
   return { managed: true, authMode: "subscription", ready, effectiveHome, sharedSourceHome };
 }

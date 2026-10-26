@@ -15,7 +15,7 @@ it("refuses a legacy process run before it can read a file-backed service creden
   process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
   const onMeta = vi.fn();
   try {
-    await expect(execute({
+    const result = await execute({
       runId: "synthetic-run",
       agent: {
         id: "synthetic-agent",
@@ -32,7 +32,13 @@ it("refuses a legacy process run before it can read a file-backed service creden
       context: {},
       onLog: async () => {},
       onMeta,
-    })).rejects.toThrow("Process adapter cannot run with file-backed database credentials");
+    });
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorMessage: expect.stringContaining("Process adapter cannot run with file-backed database credentials"),
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    });
+    expect(result.errorMessage).not.toContain("synthetic-service-secret");
     expect(existsSync(accessed)).toBe(false);
     expect(onMeta).not.toHaveBeenCalled();
 

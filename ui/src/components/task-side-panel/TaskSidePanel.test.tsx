@@ -7,6 +7,8 @@ import type { Issue, IssueDocument } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
+  taskPanelAgentTasksTab,
+  taskPanelArtifactsTab,
   taskPanelDocumentTab,
   taskPanelPropertiesTab,
   writeTaskSidePanelState,
@@ -70,6 +72,18 @@ vi.mock("@/components/task-detail/TaskDetailRelationsPanel", () => ({
   TaskDetailSubtasksPanel: ({ items }: { items: Issue[] }) => (
     <div>{`Subtasks content: ${items.length}`}</div>
   ),
+}));
+
+const agentChat = vi.hoisted(() => ({ enabled: true }));
+vi.mock("@/hooks/useAgentChatEnabled", () => ({
+  useAgentChatEnabled: () => ({ enabled: agentChat.enabled, loaded: true }),
+}));
+
+vi.mock("@/components/chat/AgentWorkPanels", () => ({
+  AgentTasksPanel: ({ agentId, excludeIssueId }: { agentId: string; excludeIssueId?: string }) => (
+    <div>{`Agent tasks ${agentId} excluding ${excludeIssueId}`}</div>
+  ),
+  AgentArtifactsPanel: ({ agentId }: { agentId: string }) => <div>{`Agent artifacts ${agentId}`}</div>,
 }));
 
 vi.mock("@/components/WorkspaceFileBrowser", () => ({
@@ -165,6 +179,28 @@ describe("TaskSidePanel", () => {
     );
   }
 
+  it("keeps the upload slot mounted and inert when switching away from Artifacts", async () => {
+    await render(panel({ streamlinedTabs: true, artifactsOpenRequestId: 1 }));
+    const slot = container.querySelector<HTMLElement>("[data-artifact-upload-slot]");
+    expect(slot).not.toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-artifacts")?.click());
+    expect(slot?.getAttribute("aria-hidden")).toBe("false");
+    expect(slot?.hasAttribute("inert")).toBe(false);
+    expect(slot?.className).not.toContain("invisible");
+
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-properties")?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBe(slot);
+    expect(slot?.getAttribute("aria-hidden")).toBe("true");
+    expect(slot?.hasAttribute("inert")).toBe(true);
+    expect(slot?.className).toContain("invisible");
+
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-artifacts")?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBe(slot);
+    expect(slot?.hasAttribute("inert")).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close Artifacts"]')?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBeNull();
+  });
+
   it("opens, deduplicates, switches and closes text attachment tabs", async () => {
     const onAttachmentOpened = vi.fn();
     await render(panel({ openAttachment: { id: "file-1", title: "AGENTS.md", requestId: 1 }, onAttachmentOpened }));
@@ -219,6 +255,82 @@ describe("TaskSidePanel", () => {
     expect(acknowledged).toHaveBeenCalledTimes(1);
     await render(panel());
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.id).toBe(`side-panel-tab-browser:${next}`);
+  });
+
+  it("opens an agent chat on the agent's tasks, not the conversation's artifacts", async () => {
+    await render(panel({ issue: issue({ conversationAgentId: "agent-1" }) }));
+    const selected = container.querySelector('[role="tab"][aria-selected="true"]');
+    expect(selected?.getAttribute("data-side-panel-tab-target")).toBe("agent-tasks");
+    expect(selected?.textContent).toContain("Tasks");
+    expect(container.textContent).toContain("Agent tasks agent-1 excluding task-1");
+    expect(container.textContent).not.toContain("Artifacts content");
+  });
+
+  it("keeps an Artifacts-only layout the user chose", async () => {
+    writeTaskSidePanelState("user-1", "company-1", "task-1", {
+      state: { tabs: [taskPanelArtifactsTab()], activeTabId: "artifacts" },
+      launcherOpen: false,
+      userInteracted: true,
+      autoPlanHandled: false,
+      updatedAt: 1,
+    });
+    await render(panel({ issue: issue({ conversationAgentId: "agent-1" }) }));
+    expect(Array.from(container.querySelectorAll('[role="tab"]')).map((tab) => tab.getAttribute("data-side-panel-tab-target")))
+      .toEqual(["artifacts"]);
+  });
+
+  it("falls back to Artifacts when Agent Chat is off and only the Tasks tab was saved", async () => {
+    agentChat.enabled = false;
+    try {
+      writeTaskSidePanelState("user-1", "company-1", "task-1", {
+        state: { tabs: [taskPanelAgentTasksTab()], activeTabId: "agent-tasks" },
+        launcherOpen: false,
+        userInteracted: true,
+        autoPlanHandled: false,
+        updatedAt: 1,
+      });
+      await render(panel({ issue: issue({ conversationAgentId: "agent-1" }) }));
+      expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("data-side-panel-tab-target")).toBe("artifacts");
+      expect(container.textContent).toContain("Artifacts content");
+    } finally {
+      agentChat.enabled = true;
+    }
+  });
+
+  it("moves a chat's stored Artifacts-only default onto the agent's tasks", async () => {
+    writeTaskSidePanelState("user-1", "company-1", "task-1", {
+      state: { tabs: [taskPanelArtifactsTab()], activeTabId: "artifacts" },
+      launcherOpen: false,
+      userInteracted: false,
+      autoPlanHandled: false,
+      updatedAt: 1,
+    });
+    await render(panel({ issue: issue({ conversationAgentId: "agent-1" }) }));
+    expect(Array.from(container.querySelectorAll('[role="tab"]')).map((tab) => tab.getAttribute("data-side-panel-tab-target")))
+      .toEqual(["agent-tasks"]);
+  });
+
+  it("offers the agent's artifacts from the + launcher in an agent chat", async () => {
+    await render(panel({ issue: issue({ conversationAgentId: "agent-1" }), streamlinedTabs: true }));
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Open a new tab"]')?.click());
+    const artifactsItem = Array.from(document.body.querySelectorAll<HTMLElement>('[role="option"]'))
+      .find((item) => item.textContent?.includes("Artifacts"));
+    await act(async () => artifactsItem?.click());
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("data-side-panel-tab-target")).toBe("artifacts");
+    expect(container.textContent).toContain("Agent artifacts agent-1");
+    expect(container.textContent).not.toContain("Artifacts content");
+  });
+
+  it("keeps a chat on the conversation's own Artifacts while Agent Chat is off", async () => {
+    agentChat.enabled = false;
+    try {
+      await render(panel({ issue: issue({ conversationAgentId: "agent-1" }) }));
+      expect(container.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("data-side-panel-tab-target")).toBe("artifacts");
+      expect(container.textContent).toContain("Artifacts content");
+      expect(container.textContent).not.toContain("Agent tasks");
+    } finally {
+      agentChat.enabled = true;
+    }
   });
 
   it("opens Properties on first visit", async () => {
@@ -350,9 +462,9 @@ describe("TaskSidePanel", () => {
     const propertiesTab = container.querySelector<HTMLElement>('[data-side-panel-tab-target="properties"]');
     expect(propertiesTab?.className).toContain("text-sm");
     expect(propertiesTab?.querySelector("svg")).toBeNull();
-    expect(container.querySelector('[data-side-panel-tab-wrapper="properties"]')?.className).toContain("mx-1.5");
+    expect(container.querySelector('[data-side-panel-tab-wrapper="properties"]')?.parentElement?.className).toContain("mx-0.75");
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Close Properties"]')?.className)
-      .toContain("opacity-0");
+      .toContain("opacity-100");
     const addButton = container.querySelector<HTMLButtonElement>('button[aria-label="Open a new tab"]');
     expect(addButton?.className).toContain("h-(--side-panel-tab-height)");
     expect(addButton?.className).toContain("w-(--side-panel-tab-height)");

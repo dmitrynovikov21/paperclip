@@ -8,7 +8,6 @@ import {
 } from "../../packages/adapter-utils/src/execution-target.js";
 import { runChildProcess } from "../../packages/adapter-utils/src/server-utils.js";
 import {
-  agents,
   closeRegisteredClients,
   companies,
   createDb,
@@ -19,6 +18,7 @@ import {
   runDatabaseRestore,
 } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../src/agent-auth-jwt.js";
+import { createAgentLifecycle } from "../src/services/agent-lifecycle.js";
 
 const apiUrl = process.argv[2];
 const agentFixtureDir = process.argv[3];
@@ -55,15 +55,13 @@ try {
     issuePrefix: `SJ${randomUUID().replace(/-/g, "").slice(0, 8)}`,
   }).returning({ id: companies.id });
   if (!company) throw new Error("Company seed failed");
-  const [agent] = await db.insert(agents).values({
-    companyId: company.id,
+  const agent = await createAgentLifecycle(db).requestHire(company.id, {
     name: "Synthetic JWT agent",
     role: "general",
     adapterType: "codex_local",
     adapterConfig: {},
     runtimeConfig: {},
-  }).returning({ id: agents.id });
-  if (!agent) throw new Error("Agent seed failed");
+  });
   const runId = randomUUID();
   await db.insert(heartbeatRuns).values({
     id: runId,

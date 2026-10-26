@@ -10,6 +10,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { skillFileBytes, snapshotFile, assertSkillSnapshotPath, skillSnapshotHash } from "./skill-snapshot.js";
+import { collectPinnedLocalSkillSnapshot, readPinnedLocalSkillFile, PROJECT_ROOT_SKILL_SUBDIRECTORIES } from "./pinned-local-skill-snapshot.js";
 import { fileURLToPath } from "node:url";
 import { and, asc, desc, eq, inArray, isNull, isNotNull, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -503,12 +504,6 @@ const PROJECT_SCAN_DIRECTORY_ROOTS = [
   ".neovate/skills",
   ".pochi/skills",
   ".adal/skills",
-] as const;
-
-const PROJECT_ROOT_SKILL_SUBDIRECTORIES = [
-  "references",
-  "scripts",
-  "assets",
 ] as const;
 
 const SKILL_AUDIT_SCAN_VERSION = "skills-audit-v1";
@@ -1436,8 +1431,10 @@ export async function readLocalSkillImportFromDirectory(
   if (options?.workspaceRoot) {
     await validateProjectSkillImportPath(resolvedSkillDir, options.workspaceRoot, inventoryMode);
   }
-  const skillFilePath = path.join(resolvedSkillDir, "SKILL.md");
-  const markdown = await fs.readFile(skillFilePath, "utf8");
+  const snapshot = await collectPinnedLocalSkillSnapshot(resolvedSkillDir, inventoryMode, classifyInventoryKind);
+  const entrypoint = snapshot.find((entry) => entry.path === "SKILL.md")!;
+  if (entrypoint.encoding) throw unprocessable("SKILL.md must be UTF-8 text.");
+  const markdown = entrypoint.content;
   const parsed = parseFrontmatterMarkdown(markdown);
   const slug = deriveImportedSkillSlug(parsed.frontmatter, path.basename(resolvedSkillDir));
   const parsedMetadata = isPlainRecord(parsed.frontmatter.metadata) ? parsed.frontmatter.metadata : null;
@@ -1448,7 +1445,7 @@ export async function readLocalSkillImportFromDirectory(
     sourceKind: "local_path",
     ...(options?.metadata ?? {}),
   };
-  const inventory = await collectLocalSkillInventory(resolvedSkillDir, inventoryMode);
+  const inventory = snapshot.map(({ path: filePath, kind }) => ({ path: filePath, kind }));
 
   return {
     key: deriveCanonicalSkillKey(companyId, {
@@ -3081,11 +3078,9 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
 
   async function collectVersionFileInventoryFromDirectory(
     skillDir: string,
+    mode: LocalSkillInventoryMode = "full",
   ): Promise<CompanySkillVersionFileInventoryEntry[]> {
-    const inventory = await collectLocalSkillInventory(skillDir);
-    return Promise.all(inventory.map(async (entry) => ({
-      ...snapshotFile(entry.path, entry.kind, await fs.readFile(path.join(skillDir, entry.path)), Boolean((await fs.stat(path.join(skillDir, entry.path))).mode & 0o111)),
-    })));
+    return collectPinnedLocalSkillSnapshot(skillDir, mode, classifyInventoryKind);
   }
 
   async function ensureBundledSkillReleases(companyId: string, bundledSkills: CompanySkill[]) {
@@ -3642,6 +3637,12 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     companyId: string,
     skill: CompanySkill,
   ): Promise<CompanySkillVersionFileInventoryEntry[]> {
+    if (skill.sourceType === "local_path" || skill.sourceType === "catalog") {
+      const directory = normalizeSkillDirectory(skill);
+      if (directory && await statPath(directory)) {
+        return collectVersionFileInventoryFromDirectory(directory, inferLocalSkillInventoryMode(skill));
+      }
+    }
     const out: CompanySkillVersionFileInventoryEntry[] = [];
     for (const entry of skill.fileInventory) {
       const detail = await readFile(companyId, skill.id, entry.path);
@@ -4412,10 +4413,9 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     let content = "";
 
     if (skill.sourceType === "local_path" || skill.sourceType === "catalog") {
-      const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
-      const diskBytes = absolutePath ? await fs.readFile(absolutePath).catch(() => null) : null;
-      if (diskBytes !== null) {
-        const file = snapshotFile(normalizedPath, fileEntry.kind, diskBytes, Boolean((await fs.stat(absolutePath!)).mode & 0o111));
+      const directory = normalizeSkillDirectory(skill);
+      const file = directory ? await readPinnedLocalSkillFile(directory, normalizedPath, fileEntry.kind) : null;
+      if (file) {
         return { ...file, skillId: skill.id, language: file.encoding === "base64" ? null : inferLanguageFromPath(normalizedPath),
           markdown: file.encoding !== "base64" && isMarkdownPath(normalizedPath), editable: source.editable && file.encoding !== "base64" };
       } else if (normalizedPath === "SKILL.md") {
@@ -4713,10 +4713,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
   }
 
   async function refreshEditedSkillInventory(skill: CompanySkill, tx: DbOrTransaction) {
-    const entries = await collectLocalSkillInventory(normalizeSkillDirectory(skill)!, inferLocalSkillInventoryMode(skill));
-    const inventory = await Promise.all(entries.map(async (entry) => ({
-      ...snapshotFile(entry.path, entry.kind, await fs.readFile(path.join(normalizeSkillDirectory(skill)!, entry.path)), Boolean((await fs.stat(path.join(normalizeSkillDirectory(skill)!, entry.path))).mode & 0o111)),
-    })));
+    const inventory = await collectVersionFileInventoryFromDirectory(normalizeSkillDirectory(skill)!, inferLocalSkillInventoryMode(skill));
     await tx.update(companySkills).set({
       fileInventory: serializeFileInventory(inventory),
       trustLevel: deriveTrustLevel(inventory),
@@ -6201,7 +6198,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         const installed: RuntimeSkillSourceResolution | null = installedDirectory ? { status: "available", source: installedDirectory }
           : await resolveRuntimeSkillSource(companyId, skill, { ...options, snapshotLatest: false, materializeMissing: false });
         const inventory = installed?.status === "available"
-          ? await collectVersionFileInventoryFromDirectory(installed.source)
+          ? await collectVersionFileInventoryFromDirectory(installed.source, inferLocalSkillInventoryMode(skill))
           : skill.fileInventory.length === 1 && skill.fileInventory[0]?.path === "SKILL.md" && skill.markdown
             ? [{ path: "SKILL.md", kind: "skill" as const, content: skill.markdown }] : null;
         if (inventory) {

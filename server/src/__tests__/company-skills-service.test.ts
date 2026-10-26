@@ -2700,6 +2700,54 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(imported.imported).toEqual([expect.objectContaining({ name: "Editorial" })]);
   });
 
+  it("refuses a selected project skill changed to a service-credential link before version creation or staging", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-credential-workspace-"));
+    const serviceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-service-only-"));
+    cleanupDirs.add(workspaceDir);
+    cleanupDirs.add(serviceDir);
+    const skillDir = path.join(workspaceDir, ".codex", "skills", "selected");
+    const skillFile = path.join(skillDir, "SKILL.md");
+    const regularMarkdown = "---\nname: selected\n---\nSafe project skill.\n";
+    const syntheticCredential = "postgres://synthetic-service-only-credential";
+    const credentialFile = path.join(serviceDir, "database-url");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(skillFile, regularMarkdown);
+    await fs.writeFile(credentialFile, syntheticCredential, { mode: 0o400 });
+    await db.insert(companies).values({ id: companyId, name: "Skill snapshot boundary", issuePrefix: "SKB" });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Writable project" });
+    await db.insert(projectWorkspaces).values({ id: workspaceId, companyId, projectId, name: "Writable workspace",
+      cwd: workspaceDir, sourceType: "local_path", isPrimary: true });
+
+    const imported = await svc.scanProjectWorkspaces(companyId, { projectIds: [projectId], mode: "import",
+      selection: [{ workspaceId, path: ".codex/skills/selected" }] });
+    expect(imported.imported).toHaveLength(1);
+    const skill = imported.imported[0]!;
+    const selected = { snapshotLatest: true, onlyKeys: new Set([skill.key]) };
+    const regular = await svc.listRuntimeSkillEntries(companyId, selected);
+    expect(regular).toMatchObject([{ key: skill.key, sourceStatus: "available" }]);
+    expect(await fs.readFile(path.join(regular[0]!.source, "SKILL.md"), "utf8")).toBe(regularMarkdown);
+    const before = await svc.listVersions(companyId, skill.id);
+
+    await fs.unlink(skillFile);
+    await fs.symlink(credentialFile, skillFile);
+    const stage = vi.fn();
+    await expect(svc.readFile(companyId, skill.id, "SKILL.md")).rejects.toThrow(/Unsafe local skill source entry/);
+    await expect(svc.withRuntimeSkillEntries(companyId, selected, stage)).rejects.toThrow(/Unsafe local skill source entry/);
+    expect(stage).not.toHaveBeenCalled();
+    const after = await svc.listVersions(companyId, skill.id);
+    expect(after.map((version) => version.id)).toEqual(before.map((version) => version.id));
+    expect(JSON.stringify(after)).not.toContain(syntheticCredential);
+    expect(await fs.readFile(path.join(regular[0]!.source, "SKILL.md"), "utf8")).toBe(regularMarkdown);
+
+    await fs.unlink(skillFile);
+    await fs.writeFile(skillFile, regularMarkdown);
+    await svc.withRuntimeSkillEntries(companyId, selected, stage);
+    expect(stage).toHaveBeenCalledOnce();
+  });
+
   it("previews project workspace skill candidates without importing them", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

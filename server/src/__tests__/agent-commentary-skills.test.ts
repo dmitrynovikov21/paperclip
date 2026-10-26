@@ -36,7 +36,10 @@ describe("default feedback skill delivery", () => {
     const codexHome = join(root, "codex");
     await ensureCodexSkillsInjected(async () => {}, { skillsHome: join(codexHome, "skills"), skillsEntries: entries, desiredSkillNames });
     const claude = await prepareClaudePromptBundle({ companyId: "company", skills: selected, instructionsContents: null, onLog: async () => {} });
-    const staged = await stageCodexHomeForSync(codexHome, { runId: "commentary-test" });
+    const staged = await stageCodexHomeForSync(codexHome, {
+      runId: "commentary-test",
+      skillSources: selected.map((entry) => ({ name: entry.runtimeName, source: entry.source })),
+    });
     cleanup.push(staged);
     for (const skills of [join(codexHome, "skills"), join(claude.addDir, ".claude", "skills"), join(staged, "skills")]) {
       for (const name of ["complain", "suggestion-box"]) {

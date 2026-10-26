@@ -3531,6 +3531,13 @@ export function sanitizeInheritedPaperclipEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
+    // Better Auth uses this host secret to sign human sessions. It can also
+    // sign agent JWTs when PAPERCLIP_AGENT_JWT_SECRET is unset. A local agent
+    // must receive only its minted run token, never either signing source.
+    if (key.toUpperCase() === "BETTER_AUTH_SECRET") {
+      delete env[key];
+      continue;
+    }
     if (AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase())) {
       delete env[key];
       continue;

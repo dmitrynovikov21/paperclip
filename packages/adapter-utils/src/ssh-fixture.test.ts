@@ -759,6 +759,8 @@ describe("ssh env-lab fixture", () => {
     await git(localRepo, ["add", "tracked.txt"]);
     await git(localRepo, ["commit", "-m", "initial"]);
     const originalHead = await git(localRepo, ["rev-parse", "HEAD"]);
+    await mkdir(path.join(localRepo, ".paperclip"));
+    await writeFile(path.join(localRepo, ".paperclip", ".env"), "synthetic-source-jwt\n");
     await writeFile(path.join(localRepo, "tracked.txt"), "dirty local\n", "utf8");
     await writeFile(path.join(localRepo, "untracked.txt"), "from local\n", "utf8");
 
@@ -775,6 +777,7 @@ describe("ssh env-lab fixture", () => {
       localDir: localRepo,
       remoteDir: started.workspaceDir,
     });
+    await runSshCommand(config, `test ! -e ${JSON.stringify(path.posix.join(started.workspaceDir, ".paperclip"))}`);
 
     const remoteStatus = await runSshCommand(
       config,
@@ -786,7 +789,7 @@ describe("ssh env-lab fixture", () => {
 
     await runSshCommand(
       config,
-      `cd ${JSON.stringify(started.workspaceDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && git add tracked.txt untracked.txt && git commit -m "remote update" >/dev/null && printf "remote dirty\\n" > tracked.txt && printf "remote extra\\n" > remote-only.txt`,
+      `cd ${JSON.stringify(started.workspaceDir)} && git config user.name "Paperclip SSH" && git config user.email "ssh@paperclip.dev" && git add tracked.txt untracked.txt && git commit -m "remote update" >/dev/null && printf "remote dirty\\n" > tracked.txt && printf "remote extra\\n" > remote-only.txt && mkdir .paperclip && printf "remote tamper\\n" > .paperclip/.env`,
       { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
     );
 
@@ -801,7 +804,27 @@ describe("ssh env-lab fixture", () => {
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
     expect(await git(localRepo, ["status", "--short"])).toContain("M tracked.txt");
     expect(await git(localRepo, ["status", "--short"])).not.toContain("._tracked.txt");
+    expect(await readFile(path.join(localRepo, ".paperclip", ".env"), "utf8")).toBe("synthetic-source-jwt\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("rejects a historical control-plane file before opening SSH", async () => {
+    const rootDir = await createFixtureRootDir();
+    const repo = path.join(rootDir, "workspace");
+    await mkdir(path.join(repo, ".paperclip"), { recursive: true });
+    await git(repo, ["init"]);
+    await git(repo, ["config", "user.name", "Paperclip Test"]);
+    await git(repo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(repo, ".paperclip", ".env"), "synthetic-signing-key\n");
+    await git(repo, ["add", "-f", ".paperclip/.env"]);
+    await git(repo, ["commit", "-m", "add fixture"]);
+    await git(repo, ["rm", ".paperclip/.env"]);
+    await git(repo, ["commit", "-m", "remove fixture"]);
+
+    await expect(prepareWorkspaceForSshExecution({
+      spec: UNREACHABLE_SSH_SPEC,
+      localDir: repo,
+    })).rejects.toThrow("workspace_git_history_contains_control_plane_files");
+  });
 
   it("preserves both concurrent SSH restores in a shared git workspace", async () => {
     const rootDir = await createFixtureRootDir();

@@ -7,7 +7,9 @@ import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
+  assertNoControlPlaneGitHistory,
   createUnrelatedHistoryGraftCommit,
+  CONTROL_PLANE_WORKSPACE_EXCLUDES,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   PROJECT_REPOSITORIES_DIR,
   readSanitizedOriginRemoteUrl,
@@ -772,6 +774,7 @@ async function importGitWorkspaceToSsh(input: {
   const tempRef = `refs/paperclip/ssh-sync/import/${randomUUID()}`;
 
   try {
+    await assertNoControlPlaneGitHistory(input.localDir, input.snapshot.headCommit);
     await runLocalGit(input.localDir, ["update-ref", tempRef, input.snapshot.headCommit], {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
@@ -895,16 +898,17 @@ async function exportGitWorkspaceFromSsh(input: {
       timeout: 60_000,
       maxBuffer: 1024 * 1024,
     });
+    const importedHead = await runLocalGit(input.localDir, ["rev-parse", importedRef], {
+      timeout: 10_000,
+      maxBuffer: 16 * 1024,
+    });
+    await assertNoControlPlaneGitHistory(input.localDir, importedHead.stdout.trim());
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {
         timeout: 60_000,
         maxBuffer: 1024 * 1024,
       });
     }
-    const importedHead = await runLocalGit(input.localDir, ["rev-parse", importedRef], {
-      timeout: 10_000,
-      maxBuffer: 16 * 1024,
-    });
     return importedHead.stdout.trim();
   } finally {
     if (input.resetLocalWorkspace !== false) {
@@ -1132,7 +1136,7 @@ async function transportGitWorkspaceToSsh(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir: input.remoteDir,
-    exclude: [".git", ".paperclip-runtime", ...(input.exclude ?? [])],
+    exclude: [".git", ".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES, ...(input.exclude ?? [])],
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });
@@ -1687,7 +1691,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+    exclude: [".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES, ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1821,8 +1825,8 @@ async function restoreWorkspaceRootFromSsh(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries],
-      preserveLocalEntries: [".git", ...projectRepositoryEntries],
+      exclude: [".git", ".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES, ...projectRepositoryEntries],
+      preserveLocalEntries: [".git", ".paperclip", ...projectRepositoryEntries],
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
     });
@@ -1833,7 +1837,8 @@ async function restoreWorkspaceRootFromSsh(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES],
+    preserveLocalEntries: [".paperclip"],
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
   });

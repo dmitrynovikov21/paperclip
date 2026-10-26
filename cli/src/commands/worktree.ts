@@ -2524,18 +2524,17 @@ async function runWorktreeInit(opts: WorktreeInitOptions): Promise<void> {
       seedMode,
     });
   }
-  const sourceEnvEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(sourceConfigPath));
-  const existingAgentJwtSecret =
-    opts.empty ? randomBytes(32).toString("base64url") : nonEmpty(sourceEnvEntries.PAPERCLIP_AGENT_JWT_SECRET) ??
-    nonEmpty(process.env.PAPERCLIP_AGENT_JWT_SECRET);
-  const existingToolActionSigningSecret =
-    opts.empty ? randomBytes(32).toString("base64url") : nonEmpty(sourceEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
-    nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
+  // The source instance's signing keys must never be written inside an
+  // agent-accessible worktree, including a lean --no-seed worktree. Every new
+  // instance gets its own keys; seeding copies data, not signing authority.
+  const agentJwtSecret = randomBytes(32).toString("base64url");
+  const toolActionSigningSecret = randomBytes(32).toString("base64url");
   mergePaperclipEnvEntries(
     {
       ...buildWorktreeEnvEntries(paths, branding),
-      ...(existingAgentJwtSecret ? { PAPERCLIP_AGENT_JWT_SECRET: existingAgentJwtSecret } : {}),
-      ...(existingToolActionSigningSecret ? { PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: existingToolActionSigningSecret } : {}),
+      PAPERCLIP_SIGNING_KEYS_ISOLATED: "true",
+      PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
     },
     paths.envPath,
   );

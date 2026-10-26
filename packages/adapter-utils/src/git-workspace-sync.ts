@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { shouldExcludePath } from "./exclude-patterns.js";
 import { createWorkspaceManifest, workspacePaths, WorkspaceNulParser, type WorkspacePaths } from "./workspace-manifest.js";
 import { runWorkspaceGitProcess } from "./workspace-git-stream.js";
 import { preserveWorkspaceRestoreErrorDiagnostic, withWorkspaceRestoreGitCommand, type WorkspaceRestoreGitCommand } from "./workspace-restore-diagnostics.js";
@@ -73,6 +74,21 @@ export function setExpensiveWorkspaceGitExecutor(executor: ExpensiveWorkspaceGit
 }
 
 export const GIT_ARCHIVE_EXCLUDES = [".git", ".git/*"] as const;
+// This directory belongs to the Paperclip control plane, not the agent's
+// repository. Git ignore rules are user-controlled and cannot protect it.
+export const CONTROL_PLANE_WORKSPACE_EXCLUDES = [".paperclip", ".paperclip/*", "*/.paperclip", "*/.paperclip/*"] as const;
+
+/** Git packs can expose excluded files from earlier commits even when the checkout omits them. */
+export async function assertNoControlPlaneGitHistory(localDir: string, revision: string): Promise<void> {
+  const result = await runLocalGit(localDir, [
+    "log", "--full-history", "-1", "--format=%H", revision, "--", ":(glob)**/.paperclip/**",
+  ], { timeout: 60_000, maxBuffer: 1024 });
+  if (result.stdout.trim()) {
+    throw Object.assign(new Error("workspace_git_history_contains_control_plane_files"), {
+      code: "workspace_git_history_contains_control_plane_files",
+    });
+  }
+}
 
 /**
  * Identity flags for commits the sync machinery itself creates (the merge
@@ -257,6 +273,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     const scan = async (args: string[], operation: string, category: string) => {
       const parser = new WorkspaceNulParser((record) => {
         const relative = category === "ignored" ? record.replace(/\/+$/, "") : record;
+        if (shouldExcludePath(relative, CONTROL_PLANE_WORKSPACE_EXCLUDES)) return;
         if (category === "ignored" && repositories.length && relative === PROJECT_REPOSITORIES_DIR) return;
         // Managed children have their own exact file selections. Never stage a
         // parent Git directory record that could admit files created later.
@@ -291,7 +308,10 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
     if (controller.signal.aborted) throw Object.assign(new Error("Workspace snapshot cancelled"), { code: "workspace_git_scan_cancelled" });
     for (const repo of repositories) {
       for (const [category, paths] of [["overlay", repo.snapshot.overlayPaths], ["deleted", repo.snapshot.deletedPaths], ["ignored", repo.snapshot.ignoredPaths]] as const) {
-        for (const relative of workspacePaths(paths)) writer.add(category, `${repo.path}/${relative}`);
+        for (const relative of workspacePaths(paths)) {
+          const nestedPath = `${repo.path}/${relative}`;
+          if (!shouldExcludePath(nestedPath, CONTROL_PLANE_WORKSPACE_EXCLUDES)) writer.add(category, nestedPath);
+        }
       }
     }
     const head = (settled[0] as PromiseFulfilledResult<GitCommandResult>).value.stdout.trim();
@@ -626,6 +646,7 @@ export async function withShallowGitWorkspaceClone<T>(
   const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
+    await assertNoControlPlaneGitHistory(input.localDir, input.snapshot.headCommit);
     const originUrl = input.snapshot.originUrl !== undefined ? input.snapshot.originUrl : await readSanitizedOriginRemoteUrl(input.localDir);
     await runLocalGit(input.localDir, ["update-ref", tempRef, input.snapshot.headCommit], {
       timeout: 10_000,
@@ -728,6 +749,7 @@ export async function fetchGitBundleIntoLocalRef(input: {
     timeout: 10_000,
     maxBuffer: 16 * 1024,
   });
+  await assertNoControlPlaneGitHistory(input.localDir, importedHead.stdout.trim());
   return importedHead.stdout.trim();
 }
 

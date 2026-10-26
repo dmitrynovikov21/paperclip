@@ -67,6 +67,7 @@ import {
   sanitizeWorktreeInstanceId,
 } from "../commands/worktree-lib.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import { readPaperclipEnvEntries } from "../config/env.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   getEmbeddedPostgresTestSupport,
@@ -1485,7 +1486,7 @@ describe("worktree helpers", () => {
     }
   });
 
-  it("persists the current agent jwt secret into the worktree env file", async () => {
+  it("creates independent signing keys for --no-seed even with source keys in env and process", async () => {
     const tempRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "paperclip-worktree-jwt-"));
     const repoRoot = path.join(tempRoot, "repo");
     const originalCwd = process.cwd();
@@ -1494,20 +1495,29 @@ describe("worktree helpers", () => {
 
     try {
       fs.mkdirSync(repoRoot, { recursive: true });
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "worktree-shared-secret";
-      process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "worktree-tool-action-secret";
+      const sourceDir = path.join(tempRoot, "source");
+      fs.mkdirSync(sourceDir);
+      fs.writeFileSync(path.join(sourceDir, ".env"), "PAPERCLIP_AGENT_JWT_SECRET=source-file-jwt\nPAPERCLIP_TOOL_ACTION_SIGNING_SECRET=source-file-actions\n");
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "source-process-jwt";
+      process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "source-process-actions";
       process.chdir(repoRoot);
 
       await worktreeInitCommand({
         seed: false,
-        fromConfig: path.join(tempRoot, "missing", "config.json"),
+        fromConfig: path.join(sourceDir, "config.json"),
         home: path.join(tempRoot, ".paperclip-worktrees"),
       });
 
       const envPath = path.join(repoRoot, ".paperclip", ".env");
       const envContents = fs.readFileSync(envPath, "utf8");
-      expect(envContents).toContain("PAPERCLIP_AGENT_JWT_SECRET=worktree-shared-secret");
-      expect(envContents).toContain("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=worktree-tool-action-secret");
+      for (const sourceSecret of ["source-file-jwt", "source-file-actions", "source-process-jwt", "source-process-actions"]) {
+        expect(envContents).not.toContain(sourceSecret);
+      }
+      const entries = readPaperclipEnvEntries(envPath);
+      expect(entries.PAPERCLIP_SIGNING_KEYS_ISOLATED).toBe("true");
+      expect(entries.PAPERCLIP_AGENT_JWT_SECRET).toBeTruthy();
+      expect(entries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeTruthy();
+      expect(entries.PAPERCLIP_AGENT_JWT_SECRET).not.toBe(entries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET);
       expect(envContents).toContain("PAPERCLIP_WORKTREE_NAME=repo");
       expect(envContents).toMatch(/PAPERCLIP_WORKTREE_COLOR=\"#[0-9a-f]{6}\"/);
     } finally {

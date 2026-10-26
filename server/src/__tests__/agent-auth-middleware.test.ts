@@ -219,6 +219,24 @@ describe("agent auth middleware", () => {
     expect(res.body).toMatchObject({ type: "board", userId: "local-board", runId });
   });
 
+  it("accepts a worktree run JWT while rejecting a token signed by its source instance", async () => {
+    const agentId = randomUUID();
+    const companyId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, agentId, companyId } });
+    const sourceToken = createLocalAgentJwt(agentId, companyId, "codex_local", runId, null);
+    process.env.PAPERCLIP_INSTANCE_ID = "synthetic-worktree";
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-worktree-jwt-secret";
+    const worktreeToken = createLocalAgentJwt(agentId, companyId, "codex_local", runId, null);
+    const app = createApp(db);
+
+    const authorized = await request(app).get("/actor").set("Authorization", `Bearer ${worktreeToken}`);
+    expect(authorized.status).toBe(200);
+    expect(authorized.body).toMatchObject({ type: "agent", agentId, companyId, runId });
+    const source = await request(app).get("/actor").set("Authorization", `Bearer ${sourceToken}`);
+    expect(source.status).toBe(401);
+  });
+
   it.each([
     ["empty bearer token", "Bearer   ", "Empty bearer token"],
     ["unverified token", "Bearer not-a-token", "Agent token did not verify"],

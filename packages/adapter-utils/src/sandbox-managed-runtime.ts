@@ -1,7 +1,7 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
 import { workspaceSeedGeneration, readWorkspaceSeedGeneration, publishWorkspaceSeedGeneration } from "./workspace-seed-cache.js";
 import { writeCheckpointBaseline, workspaceCheckpointScript, readCheckpointSnapshot, validateCheckpointPayload } from "./workspace-checkpoint.js";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
@@ -20,6 +20,7 @@ import {
   deleteLocalGitRef,
   fetchGitBundleIntoLocalRef,
   GIT_ARCHIVE_EXCLUDES,
+  CONTROL_PLANE_WORKSPACE_EXCLUDES,
   type GitWorkspaceSnapshot,
   integrateImportedGitHead,
   readGitWorkspaceSnapshot,
@@ -822,6 +823,41 @@ async function sha256File(filePath: string): Promise<string> {
   });
 }
 
+async function assertNoControlPlaneArchiveEntries(archivePath: string): Promise<void> {
+  // A durable seed may have been recorded by an older binary. Validate its
+  // members before copying the archive into the agent's runtime directory.
+  await new Promise<void>((resolve, reject) => {
+    const tar = spawn("tar", ["-tf", archivePath], { stdio: ["ignore", "pipe", "pipe"] });
+    let pending = "";
+    let failure: Error | null = null;
+    const fail = (message: string) => {
+      failure ??= new Error(message);
+      tar.kill();
+    };
+    tar.stdout.on("data", (chunk: Buffer) => {
+      if (failure) return;
+      pending += chunk.toString("utf8");
+      let end: number;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        const member = pending.slice(0, end).replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+        pending = pending.slice(end + 1);
+        if (shouldExcludePath(member, CONTROL_PLANE_WORKSPACE_EXCLUDES)) {
+          fail("workspace_durable_seed_contains_control_plane_files");
+          return;
+        }
+      }
+      if (pending.length > 1024 * 1024) fail("workspace_durable_seed_invalid");
+    });
+    tar.stderr.resume();
+    tar.on("error", reject);
+    tar.on("close", (code) => {
+      if (failure) reject(failure);
+      else if (code !== 0) reject(new Error("workspace_durable_seed_invalid"));
+      else resolve();
+    });
+  });
+}
+
 async function copyDurableSeedArchive(input: {
   sourcePath: string;
   targetPath: string;
@@ -837,6 +873,7 @@ async function copyDurableSeedArchive(input: {
   ) {
     throw new Error("workspace_durable_seed_digest_mismatch");
   }
+  await assertNoControlPlaneArchiveEntries(input.sourcePath);
   await fs.copyFile(input.sourcePath, input.targetPath, fsConstants.COPYFILE_FICLONE);
 }
 
@@ -1453,7 +1490,7 @@ export async function prepareSandboxManagedRuntime(input: {
   }
   const gitIgnoredExcludes = directoryIgnore?.kind === "git" ? directoryIgnore.ignoredPaths : undefined;
   const workspaceArchiveExclude = mergeExcludes(
-    [".paperclip-runtime"],
+    [".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES],
     repositoryMetadataExcludes,
     input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
     input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
@@ -1461,6 +1498,7 @@ export async function prepareSandboxManagedRuntime(input: {
     gitIgnoredExcludes,
   );
   const restoreExclude = mergeExcludes(
+    [...CONTROL_PLANE_WORKSPACE_EXCLUDES],
     repositoryMetadataExcludes,
     input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
     input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
@@ -1481,9 +1519,11 @@ export async function prepareSandboxManagedRuntime(input: {
         }),
       )))
     : null;
-  if (input.workspaceBaseline && repositoryMetadataExcludes.length) {
+  if (input.workspaceBaseline) {
     baselineSnapshot = await selectDirectorySnapshot(input.workspaceBaseline, {
-      omit: repositoryMetadataExcludes, exclude: mergeExcludes(input.workspaceBaseline.exclude, repositoryMetadataExcludes),
+      omit: repositoryMetadataExcludes,
+      omitPatterns: CONTROL_PLANE_WORKSPACE_EXCLUDES,
+      exclude: mergeExcludes(input.workspaceBaseline.exclude, repositoryMetadataExcludes, [...CONTROL_PLANE_WORKSPACE_EXCLUDES]),
       ignoredPaths: input.workspaceBaseline.ignoredPaths,
     });
   }
@@ -1539,7 +1579,7 @@ export async function prepareSandboxManagedRuntime(input: {
   // resolved Git-ignored paths (or keeps this fixed set as-is for a non-Git
   // source) — see `resolveReferencedSourceIgnore` and the per-project merge
   // below.
-  const additionalSourceBaseExclude = mergeExcludes(SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [".git"]);
+  const additionalSourceBaseExclude = mergeExcludes(SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [".git", ...CONTROL_PLANE_WORKSPACE_EXCLUDES]);
 
   // Every delegated post-upload command (extract/wipe/remove-deleted/asset merge)
   // must run under the run-specific timeout (`spec.timeoutMs`), not the provider
@@ -1674,7 +1714,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   expectedSha256: replaySeed.gitArchiveSha256,
                 }));
               } else {
-                const archive = async (cloneDir: string) => runStepSpan("workspace.git_archive", () => createTarballFromDirectory({ localDir: cloneDir, archivePath: gitTarPath, exclude: [".paperclip-runtime"] }));
+                const archive = async (cloneDir: string) => runStepSpan("workspace.git_archive", () => createTarballFromDirectory({ localDir: cloneDir, archivePath: gitTarPath, exclude: [".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES] }));
                 if (gitSnapshot) await runStepSpan("workspace.git_clone", () => withShallowGitWorkspaceClone({ localDir: input.workspaceLocalDir, snapshot: gitSnapshot }, archive));
                 else await runStepSpan("workspace.git_clone", () => withTempDir("paperclip-managed-repositories-", async (cloneDir) => {
                   for (const repo of repositories) await withShallowGitWorkspaceClone({ localDir: path.join(input.workspaceLocalDir, repo.path), snapshot: repo.snapshot }, async (child) => copyCloneTree(child, path.join(cloneDir, repo.path)));
@@ -2067,7 +2107,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 workspaceExclude: nestedExclude,
                 workspaceBaseline: await selectDirectorySnapshot(baselineSnapshot!, {
                   prefix,
-                  exclude: mergeExcludes(input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [...GIT_ARCHIVE_EXCLUDES], [".paperclip-runtime"], nestedExclude),
+                  exclude: mergeExcludes(input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [...GIT_ARCHIVE_EXCLUDES], [".paperclip-runtime", ...CONTROL_PLANE_WORKSPACE_EXCLUDES], nestedExclude),
                   ignoredPaths: input.workspaceFileMode === "all" ? undefined : repository.snapshot.ignoredPaths,
                 }),
                 onRuntimeProgress: input.onRuntimeProgress,

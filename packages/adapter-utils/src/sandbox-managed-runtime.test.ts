@@ -18,6 +18,7 @@ import {
 
 import {
   assertSyncOperationsConfined,
+  createTarballFromDirectory,
   escapeTarExcludeLiteral,
   mirrorDirectory,
   prepareSandboxManagedRuntime,
@@ -452,6 +453,69 @@ describe("sandbox managed runtime", () => {
     } finally { capture.mockRestore(); merge.mockRestore(); }
   });
 
+  it.each([undefined, "all"] as const)("keeps unignored control-plane files out of sandbox archives and sync-back (file mode %s)", async (workspaceFileMode) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-signing-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local");
+    const remote = path.join(root, "remote");
+    await initGitRepo(local);
+    await mkdir(path.join(local, ".paperclip"));
+    await writeFile(path.join(local, ".paperclip", ".env"), "PAPERCLIP_AGENT_JWT_SECRET=synthetic-source-jwt\nPAPERCLIP_TOOL_ACTION_SIGNING_SECRET=synthetic-source-actions\n");
+    const suppliedBaseline = await restoreMerge.captureDirectorySnapshot(local, { exclude: [".git", ".git/*"], diskBacked: true });
+    expect(suppliedBaseline.entries.has(".paperclip/.env")).toBe(true);
+    const client = makeFilesystemClient();
+    const originalSyncIn = client.syncIn!;
+    let checkedArchives = 0;
+    client.syncIn = async (operations) => {
+      for (const operation of operations) for (const mapping of operation.files) {
+        if (!mapping.sourcePath.endsWith(".tar")) continue;
+        const members = await listTarMembers(root, `members-${checkedArchives++}.tar`, await readFile(mapping.sourcePath));
+        expect(members.some((member) => member.split("/").includes(".paperclip"))).toBe(false);
+      }
+      return originalSyncIn(operations);
+    };
+
+    try {
+      const prepared = await prepareSandboxManagedRuntime({
+        spec: sandboxSpec("synthetic", remote), client, adapterKey: "test", workspaceLocalDir: local,
+        workspaceBaseline: suppliedBaseline,
+        ...(workspaceFileMode ? { workspaceFileMode } : {}),
+      });
+      expect(checkedArchives).toBeGreaterThan(0);
+      await expect(stat(path.join(remote, ".paperclip"))).rejects.toMatchObject({ code: "ENOENT" });
+      await mkdir(path.join(remote, ".paperclip"));
+      await writeFile(path.join(remote, ".paperclip", ".env"), "remote-tamper\n");
+      await writeFile(path.join(remote, "README.md"), "agent edit\n");
+      await prepared.restoreWorkspace();
+      expect(await readFile(path.join(local, ".paperclip", ".env"), "utf8")).toContain("synthetic-source-jwt");
+      expect(await readFile(path.join(local, "README.md"), "utf8")).toBe("agent edit\n");
+    } finally {
+      await restoreMerge.disposeDirectorySnapshot(suppliedBaseline);
+    }
+  });
+
+  it("rejects an old durable seed containing a worktree env before upload", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-legacy-signing-seed-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local");
+    await mkdir(path.join(local, ".paperclip"), { recursive: true });
+    await writeFile(path.join(local, ".paperclip", ".env"), "synthetic-source-signing-key\n");
+    await writeFile(path.join(local, "README.md"), "safe\n");
+    const seed = path.join(root, "old-workspace.tar");
+    await createTarballFromDirectory({ localDir: local, archivePath: seed });
+    const baseline = await restoreMerge.captureDirectorySnapshot(local, { diskBacked: true });
+    try {
+      await expect(prepareSandboxManagedRuntime({
+        spec: sandboxSpec("legacy-seed", path.join(root, "remote")), client: makeFilesystemClient(),
+        adapterKey: "test", workspaceLocalDir: local, workspaceFileMode: "all",
+        workspaceInboundMode: "durable_seed", workspaceBaseline: baseline,
+        workspaceDurableSeed: { workspaceArchivePath: seed },
+      })).rejects.toThrow("workspace_durable_seed_contains_control_plane_files");
+    } finally {
+      await restoreMerge.disposeDirectorySnapshot(baseline);
+    }
+  });
+
   it.each(["host_current", "adopt_remote", "durable_seed"] as const)("stages and restores both project repositories with independent Git histories (%s)", async (mode) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-multi-repo-"));
     cleanupDirs.push(root);
@@ -472,6 +536,8 @@ describe("sandbox managed runtime", () => {
       await symlink("../../skills/demo", path.join(cwd, ".claude/skills/demo"));
       await git(cwd, ["add", "."]);
       await git(cwd, ["commit", "-m", contents!]);
+      await mkdir(path.join(cwd, ".paperclip"));
+      await writeFile(path.join(cwd, ".paperclip", ".env"), "synthetic-nested-signing-secret\n");
       await writeFile(path.join(cwd, "secret.txt"), "must stay local");
     }
     await writeFile(path.join(local, ".git/info/exclude"), ".paperclip-repositories/\n");
@@ -500,6 +566,7 @@ describe("sandbox managed runtime", () => {
       expect(await readlink(path.join(cwd, ".claude/skills/demo"))).toBe("../../skills/demo");
       expect(await readFile(path.join(cwd, ".claude/skills/demo/SKILL.md"), "utf8")).toBe("base skill\n");
       await expect(stat(path.join(cwd, "secret.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(path.join(cwd, ".paperclip"))).rejects.toMatchObject({ code: "ENOENT" });
       await writeFile(path.join(cwd, "README.md"), `updated ${relative}`);
       await writeFile(path.join(cwd, ".claude/skills/demo/SKILL.md"), "updated skill\n");
       await git(cwd, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-am", "remote change"]);
@@ -512,6 +579,7 @@ describe("sandbox managed runtime", () => {
     if (mode !== "host_current") expect(await readFile(path.join(local, secondPath, "host-only.txt"), "utf8")).toBe("concurrent host work");
     for (const relative of ["", secondPath]) {
       expect(await readFile(path.join(local, relative, "README.md"), "utf8")).toBe(`updated ${relative}`);
+      expect(await readFile(path.join(local, relative, ".paperclip", ".env"), "utf8")).toBe("synthetic-nested-signing-secret\n");
       expect(await git(path.join(local, relative), ["log", "-1", "--format=%s"])).toBe("remote change");
       expect(await readFile(path.join(local, relative, "secret.txt"), "utf8")).toBe("must stay local");
       expect(await readlink(path.join(local, relative, ".claude/skills/demo"))).toBe("../../skills/demo");

@@ -16,7 +16,7 @@ import {
 } from "@paperclipai/shared/worktree-port-registry";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import { rewriteUrlPort } from "./url-utils.js";
-import { applyEmptyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
+import { applyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
 
 function nonEmpty(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -456,7 +456,7 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     return { repairedConfig: false, repairedEnv: false };
   }
 
-  applyEmptyWorktreeSigningSecrets(path.resolve(path.dirname(context.configPath), ".."));
+  applyWorktreeSigningSecrets(path.resolve(path.dirname(context.configPath), ".."));
 
   process.env.PAPERCLIP_HOME = context.homeDir;
   process.env.PAPERCLIP_INSTANCE_ID = context.instanceId;
@@ -538,10 +538,16 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     ? fs.readFileSync(context.envPath, "utf8")
     : null;
   const existingEnvEntries = parseEnvFile(existingContents ?? "");
-  const toolActionSigningSecret =
-    nonEmpty(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
-    nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) ??
-    randomBytes(32).toString("hex");
+  // Worktrees created before key isolation may contain the source instance's
+  // signing keys. Rotate them once; explicitly empty worktrees already had
+  // independent keys, and new worktrees carry the isolation marker.
+  const preserveSavedKeys = existingEnvEntries.PAPERCLIP_SIGNING_KEYS_ISOLATED === "true"
+    || fs.existsSync(path.join(path.dirname(context.envPath), "seed-empty"));
+  const agentJwtSecret = (preserveSavedKeys ? nonEmpty(existingEnvEntries.PAPERCLIP_AGENT_JWT_SECRET) : null)
+    ?? randomBytes(32).toString("hex");
+  const toolActionSigningSecret = (preserveSavedKeys ? nonEmpty(existingEnvEntries.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET) : null)
+    ?? randomBytes(32).toString("hex");
+  const betterAuthSecret = (preserveSavedKeys ? nonEmpty(existingEnvEntries.BETTER_AUTH_SECRET) : null) ?? agentJwtSecret;
 
   const managedEnvEntries: Record<string, string> = {
     PAPERCLIP_HOME: context.homeDir,
@@ -551,11 +557,16 @@ export function maybeRepairLegacyWorktreeConfigAndEnvFiles(): {
     PAPERCLIP_IN_WORKTREE: "true",
     PAPERCLIP_DB_BACKUP_ENABLED: "false",
     PAPERCLIP_WORKTREE_NAME: context.worktreeName,
+    PAPERCLIP_SIGNING_KEYS_ISOLATED: "true",
+    PAPERCLIP_AGENT_JWT_SECRET: agentJwtSecret,
     PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: toolActionSigningSecret,
+    BETTER_AUTH_SECRET: betterAuthSecret,
   };
 
   process.env.PAPERCLIP_DB_BACKUP_ENABLED = "false";
+  process.env.PAPERCLIP_AGENT_JWT_SECRET = agentJwtSecret;
   process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = toolActionSigningSecret;
+  process.env.BETTER_AUTH_SECRET = betterAuthSecret;
   const repairedContents = updateEnvFileContents(
     existingContents ?? emptyWorktreeEnvFileContents(),
     managedEnvEntries,

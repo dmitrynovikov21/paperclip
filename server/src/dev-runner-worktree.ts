@@ -57,12 +57,22 @@ export function resolveWorktreeEnvFilePath(rootDir: string): string {
   return path.resolve(rootDir, ".paperclip", ".env");
 }
 
-/** An explicitly empty instance owns its saved keys, even in an agent shell. */
-export function applyEmptyWorktreeSigningSecrets(rootDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (!existsSync(path.resolve(rootDir, ".paperclip", "seed-empty"))) return false;
-  const entries = parseEnvFile(readFileSync(resolveWorktreeEnvFilePath(rootDir), "utf8"));
+/** A worktree instance uses its saved keys even when the shell inherited source keys. */
+export function applyWorktreeSigningSecrets(rootDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const envPath = resolveWorktreeEnvFilePath(rootDir);
+  if (!existsSync(envPath)) return false;
+  const entries = parseEnvFile(readFileSync(envPath, "utf8"));
+  const isEmpty = existsSync(path.resolve(rootDir, ".paperclip", "seed-empty"));
+  if (!isEmpty && (entries.PAPERCLIP_IN_WORKTREE !== "true" || entries.PAPERCLIP_SIGNING_KEYS_ISOLATED !== "true")) return false;
   for (const key of ["PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"] as const) {
-    if (!entries[key]?.trim()) throw new Error(`Empty worktree is missing its saved ${key}. Reinitialize its configuration before starting.`);
+    if (!entries[key]?.trim()) {
+      if (isEmpty) throw new Error(`Empty worktree is missing its saved ${key}. Reinitialize its configuration before starting.`);
+      // Older worktrees may lack a key. Their config repair creates and saves
+      // fresh keys before the server starts.
+      return false;
+    }
+  }
+  for (const key of ["PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"] as const) {
     env[key] = entries[key];
   }
   // Better Auth otherwise prefers an inherited key over this instance's JWT key.
@@ -147,7 +157,7 @@ export function bootstrapDevRunnerWorktreeEnv(
     if (typeof env[key] === "string" && env[key]!.trim().length > 0) continue;
     env[key] = value;
   }
-  applyEmptyWorktreeSigningSecrets(rootDir, env);
+  applyWorktreeSigningSecrets(rootDir, env);
 
   return {
     envPath,

@@ -170,13 +170,18 @@ describe("worktree config repair", () => {
     expect(repairedEnv).toContain(`PAPERCLIP_CONFIG=${JSON.stringify(await fs.realpath(configPath))}`);
     expect(repairedEnv).toContain(`PAPERCLIP_CONTEXT=${JSON.stringify(path.join(isolatedHome, "context.json"))}`);
     expect(repairedEnv).toContain('PAPERCLIP_DB_BACKUP_ENABLED="false"');
-    expect(repairedEnv).toContain("PAPERCLIP_AGENT_JWT_SECRET=shared-secret");
+    expect(repairedEnv).not.toContain("shared-secret");
+    expect(repairedEnv).toContain('PAPERCLIP_SIGNING_KEYS_ISOLATED="true"');
+    expect(repairedEnv).toContain("PAPERCLIP_AGENT_JWT_SECRET=");
     expect(repairedEnv).toContain("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=");
     expect(process.env.PAPERCLIP_HOME).toBe(isolatedHome);
     expect(process.env.PORT).toBe("3101");
     expect(process.env.PAPERCLIP_INSTANCE_ID).toBe("pap-884-ai-commits-component");
     expect(process.env.PAPERCLIP_DB_BACKUP_ENABLED).toBe("false");
+    expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).not.toBe("shared-secret");
     expect(process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toHaveLength(64);
+    expect(process.env.BETTER_AUTH_SECRET).toBe(process.env.PAPERCLIP_AGENT_JWT_SECRET);
+    expect(maybeRepairLegacyWorktreeConfigAndEnvFiles().repairedEnv).toBe(false);
   });
 
   it("disables backups in an otherwise isolated existing worktree config", async () => {

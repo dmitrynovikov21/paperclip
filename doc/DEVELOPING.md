@@ -1432,6 +1432,7 @@ This command:
 - when run inside a linked git worktree, mirrors the effective git hooks into that worktree's private git dir
 - picks a free app port and embedded PostgreSQL port
 - disables automatic database backups for the isolated instance
+- creates independent JWT and tool-action signing keys for every new worktree; database seeding never copies the source instance's signing authority
 - by default seeds the isolated DB in `minimal` mode from the current effective Paperclip instance/config (repo-local worktree config when present, otherwise the default instance) via a logical SQL snapshot
 
 Seed modes:
@@ -1439,15 +1440,21 @@ Seed modes:
 - `minimal` keeps core app state like companies, projects, issues, comments, approvals, and auth state, preserves schema for all tables, but omits row data from heavy operational history such as heartbeat runs, wake requests, activity logs, runtime services, and agent session state
 - `full` makes a full logical clone of the source instance
 - `--no-seed` defers database copying until the worktree is first used
-- `--empty` creates an empty isolated instance, with fresh signing secrets and no deferred copy; use this for synthetic test drives
+- `--empty` creates an empty isolated instance with no deferred copy; use this for synthetic test drives
 
 `--empty` persists a `.paperclip/seed-empty` marker before writing the instance config.
 The CLI and managed runtime provisioner honor it even when a registered source
 instance is present. An explicit successful `worktree reseed`, or a replacement
 `worktree init --force` without `--empty`, clears the choice.
-While that marker exists, startup uses the instance's saved JWT and tool-action
-signing keys even if the shell inherited another instance's keys. Better Auth
-uses its saved key or the fresh instance JWT key. Missing saved keys stop startup.
+Startup uses the worktree's saved JWT and tool-action signing keys even if the
+shell inherited another instance's keys. Better Auth uses its saved key or the
+worktree JWT key. Missing saved keys stop startup for explicitly empty instances;
+legacy worktrees without an isolation marker rotate their signing keys once
+during config repair, including keys previously copied from the source instance.
+Workspace sync never sends `.paperclip` (including `.paperclip/.env`) to sandbox
+or SSH agents, regardless of Git ignore rules. Git-based transport rejects a
+repository whose transferred history ever tracked `.paperclip` files. Local agents still require OS-level
+isolation from the control plane when the host itself holds sensitive keys.
 
 Seeded worktree instances quarantine copied live execution by default for both `minimal` and `full` seeds. During restore, Paperclip disables copied agent timer heartbeats, resets copied `running` agents to `idle`, blocks and unassigns copied agent-owned `in_progress` issues, and unassigns copied agent-owned `todo`/`in_review` issues. This keeps a freshly booted worktree from starting agents for work already owned by the source instance. Pass `--preserve-live-work` only when you intentionally want the isolated worktree to resume copied assignments.
 

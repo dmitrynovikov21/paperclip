@@ -282,6 +282,39 @@ describe("git workspace sync", () => {
     });
   });
 
+  it("refuses to package Git history that once tracked a control-plane file", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-secret-history-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    await mkdir(path.join(repo, "nested", ".paperclip"), { recursive: true });
+    await writeFile(path.join(repo, "nested", ".paperclip", ".env"), "synthetic-signing-key\n");
+    await git(repo, ["add", "-f", "nested/.paperclip/.env"]);
+    await git(repo, ["commit", "-qm", "add fixture"]);
+    await git(repo, ["rm", "-q", "nested/.paperclip/.env"]);
+    await git(repo, ["commit", "-qm", "remove fixture"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    await expect(withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async () => undefined))
+      .rejects.toThrow("workspace_git_history_contains_control_plane_files");
+  });
+
+  it("finds a control-plane blob on a merged branch even when the merge kept the clean tree", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-merged-secret-"));
+    cleanupDirs.push(rootDir);
+    const repo = await createRepo(rootDir);
+    await git(repo, ["checkout", "-b", "secret-branch"]);
+    await mkdir(path.join(repo, ".paperclip"));
+    await writeFile(path.join(repo, ".paperclip", ".env"), "synthetic-signing-key\n");
+    await git(repo, ["add", "-f", ".paperclip/.env"]);
+    await git(repo, ["commit", "-qm", "add fixture"]);
+    await git(repo, ["checkout", "main"]);
+    await git(repo, ["merge", "--no-ff", "-s", "ours", "-m", "clean merge", "secret-branch"]);
+
+    const snapshot = await readGitWorkspaceSnapshot(repo);
+    await expect(withShallowGitWorkspaceClone({ localDir: repo, snapshot: snapshot! }, async () => undefined))
+      .rejects.toThrow("workspace_git_history_contains_control_plane_files");
+  });
+
   it.skipIf(process.platform === "win32")("preserves nested repository symlinks after the temporary clone is removed", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-nested-links-"));
     cleanupDirs.push(rootDir);

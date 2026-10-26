@@ -12,7 +12,8 @@ export function workspaceSeedGeneration(baseline: DirectorySnapshot, git: GitWor
     head: snapshot.headCommit, branch: snapshot.branchName, origin: snapshot.originUrl,
     repositories: snapshot.repositories?.map((repo) => ({ path: repo.path, git: identity(repo.snapshot) })),
   });
-  return createHash("sha256").update("verified-seed-v1\0").update(JSON.stringify([directorySnapshotSha256(baseline), identity(git), repositories.map((repo) => ({ path: repo.path, git: identity(repo.snapshot) }))])).digest("hex");
+  // v2 invalidates archives created before control-plane workspace exclusions.
+  return createHash("sha256").update("verified-seed-v2\0").update(JSON.stringify([directorySnapshotSha256(baseline), identity(git), repositories.map((repo) => ({ path: repo.path, git: identity(repo.snapshot) }))])).digest("hex");
 }
 async function digest(file: string): Promise<string> {
   const hash = createHash("sha256");

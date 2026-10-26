@@ -669,13 +669,14 @@ export async function captureDirectorySnapshotOffThread(
 
 /** A disk-backed subset for independent nested-repository merges. */
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
-  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
+  prefix?: string; omit?: string[]; omitPatterns?: readonly string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
 }): Promise<DirectorySnapshot> {
   const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
   try {
     for (const [relative, entry] of snapshot.entries) {
       if (options.prefix && !relative.startsWith(options.prefix)) continue;
       if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
+      if (options.omitPatterns && shouldExcludePath(relative, options.omitPatterns)) continue;
       writer.add("baseline", options.prefix ? relative.slice(options.prefix.length) : relative, JSON.stringify(entry));
     }
     const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,

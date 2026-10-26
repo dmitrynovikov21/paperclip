@@ -7,7 +7,7 @@ import { config as loadDotenv } from "dotenv";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
 import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
-import { applyEmptyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
+import { applyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
 import {
   AUTH_BASE_URL_MODES,
   BIND_MODES,
@@ -50,7 +50,7 @@ if (shouldLoadWorkingDirectoryEnv({
 }
 
 if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
-  applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+  applyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
 }
 maybeRepairLegacyWorktreeConfigAndEnvFiles();
 

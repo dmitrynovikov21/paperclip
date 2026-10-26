@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runChildProcess, sanitizeInheritedPaperclipEnv } from "./server-utils.js";
 import { projectAcpxInheritedHostEnvironment } from "./acpx-engine/execute.js";
+import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -33,6 +34,9 @@ describe("sanitizeInheritedPaperclipEnv", () => {
     expect(sanitizeInheritedPaperclipEnv(inherited)).toEqual({ PATH: "/usr/bin" });
     expect(projectAcpxInheritedHostEnvironment(inherited, "codex", true)).toEqual({ PATH: "/usr/bin" });
     expect(projectAcpxInheritedHostEnvironment(inherited, "codex", false)).toEqual({});
+    expect(sanitizeRemoteExecutionEnv({ ...inherited, PAPERCLIP_API_KEY: "synthetic-run-token" }, inherited)).toEqual({
+      PAPERCLIP_API_KEY: "synthetic-run-token",
+    });
   });
 
   it("does not expose host signing secrets in a real local agent process", async () => {

@@ -5,7 +5,7 @@ import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
-import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { isControlPlaneSourceSecretEnvKey, sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -3525,27 +3525,13 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
-// These are source-instance credentials, not run-scoped agent credentials.
-// Some callers pre-merge process.env into their explicit launch env, so the
-// child-process boundary must remove them from both inputs.
-const CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS = new Set([
-  "BETTER_AUTH_SECRET",
-  "PAPERCLIP_AGENT_JWT_SECRET",
-  "PAPERCLIP_AUTH_SECRET",
-  "PAPERCLIP_DECISION_SIGNING_SECRET",
-  "PAPERCLIP_SECRETS_MASTER_KEY",
-  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
-  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
-  "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
-]);
-
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
-    if (CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) {
+    if (isControlPlaneSourceSecretEnvKey(key)) {
       delete env[key];
       continue;
     }
@@ -4970,7 +4956,7 @@ export async function runChildProcess(
   return new Promise<RunProcessResult>((resolve, reject) => {
     const runEnv = { ...opts.env };
     for (const key of Object.keys(runEnv)) {
-      if (CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) delete runEnv[key];
+      if (isControlPlaneSourceSecretEnvKey(key)) delete runEnv[key];
     }
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
@@ -5004,7 +4990,7 @@ export async function runChildProcess(
       .then((target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
-          if (value === undefined || CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase())) {
+          if (value === undefined || isControlPlaneSourceSecretEnvKey(key)) {
             delete childEnv[key];
           }
         }

@@ -1,3 +1,20 @@
+// Source-instance signing and encryption material is never part of an agent
+// launch, even when a caller passes a pre-merged copy of process.env.
+const CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS = new Set([
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "PAPERCLIP_AUTH_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
+]);
+
+export function isControlPlaneSourceSecretEnvKey(key: string): boolean {
+  return CONTROL_PLANE_SOURCE_SECRET_ENV_KEYS.has(key.toUpperCase());
+}
+
 const REMOTE_EXECUTION_ENV_IDENTITY_KEYS = new Set([
   "PATH",
   "HOME",
@@ -34,6 +51,7 @@ export function sanitizeRemoteExecutionEnv(
 ): Record<string, string> {
   const sanitized: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
+    if (isControlPlaneSourceSecretEnvKey(key)) continue;
     const normalizedKey = key.toUpperCase();
     if (!REMOTE_EXECUTION_ENV_IDENTITY_KEYS.has(normalizedKey)) {
       sanitized[key] = value;

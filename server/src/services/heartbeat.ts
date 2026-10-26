@@ -16644,21 +16644,110 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
-      if (issue.executionRunId && issue.executionRunId !== run.id) return null;
-
+      const otherLockRunId = issue.executionRunId && issue.executionRunId !== run.id
+        ? issue.executionRunId
+        : null;
       const competingIssueRun = await tx
-        .select({ id: heartbeatRuns.id })
+        .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, issue.companyId),
           ne(heartbeatRuns.id, run.id),
           inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          otherLockRunId
+            ? eq(heartbeatRuns.id, otherLockRunId)
+            : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
         ))
         .limit(1)
         .then((rows) => rows[0] ?? null);
+      if (otherLockRunId && !competingIssueRun) return null;
       if (competingIssueRun) {
         if (options.reconcile) throw conflict("Another active run already owns this issue");
+        const reviewState = parseIssueExecutionState(issue.executionState);
+        const currentParticipant = reviewState?.currentParticipant;
+        if (
+          !options.suppressImmediateRecovery &&
+          issue.status === "in_review" &&
+          reviewState?.status === "pending" &&
+          reviewState.currentStageType === "review" &&
+          reviewState.currentStageId &&
+          currentParticipant?.type === "agent" &&
+          currentParticipant.agentId === run.agentId &&
+          issue.assigneeAgentId === run.agentId &&
+          competingIssueRun.agentId !== run.agentId &&
+          isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+          !issue.monitorNextCheckAt &&
+          !await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
+        ) {
+          if (!recoveryAgentInvokable || !recoveryAgent || isExecutionReviewParticipantRecoveryRun(run)) {
+            return {
+              kind: "blocked" as const,
+              issue,
+              previousStatus: issue.status,
+              notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+              recoveryOwnerAgentId: currentParticipant.agentId,
+            };
+          }
+          const parkedWakes = await tx
+            .select({ payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.agentId, run.agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            ));
+          const alreadyParked = parkedWakes.some(({ payload }) => {
+            const context = parseObject(parseObject(payload)[DEFERRED_WAKE_CONTEXT_KEY]);
+            const stage = parseObject(context.executionStage);
+            const participant = parseObject(stage.currentParticipant);
+            return readNonEmptyString(context.wakeReason) === "execution_review_requested" &&
+              readNonEmptyString(stage.stageId) === reviewState.currentStageId &&
+              readNonEmptyString(participant.agentId) === run.agentId;
+          });
+          if (!alreadyParked) {
+            const executionStage = {
+              wakeRole: "reviewer",
+              stageId: reviewState.currentStageId,
+              stageType: "review",
+              currentParticipant,
+              returnAssignee: reviewState.returnAssignee,
+              reviewRequest: reviewState.reviewRequest,
+              lastDecisionOutcome: reviewState.lastDecisionOutcome,
+              allowedActions: ["approve", "request_changes"],
+            };
+            const retryContext = {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: "execution_review_requested",
+              source: "issue.execution_review_recovery",
+              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+              retryOfRunId: run.id,
+              currentStageId: reviewState.currentStageId,
+              currentStageType: "review",
+              executionStage,
+              reviewRecoveryInstruction:
+                "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+            };
+            await tx.insert(agentWakeupRequests).values({
+              companyId: issue.companyId,
+              agentId: run.agentId,
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_execution_deferred",
+              payload: {
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+                executionStage,
+                [DEFERRED_WAKE_CONTEXT_KEY]: retryContext,
+              },
+              status: "deferred_issue_execution",
+              requestedByActorType: "system",
+            });
+          }
+        }
         return { kind: "released" as const };
       }
 
@@ -16747,14 +16836,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (readNonEmptyString(deferredContextSeed.wakeReason) === "execution_review_requested") {
           const reviewState = parseIssueExecutionState(issue.executionState);
           const deferredStage = parseObject(deferredContextSeed.executionStage);
+          const deferredParticipant = parseObject(deferredStage.currentParticipant);
           const currentReviewer = reviewState?.currentParticipant;
           if (
             issue.status !== "in_review" ||
             reviewState?.status !== "pending" ||
             reviewState.currentStageType !== "review" ||
             readNonEmptyString(deferredStage.stageId) !== reviewState.currentStageId ||
+            readNonEmptyString(deferredStage.stageType) !== "review" ||
             currentReviewer?.type !== "agent" ||
             currentReviewer.agentId !== deferred.agentId ||
+            readNonEmptyString(deferredParticipant.agentId) !== currentReviewer.agentId ||
             issue.assigneeAgentId !== deferred.agentId
           ) {
             if (options.reconcile) throw conflict("Deferred reviewer wake no longer matches the current stage");

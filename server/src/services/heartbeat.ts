@@ -16644,22 +16644,63 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
-      const otherLockRunId = issue.executionRunId && issue.executionRunId !== run.id
+      let otherLockRunId = issue.executionRunId && issue.executionRunId !== run.id
         ? issue.executionRunId
         : null;
-      const competingIssueRun = await tx
-        .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.companyId, issue.companyId),
-          ne(heartbeatRuns.id, run.id),
-          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-          otherLockRunId
-            ? eq(heartbeatRuns.id, otherLockRunId)
-            : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
+      let lockedRun: { id: string; agentId: string; status: string } | null = null;
+      if (otherLockRunId) {
+        lockedRun = await tx
+          .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, otherLockRunId), eq(heartbeatRuns.companyId, issue.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (lockedRun && isHeartbeatRunTerminalStatus(lockedRun.status)) {
+          // A holder can persist its terminal status before its separate release
+          // transaction starts. Clear only that terminal holder's pointers while
+          // holding the issue row, so the ending reviewer can retain a recovery
+          // path. The holder's later release must not clear a successor's lock.
+          const now = new Date();
+          await tx.update(issues).set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          }).where(and(
+            eq(issues.companyId, issue.companyId),
+            eq(issues.id, issue.id),
+            eq(issues.executionRunId, otherLockRunId),
+          ));
+          await tx.update(issues).set({ checkoutRunId: null, updatedAt: now }).where(and(
+            eq(issues.companyId, issue.companyId),
+            eq(issues.id, issue.id),
+            eq(issues.checkoutRunId, otherLockRunId),
+          ));
+          issue = {
+            ...issue,
+            executionRunId: null,
+            checkoutRunId: issue.checkoutRunId === otherLockRunId ? null : issue.checkoutRunId,
+          };
+          otherLockRunId = null;
+        }
+      }
+      // Use the same holder-status read to decide whether to park a wake. If
+      // the holder terminalizes after that read, its release will promote the
+      // parked wake; a second status query could miss both paths.
+      const competingIssueRun = otherLockRunId
+        ? lockedRun && EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
+          lockedRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
+        ) ? lockedRun : null
+        : await tx
+          .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            ne(heartbeatRuns.id, run.id),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
       if (otherLockRunId && !competingIssueRun) return null;
       if (competingIssueRun) {
         if (options.reconcile) throw conflict("Another active run already owns this issue");

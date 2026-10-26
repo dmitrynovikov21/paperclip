@@ -152,6 +152,8 @@ When a reviewer run ends with its review stage still pending while another agent
 
 For a previously stranded reviewer wake, a board operator may call `POST /api/issues/:issueId/deferred-wakes/:wakeId/reconcile` with `expectedHolderRunId` and `expectedStageId` UUIDs. The endpoint requires the original wake to belong to the issue and current reviewer, to have been parked during the specified holder's lifetime, and to match the pending review stage. The holder must be terminal; both issue locks must be empty; the reviewer must be invokable and free of a budget pause; no other issue run or subtree pause hold may be active. Under the issue-row lock, a successful request promotes that same wake and returns `{ outcome: "promoted", issueId, wakeId, holderRunId, stageId, runId, runStatus: "queued", newWakeRequests: 0 }`. A repeat returns `outcome: "already_promoted"` and the original run ID. Changed preconditions return `409`; an agent caller receives `403`. The endpoint does not record a review decision or advance the stage.
 
+If the holder has already reached a terminal run status but still occupies the issue lock, reviewer finalization clears that terminal holder's lock under the issue-row lock and creates its recovery path there. A later release of the holder preserves the reviewer's successor lock and does not dispatch a second reviewer run.
+
 ### Pre-dispatch configuration validation
 
 Pre-dispatch configuration validation is a distinct gate that runs after ownership and checkout are resolved but before the control plane actually dispatches a run.

@@ -550,6 +550,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(prompt).toContain("The client reads PAPERCLIP_API_KEY from env in memory");
     expect(prompt).toContain('python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" GET /api/agents/me');
     expect(prompt).toContain('python3 "$PAPERCLIP_SKILL_DIR/scripts/paperclip-api.py" POST "/api/issues/$PAPERCLIP_TASK_ID/comments" --body-stdin');
+    expect(prompt).toContain("never put bearer headers or JSON bodies in command arguments");
     expect(prompt).not.toContain("Authorization: Bearer");
     expect(prompt).not.toContain("$PAPERCLIP_API_URL/api/");
     expect(prompt).not.toContain("/api/issues/{id}");
@@ -567,7 +568,7 @@ describe("shared ACPX engine runtime behavior", () => {
     const prompt = String(meta[0]?.prompt ?? "");
     expect(prompt).toContain("Paperclip API access note:");
     expect(prompt).toContain("Use a real issue id from the current context before making issue write requests.");
-    expect(prompt).not.toContain('POST "/api/issues/$PAPERCLIP_TASK_ID/comments"');
+    expect(prompt).not.toContain('/api/issues/$PAPERCLIP_TASK_ID/comments');
   });
 
   it("emits ACP text deltas as stdout transcript records", async () => {
@@ -1485,8 +1486,12 @@ describe("shared ACPX engine runtime behavior", () => {
       }) as never,
     });
     const previousApiKey = process.env.PAPERCLIP_API_KEY;
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    const previousDatabaseFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
     try {
       delete process.env.PAPERCLIP_API_KEY;
+      process.env.DATABASE_URL = "postgres://synthetic:synthetic@localhost/db";
+      delete process.env.PAPERCLIP_DATABASE_URL_FILE;
       const result = await execute({
         runId: "run-1",
         agent: { id: "agent-1", companyId: "company-1" },
@@ -1499,10 +1504,38 @@ describe("shared ACPX engine runtime behavior", () => {
       } as never);
       expect(result.exitCode).toBe(0);
       expect(observedSessionEnv?.PAPERCLIP_API_KEY).toBe("runtime-key");
+      expect(observedSessionEnv?.DATABASE_URL).toBeUndefined();
+      expect(observedSessionEnv?.PAPERCLIP_DATABASE_URL_FILE).toBeUndefined();
       expect(process.env.PAPERCLIP_API_KEY).toBeUndefined();
     } finally {
       if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
+      if (previousDatabaseFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousDatabaseFile;
+    }
+  });
+
+  it("refuses local ACPX when the service has a file-backed database source", async () => {
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => { throw new Error("ACPX must not start"); },
+    });
+    const previousDatabaseFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = "/private/database-url";
+      await expect(execute({
+        runId: "run-file-backed-local",
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: {},
+        config: { agent: "custom", agentCommand: "node ./fake-acp.js" },
+        context: {},
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never)).rejects.toThrow("require ACPX to run in an isolated remote environment");
+    } finally {
+      if (previousDatabaseFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousDatabaseFile;
     }
   });
 

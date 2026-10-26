@@ -1412,6 +1412,21 @@ describe("company portability", () => {
     expect(extension).toContain('projectWorkspaceKey: "paperclip"');
     expect(exported.warnings).not.toContainEqual(expect.stringContaining("does not have a portable repoUrl"));
     expect(exported.warnings).not.toContainEqual(expect.stringContaining("reference workspace workspace-1"));
+
+    const privateDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-portability-db-"));
+    const dbFile = path.join(privateDir, "synthetic-database-url");
+    await fs.writeFile(dbFile, "postgres://synthetic-only@localhost/test\n", { mode: 0o600 });
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", dbFile);
+    try {
+      const blockedExport = await portability.exportBundle("company-1", {
+        include: { company: false, agents: false, projects: true, issues: true },
+      });
+      expect(asTextFile(blockedExport.files[".paperclip.yaml"])).not.toContain('repoUrl: "https://github.com/paperclipai/paperclip.git"');
+      expect(blockedExport.warnings).toContain("Project paperclip-app workspace paperclip was omitted from export because it does not have a portable repoUrl.");
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(privateDir, { recursive: true, force: true });
+    }
   });
 
   it("collapses repeated task workspace warnings into one summary per missing workspace", async () => {

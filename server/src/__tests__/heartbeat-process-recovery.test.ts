@@ -4558,14 +4558,103 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     )).toBe(true);
   });
 
-  it("retries a pending execution-review participant when another agent has an active issue run", async () => {
-    const { companyId, agentId, issueId, runId } = await seedInReviewParticipantRunFixture();
-    const otherAgentId = randomUUID();
-    const otherRunId = randomUUID();
+  it.each(["reviewer", "holder"] as const)(
+    "parks reviewer recovery until the competing issue run releases the holder (%s lock)",
+    async (lockOwner) => {
+      const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
+      const otherAgentId = randomUUID();
+      const otherRunId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "CodexImplementor",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: otherRunId,
+        companyId,
+        agentId: otherAgentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_commented",
+        },
+        startedAt: new Date("2026-03-19T00:01:00.000Z"),
+        updatedAt: new Date("2026-03-19T00:01:00.000Z"),
+      });
+      if (lockOwner === "holder") {
+        await db.update(issues).set({ executionRunId: otherRunId }).where(eq(issues.id, issueId));
+      }
+
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      expect((await waitForRunToSettle(heartbeat, runId, 8_000))?.status).toBe("succeeded");
+      const parkedWake = await waitForValue(async () => {
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+        return wakes.find((wake) => wake.status === "deferred_issue_execution") ?? null;
+      });
+      expect(parkedWake).toMatchObject({
+        companyId,
+        agentId,
+        status: "deferred_issue_execution",
+        runId: null,
+      });
+      expect(parkedWake?.payload).toMatchObject({
+        issueId,
+        retryOfRunId: runId,
+        retryReason: "execution_review_participant_recovery",
+        _paperclipWakeContext: {
+          wakeReason: "execution_review_requested",
+          executionStage: { stageId, currentParticipant: { type: "agent", agentId } },
+        },
+      });
+      const beforeRelease = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(beforeRelease).toHaveLength(1);
+      expect(beforeRelease[0]?.id).toBe(runId);
+
+      await heartbeat.reconcileStrandedAssignedIssues();
+      const stillParked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(stillParked.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(1);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+
+      await heartbeat.cancelRun(otherRunId);
+      const promotedWake = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, parkedWake!.id)).then((rows) => rows[0]);
+      const promotedRun = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, promotedWake!.runId!)).then((rows) => rows[0]);
+      expect(promotedWake?.runId).toBeTruthy();
+      expect(promotedRun).toMatchObject({
+        companyId,
+        agentId,
+        wakeupRequestId: parkedWake!.id,
+        contextSnapshot: {
+          issueId,
+          retryOfRunId: runId,
+          retryReason: "execution_review_participant_recovery",
+          currentStageId: stageId,
+        },
+      });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(2);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(2);
+    },
+  );
+
+  it("retains one reviewer recovery when the holder is terminal but has not released its issue lock", async () => {
+    const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
+    const holderAgentId = randomUUID();
+    const holderRunId = randomUUID();
     await db.insert(agents).values({
-      id: otherAgentId,
+      id: holderAgentId,
       companyId,
-      name: "CodexImplementor",
+      name: "Terminal Holder",
       role: "engineer",
       status: "idle",
       adapterType: "codex_local",
@@ -4574,39 +4663,89 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       permissions: {},
     });
     await db.insert(heartbeatRuns).values({
-      id: otherRunId,
+      id: holderRunId,
       companyId,
-      agentId: otherAgentId,
+      agentId: holderAgentId,
       invocationSource: "automation",
       triggerDetail: "system",
       status: "running",
-      contextSnapshot: {
-        issueId,
-        taskId: issueId,
-        wakeReason: "issue_commented",
-      },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
       startedAt: new Date("2026-03-19T00:01:00.000Z"),
-      updatedAt: new Date("2026-03-19T00:01:00.000Z"),
+    });
+    await db.update(issues).set({
+      executionRunId: holderRunId,
+      checkoutRunId: holderRunId,
+    }).where(eq(issues.id, issueId));
+
+    let finishRecovery!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => { finishRecovery = resolve; });
+    mockAdapterExecute.mockImplementation(async (input?: unknown) => {
+      if ((input as { runId?: string } | undefined)?.runId !== runId) await recoveryGate;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Recovered stranded heartbeat work.",
+        provider: "test",
+        model: "test-model",
+      };
     });
 
     const heartbeat = heartbeatService(db);
-    await heartbeat.resumeQueuedRuns();
-    const reviewRecoveryRun = await waitForValue(async () => {
-      const runs = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, agentId));
-      return runs.find((row) =>
-        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason ===
-          "execution_review_participant_recovery"
-      ) ?? null;
-    }, 8_000);
+    const originalTransaction = db.transaction.bind(db);
+    let releaseHolder!: () => void;
+    const holderReleaseGate = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    let signalHolderRelease!: () => void;
+    const holderReleaseReached = new Promise<void>((resolve) => { signalHolderRelease = resolve; });
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementationOnce(((callback: any) => {
+      signalHolderRelease();
+      return holderReleaseGate.then(() => originalTransaction(callback));
+    }) as typeof db.transaction);
+    const holderCancellation = heartbeat.cancelRun(holderRunId);
 
-    expect(reviewRecoveryRun).toMatchObject({
-      companyId,
-      agentId,
-      retryOfRunId: runId,
-    });
+    try {
+      await holderReleaseReached;
+      const [terminalHolder] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, holderRunId));
+      const [lockedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(terminalHolder?.status).toBe("cancelled");
+      expect(lockedIssue?.executionRunId).toBe(holderRunId);
+      expect(lockedIssue?.checkoutRunId).toBe(holderRunId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect((await waitForRunToSettle(heartbeat, runId, 8_000))?.status).toBe("succeeded");
+      const recoveryRun = await waitForValue(async () => {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        return runs.find((row) => row.id !== runId) ?? null;
+      });
+      const [afterReviewer] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(recoveryRun?.contextSnapshot).toMatchObject({
+        issueId,
+        retryOfRunId: runId,
+        retryReason: "execution_review_participant_recovery",
+        currentStageId: stageId,
+      });
+      expect(afterReviewer?.executionRunId).toBe(recoveryRun?.id);
+      expect(afterReviewer?.checkoutRunId).toBeNull();
+
+      releaseHolder();
+      await holderCancellation;
+      const reviewerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const reviewerWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(reviewerRuns).toHaveLength(2);
+      expect(reviewerWakes).toHaveLength(2);
+      expect(reviewerWakes.find((wake) => wake.runId === recoveryRun?.id)?.id).toBe(recoveryRun?.wakeupRequestId);
+      const [afterHolder] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(afterHolder?.executionRunId).toBe(recoveryRun?.id);
+    } finally {
+      releaseHolder();
+      finishRecovery();
+      try {
+        await holderCancellation;
+      } finally {
+        transactionSpy.mockRestore();
+      }
+    }
   });
 
   it("does not immediately recover a generic on-demand run used for an in-review agent API update", async () => {

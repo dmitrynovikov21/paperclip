@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -94,6 +95,151 @@ describe("local process sandbox", () => {
     expect(target.args).toContain(workspace);
     expect(target.args).toContain(managedHome);
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
+    expect(target.args).toContain("--ro-bind-fd");
+    expect(target.args).toContain("--bind-fd");
+    await target.cleanup?.();
+  });
+
+  it.runIf(process.platform === "linux")("rejects mounts that contain a file-backed service credential", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-credential-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const credential = path.join(root, "database-url");
+    await fs.mkdir(workspace);
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: root, access: "ro" }],
+        },
+      })).rejects.toThrow("mount would expose the service database credential");
+      const allowed = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace" },
+      });
+      expect(allowed.command).toBe("bwrap");
+      await allowed.cleanup?.();
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects mounts of service keys and config separate from the DB credential", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-private-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const databaseFile = path.join(root, "database", "database-url");
+    const masterKey = path.join(root, "private-group", "..private-keys", "master.key");
+    const instanceRoot = path.join(root, "paperclip-home", "instances", "default");
+    const signingKey = path.join(instanceRoot, "secrets", "decision-signing.key");
+    const config = path.join(instanceRoot, "config.json");
+    const environment = path.join(instanceRoot, ".env");
+    await Promise.all([
+      fs.mkdir(workspace), fs.mkdir(path.dirname(databaseFile)), fs.mkdir(path.dirname(masterKey), { recursive: true }),
+      fs.mkdir(path.dirname(signingKey), { recursive: true }),
+    ]);
+    for (const file of [databaseFile, masterKey, signingKey, config, environment]) {
+      await fs.writeFile(file, "synthetic", { mode: 0o600 });
+    }
+    const previous = {
+      db: process.env.PAPERCLIP_DATABASE_URL_FILE,
+      key: process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE,
+      home: process.env.PAPERCLIP_HOME,
+      instance: process.env.PAPERCLIP_INSTANCE_ID,
+    };
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = databaseFile;
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = masterKey;
+      process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      for (const [source, reason] of [
+        [masterKey, "service secrets"],
+        [path.dirname(masterKey), "service secrets"],
+        [path.join(root, "private-group"), "service secrets"],
+        [signingKey, "service secrets"],
+        [config, "service configuration"],
+        [environment, "service environment"],
+      ] as const) {
+        await expect(buildLocalProcessSandboxSpawnTarget({
+          executable: process.execPath,
+          args: [],
+          cwd: workspace,
+          options: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            extraPaths: [{ path: source, access: "ro" }],
+          },
+        })).rejects.toThrow(`mount would expose ${reason}`);
+      }
+      const allowed = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace" },
+      });
+      expect(allowed.command).toBe("bwrap");
+      await allowed.cleanup?.();
+    } finally {
+      if (previous.db === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous.db;
+      if (previous.key === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+      else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previous.key;
+      if (previous.home === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previous.home;
+      if (previous.instance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previous.instance;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects a private instance mount through a symlinked home before keys are created", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-home-alias-"));
+    cleanup.push(root);
+    const realHome = path.join(root, "real-home");
+    const homeAlias = path.join(root, "home-alias");
+    const instanceRoot = path.join(realHome, "instances", "default");
+    const workspace = path.join(root, "workspace");
+    const dbFile = path.join(root, "database-url");
+    await fs.mkdir(instanceRoot, { recursive: true });
+    await fs.mkdir(workspace);
+    await fs.symlink(realHome, homeAlias, "dir");
+    await fs.writeFile(dbFile, "synthetic", { mode: 0o600 });
+    const previous = {
+      db: process.env.PAPERCLIP_DATABASE_URL_FILE,
+      home: process.env.PAPERCLIP_HOME,
+      instance: process.env.PAPERCLIP_INSTANCE_ID,
+    };
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = dbFile;
+      process.env.PAPERCLIP_HOME = homeAlias;
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: instanceRoot, access: "ro" }],
+        },
+      })).rejects.toThrow("mount would expose service secrets");
+    } finally {
+      if (previous.db === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previous.db;
+      if (previous.home === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previous.home;
+      if (previous.instance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previous.instance;
+    }
   });
 
   it("binds a confined absolute alias to the synchronized workspace", async () => {
@@ -113,7 +259,208 @@ describe("local process sandbox", () => {
       },
     });
 
-    expect(target.args).toEqual(expect.arrayContaining(["--bind", workspace, "/app"]));
+    const aliasArgIndex = target.args.indexOf("/app");
+    expect(target.args[aliasArgIndex - 2]).toBe("--bind-fd");
+    expect(Number(target.args[aliasArgIndex - 1])).toBeGreaterThan(3);
+    await target.cleanup?.();
+
+    const source = path.join(workspace, "source");
+    const inWorkspaceLink = path.join(workspace, "source-link");
+    await fs.mkdir(source);
+    await fs.symlink(source, inWorkspaceLink);
+    const linkedTarget = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: [],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        pathAliases: [{ path: "/app", target: inWorkspaceLink }],
+      },
+    });
+    const linkedAliasArgIndex = linkedTarget.args.indexOf("/app");
+    expect(linkedTarget.args[linkedAliasArgIndex - 2]).toBe("--bind-fd");
+    expect(Number(linkedTarget.args[linkedAliasArgIndex - 1])).toBeGreaterThan(3);
+    await linkedTarget.cleanup?.();
+  });
+
+  it.runIf(process.platform === "linux")("pins an alias source when its path is replaced after validation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-race-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const source = path.join(workspace, "source");
+    const preserved = path.join(workspace, "preserved");
+    const serviceDir = path.join(root, "service");
+    const credential = path.join(serviceDir, "database-url");
+    await fs.mkdir(source, { recursive: true });
+    await fs.mkdir(serviceDir);
+    await fs.writeFile(path.join(source, "allowed-marker"), "safe");
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      const bwrapE2e = process.env.PAPERCLIP_BWRAP_E2E === "1";
+      const probe = `from pathlib import Path
+alias = Path('/app')
+if (alias / 'allowed-marker').read_text() != 'safe':
+    raise RuntimeError('alias did not bind the checked directory')
+if (alias / 'database-url').exists():
+    raise RuntimeError('alias exposed the service credential')
+print('alias pinned; credential denied')`;
+      if (bwrapE2e) {
+        const normal = await runChildProcess("alias-normal-e2e", "/usr/bin/python3", ["-c", probe], {
+          cwd: workspace,
+          env: {},
+          timeoutSec: 10,
+          graceSec: 2,
+          onLog: async () => {},
+          localProcessSandbox: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            pathAliases: [{ path: "/app", target: source }],
+          },
+        });
+        expect(normal.exitCode, normal.stderr).toBe(0);
+        expect(normal.stdout).toContain("alias pinned; credential denied");
+      }
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: bwrapE2e ? "/usr/bin/python3" : process.execPath,
+        args: bwrapE2e ? ["-c", probe] : [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          pathAliases: [{ path: "/app", target: source }],
+        },
+      });
+      try {
+        await fs.rename(source, preserved);
+        await fs.symlink(serviceDir, source);
+        const aliasArgIndex = target.args.indexOf("/app");
+        expect(target.args[aliasArgIndex - 2]).toBe("--bind-fd");
+        const pinnedFd = target.inheritedFds![Number(target.args[aliasArgIndex - 1]) - 3];
+        expect(await fs.readFile(`/proc/self/fd/${pinnedFd}/allowed-marker`, "utf8")).toBe("safe");
+        await expect(fs.access(`/proc/self/fd/${pinnedFd}/database-url`)).rejects.toThrow();
+        if (bwrapE2e) {
+          const raced = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+            const child = spawn(target.command, target.args, {
+              cwd: target.cwd,
+              env: { PATH: "/usr/bin:/bin" },
+              stdio: ["ignore", "pipe", "pipe", ...(target.inheritedFds ?? [])],
+            });
+            let stdout = "";
+            let stderr = "";
+            child.stdout!.on("data", (chunk) => { stdout += chunk; });
+            child.stderr!.on("data", (chunk) => { stderr += chunk; });
+            child.on("error", reject);
+            child.on("close", (code) => resolve({ code, stdout, stderr }));
+          });
+          expect(raced.code, raced.stderr).toBe(0);
+          expect(raced.stdout).toContain("alias pinned; credential denied");
+        }
+      } finally {
+        await target.cleanup?.();
+      }
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("pins an extra mount source when its path is replaced before Bubblewrap starts", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-extra-race-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const extraPath = path.join(root, "extra");
+    const preserved = path.join(root, "preserved");
+    const serviceDir = path.join(root, "service");
+    const credential = path.join(serviceDir, "database-url");
+    await Promise.all([fs.mkdir(workspace), fs.mkdir(extraPath), fs.mkdir(serviceDir)]);
+    await fs.writeFile(path.join(extraPath, "allowed-marker"), "safe");
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      const bwrapE2e = process.env.PAPERCLIP_BWRAP_E2E === "1";
+      const probe = `from pathlib import Path
+mount = Path(${JSON.stringify(extraPath)})
+if (mount / 'allowed-marker').read_text() != 'safe':
+    raise RuntimeError('extra path did not bind the checked directory')
+if (mount / 'database-url').exists():
+    raise RuntimeError('extra path exposed the service credential')
+print('extra mount pinned; credential denied')`;
+      const target = await buildLocalProcessSandboxSpawnTarget({
+        executable: bwrapE2e ? "/usr/bin/python3" : process.execPath,
+        args: bwrapE2e ? ["-c", probe] : [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          extraPaths: [{ path: extraPath, access: "ro" }],
+        },
+      });
+      try {
+        await fs.rename(extraPath, preserved);
+        await fs.symlink(serviceDir, extraPath);
+        const mountArgIndex = target.args.indexOf(extraPath);
+        expect(target.args[mountArgIndex - 2]).toBe("--ro-bind-fd");
+        const pinnedFd = target.inheritedFds![Number(target.args[mountArgIndex - 1]) - 3];
+        expect(await fs.readFile(`/proc/self/fd/${pinnedFd}/allowed-marker`, "utf8")).toBe("safe");
+        await expect(fs.access(`/proc/self/fd/${pinnedFd}/database-url`)).rejects.toThrow();
+        if (bwrapE2e) {
+          const raced = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+            const child = spawn(target.command, target.args, {
+              cwd: target.cwd,
+              env: { PATH: "/usr/bin:/bin" },
+              stdio: ["ignore", "pipe", "pipe", ...(target.inheritedFds ?? [])],
+            });
+            let stdout = "";
+            let stderr = "";
+            child.stdout!.on("data", (chunk) => { stdout += chunk; });
+            child.stderr!.on("data", (chunk) => { stderr += chunk; });
+            child.on("error", reject);
+            child.on("close", (code) => resolve({ code, stdout, stderr }));
+          });
+          expect(raced.code, raced.stderr).toBe(0);
+          expect(raced.stdout).toContain("extra mount pinned; credential denied");
+        }
+      } finally {
+        await target.cleanup?.();
+      }
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
+  });
+
+  it.runIf(process.platform === "linux")("rejects an alias symlink to a service credential outside the workspace before launch", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-alias-escape-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const serviceDir = path.join(root, "service");
+    const credential = path.join(serviceDir, "database-url");
+    const aliasTarget = path.join(workspace, "service-link");
+    await fs.mkdir(workspace);
+    await fs.mkdir(serviceDir);
+    await fs.writeFile(credential, "synthetic", { mode: 0o600 });
+    await fs.symlink(serviceDir, aliasTarget);
+    const previousFile = process.env.PAPERCLIP_DATABASE_URL_FILE;
+    try {
+      process.env.PAPERCLIP_DATABASE_URL_FILE = credential;
+      await expect(buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: [],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          pathAliases: [{ path: "/app", target: aliasTarget }],
+        },
+      })).rejects.toThrow("must target the synchronized workspace");
+    } finally {
+      if (previousFile === undefined) delete process.env.PAPERCLIP_DATABASE_URL_FILE;
+      else process.env.PAPERCLIP_DATABASE_URL_FILE = previousFile;
+    }
   });
 
   it("rejects writable out-of-tree paths without an outbound restore mapping", async () => {

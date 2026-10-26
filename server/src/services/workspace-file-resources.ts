@@ -16,6 +16,7 @@ import type {
   WorkspaceFileWorkspaceKind,
 } from "@paperclipai/shared";
 import { HttpError, notFound, unprocessable } from "../errors.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 
 export const WORKSPACE_FILE_TEXT_MAX_BYTES = 512 * 1024;
 export const WORKSPACE_FILE_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
@@ -864,10 +865,12 @@ async function listChangedWorkspaceFiles(input: {
 }) {
   let stdout: string;
   try {
+    const guardedCwd = await assertHostGitWorkspaceAllowed(input.rootReal);
+    const git = prepareHostGitInvocation(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const result = await execFileAsync(
       "git",
-      ["-C", input.rootReal, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-      { maxBuffer: GIT_STATUS_MAX_BUFFER_BYTES },
+      git.args,
+      { cwd: guardedCwd, env: git.env, maxBuffer: GIT_STATUS_MAX_BUFFER_BYTES },
     );
     stdout = result.stdout;
   } catch {

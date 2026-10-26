@@ -73,6 +73,7 @@ import { findServerAdapter } from "../adapters/index.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { ghFetch, gitHubApiBase, resolveRawGitHubUrl } from "./github-fetch.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import type { StorageService } from "../storage/types.js";
 import { accessService } from "./access.js";
 import { agentService } from "./agents.js";
@@ -1353,7 +1354,9 @@ function stripPortableProjectExecutionWorkspaceRefs(policy: Record<string, unkno
 }
 
 async function readGitOutput(cwd: string, args: string[]) {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  const guardedCwd = await assertHostGitWorkspaceAllowed(cwd);
+  const git = prepareHostGitInvocation(args);
+  const { stdout } = await execFileAsync("git", git.args, { cwd: guardedCwd, env: git.env });
   const trimmed = stdout.trim();
   return trimmed.length > 0 ? trimmed : null;
 }
@@ -2550,12 +2553,16 @@ function applySelectedFilesToSource(source: ResolvedSource, selectedFiles?: stri
 
 async function resolveBundledSkillsCommit() {
   if (!bundledSkillsCommitPromise) {
-    bundledSkillsCommitPromise = execFileAsync("git", ["rev-parse", "HEAD"], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-    })
-      .then(({ stdout }) => stdout.trim() || null)
-      .catch(() => null);
+    bundledSkillsCommitPromise = (async () => {
+      const guardedCwd = await assertHostGitWorkspaceAllowed(process.cwd());
+      const git = prepareHostGitInvocation(["rev-parse", "HEAD"]);
+      const { stdout } = await execFileAsync("git", git.args, {
+        cwd: guardedCwd,
+        env: git.env,
+        encoding: "utf8",
+      });
+      return stdout.trim() || null;
+    })().catch(() => null);
   }
   return bundledSkillsCommitPromise;
 }

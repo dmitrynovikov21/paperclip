@@ -51,6 +51,7 @@ import {
   type PullRequestMergeDetailsResolver,
 } from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { assertHostGitWorkspaceAllowed, prepareHostGitInvocation } from "./host-git-security.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
@@ -235,7 +236,9 @@ async function pathExists(value: string | null | undefined) {
 }
 
 async function runGit(args: string[], cwd: string) {
-  return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  const guardedCwd = await assertHostGitWorkspaceAllowed(cwd);
+  const git = prepareHostGitInvocation(args);
+  return await execFileAsync("git", git.args, { cwd: guardedCwd, env: git.env });
 }
 
 async function readGitStdout(args: string[], cwd: string): Promise<string | null> {

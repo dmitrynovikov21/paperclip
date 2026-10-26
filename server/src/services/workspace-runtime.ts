@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/shared";
 import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
+import { forbidden } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
 import {
   createLocalServiceKey,
@@ -353,11 +354,12 @@ export async function ensureServerWorkspaceLinksCurrent(
 export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   for (const key of Object.keys(env)) {
-    if (key.startsWith("PAPERCLIP_")) {
+    if (key.startsWith("PAPERCLIP_") || /^PG[A-Z0-9_]+$/.test(key)) {
       delete env[key];
     }
   }
   delete env.DATABASE_URL;
+  delete env.DATABASE_MIGRATION_URL;
   delete env.npm_config_tailscale_auth;
   delete env.npm_config_authenticated_private;
   return env;
@@ -2475,6 +2477,18 @@ function resolveRepoManagedWorkspaceCommand(command: string, repoRoot: string) {
   return command;
 }
 
+function assertHostWorkspaceExecutionAllowed(kind: "workspace commands" | "runtime services") {
+  // A host child inherits the service UID and can open the DB credential file
+  // even when its environment has been sanitized. This check must also cover
+  // deployments that did not explicitly enable isolated local secrets.
+  if (process.env.PAPERCLIP_DATABASE_URL_FILE?.trim()) {
+    throw forbidden(`File-backed database credentials forbid host ${kind}.`);
+  }
+  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
+    throw forbidden(`Isolated local secrets forbid host ${kind}.`);
+  }
+}
+
 async function runWorkspaceCommand(input: {
   command: string;
   resolvedCommand?: string;
@@ -2483,6 +2497,7 @@ async function runWorkspaceCommand(input: {
   label: string;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }) {
+  assertHostWorkspaceExecutionAllowed("workspace commands");
   const shell = resolveShell();
   const proc = await executeProcess({
     command: shell,
@@ -2582,10 +2597,8 @@ async function recordWorkspaceCommandOperation(
   },
 ) {
   // These commands run on the Paperclip host as the service UID, before the
-  // sandbox agent starts. That UID owns the local master key in isolated mode.
-  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
-    throw new Error("Isolated local secrets forbid host workspace commands.");
-  }
+  // sandbox agent starts. Check before recording or spawning the operation.
+  assertHostWorkspaceExecutionAllowed("workspace commands");
   if (!recorder) {
     await runWorkspaceCommand(input);
     return null;
@@ -3735,6 +3748,7 @@ export async function runWorkspaceJobForControl(input: {
   recorder?: WorkspaceOperationRecorder | null;
   metadata?: Record<string, unknown> | null;
 }) {
+  assertHostWorkspaceExecutionAllowed("workspace commands");
   const resolved = resolveWorkspaceCommandExecution({
     command: input.command,
     workspace: input.workspace,
@@ -4259,9 +4273,7 @@ function createProvisioningRuntimeServiceRecord(
 }
 
 async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): Promise<LocalRuntimeServiceStart> {
-  if (process.env.PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME === "true") {
-    throw new Error("Isolated local secrets forbid host runtime services.");
-  }
+  assertHostWorkspaceExecutionAllowed("runtime services");
   const leaseRunId = input.leaseRunId === undefined ? input.runId : input.leaseRunId;
   const startedByRunId = input.startedByRunId === undefined ? input.runId : input.startedByRunId;
   const identity = resolveRuntimeServiceReuseIdentity({
@@ -4607,6 +4619,7 @@ async function startLocalRuntimeService(
   input: StartLocalRuntimeServiceInput,
   options?: { deferReadiness?: boolean },
 ): Promise<LocalRuntimeServiceStart> {
+  assertHostWorkspaceExecutionAllowed("runtime services");
   const runtimeProvisionCommand = asString(input.runtimeProvisionCommand, "").trim();
   const provisioningRecord = input.preparedProvisioningRecord === undefined
     ? await prepareRuntimeProvisioning(input)
@@ -4837,6 +4850,7 @@ export async function ensureRuntimeServicesForRun(input: {
     defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "running",
     serviceStates: readConfiguredServiceStates(input.config),
   });
+  if (rawServices.length > 0) assertHostWorkspaceExecutionAllowed("runtime services");
   const acquiredServiceIds: string[] = [];
   const refs: RuntimeServiceRef[] = [];
   const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
@@ -5051,6 +5065,7 @@ export async function startRuntimeServicesForWorkspaceControl(
     defaultDesiredState: readDesiredRuntimeState(input.config.desiredState) ?? "stopped",
     serviceStates: readConfiguredServiceStates(input.config),
   });
+  if (rawServices.length > 0) assertHostWorkspaceExecutionAllowed("runtime services");
   const invocationId = input.invocationId ?? randomUUID();
   const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
   const provisionCoordinator = createRuntimeProvisionCoordinator();

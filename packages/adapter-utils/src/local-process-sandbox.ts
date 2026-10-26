@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { resolveDefaultSecretsKeyFilePath, resolvePaperclipInstanceRoot } from "@paperclipai/shared/home-paths";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -36,6 +38,7 @@ export interface LocalProcessSandboxSpawnTarget {
   args: string[];
   cwd: string;
   env?: Record<string, string | undefined>;
+  inheritedFds?: number[];
   cleanup?: () => Promise<void>;
 }
 
@@ -49,11 +52,9 @@ interface NetworkAllowlistProxy {
 }
 
 const SYSTEM_READ_PATHS = [
-  "/bin",
-  "/sbin",
   "/usr",
-  "/lib",
-  "/lib64",
+  // /bin, /sbin and /lib* are aliases into /usr in the sandbox below.
+  // Binding onto those symlink destinations makes Bubblewrap fail to start.
   "/etc/ca-certificates",
   "/etc/ssl",
   "/etc/resolv.conf",
@@ -81,6 +82,27 @@ function normalizeAbsolutePath(candidate: string, label: string): string {
 
 async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
+}
+
+function isWithinPath(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function realpathOrMissing(candidate: string): Promise<string> {
+  let current = path.resolve(candidate);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return path.join(await fs.realpath(current), ...missingSegments.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      missingSegments.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -381,6 +403,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts"];
   const env: Record<string, string | undefined> = {};
   let cleanup: (() => Promise<void>) | undefined;
+  const mountHandles: FileHandle[] = [];
   let executable = input.executable;
   let executableArgs = input.args;
 
@@ -394,59 +417,155 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     );
     const created = new Set<string>(["/", "/proc", "/dev", "/tmp"]);
     const mounted = new Set<string>();
-    const mount = async (source: string, access: LocalProcessSandboxAccess) => {
-      const normalized = normalizeAbsolutePath(source, "Sandbox path");
-      if (mounted.has(normalized) || !(await pathExists(normalized))) return;
-      addParentDirectories(args, created, normalized);
-      args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
-      mounted.add(normalized);
-      created.add(normalized);
-    };
-    for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
-    for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
-    if (networkScope === "allowlist") {
-      for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");
-    }
-    for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
-    for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
-    await mount(workspaceDir, "rw");
-    for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
-      const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
-      const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
-      const relativeTarget = path.relative(workspaceDir, aliasTarget);
-      if (relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) {
-        throw new Error(
-          `Sandbox path alias "${aliasPath}" must target the synchronized workspace "${workspaceDir}".`,
-        );
-      }
-      if (!(await pathExists(aliasTarget))) {
-        throw new Error(`Sandbox path alias target "${aliasTarget}" does not exist.`);
-      }
-      addParentDirectories(args, created, aliasPath);
-      args.push("--bind", aliasTarget, aliasPath);
-      created.add(aliasPath);
-    }
-
-    if (networkScope === "allowlist") {
-      const tempDir = await createNetworkProxyTempDir();
-      const socketPath = path.join(tempDir, "proxy.sock");
-      const bridgePath = path.join(tempDir, "bridge.cjs");
-      await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
-      const proxy = await startNetworkAllowlistProxy(
-        input.options.networkAllowlist ?? [],
-        input.options.networkTrustedUrls ?? [],
-        socketPath,
-      ).catch(async (error) => {
-        await fs.rm(tempDir, { recursive: true, force: true });
-        throw error;
-      });
-      await mount(tempDir, "rw");
-      executable = process.execPath;
-      executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
-      cleanup = async () => {
-        await proxy.close();
-        await fs.rm(tempDir, { recursive: true, force: true });
+    try {
+      const rejectServiceCredentialMount = async (source: string) => {
+        const credentialPath = process.env.PAPERCLIP_DATABASE_URL_FILE?.trim();
+        if (!credentialPath) return;
+        const instanceRoot = resolvePaperclipInstanceRoot();
+        const defaultSecretsDir = path.dirname(resolveDefaultSecretsKeyFilePath());
+        const configuredKeyPath = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE?.trim();
+        const configuredConfigPath = process.env.PAPERCLIP_CONFIG?.trim();
+        let activeConfigPath = configuredConfigPath ? path.resolve(configuredConfigPath) : path.join(instanceRoot, "config.json");
+        if (!configuredConfigPath) {
+          for (let directory = process.cwd(); ; directory = path.dirname(directory)) {
+            const candidate = path.join(directory, ".paperclip", "config.json");
+            if (await pathExists(candidate)) {
+              activeConfigPath = candidate;
+              break;
+            }
+            if (directory === path.dirname(directory)) break;
+          }
+        }
+        const protectedPaths = [
+          { path: credentialPath, directory: false, label: "the service database credential" },
+          { path: defaultSecretsDir, directory: true, label: "service secrets" },
+          { path: path.join(instanceRoot, "db"), directory: true, label: "service database files" },
+          { path: path.join(instanceRoot, "data"), directory: true, label: "service data" },
+          { path: path.join(instanceRoot, "logs"), directory: true, label: "service logs" },
+          { path: path.join(instanceRoot, "config.json"), directory: false, label: "service configuration" },
+          { path: path.join(instanceRoot, ".env"), directory: false, label: "service environment" },
+          { path: activeConfigPath, directory: false, label: "service configuration" },
+          { path: path.join(path.dirname(activeConfigPath), ".env"), directory: false, label: "service environment" },
+          { path: path.resolve(process.cwd(), ".env"), directory: false, label: "service environment" },
+          ...(configuredKeyPath
+            ? [{ path: path.dirname(path.resolve(configuredKeyPath)), directory: true, label: "service secrets" }]
+            : []),
+        ];
+        const realSource = await fs.realpath(source);
+        for (const protectedPath of protectedPaths) {
+          const realProtectedPath = await realpathOrMissing(protectedPath.path);
+          const sourceContainsProtected = isWithinPath(realSource, realProtectedPath);
+          const sourceInsideProtected = protectedPath.directory && isWithinPath(realProtectedPath, realSource);
+          if (sourceContainsProtected || sourceInsideProtected) {
+            throw new Error(`Local filesystem sandbox mount would expose ${protectedPath.label}.`);
+          }
+        }
       };
+      const mount = async (source: string, access: LocalProcessSandboxAccess) => {
+        const normalized = normalizeAbsolutePath(source, "Sandbox path");
+        if (mounted.has(normalized) || !(await pathExists(normalized))) return;
+        // Open and validate the same inode that Bubblewrap will bind. A caller
+        // can replace a workspace or extra path while this command is prepared.
+        const realSource = await fs.realpath(normalized);
+        const handle = await fs.open(realSource, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+          await rejectServiceCredentialMount(`/proc/self/fd/${handle.fd}`);
+          addParentDirectories(args, created, normalized);
+          args.push(access === "rw" ? "--bind-fd" : "--ro-bind-fd", String(3 + mountHandles.length), normalized);
+          mountHandles.push(handle);
+          mounted.add(normalized);
+          created.add(normalized);
+        } catch (error) {
+          await handle.close();
+          throw error;
+        }
+      };
+      for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
+      for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
+      if (networkScope === "allowlist") {
+        for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");
+      }
+      for (const managedPath of input.options.managedPaths ?? []) await mount(managedPath.path, managedPath.access);
+      for (const extraPath of input.options.extraPaths ?? []) await mount(extraPath.path, extraPath.access);
+      await mount(workspaceDir, "rw");
+      const realWorkspaceDir = await fs.realpath(workspaceDir);
+      const aliasFdMounts: Array<{ source: string; destination: string; fdArgIndex: number }> = [];
+      for (const [index, alias] of (input.options.pathAliases ?? []).entries()) {
+        const aliasPath = normalizeAbsolutePath(alias.path, `Sandbox pathAliases[${index}].path`);
+        const aliasTarget = normalizeAbsolutePath(alias.target, `Sandbox pathAliases[${index}].target`);
+        const relativeTarget = path.relative(workspaceDir, aliasTarget);
+        if (relativeTarget.startsWith("..") || path.isAbsolute(relativeTarget)) {
+          throw new Error(
+            `Sandbox path alias "${aliasPath}" must target the synchronized workspace "${workspaceDir}".`,
+          );
+        }
+        if (!(await pathExists(aliasTarget))) {
+          throw new Error(`Sandbox path alias target "${aliasTarget}" does not exist.`);
+        }
+        const realAliasTarget = await fs.realpath(aliasTarget);
+        const relativeRealTarget = path.relative(realWorkspaceDir, realAliasTarget);
+        if (relativeRealTarget.startsWith("..") || path.isAbsolute(relativeRealTarget)) {
+          throw new Error(
+            `Sandbox path alias "${aliasPath}" must target the synchronized workspace "${workspaceDir}".`,
+          );
+        }
+        await rejectServiceCredentialMount(realAliasTarget);
+        addParentDirectories(args, created, aliasPath);
+        aliasFdMounts.push({ source: realAliasTarget, destination: aliasPath, fdArgIndex: args.length + 1 });
+        args.push("--bind-fd", "", aliasPath);
+        created.add(aliasPath);
+      }
+
+      if (networkScope === "allowlist") {
+        const tempDir = await createNetworkProxyTempDir();
+        const socketPath = path.join(tempDir, "proxy.sock");
+        const bridgePath = path.join(tempDir, "bridge.cjs");
+        await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
+        const proxy = await startNetworkAllowlistProxy(
+          input.options.networkAllowlist ?? [],
+          input.options.networkTrustedUrls ?? [],
+          socketPath,
+        ).catch(async (error) => {
+          await fs.rm(tempDir, { recursive: true, force: true });
+          throw error;
+        });
+        cleanup = async () => {
+          await proxy.close();
+          await fs.rm(tempDir, { recursive: true, force: true });
+        };
+        await mount(tempDir, "rw");
+        executable = process.execPath;
+        executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
+      }
+
+        for (const alias of aliasFdMounts) {
+          // Keep the checked inode alive until Bubblewrap binds it. The source
+          // path can be replaced by an agent in the writable workspace.
+          const handle = await fs.open(
+            alias.source,
+            fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+          );
+          const openedSource = `/proc/self/fd/${handle.fd}`;
+          try {
+            const realOpenedSource = await fs.realpath(openedSource);
+            const relativeOpenedSource = path.relative(realWorkspaceDir, realOpenedSource);
+            if (relativeOpenedSource.startsWith("..") || path.isAbsolute(relativeOpenedSource)) {
+              throw new Error(
+                `Sandbox path alias "${alias.destination}" must target the synchronized workspace "${workspaceDir}".`,
+              );
+            }
+            await rejectServiceCredentialMount(openedSource);
+            args[alias.fdArgIndex] = String(3 + mountHandles.length);
+            mountHandles.push(handle);
+          } catch (error) {
+            await handle.close();
+            throw error;
+          }
+        }
+    } catch (error) {
+      await Promise.all(mountHandles.map((handle) => handle.close()));
+      await cleanup?.();
+      throw error;
     }
   } else {
     args.push("--bind", "/", "/");
@@ -487,7 +606,27 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   }
 
   args.push("--chdir", cwd, "--", executable, ...executableArgs);
-  return { command: bwrapCommand, args, cwd: "/", env, cleanup };
+  if (mountHandles.length > 0) {
+    const previousCleanup = cleanup;
+    let cleaned = false;
+    cleanup = async () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        await Promise.all(mountHandles.map((handle) => handle.close()));
+      } finally {
+        await previousCleanup?.();
+      }
+    };
+  }
+  return {
+    command: bwrapCommand,
+    args,
+    cwd: "/",
+    env,
+    inheritedFds: mountHandles.map((handle) => handle.fd),
+    cleanup,
+  };
 }
 
 export function parseLocalProcessSandboxExtraPaths(value: unknown): LocalProcessSandboxPath[] {

@@ -230,6 +230,50 @@ describePostgres("deferred reviewer wake reconciliation", () => {
     expect(state.decisions).toHaveLength(0);
   });
 
+  it.each(["stage", "participant"] as const)(
+    "fails a parked reviewer wake when its saved %s no longer matches",
+    async (mismatch) => {
+      const fixture = await seedReviewFixture(db, "queued");
+      const changedState = { ...fixture.executionState, currentStageId: randomUUID() };
+      if (mismatch === "stage") {
+        await db.update(issues).set({ executionState: changedState }).where(eq(issues.id, fixture.issueId));
+      } else {
+        const [wake] = await db.select().from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+        const payload = wake?.payload ?? {};
+        const context = payload._paperclipWakeContext as Record<string, unknown>;
+        const executionStage = context.executionStage as Record<string, unknown>;
+        await db.update(agentWakeupRequests).set({
+          payload: {
+            ...payload,
+            _paperclipWakeContext: {
+              ...context,
+              executionStage: {
+                ...executionStage,
+                currentParticipant: { type: "agent", agentId: randomUUID(), userId: null },
+              },
+            },
+          },
+        }).where(eq(agentWakeupRequests.id, fixture.wakeId));
+      }
+
+      await heartbeatService(db).resumeQueuedRuns();
+
+      const state = await snapshot(db, fixture);
+      expect(state.runs.find((run) => run.id === fixture.holderRunId)?.status).toBe("cancelled");
+      expect(state.wake).toMatchObject({
+        status: "failed",
+        runId: null,
+        error: "Deferred reviewer wake no longer matches the current review stage",
+      });
+      expect(state.runs).toHaveLength(2);
+      expect(state.wakes).toHaveLength(2);
+      expect(state.issue?.executionRunId).toBeNull();
+      expect(state.issue?.executionState).toEqual(mismatch === "stage" ? changedState : fixture.executionState);
+      expect(state.decisions).toHaveLength(0);
+    },
+  );
+
   it("allows only the board to reconcile an exact parked wake, and repeats return its run", async () => {
     const fixture = await seedReviewFixture(db, "cancelled");
     const siblingId = randomUUID();
@@ -332,6 +376,18 @@ describePostgres("deferred reviewer wake reconciliation", () => {
     expect(state.wake?.runId).toBeNull();
     expect(state.issue?.executionState).toEqual(fixture.executionState);
     expect(state.wakes).toHaveLength(2);
+
+    await db.delete(issueTreeHolds).where(eq(issueTreeHolds.rootIssueId, fixture.issueId));
+    const promoted = await reconcile();
+    const repeated = await reconcile();
+    expect(promoted.status).toBe(200);
+    expect(promoted.body).toMatchObject({ outcome: "promoted", wakeId: fixture.wakeId, newWakeRequests: 0 });
+    expect(repeated.status).toBe(200);
+    expect(repeated.body).toMatchObject({ outcome: "already_promoted", runId: promoted.body.runId });
+    const after = await snapshot(db, fixture);
+    expect(after.wake?.runId).toBe(promoted.body.runId);
+    expect(after.runs.find((run) => run.id === promoted.body.runId)?.wakeupRequestId).toBe(fixture.wakeId);
+    expect(after.wakes).toHaveLength(2);
   });
 
   it("returns the receipt while the reviewer's start lock is still held", async () => {

@@ -70,6 +70,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext } from "../instrumentation.js";
+import { assertNoFileBackedIssueAuthSourceOverrides } from "../lib/adapter-auth-source.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -768,14 +769,15 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
 
 // PAPERCLIP_* env binding policy:
-// 1. PAPERCLIP_API_KEY is never accepted from user/adapter/project/routine
-//    config — the harness-minted run token is the only source.
+// 1. PAPERCLIP_API_KEY and PAPERCLIP_DATABASE_URL_FILE are never accepted
+//    from user/adapter/project/routine config — these belong to the control
+//    plane, not to a run.
 // 2. A PAPERCLIP_* runtime var the harness assigns for the run (RUN_ID,
 //    AGENT_ID, wake/workspace vars, ...) always wins over a same-named
 //    binding; adapters enforce this at env-merge time.
 // 3. Any other PAPERCLIP_*-named binding is user data and flows through to
 //    the run env like any non-prefixed binding.
-const FORBIDDEN_ENV_BINDING_KEYS = new Set(["PAPERCLIP_API_KEY"]);
+const FORBIDDEN_ENV_BINDING_KEYS = new Set(["PAPERCLIP_API_KEY", "PAPERCLIP_DATABASE_URL_FILE"]);
 
 function stripForbiddenEnvBindings(envValue: unknown): Record<string, unknown> | null {
   const record = parseObject(envValue);
@@ -3975,9 +3977,12 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
   };
 }
 
-function parseIssueAssigneeAdapterOverrides(
+export function parseIssueAssigneeAdapterOverrides(
   raw: unknown,
 ): ParsedIssueAssigneeAdapterOverrides | null {
+  // Persisted overrides may predate the API write guard. Reject them before
+  // they can be merged into a run config or used for Codex home staging.
+  assertNoFileBackedIssueAuthSourceOverrides(raw);
   const parsed = parseObject(raw);
   const modelProfile = MODEL_PROFILE_KEYS.includes(parsed.modelProfile as ModelProfileKey)
     ? parsed.modelProfile as ModelProfileKey
@@ -16639,21 +16644,151 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
-      if (issue.executionRunId && issue.executionRunId !== run.id) return null;
-
-      const competingIssueRun = await tx
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(and(
-          eq(heartbeatRuns.companyId, issue.companyId),
-          ne(heartbeatRuns.id, run.id),
-          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
-        ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
+      let otherLockRunId = issue.executionRunId && issue.executionRunId !== run.id
+        ? issue.executionRunId
+        : null;
+      let lockedRun: { id: string; agentId: string; status: string } | null = null;
+      if (otherLockRunId) {
+        lockedRun = await tx
+          .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, otherLockRunId), eq(heartbeatRuns.companyId, issue.companyId)))
+          .then((rows) => rows[0] ?? null);
+        if (lockedRun && isHeartbeatRunTerminalStatus(lockedRun.status)) {
+          // A holder can persist its terminal status before its separate release
+          // transaction starts. Clear only that terminal holder's pointers while
+          // holding the issue row, so the ending reviewer can retain a recovery
+          // path. The holder's later release must not clear a successor's lock.
+          const now = new Date();
+          await tx.update(issues).set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            updatedAt: now,
+          }).where(and(
+            eq(issues.companyId, issue.companyId),
+            eq(issues.id, issue.id),
+            eq(issues.executionRunId, otherLockRunId),
+          ));
+          await tx.update(issues).set({ checkoutRunId: null, updatedAt: now }).where(and(
+            eq(issues.companyId, issue.companyId),
+            eq(issues.id, issue.id),
+            eq(issues.checkoutRunId, otherLockRunId),
+          ));
+          issue = {
+            ...issue,
+            executionRunId: null,
+            checkoutRunId: issue.checkoutRunId === otherLockRunId ? null : issue.checkoutRunId,
+          };
+          otherLockRunId = null;
+        }
+      }
+      // Use the same holder-status read to decide whether to park a wake. If
+      // the holder terminalizes after that read, its release will promote the
+      // parked wake; a second status query could miss both paths.
+      const competingIssueRun = otherLockRunId
+        ? lockedRun && EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
+          lockedRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
+        ) ? lockedRun : null
+        : await tx
+          .select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            ne(heartbeatRuns.id, run.id),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      if (otherLockRunId && !competingIssueRun) return null;
       if (competingIssueRun) {
         if (options.reconcile) throw conflict("Another active run already owns this issue");
+        const reviewState = parseIssueExecutionState(issue.executionState);
+        const currentParticipant = reviewState?.currentParticipant;
+        if (
+          !options.suppressImmediateRecovery &&
+          issue.status === "in_review" &&
+          reviewState?.status === "pending" &&
+          reviewState.currentStageType === "review" &&
+          reviewState.currentStageId &&
+          currentParticipant?.type === "agent" &&
+          currentParticipant.agentId === run.agentId &&
+          issue.assigneeAgentId === run.agentId &&
+          competingIssueRun.agentId !== run.agentId &&
+          isExecutionReviewParticipantRecoveryEligibleRun(run) &&
+          !issue.monitorNextCheckAt &&
+          !await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
+        ) {
+          if (!recoveryAgentInvokable || !recoveryAgent || isExecutionReviewParticipantRecoveryRun(run)) {
+            return {
+              kind: "blocked" as const,
+              issue,
+              previousStatus: issue.status,
+              notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
+              recoveryOwnerAgentId: currentParticipant.agentId,
+            };
+          }
+          const parkedWakes = await tx
+            .select({ payload: agentWakeupRequests.payload })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.agentId, run.agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            ));
+          const alreadyParked = parkedWakes.some(({ payload }) => {
+            const context = parseObject(parseObject(payload)[DEFERRED_WAKE_CONTEXT_KEY]);
+            const stage = parseObject(context.executionStage);
+            const participant = parseObject(stage.currentParticipant);
+            return readNonEmptyString(context.wakeReason) === "execution_review_requested" &&
+              readNonEmptyString(stage.stageId) === reviewState.currentStageId &&
+              readNonEmptyString(participant.agentId) === run.agentId;
+          });
+          if (!alreadyParked) {
+            const executionStage = {
+              wakeRole: "reviewer",
+              stageId: reviewState.currentStageId,
+              stageType: "review",
+              currentParticipant,
+              returnAssignee: reviewState.returnAssignee,
+              reviewRequest: reviewState.reviewRequest,
+              lastDecisionOutcome: reviewState.lastDecisionOutcome,
+              allowedActions: ["approve", "request_changes"],
+            };
+            const retryContext = {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: "execution_review_requested",
+              source: "issue.execution_review_recovery",
+              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+              retryOfRunId: run.id,
+              currentStageId: reviewState.currentStageId,
+              currentStageType: "review",
+              executionStage,
+              reviewRecoveryInstruction:
+                "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+            };
+            await tx.insert(agentWakeupRequests).values({
+              companyId: issue.companyId,
+              agentId: run.agentId,
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_execution_deferred",
+              payload: {
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+                executionStage,
+                [DEFERRED_WAKE_CONTEXT_KEY]: retryContext,
+              },
+              status: "deferred_issue_execution",
+              requestedByActorType: "system",
+            });
+          }
+        }
         return { kind: "released" as const };
       }
 
@@ -16742,14 +16877,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (readNonEmptyString(deferredContextSeed.wakeReason) === "execution_review_requested") {
           const reviewState = parseIssueExecutionState(issue.executionState);
           const deferredStage = parseObject(deferredContextSeed.executionStage);
+          const deferredParticipant = parseObject(deferredStage.currentParticipant);
           const currentReviewer = reviewState?.currentParticipant;
           if (
             issue.status !== "in_review" ||
             reviewState?.status !== "pending" ||
             reviewState.currentStageType !== "review" ||
             readNonEmptyString(deferredStage.stageId) !== reviewState.currentStageId ||
+            readNonEmptyString(deferredStage.stageType) !== "review" ||
             currentReviewer?.type !== "agent" ||
             currentReviewer.agentId !== deferred.agentId ||
+            readNonEmptyString(deferredParticipant.agentId) !== currentReviewer.agentId ||
             issue.assigneeAgentId !== deferred.agentId
           ) {
             if (options.reconcile) throw conflict("Deferred reviewer wake no longer matches the current stage");

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 
@@ -14,14 +15,17 @@ const {
   prepareManagedCodexHome,
   restoreWorkspace,
   capturedHomeAssetFiles,
+  capturedHomeAssetAuth,
 } = vi.hoisted(() => {
   const restoreWorkspace = vi.fn(async () => {});
   // Records the files staged in the uploaded "home" asset at call time, before
   // the probe's cleanup deletes the temp dir. Lets tests assert the upload is a
   // minimal credentials-only home and not the full managed CODEX_HOME.
   const capturedHomeAssetFiles: { value: string[] | null } = { value: null };
+  const capturedHomeAssetAuth: { value: string | null } = { value: null };
   return {
     capturedHomeAssetFiles,
+    capturedHomeAssetAuth,
     ensureAdapterExecutionTargetDirectory: vi.fn(async () => {}),
     ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
     maybeRunSandboxInstallCommand: vi.fn(async () => null),
@@ -50,6 +54,7 @@ const {
       const homeAsset = input?.assets?.find((asset) => asset.key === "home");
       if (homeAsset) {
         capturedHomeAssetFiles.value = (await fs.readdir(homeAsset.localDir)).sort();
+        capturedHomeAssetAuth.value = await fs.readFile(path.join(homeAsset.localDir, "auth.json"), "utf8");
       }
       return {
         target: null,
@@ -102,6 +107,8 @@ import { testEnvironment } from "./test.js";
 describe("codex remote environment diagnostics", () => {
   afterEach(() => {
     vi.clearAllMocks();
+    capturedHomeAssetFiles.value = null;
+    capturedHomeAssetAuth.value = null;
     delete process.env.OPENAI_API_KEY;
   });
 
@@ -149,7 +156,7 @@ describe("codex remote environment diagnostics", () => {
     // The probe must upload only a minimal credentials-only home, never the
     // full managed CODEX_HOME (which can be hundreds of MB of session history).
     const homeAsset = runtimeInput?.assets?.find((asset) => asset.key === "home");
-    expect(homeAsset?.localDir).toContain(`${os.tmpdir()}/paperclip-codex-probe-home-`);
+    expect(homeAsset?.localDir).toContain(`${os.tmpdir()}/paperclip-codex-home-sync-`);
     expect(capturedHomeAssetFiles.value).toEqual(["auth.json", "config.toml"]);
     expect(runtimeInput?.workspaceLocalDir).toContain(`${os.tmpdir()}/paperclip-codex-envtest-`);
     expect(runtimeInput?.workspaceLocalDir).not.toBe("/remote/workspace");
@@ -175,6 +182,73 @@ describe("codex remote environment diagnostics", () => {
       }),
     });
     expect(restoreWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("stages bound auth and rejects a credential link swapped after preparation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-probe-link-"));
+    const previousCodexHome = process.env.CODEX_HOME;
+    try {
+      const sharedHome = path.join(root, "shared");
+      const managedHome = path.join(root, "managed");
+      const serviceCredential = path.join(root, "service-db-url");
+      await fs.mkdir(sharedHome);
+      await fs.mkdir(managedHome);
+      await fs.writeFile(path.join(sharedHome, "auth.json"), '{"OPENAI_API_KEY":"sk-valid"}');
+      await fs.writeFile(serviceCredential, "SYNTHETIC_SERVICE_DB_CREDENTIAL");
+      const managedAuth = path.join(managedHome, "auth.json");
+      await fs.symlink(path.join(sharedHome, "auth.json"), managedAuth);
+      process.env.CODEX_HOME = sharedHome;
+      prepareManagedCodexHome.mockResolvedValueOnce(managedHome);
+
+      const remoteTarget: AdapterExecutionTarget = {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/remote/workspace",
+        spec: {
+          host: "127.0.0.1",
+          port: 22,
+          username: "agent",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "KNOWN HOSTS",
+          remoteCwd: "/remote/workspace",
+          remoteWorkspacePath: "/remote/workspace",
+          strictHostKeyChecking: false,
+        },
+      };
+
+      const context = {
+        companyId: "company-1",
+        adapterType: "codex_local",
+        config: { engine: "cli", command: "codex" },
+        executionTarget: remoteTarget,
+        environmentName: "QA SSH",
+      };
+      const validProbe = await testEnvironment(context);
+      expect(validProbe.status).toBe("pass");
+      expect(capturedHomeAssetFiles.value).toEqual(["auth.json"]);
+      expect(capturedHomeAssetAuth.value).toBe('{"OPENAI_API_KEY":"sk-valid"}');
+      expect(JSON.stringify(validProbe)).not.toContain("SYNTHETIC_SERVICE_DB_CREDENTIAL");
+
+      // This callback models the gap after prepareManagedCodexHome has checked
+      // the expected link and before the probe stages its remote asset.
+      prepareManagedCodexHome.mockImplementationOnce(async () => {
+        expect(await fs.readlink(managedAuth)).toBe(path.join(sharedHome, "auth.json"));
+        await fs.unlink(managedAuth);
+        await fs.symlink(serviceCredential, managedAuth);
+        return managedHome;
+      });
+      await expect(testEnvironment(context)).rejects.toThrow("Codex auth symlink escaped its expected source");
+      expect(prepareAdapterExecutionTargetRuntime).toHaveBeenCalledTimes(1);
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
+      expect(capturedHomeAssetAuth.value).not.toContain("SYNTHETIC_SERVICE_DB_CREDENTIAL");
+      expect(JSON.stringify(runAdapterExecutionTargetProcess.mock.calls)).not.toContain("SYNTHETIC_SERVICE_DB_CREDENTIAL");
+      const probeResult = await runAdapterExecutionTargetProcess.mock.results[0]?.value;
+      expect(`${probeResult?.stdout ?? ""}\n${probeResult?.stderr ?? ""}`).not.toContain("SYNTHETIC_SERVICE_DB_CREDENTIAL");
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("avoids /tmp CODEX_HOME for remote API-key hello probes", async () => {

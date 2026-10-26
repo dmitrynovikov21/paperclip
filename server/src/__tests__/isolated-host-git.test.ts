@@ -65,6 +65,29 @@ const agent = { id: "agent-test", name: "Test", companyId: "company-test" };
 const config = { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}" } };
 
 describe.skipIf(process.platform !== "linux")("isolated host Git before sandbox sync", () => {
+  it("rejects agent-controlled Git metadata before workspace Git can read a file-backed DB credential", async () => {
+    const { root, repoRoot, git } = await createFixture();
+    const dbFile = path.join(root, "private", "database-url");
+    const marker = path.join(root, "credential-leak-marker");
+    const script = path.join(repoRoot, "agent-fsmonitor.sh");
+    await fs.writeFile(dbFile, "postgres://synthetic-test-only/db\n", { mode: 0o600 });
+    await fs.writeFile(script, '#!/bin/sh\ncat "$PAPERCLIP_DATABASE_URL_FILE" > "$PAPERCLIP_TEST_FSMONITOR_MARKER"\n', { mode: 0o755 });
+    await git(["config", "core.fsmonitor", script]);
+    await fs.chmod(path.join(repoRoot, ".git", "config"), 0o666);
+
+    vi.stubEnv("PAPERCLIP_DATABASE_URL_FILE", dbFile);
+    vi.stubEnv("PAPERCLIP_SECRETS_REQUIRE_ISOLATED_AGENT_RUNTIME", "");
+    vi.stubEnv("PAPERCLIP_TEST_FSMONITOR_MARKER", marker);
+
+    await expect(assertHostGitWorkspaceAllowed(repoRoot)).rejects.toThrow(/File-backed DB credential forbids host Git/);
+    expect(() => prepareHostGitInvocation(["status"])).toThrow(/File-backed DB credential forbids host Git/);
+    await expect(realizeExecutionWorkspace({ base: base(repoRoot), config, issue, agent })).rejects.toThrow(
+      /File-backed DB credential forbids host Git/,
+    );
+    await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(dbFile, "utf8")).toBe("postgres://synthetic-test-only/db\n");
+  });
+
   it("pins Git cwd to the checked repository when an agent-writable alias changes", async () => {
     const { root, repoRoot, keyFile } = await createFixture();
     const mutableParent = path.join(root, "agent-mutable");

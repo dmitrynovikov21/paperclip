@@ -4514,6 +4514,28 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/deferred-wakes/{wakeId}/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile a deferred reviewer wake (board)",
+  request: {
+    params: z.object({ id: z.string(), wakeId: z.string().uuid() }),
+    body: jsonBody(z.object({
+      expectedHolderRunId: z.string().uuid(),
+      expectedStageId: z.string().uuid(),
+    }).strict()),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/tree-control/state",
   tags: ["issues"],

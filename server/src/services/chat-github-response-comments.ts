@@ -11,7 +11,8 @@ import { githubAutomaticAdmission } from "./chat-github-events.js";
 import { githubBotRepositoryToken, githubBotRequest } from "./chat-github-client.js";
 import { withGitHubPublicationLease } from "./chat-github-publication-lease.js";
 import { projectSafeChatPublicationText } from "./chat-publication-projection.js";
-import type { GitHubAutomaticEventContext } from "@paperclipai/shared";
+import type { GitHubAutomaticPolicyContext } from "./chat-github-review-policy.js";
+import { githubResponseAuthorityFields } from "./chat-channels/github/response-authority-read.js";
 import { githubRunReplyState } from "./chat-run-publications.js";
 import { logActivity } from "./activity-log.js";
 import { boundRunIssueId } from "./run-task-binding.js";
@@ -159,8 +160,7 @@ export async function writeGitHubResponseComment(
 
 export function githubResponseCommentService(db: Db, fetchImpl = fetch) {
   async function context(deliveryId: string) {
-    const [row] = await db.select({ endpoint: chatEndpoints, conversation: chatConversations,
-      delivery: chatDeliveries, resource: chatEndpointResources, config: chatGitHubConfigurations,
+    const [row] = await db.select({ ...githubResponseAuthorityFields,
       assignee: issues.assigneeAgentId, issueStatus: issues.status, sourceMessageId: chatMessageLinks.commentId }).from(chatMessageLinks)
       .innerJoin(chatDeliveries, and(eq(chatDeliveries.id, chatMessageLinks.deliveryId), eq(chatDeliveries.companyId, chatMessageLinks.companyId)))
       .innerJoin(chatConversations, and(eq(chatConversations.id, chatMessageLinks.conversationId), eq(chatConversations.companyId, chatMessageLinks.companyId)))
@@ -170,13 +170,13 @@ export function githubResponseCommentService(db: Db, fetchImpl = fetch) {
       .innerJoin(issues, and(eq(issues.id, chatConversations.issueId), eq(issues.companyId, chatEndpoints.companyId)))
       .where(and(eq(chatMessageLinks.deliveryId, deliveryId), eq(chatMessageLinks.direction, "inbound"), eq(chatEndpoints.provider, "github")));
     if (!row || !row.delivery.principalId || !["processing", "processed"].includes(row.delivery.state) ||
-        !["active", "verifying"].includes(row.endpoint.status) || !row.config.configuration.toolsEnabled ||
+        !["active", "verifying"].includes(row.endpoint.status) || !row.toolsEnabled ||
         !row.resource.enabled || row.resource.availability !== "available" || row.assignee !== row.endpoint.assignedAgentId)
       throw forbidden("GitHub request is no longer authorized");
     const access = await githubChatPrincipalAccess(db, row.endpoint, row.delivery.principalId);
     if (!access?.allowed) throw forbidden("The initiating GitHub person is no longer authorized");
     const automatic = (row.delivery.normalizedEvent.githubAutomatic ?? row.delivery.normalizedEvent.githubIssue) as
-      { context: GitHubAutomaticEventContext } | undefined;
+      { context: GitHubAutomaticPolicyContext } | undefined;
     if (automatic && !(await githubAutomaticAdmission(db, row.endpoint, automatic.context))?.allowed)
       throw forbidden("Automatic GitHub task authority changed");
     const match = /^github:([^:]+):(?:issue:)?([1-9][0-9]*)(?::rc:([1-9][0-9]*))?$/.exec(row.conversation.externalThreadId);

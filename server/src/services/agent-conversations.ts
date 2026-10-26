@@ -282,7 +282,7 @@ export async function prepareConversationTurn(
 /** Finalizers only park a turn with a durable response, interaction, or processed /new. */
 export async function settleConversationTurn(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
 ) {
   if (run.status !== "succeeded") return false;
   const context = run.contextSnapshot ?? {};
@@ -291,7 +291,12 @@ export async function settleConversationTurn(
   let publication: ActivityPublication | null = null;
   const settled = await db.transaction(async (tx) => {
     const [issue] = await tx
-      .select()
+      .select({
+        id: issues.id, companyId: issues.companyId, status: issues.status,
+        conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
+        conversationState: issues.conversationState, conversationSessionGeneration: issues.conversationSessionGeneration,
+        executionRunId: issues.executionRunId,
+      })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .for("update");
@@ -344,7 +349,7 @@ export async function settleConversationTurn(
     const [wake] =
       typeof wakeId === "string"
         ? await tx
-            .select()
+            .select({ id: issueComments.id })
             .from(issueComments)
             .where(eq(issueComments.id, wakeId))
         : [];
@@ -405,6 +410,26 @@ export async function settleConversationTurn(
   });
   if (publication) publishActivity(publication);
   return settled;
+}
+
+export async function settleConversationTurnForRun(
+  db: Db,
+  companyId: string,
+  runId: string,
+) {
+  const [run] = await db.select({
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
+    contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then jsonb_build_object(
+        'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+        'conversationReset', ${heartbeatRuns.contextSnapshot}->'conversationReset',
+        'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
+        'conversationReplyBoundaryCommentId', ${heartbeatRuns.contextSnapshot}->'conversationReplyBoundaryCommentId',
+        'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+        'commentId', ${heartbeatRuns.contextSnapshot}->'commentId'
+      ) else null end`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+  return run ? settleConversationTurn(db, run) : false;
 }
 
 /** Fresh provider context uses only messages in this session, up to this turn. */

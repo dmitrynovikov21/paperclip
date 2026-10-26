@@ -264,6 +264,7 @@ async function restartIsolatedPaperclipServer(input: {
   deadlineAt: number;
   preserveRunner?: RestartRunnerIdentity;
   crashAfterResult?: FinalizationCrashBinding;
+  controllerDowntimeMs?: number;
 }): Promise<void> {
   const {
     controlDirectory,
@@ -274,7 +275,8 @@ async function restartIsolatedPaperclipServer(input: {
   const temporaryRequestPath = `${requestPath}.${process.pid}.${input.requestId}.tmp`;
   await writeFile(
     temporaryRequestPath,
-    JSON.stringify({ requestId: input.requestId, ...(input.preserveRunner ? { preserveRunner: input.preserveRunner } : {}),
+    JSON.stringify({ requestId: input.requestId, ...(input.controllerDowntimeMs !== undefined ? { controllerDowntimeMs: input.controllerDowntimeMs } : {}),
+      ...(input.preserveRunner ? { preserveRunner: input.preserveRunner } : {}),
       ...(input.crashAfterResult ? { crashAfterResult: input.crashAfterResult } : {}) }),
     { encoding: "utf8", mode: 0o600 },
   );
@@ -1240,7 +1242,7 @@ for (const execution of executions) {
         const story = await runEverydayFlow({
           page, api, fixtures, execution, nonce, workspacePath, privateDir,
           deadlineAt: startedAtMs + deadlineMs,
-          restart: () => restartIsolatedPaperclipServer({ api, requestId: `story-${nonce}`, deadlineAt: startedAtMs + deadlineMs }),
+          restart: controllerDowntimeMs => restartIsolatedPaperclipServer({ api, requestId: `story-${nonce}`, deadlineAt: startedAtMs + deadlineMs, controllerDowntimeMs }),
           observe: (storyIssue, storyRuns) => { issue = storyIssue; selectedRuns = storyRuns; },
           capture: captureScreenshot,
           evidence: (name, data) => writeSanitizedJson(snapshotsDir, name, data, secrets),

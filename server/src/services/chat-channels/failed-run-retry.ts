@@ -2,6 +2,7 @@ import { continuingTeamsFilePublication, type ContinuingTeamsFileTransfer } from
 import { readTaskChatRetryIntent, taskChatRetryCanAwaitRecovery, taskChatRetryExecutionStopped } from "./task-retry-authority.js";
 import { notifyChatActionWork, notifyChatPublicationWork } from "../chat-work-notifications.js";
 import { FAILED_RUN_RETRY_STALE_MS, dueChatAction } from "../chat-action-work.js";
+import { readChatAuthorizationRun } from "./authorization-run-read.js";
 
 import {
   createHash,
@@ -688,17 +689,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         ),
       )
       .for("share", { noWait: true });
-    const [failedRun] = await tx
-      .select()
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.id, input.failedRunId),
-          eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, input.agentId),
-        ),
-      )
-      .for("share", { noWait: true });
+    const evidence = await readChatAuthorizationRun(tx, input, Boolean(input.committedResponse));
+    const failedRun = evidence.run;
     if (
       !issue ||
       issue.assigneeAgentId !== input.agentId ||
@@ -719,7 +711,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
             "process_exit",
             "timeout",
           ].includes(failedRun.errorCode ?? "") ||
-          (await isPreProviderReviewedChatFailure(tx, failedRun))
+          (evidence.kind === "retry" && await isPreProviderReviewedChatFailure(tx, evidence.run))
         )) ||
       (!input.publication &&
         ["backlog", "done", "cancelled"].includes(issue.status))
@@ -729,8 +721,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       companyId: input.companyId, issueId: issue.id, agentId: input.agentId,
       sourceRunId: failedRun.id, intentId: input.taskRetryIntentId,
     })) throw failedChatRetryDenied();
-    if (failedRun.runtimeMode === "native" && !input.committedResponse && !input.taskRetryIntentId)
-      await failedNativeRetryCoordinator(tx, failedRun, issue.id);
+    if (failedRun.runtimeMode === "native" && evidence.kind === "retry" && !input.taskRetryIntentId)
+      await failedNativeRetryCoordinator(tx, evidence.run, issue.id);
     const context = failedRun.contextSnapshot ?? {};
     const provider = CHAT_PROVIDERS.find(
       (value) => context.source === `chat:${value}`,

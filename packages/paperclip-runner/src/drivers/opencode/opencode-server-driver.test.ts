@@ -1513,7 +1513,7 @@ describe("OpenCodeServerDriver", () => {
     );
     const isolatedHome = runtimeEnvironment.home;
     expect(startupFailurePending).toBe(false);
-    expect(dirname(isolatedHome)).toBe(sessionRoot);
+    expect(dirname(isolatedHome)).toBe(join(sessionRoot, "homes"));
     expect(basename(isolatedHome)).toMatch(/^home-/);
     await expect(
       readFile(
@@ -1553,6 +1553,59 @@ describe("OpenCodeServerDriver", () => {
       readFile(join(instructionRoot, "sibling.md"), "utf8"),
     ).resolves.toBe("instruction sibling\n");
     await session.close({ reason: "test" });
+    await expect(readdir(join(sessionRoot, "homes"))).resolves.toEqual([]);
+  });
+
+  it("removes isolated homes left by earlier launches when a session reopens", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-legacy-home-"));
+    const workspace = await mkdtemp(
+      join(tmpdir(), "paperclip-opencode-legacy-home-workspace-"),
+    );
+    const skillRoot = join(root, "skill-source");
+    const instructionRoot = join(root, "instruction-source");
+    roots.push(root, workspace);
+    await Promise.all([
+      mkdir(skillRoot, { recursive: true }),
+      mkdir(instructionRoot, { recursive: true }),
+    ]);
+    await writeFile(join(skillRoot, "SKILL.md"), "# Assigned\n");
+    await writeFile(join(instructionRoot, "AGENTS.md"), "instructions\n");
+    const sessionRoot = join(root, "legacy");
+    const legacyHome = join(sessionRoot, "home-AbC123");
+    const sealedSkill = join(legacyHome, ".claude", "skills", "assigned");
+    await mkdir(sealedSkill, { recursive: true });
+    await mkdir(join(legacyHome, ".npm", "_cacache"), { recursive: true });
+    await writeFile(join(legacyHome, ".npm", "_cacache", "entry"), "cache");
+    await writeFile(join(sealedSkill, "SKILL.md"), "# Assigned\n");
+    await chmod(join(sealedSkill, "SKILL.md"), 0o444);
+    await chmod(sealedSkill, 0o555);
+    await mkdir(join(sessionRoot, "data", "opencode"), { recursive: true });
+    await writeFile(join(sessionRoot, "data", "opencode", "opencode.db"), "history");
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      runtimeContext: runtimeContext(skillRoot, instructionRoot),
+      environment: {
+        PATH: process.env.PATH,
+        OPENROUTER_API_KEY: "fixture-key",
+      },
+    });
+    const session = await driver.openSession({
+      runId: "run-legacy-home",
+      normalizedSessionId: "legacy",
+      workingDirectory: workspace,
+    });
+    await expect(lstat(legacyHome)).rejects.toMatchObject({ code: "ENOENT" });
+    await session.close({ reason: "test" });
+    expect(
+      (await readdir(sessionRoot)).filter((entry) => entry.startsWith("home-")),
+    ).toEqual([]);
+    await expect(readdir(join(sessionRoot, "homes"))).resolves.toEqual([]);
+    await expect(
+      readFile(join(sessionRoot, "data", "opencode", "opencode.db"), "utf8"),
+    ).resolves.toBe("history");
   });
 
   it("resends system instructions without repeating the task envelope on recovery", async () => {

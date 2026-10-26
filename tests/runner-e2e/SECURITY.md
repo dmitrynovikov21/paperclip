@@ -14,6 +14,13 @@ their expected four-field result, exact base64 download bytes, checksums, size,
 and attachment/run IDs. Extra fields and arbitrary agent output are rejected.
 It contains no credentials, browser state, request headers, or provider text.
 
+The optional `onboardingConnect` diagnostic is also a closed, versioned receipt.
+It retains only a known checkpoint, response states, HTTP statuses, known adapter
+names, and allowlisted outcome/check/server codes (at most 32 checks per response).
+Unknown codes become `unrecognized`; raw bodies, messages, URLs, headers, and
+browser errors are excluded. Reports validate the receipt before rendering its
+explicit fields, and historical results may omit it.
+
 ## Attended connection authentication
 
 See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only
@@ -46,13 +53,17 @@ changes.
 
 ## GitHub authorization
 
-The Everyday remote Codex restart oracle reads only the existing public run,
+The Everyday remote native restart oracle reads only the existing public run,
 event, environment-lease, workspace-operation and recovery APIs. It does not
 execute commands in a provider sandbox or signal a provider process. Its new
 evidence projects closed receipt metadata and hashes the provider sandbox ID
 and full native event content. Provider text, tool arguments and command output
 do not enter these snapshots. Existing image admission, credentials, billing,
 retention and cleanup rules continue to apply.
+The isolated server's private restart request may delay its replacement by at
+most five minutes. This fault injection never stops a hosted instance or a
+provider sandbox. The explicit Daytona continuity suite has one attempt and
+1,000-cent company and agent hard stops.
 
 Set `RUNNER_E2E_ALLOWED_ACTOR_IDS` to a non-empty JSON array of numeric GitHub
 user IDs. Keep the list equal to the owners of `.github/**` in

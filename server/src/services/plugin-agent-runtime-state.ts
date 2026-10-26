@@ -36,7 +36,7 @@ async function readState(db: Db, pluginId: string, companyId: string, agentId: s
     };
     const instructions = await agentInstructionsService().getBundleLocation(agent);
     const records = agentRecordQueries(tx as unknown as Db);
-    const companyAgents = await records.listCompanyAgentRows(companyId);
+    const companyAgents = await records.listCompanyAgentEligibilityRows(companyId);
     return {
       revision: String(latest?.id ?? 0), agent: records.normalizeAgentRow(agent, companyAgents) as PluginAgentRuntimeState["agent"],
       instructionsRootPath: instructions.rootPath, instructionsEntryFile: instructions.entryFile,

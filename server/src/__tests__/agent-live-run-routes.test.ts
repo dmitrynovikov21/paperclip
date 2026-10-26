@@ -16,6 +16,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunReadAccess: vi.fn(),
   getRunLogAccess: vi.fn(),
+  getRunWorkspaceAccess: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
@@ -378,6 +379,10 @@ describe("agent live run routes", () => {
       logStore: "local_file",
       logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
     });
+    mockHeartbeatService.getRunWorkspaceAccess.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1", scopeKind: "company", issueId: null,
+      executionWorkspaceId: null,
+    });
     mockHeartbeatService.readLog.mockResolvedValue({
       runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       store: "local_file",
@@ -686,6 +691,21 @@ describe("agent live run routes", () => {
       }));
     },
   );
+
+  it("lists workspace operations using narrow current run access", async () => {
+    mockHeartbeatService.getRunWorkspaceAccess.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1", scopeKind: "company", issueId: null,
+      executionWorkspaceId: " workspace-one ",
+    });
+    mockWorkspaceOperationService.listForRun.mockResolvedValue([]);
+    const response = await requestApp(await createApp(), baseUrl => request(baseUrl)
+      .get("/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/workspace-operations"));
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual([]);
+    expect(mockHeartbeatService.getRunWorkspaceAccess).toHaveBeenCalledWith("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockWorkspaceOperationService.listForRun).toHaveBeenCalledWith("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "workspace-one");
+  });
 
   it("caps company live run polling by default", async () => {
     const rows = Array.from({ length: 75 }, (_, index) => ({

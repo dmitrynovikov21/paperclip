@@ -1,6 +1,23 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, issues, statusDecisions, type Db } from "@paperclipai/db";
 import { authorizeChatConversationForBoundRun } from "./chat-attachment-reuse.js";
+import { EXTERNAL_CHAT_QUESTION_RESPONSE_KEY } from "./external-chat-question-response.js";
+
+const authorizationContextKeys = [
+  "source", "issueId", "wakeReason", "interactionKind", "interactionStatus", "externalChatContinuation",
+  "interactionId", "sourceRunId", "sourceCommentId", "wakeCommentId", "wakeCommentIds",
+  "paperclipHarnessCheckedOut", "paperclipExternalChatExecutionBound",
+  EXTERNAL_CHAT_QUESTION_RESPONSE_KEY,
+] as const;
+
+const authorizationContext = sql<Record<string, unknown> | null>`
+  case when ${heartbeatRuns.contextSnapshot} is null then null else (
+    select coalesce(jsonb_object_agg(field.key, field.value), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end) as field(key, value)
+    where field.key in (${sql.join(authorizationContextKeys.map(key => sql`${key}`), sql`, `)})
+  ) end
+`;
 
 export async function listExternalReviewWaits(db: Db, companyId: string, issueIds: string[]) {
   if (!issueIds.length) return [];
@@ -12,7 +29,7 @@ export async function listExternalReviewWaits(db: Db, companyId: string, issueId
     createdAt: statusDecisions.createdAt,
     runId: heartbeatRuns.id,
     agentId: heartbeatRuns.agentId,
-    contextSnapshot: heartbeatRuns.contextSnapshot,
+    contextSnapshot: authorizationContext,
   }).from(issues)
     .innerJoin(statusDecisions, and(
       eq(statusDecisions.id, issues.lastStatusDecisionId),

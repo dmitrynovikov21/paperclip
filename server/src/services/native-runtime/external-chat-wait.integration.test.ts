@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { and, eq, ne, sql } from "drizzle-orm";
+import { createDatabaseResponseCapture, installDatabaseResponseCapture } from "@paperclipai/db/response-capture";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
@@ -71,6 +72,7 @@ import { voiceCredentialFingerprint } from "../voice/voice-session-store.js";
 import { nativeSha256 } from "./canonical.js";
 import { questionResponseDeliveryValues } from "../question-response-delivery.js";
 import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
+import { listExternalReviewWaits } from "./external-review-wait.js";
 import { materializeExternalChatQuestionResponseInput } from "./external-chat-question-response-input.js";
 import * as nativeInteractionBridge from "./native-interaction-bridge.js";
 import { defaultGitHubReviewPolicy, type AskUserQuestionsInteraction } from "@paperclipai/shared";
@@ -467,7 +469,7 @@ describe("native external-chat response wait", () => {
       fixture: Awaited<ReturnType<typeof seedWaitTurn>>;
       gate: Awaited<ReturnType<typeof seedPriorCompletionReview>>;
     },
-    responseKind: "button" | "form" = "button",
+    responseKind: "button" | "form" | "multi" = "button",
   ) {
     const fixture = target?.fixture ?? await seedWaitTurn(provider);
     const gate = target?.gate ?? await seedPriorCompletionReview(fixture);
@@ -520,7 +522,7 @@ describe("native external-chat response wait", () => {
               {
                 id: "color",
                 prompt: "Choose a color",
-                selectionMode: "single" as const,
+                selectionMode: responseKind === "multi" ? "multi" as const : "single" as const,
                 required: true,
                 allowOther: false,
                 options: [
@@ -545,7 +547,7 @@ describe("native external-chat response wait", () => {
           }
         : {
             version: 1 as const,
-            answers: [{ questionId: "color", optionIds: ["cobalt"] }],
+            answers: [{ questionId: "color", optionIds: responseKind === "multi" ? ["cobalt", "amber"] : ["cobalt"] }],
           };
     await db.insert(heartbeatRuns).values({
       id: sourceRunId,
@@ -641,7 +643,7 @@ describe("native external-chat response wait", () => {
               interactionId,
               publicationId,
               questionId: "color",
-              optionId: "cobalt",
+              ...(responseKind === "multi" ? { selectionOptions: [{ value: "opaque-cobalt", optionId: "cobalt" }, { value: "opaque-amber", optionId: "amber" }], selectionValues: ["opaque-cobalt", "opaque-amber"] } : { optionId: "cobalt" }),
             },
       result:
         responseKind === "form"
@@ -700,8 +702,12 @@ describe("native external-chat response wait", () => {
     };
   }
 
-  async function seedGitHubBoardAnsweredTurn(withLink = true) {
-    const fixture = await seedWaitTurn("github");
+  async function seedBoardAnsweredTurn(withLink = true, provider: "github" | "slack" = "github", oversized = false) {
+    const fixture = await seedWaitTurn(provider);
+    if (provider === "slack") {
+      await db.update(chatEndpointResources).set({ type: "channel" }).where(eq(chatEndpointResources.id, fixture.resourceId));
+      await db.update(chatConversations).set({ isDirectMessage: false }).where(eq(chatConversations.id, fixture.conversationId));
+    }
     const gate = await seedPriorCompletionReview(fixture);
     const [current] = await db
       .select()
@@ -756,12 +762,16 @@ describe("native external-chat response wait", () => {
               {
                 id: "color",
                 prompt: "Choose a color",
-                selectionMode: "single",
+                // Multi-select plus a custom answer intentionally needs Board.
+                selectionMode: provider === "slack" ? "multi" : "single",
                 required: true,
-                allowOther: false,
+                allowOther: provider === "slack" && !oversized,
                 options: [
                   { id: "cobalt", label: "Cobalt" },
                   { id: "amber", label: "Amber" },
+                  ...(oversized ? Array.from({ length: 9 }, (_, index) => ({
+                    id: `option-${index}`, label: `Option ${index}`, description: "Detail ".repeat(550),
+                  })) : []),
                 ],
               },
             ],
@@ -779,7 +789,7 @@ describe("native external-chat response wait", () => {
       .update(chatPublications)
       .set({
         state: "published",
-        providerMessageId: "github-question",
+        providerMessageId: `${provider}-question`,
         publishedAt: new Date(),
       })
       .where(eq(chatPublications.idempotencyKey, publicationKey))
@@ -858,10 +868,68 @@ describe("native external-chat response wait", () => {
     };
   }
 
-  it.each([true, false])(
-    "attests a native GitHub question answered in Board without inventing a provider action (link: %s)",
-    async (withLink) => {
-      const fixture = await seedGitHubBoardAnsweredTurn(withLink);
+  it.each(["telegram", "github", "github_board_answer", "slack_board_answer"] as const)(
+    "reads small current external review waits without saved prompts (%s)", async source => {
+      const fixture = await (async () => {
+        if (source === "github_board_answer" || source === "slack_board_answer") {
+          const answered = await seedBoardAnsweredTurn(true, source === "github_board_answer" ? "github" : "slack");
+          await attestAnswer(answered);
+          return answered;
+        }
+        return seedWaitTurn(source);
+      })();
+      const finalized = await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      expect(finalized.phase).toBe("committed");
+      await db.update(statusDecisions).set({ toStatus: "in_review" }).where(eq(statusDecisions.id, finalized.decisionId!));
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, fixture.issueId));
+      const [decision] = await db.select({ reason: statusDecisions.reasonCode, state: statusDecisions.applicationState })
+        .from(statusDecisions).where(eq(statusDecisions.id, finalized.decisionId!));
+      const governed = source === "github_board_answer" || source === "slack_board_answer";
+      expect(decision).toEqual({ reason: governed ? "governed_response_waiting" : "external_chat_response_waiting", state: "applied" });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect(run!.status).toBe("succeeded");
+      const contextSnapshot = { ...run!.contextSnapshot, savedPrompt: "external-wait-saved-input🙂".repeat(30_000) };
+      await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, fixture.runId));
+      await authorizeChatConversationForBoundRun(db, fixture, contextSnapshot, "read");
+      const observed = createDb(temporary?.connectionString ?? externalTestDatabaseUrl!);
+      const events: Array<Record<string, unknown>> = [], now = Date.now();
+      const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+      installDatabaseResponseCapture(observed, { issues, heartbeatRuns }, capture);
+      try {
+        expect(await listExternalReviewWaits(observed, fixture.companyId, [fixture.issueId])).toEqual(governed ? [] : [
+          expect.objectContaining({ companyId: fixture.companyId, issueId: fixture.issueId }),
+        ]);
+        capture.flush();
+        const reads = events.filter(event => event.table === "issues" && event.operation === "select");
+        expect(reads.length).toBeGreaterThan(0);
+        expect(reads.reduce((bytes, event) => bytes + Number(event.responseValueBytes), 0)).toBeLessThan(4096);
+        expect(await listExternalReviewWaits(observed, randomUUID(), [fixture.issueId])).toEqual([]);
+        expect(await listExternalReviewWaits(observed, fixture.companyId, [])).toEqual([]);
+        await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, fixture.companyId));
+        expect(await listExternalReviewWaits(observed, fixture.companyId, [fixture.issueId])).toEqual([]);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId)))[0]?.contextSnapshot).toEqual(contextSnapshot);
+      } finally { capture.flush(); await observed.$client.end(); }
+    },
+  );
+
+  it("resumes an oversized Slack multi-select answered through its Paperclip handoff", async () => {
+    const fixture = await seedBoardAnsweredTurn(true, "slack", true);
+    const [publication] = await db.select().from(chatPublications).where(eq(chatPublications.id, fixture.publicationId));
+    expect(publication!.payload.card?.actions).toEqual([
+      { type: "link", label: "Open in Paperclip", url: expect.stringContaining(fixture.issueId) },
+    ]);
+    expect(publication!.payload.card?.selection).toBeUndefined();
+    await expect(db.select().from(chatActions).where(eq(chatActions.companyId, fixture.companyId))).resolves.toEqual([]);
+    await attestAnswer(fixture);
+    const responses = await materializeExternalChatQuestionResponseInput({ db, binding: fixture, contextSnapshot: fixture.context });
+    expect(responses).toHaveLength(1);
+    expect(JSON.stringify(responses)).toContain("cobalt");
+  });
+
+  it.each((["github", "slack"] as const).flatMap(provider => [true, false].map(withLink => ({ provider, withLink }))))(
+    "attests a native $provider question answered in Board without inventing a provider action (link: $withLink)",
+    async ({ provider, withLink }) => {
+      const fixture = await seedBoardAnsweredTurn(withLink, provider);
       await expect(
         db
           .select()
@@ -879,7 +947,7 @@ describe("native external-chat response wait", () => {
       ).not.toBeNull();
       await attestAnswer(fixture);
       expect(fixture.context.paperclipWake).toMatchObject({
-        externalChatProvider: "github",
+        externalChatProvider: provider,
       });
       await db
         .update(heartbeatRuns)
@@ -923,7 +991,7 @@ describe("native external-chat response wait", () => {
     },
   );
 
-  it.each([
+  it.each((["github", "slack"] as const).flatMap(provider => ([
     "different_user",
     "viewer",
     "membership_revoked",
@@ -938,10 +1006,10 @@ describe("native external-chat response wait", () => {
     "endpoint_paused",
     "resource_revoked",
     "answer_hash",
-  ] as const)(
-    "rejects GitHub Board answer authority after %s",
-    async (change) => {
-      const fixture = await seedGitHubBoardAnsweredTurn();
+  ] as const).filter(change => provider === "github" || (change !== "generation" && change !== "missing_runtime")).map(change => ({ provider, change }))))(
+    "rejects $provider Board answer authority after $change",
+    async ({ provider, change }) => {
+      const fixture = await seedBoardAnsweredTurn(true, provider);
       if (change === "different_user") {
         const otherUser = `other-${randomUUID()}`;
         await db
@@ -1080,10 +1148,10 @@ describe("native external-chat response wait", () => {
     },
   );
 
-  it.each(["generation", "identity", "membership", "reach"] as const)(
-    "rechecks GitHub Board answer %s at publication after native completion",
-    async (change) => {
-      const fixture = await seedGitHubBoardAnsweredTurn();
+  it.each((["github", "slack"] as const).flatMap(provider => (["generation", "identity", "membership", "reach"] as const).filter(change => provider === "github" || change !== "generation").map(change => ({ provider, change }))))(
+    "rechecks $provider Board answer $change at publication after native completion",
+    async ({ provider, change }) => {
+      const fixture = await seedBoardAnsweredTurn(true, provider);
       await attestAnswer(fixture);
       const resultJson = await finishReviewResponse(fixture);
       expect(
@@ -1203,7 +1271,7 @@ describe("native external-chat response wait", () => {
   async function attestAnswer(
     fixture:
       | Awaited<ReturnType<typeof seedAnsweredChatTurn>>
-      | Awaited<ReturnType<typeof seedGitHubBoardAnsweredTurn>>,
+      | Awaited<ReturnType<typeof seedBoardAnsweredTurn>>,
   ) {
     expect(
       await attestReviewedExternalChatRun({
@@ -1240,13 +1308,13 @@ describe("native external-chat response wait", () => {
     check: (input: {
       fixture:
         | Awaited<ReturnType<typeof seedAnsweredChatTurn>>
-        | Awaited<ReturnType<typeof seedGitHubBoardAnsweredTurn>>;
+        | Awaited<ReturnType<typeof seedBoardAnsweredTurn>>;
       invoke: () => Promise<unknown>;
     }) => Promise<void>,
   ) {
     const fixture =
       provider === "github"
-        ? await seedGitHubBoardAnsweredTurn()
+        ? await seedBoardAnsweredTurn()
         : await seedAnsweredChatTurn(provider);
     await attestAnswer(fixture);
     const root = await mkdtemp(path.join(tmpdir(), "answered-chat-file-"));
@@ -1327,7 +1395,7 @@ describe("native external-chat response wait", () => {
       const fixture =
         source === "direct"
           ? await seedWaitTurn("github")
-          : await seedGitHubBoardAnsweredTurn();
+          : await seedBoardAnsweredTurn();
       if (source === "direct") await seedPriorCompletionReview(fixture);
       // A previous run's failure projects `error` onto the agent. The next
       // already-claimed turn attests before execution-start changes it to
@@ -1443,6 +1511,16 @@ describe("native external-chat response wait", () => {
       ).resolves.toBe(false);
     },
   );
+
+  it.each(["valid", "tampered_selection", "revoked_identity"])("attests only the committed Slack multiple-choice response: %s", async condition => {
+    const fixture = await seedAnsweredChatTurn("slack", undefined, "multi");
+    if (condition === "tampered_selection") {
+      const [action] = await db.select().from(chatActions).where(eq(chatActions.id, fixture.actionId));
+      await db.update(chatActions).set({ payload: { ...action!.payload, selectionValues: ["opaque-amber", "opaque-cobalt"] } }).where(eq(chatActions.id, fixture.actionId));
+    }
+    if (condition === "revoked_identity") await db.update(chatIdentityLinks).set({ status: "revoked" }).where(eq(chatIdentityLinks.principalId, fixture.principalId));
+    expect(await attestReviewedExternalChatRun({ db, ...fixture, contextSnapshot: fixture.context })).toBe(condition === "valid");
+  });
 
   it("attests a genuine Slack mixed-question modal answer for its native continuation", async () => {
     const fixture = await seedAnsweredChatTurn("slack", undefined, "form");

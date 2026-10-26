@@ -1555,44 +1555,24 @@ function projectScanSelectionKey(workspaceId: string, relativePath: string) {
 
 async function readLocalSkillImports(companyId: string, sourcePath: string): Promise<ImportedSkill[]> {
   const resolvedPath = path.resolve(sourcePath);
-  const stat = await fs.stat(resolvedPath).catch(() => null);
+  const stat = await fs.lstat(resolvedPath).catch(() => null);
   if (!stat) {
     throw unprocessable(`Skill source path does not exist: ${sourcePath}`);
   }
+  if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) {
+    throw unprocessable("Unsafe local skill source entry");
+  }
 
   if (stat.isFile()) {
-    const markdown = await fs.readFile(resolvedPath, "utf8");
-    const sourceDir = path.dirname(resolvedPath);
-    const parsed = parseFrontmatterMarkdown(markdown);
-    const slug = deriveImportedSkillSlug(parsed.frontmatter, path.basename(sourceDir));
-    const parsedMetadata = isPlainRecord(parsed.frontmatter.metadata) ? parsed.frontmatter.metadata : null;
-    const skillKey = readCanonicalSkillKey(parsed.frontmatter, parsedMetadata);
-    const metadata = {
-      ...(skillKey ? { skillKey } : {}),
-      ...(parsedMetadata ?? {}),
-      sourceKind: "local_path",
-    };
-    const inventory = await collectLocalSkillInventory(sourceDir, "project_root");
-    return [{
-      key: deriveCanonicalSkillKey(companyId, {
-        slug,
-        sourceType: "local_path",
-        sourceLocator: sourceDir,
-        metadata,
-      }),
-      slug,
-      name: asString(parsed.frontmatter.name) ?? slug,
-      description: asString(parsed.frontmatter.description),
-      markdown,
-      packageDir: path.dirname(resolvedPath),
-      sourceType: "local_path",
-      sourceLocator: sourceDir,
-      sourceRef: null,
-      trustLevel: deriveTrustLevel(inventory),
-      compatibility: "compatible",
-      fileInventory: inventory,
-      metadata,
-    }];
+    if (path.basename(resolvedPath) !== "SKILL.md") {
+      throw unprocessable("Direct local skill imports require a SKILL.md file.");
+    }
+    // The pathname was authorized before this call, but an agent can replace it
+    // after that check. Read the entrypoint and support files through the same
+    // pinned, no-follow snapshot used for directory imports.
+    return [await readLocalSkillImportFromDirectory(companyId, path.dirname(resolvedPath), {
+      inventoryMode: "project_root",
+    })];
   }
 
   const root = resolvedPath;

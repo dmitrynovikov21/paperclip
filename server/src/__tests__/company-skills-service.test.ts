@@ -2031,6 +2031,67 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     ]));
   });
 
+  it("rejects a direct SKILL.md import replaced with a service credential link after source authorization", async () => {
+    const companyId = randomUUID();
+    const skillDir = await createManagedSkillDir(companyId, "direct-file-swap-");
+    const skillFile = path.join(skillDir, "SKILL.md");
+    const savedSkillFile = path.join(skillDir, "original-skill.md");
+    const serviceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-service-only-"));
+    cleanupDirs.add(serviceDir);
+    const credentialFile = path.join(serviceDir, "database-url");
+    const syntheticCredential = "postgres://synthetic-direct-file-credential";
+    const regularMarkdown = "---\nname: Direct File Skill\n---\n\nSafe instructions.\n";
+    await fs.mkdir(path.join(skillDir, "references"));
+    await fs.writeFile(skillFile, regularMarkdown);
+    await fs.writeFile(path.join(skillDir, "references", "guide.md"), "# Guide\n");
+    await fs.writeFile(credentialFile, syntheticCredential, { mode: 0o400 });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    // readLocalSkillImports lstats the file after assertLocalImportSourceAllowed
+    // has resolved it inside the managed company root. Swap at that exact point.
+    const originalLstat = fs.lstat.bind(fs);
+    let swaps = 0;
+    const statSpy = vi.spyOn(fs, "lstat").mockImplementation((async (...args: Parameters<typeof fs.lstat>) => {
+      const result = await originalLstat(...args);
+      if (String(args[0]) === skillFile && swaps === 0) {
+        swaps += 1;
+        await fs.rename(skillFile, savedSkillFile);
+        await fs.symlink(credentialFile, skillFile);
+      }
+      return result;
+    }) as typeof fs.lstat);
+    let failure: unknown;
+    try {
+      await svc.importFromSource(companyId, skillFile);
+    } catch (error) {
+      failure = error;
+    } finally {
+      statSpy.mockRestore();
+    }
+
+    expect(swaps).toBe(1);
+    expect(String(failure)).toMatch(/Unsafe local skill source entry/);
+    expect(String(failure)).not.toContain(syntheticCredential);
+    const savedSkills = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, skillDir));
+    const savedVersions = await db.select().from(companySkillVersions).where(eq(companySkillVersions.companyId, companyId));
+    expect(savedSkills).toEqual([]);
+    expect(JSON.stringify({ savedSkills, savedVersions })).not.toContain(syntheticCredential);
+
+    await fs.unlink(skillFile);
+    await fs.rename(savedSkillFile, skillFile);
+    const regular = await svc.importFromSource(companyId, skillFile);
+    expect(regular.imported).toMatchObject([{ markdown: regularMarkdown }]);
+    expect(regular.imported[0]?.fileInventory.map((entry) => entry.path)).toEqual([
+      "SKILL.md",
+      "references/guide.md",
+    ]);
+  });
+
   it("bounds direct root SKILL.md imports to known support directories", async () => {
     const companyId = randomUUID();
     const repoDir = await createManagedSkillDir(companyId, "root-skill-");

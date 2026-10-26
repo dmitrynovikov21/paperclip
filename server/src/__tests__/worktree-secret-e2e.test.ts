@@ -111,12 +111,15 @@ it("keeps source signing keys outside a Kubernetes-style worktree run and accept
     expect(authorized.body).toMatchObject({ type: "agent", agentId, companyId, runId });
     expect((await request(app).get("/actor").set("Authorization", `Bearer ${sourceToken}`)).status).toBe(401);
   } finally {
-    await restoreWorkspace?.();
-    process.chdir(previousCwd);
-    for (const [key, value] of Object.entries(previousEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+    try {
+      await restoreWorkspace?.();
+    } finally {
+      process.chdir(previousCwd);
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fs.rm(root, { recursive: true, force: true });
     }
-    await fs.rm(root, { recursive: true, force: true });
   }
 });

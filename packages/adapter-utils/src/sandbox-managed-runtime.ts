@@ -710,6 +710,21 @@ function buildWorkspaceTarExtractCommand(input: {
   );
 }
 
+// A resumed lease can contain control-plane files staged by an older version.
+// An adopt_remote run skips the inbound extract, so exclusions on new archives
+// cannot remove those files. Reject a workspace-root alias before searching;
+// find does not follow nested symlinks and rm removes named symlinks themselves.
+function buildRemoveControlPlaneWorkspaceCommand(remoteDir: string): string {
+  if (!path.posix.isAbsolute(remoteDir) || path.posix.normalize(remoteDir) === "/") {
+    throw new Error("sandbox_control_plane_workspace_cleanup_invalid_root");
+  }
+  const quotedDir = shellQuote(remoteDir);
+  return `[ ! -L ${quotedDir} ] && cd ${quotedDir} && ` +
+    "find . -mindepth 1 -name '.paperclip' -prune -exec rm -rf -- {} + && " +
+    "remaining=$(find . -mindepth 1 -name '.paperclip' -print -quit) && " +
+    '[ -z "$remaining" ]';
+}
+
 // Named builder (C3): remove paths deleted in the host git worktree from the
 // sandbox workspace. Every path is shell-quoted; the caller supplies only
 // already-confined relative paths from the git snapshot.
@@ -1479,6 +1494,18 @@ export async function prepareSandboxManagedRuntime(input: {
     if (filesystemDeleted) await fs.rm(path.dirname(filesystemDeleted.filePath), { recursive: true, force: true });
   };
   try {
+  if (workspaceInboundMode === "adopt_remote") {
+    // This must complete before the prepared runtime is returned to the agent
+    // launcher. A failed removal or verification aborts reuse of this lease.
+    try {
+      await runStepSpan("workspace.scrub_control_plane", () => input.client.run(
+        buildRemoveControlPlaneWorkspaceCommand(workspaceRemoteDir),
+        { timeoutMs: input.spec.timeoutMs },
+      ));
+    } catch {
+      throw new Error("sandbox_control_plane_workspace_cleanup_failed");
+    }
+  }
   // A selected subfolder has no cloneable Git snapshot, but its parent
   // repository's ignore rules still govern which files may leave the host.
   // Use the same bounded, path-relative resolver as referenced project trees.

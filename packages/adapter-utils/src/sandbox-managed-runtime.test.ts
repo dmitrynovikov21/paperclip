@@ -614,6 +614,10 @@ describe("sandbox managed runtime", () => {
       "remote retained\n",
       "utf8",
     );
+    await mkdir(path.join(remoteWorkspaceDir, ".paperclip"));
+    await writeFile(path.join(remoteWorkspaceDir, ".paperclip", ".env"), "synthetic-old-source-key\n");
+    await mkdir(path.join(remoteWorkspaceDir, "nested", ".paperclip"), { recursive: true });
+    await writeFile(path.join(remoteWorkspaceDir, "nested", ".paperclip", ".env"), "synthetic-nested-source-key\n");
     const client = makeFilesystemClient();
     const syncIn = vi.spyOn(client, "syncIn");
 
@@ -623,6 +627,8 @@ describe("sandbox managed runtime", () => {
     });
 
     expect(syncIn).not.toHaveBeenCalled();
+    await expect(stat(path.join(remoteWorkspaceDir, ".paperclip"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(path.join(remoteWorkspaceDir, "nested", ".paperclip"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(
       readFile(path.join(remoteWorkspaceDir, "continuity.txt"), "utf8"),
     ).resolves.toBe("remote retained\n");
@@ -637,6 +643,42 @@ describe("sandbox managed runtime", () => {
     await expect(
       readFile(path.join(localWorkspaceDir, "continuity.txt"), "utf8"),
     ).resolves.toBe("remote finalized\n");
+  });
+
+  it("refuses to adopt a remote workspace when control-plane cleanup fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-adopt-denied-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir);
+    await mkdir(path.join(remoteWorkspaceDir, ".paperclip"), { recursive: true });
+    await writeFile(path.join(remoteWorkspaceDir, ".paperclip", ".env"), "synthetic-old-source-key\n");
+    const client = makeFilesystemClient();
+    client.run = vi.fn(async () => { throw new Error("synthetic remote cleanup failure"); });
+
+    await expect(prepareSandboxManagedRuntime({
+      ...sandboxRuntimeInput(sandboxSpec("sandbox-warm-denied", remoteWorkspaceDir), "test-adapter", client, localWorkspaceDir),
+      workspaceInboundMode: "adopt_remote",
+    })).rejects.toThrow("sandbox_control_plane_workspace_cleanup_failed");
+    await expect(stat(path.join(remoteWorkspaceDir, ".paperclip", ".env"))).resolves.toBeDefined();
+  });
+
+  it("refuses a remote workspace alias before recursively deleting control-plane files", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-adopt-alias-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const actualRemoteDir = path.join(rootDir, "outside-workspace");
+    const remoteAlias = path.join(rootDir, "remote-alias");
+    await mkdir(localWorkspaceDir);
+    await mkdir(path.join(actualRemoteDir, ".paperclip"), { recursive: true });
+    await writeFile(path.join(actualRemoteDir, ".paperclip", ".env"), "synthetic-outside-key\n");
+    await symlink(actualRemoteDir, remoteAlias);
+
+    await expect(prepareSandboxManagedRuntime({
+      ...sandboxRuntimeInput(sandboxSpec("sandbox-warm-alias", remoteAlias), "test-adapter", makeFilesystemClient(), localWorkspaceDir),
+      workspaceInboundMode: "adopt_remote",
+    })).rejects.toThrow("sandbox_control_plane_workspace_cleanup_failed");
+    await expect(stat(path.join(actualRemoteDir, ".paperclip", ".env"))).resolves.toBeDefined();
   });
 
   it("reconstructs a replacement workspace from the exact durable pre-turn seed", async () => {

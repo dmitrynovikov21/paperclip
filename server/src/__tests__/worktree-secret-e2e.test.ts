@@ -89,6 +89,21 @@ it("keeps source signing keys outside a Kubernetes-style worktree run and accept
     await client.run(`test ! -e '${path.join(remote, ".paperclip")}'`);
     expect(await fs.readFile(path.join(remote, "README.md"), "utf8")).toBe("safe workspace\n");
 
+    // Model a lease that still holds a copy uploaded before the exclusion fix.
+    await fs.mkdir(path.join(remote, ".paperclip"));
+    await fs.writeFile(path.join(remote, ".paperclip", ".env"), "PAPERCLIP_AGENT_JWT_SECRET=synthetic-source-jwt\n");
+    await fs.mkdir(path.join(remote, "nested", ".paperclip"), { recursive: true });
+    await fs.writeFile(path.join(remote, "nested", ".paperclip", ".env"), "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=synthetic-source-actions\n");
+    const adopted = await prepareSandboxManagedRuntime({
+      spec: { transport: "sandbox", provider: "kubernetes", sandboxId: "synthetic", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+      client, adapterKey: "test", workspaceLocalDir: workspace,
+      workspaceInboundMode: "adopt_remote",
+    });
+    restoreWorkspace = adopted.restoreWorkspace;
+    await prepared.cleanupWorkspaceSnapshot?.();
+    await client.run(`test ! -e '${path.join(remote, ".paperclip")}' && test ! -e '${path.join(remote, "nested", ".paperclip")}'`);
+    expect(await fs.readFile(path.join(remote, "README.md"), "utf8")).toBe("safe workspace\n");
+
     const agentId = randomUUID();
     const companyId = randomUUID();
     const runId = randomUUID();

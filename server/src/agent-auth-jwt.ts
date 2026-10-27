@@ -54,9 +54,9 @@ function jwtConfig() {
     audience: process.env.PAPERCLIP_AGENT_JWT_AUDIENCE ?? "paperclip-api",
     // The control-plane instance this process belongs to. The live plane runs as
     // "default"; every worktree/fork instance gets a distinct id (its worktree
-    // name) even though it deliberately shares PAPERCLIP_AGENT_JWT_SECRET with
-    // the source instance. Folding this into the signing-key derivation is what
-    // prevents a fork-minted token from authenticating against the live plane.
+    // name). New worktrees also receive independent signing secrets. Folding
+    // the instance id into the signing key still separates older instances
+    // that share a master secret.
     instanceId: resolvePaperclipInstanceId(),
     disableLegacyFallback: parseBooleanEnv(process.env.PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK),
   };
@@ -70,20 +70,20 @@ function jwtConfig() {
  *  - Per-company: a JWT signed for company A cannot be reused to authenticate
  *    as an agent in company B, even if the raw token leaks.
  *  - Per-instance: a JWT minted by a worktree/fork control-plane instance
- *    cannot authenticate against the live plane, even though forks
- *    deliberately share the same master secret (it is copied into worktree
- *    envs by provisioning). The live plane derives its key from its own
- *    instanceId ("default"), so a fork token — signed under the fork's
- *    instanceId — never matches. See PAP-12896 for the incident this closes.
+ *    cannot authenticate against the live plane. New worktrees have independent
+ *    master secrets; for older instances that still share one, the live plane
+ *    derives its key from its own instanceId ("default"), so a fork token —
+ *    signed under the fork's instanceId — never matches. See PAP-12896 for
+ *    the incident this closes.
  *
  * The instance-wide master secret is never used to sign new tokens — it is
  * retained only as a verification fallback so that tokens issued before this
  * change continue to validate. NOTE: that legacy fallback is instance-agnostic
- * (it signs with the raw shared secret), so complete cryptographic instance
- * isolation additionally requires disabling it once outstanding legacy tokens
- * have expired (set PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK=true). Normal
- * fork-minted run tokens are already rejected without that step because they
- * are signed with the derived key, not the raw master secret.
+ * (it signs with the raw master secret), so older instances that share that
+ * secret must disable it once outstanding legacy tokens have expired (set
+ * PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK=true). Normal fork-minted run
+ * tokens are already rejected without that step because they are signed with
+ * the derived key, not the raw master secret.
  *
  * The derivation domain-separates with the `jwt:` prefix so the same master
  * secret can safely be reused for other HMAC purposes without key reuse.

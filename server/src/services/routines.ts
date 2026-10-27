@@ -50,6 +50,7 @@ import {
   extractRoutineVariableNames,
   interpolateRoutineTemplate,
   isValidRoutineDateString,
+  normalizeAgentUrlKey,
   pluginOperationIssueOriginKind,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
@@ -1974,12 +1975,18 @@ export function routineService(
     getDetail: async (id: string): Promise<RoutineDetail | null> => {
       const row = await getRoutineById(id);
       if (!row) return null;
-      const [project, assignee, parentIssue, descriptionDocument, triggers, recentRuns, activeIssue, managedByRoutine] = await Promise.all([
+      const [project, assigneeRow, parentIssue, descriptionDocument, triggers, recentRuns, activeIssue, managedByRoutine] = await Promise.all([
         row.projectId
           ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
           : null,
         row.assigneeAgentId
-          ? db.select().from(agents).where(eq(agents.id, row.assigneeAgentId)).then((rows) => rows[0] ?? null)
+          ? db.select({
+              id: agents.id,
+              name: agents.name,
+              role: agents.role,
+              title: agents.title,
+            }).from(agents).where(and(eq(agents.id, row.assigneeAgentId), eq(agents.companyId, row.companyId)))
+              .then((rows) => rows[0] ?? null)
           : null,
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
@@ -2063,7 +2070,13 @@ export function routineService(
         ...row,
         managedByPlugin: managedByRoutine.get(row.id) ?? null,
         project,
-        assignee,
+        assignee: assigneeRow ? {
+          id: assigneeRow.id,
+          name: assigneeRow.name,
+          role: assigneeRow.role,
+          title: assigneeRow.title,
+          urlKey: normalizeAgentUrlKey(assigneeRow.name) ?? assigneeRow.id,
+        } : null,
         parentIssue,
         descriptionDocument,
         triggers: triggers as RoutineTrigger[],

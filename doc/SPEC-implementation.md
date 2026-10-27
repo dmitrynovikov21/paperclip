@@ -542,6 +542,10 @@ Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and
   - modify company-wide budgets directly
   - mutate auth/keys
 
+Routine detail is company-visible work context. Its `assignee` field contains only
+`id`, `name`, `role`, `title`, and `urlKey`; it does not expose agent adapter or
+runtime configuration, permissions, or metadata.
+
 ## 9.3 Permission Matrix (V1)
 
 | Action | Board | Agent |

@@ -229,6 +229,92 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     return { companyId, agentId, projectId, userId };
   }
 
+  it("returns only the public assignee summary to same-company agents and board viewers", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const readerAgentId = randomUUID();
+    const foreignCompanyId = randomUUID();
+    const foreignAgentId = randomUUID();
+    const adapterSentinel = "SYNTHETIC_ROUTINE_ADAPTER_SECRET";
+    const runtimeSentinel = "SYNTHETIC_ROUTINE_RUNTIME_SECRET";
+
+    await db.update(agents).set({
+      name: "Assigned Agent",
+      title: "Routine owner",
+      adapterConfig: { env: { SYNTHETIC_TOKEN: adapterSentinel } },
+      runtimeConfig: { syntheticCredential: runtimeSentinel },
+      permissions: { privateFlag: true },
+      metadata: { privateNote: "synthetic-only" },
+    }).where(eq(agents.id, agentId));
+    await db.insert(agents).values({
+      id: readerAgentId,
+      companyId,
+      name: "Routine Reader",
+      role: "engineer",
+      status: "active",
+    });
+    await db.insert(companies).values({
+      id: foreignCompanyId,
+      name: "Other Company",
+      issuePrefix: `T${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: foreignCompanyId,
+      name: "Foreign Reader",
+      role: "engineer",
+      status: "active",
+    });
+
+    const ownerApp = await createApp({
+      type: "board",
+      userId,
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+    const created = await request(ownerApp)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ title: "Safe routine detail", projectId, assigneeAgentId: agentId });
+    expect(created.status).toBe(201);
+    const detailPath = `/api/routines/${created.body.id}`;
+    const expectedAssignee = {
+      id: agentId,
+      name: "Assigned Agent",
+      role: "engineer",
+      title: "Routine owner",
+      urlKey: "assigned-agent",
+    };
+
+    const readerApp = await createApp({ type: "agent", agentId: readerAgentId, companyId });
+    const viewerApp = await createApp({
+      type: "board",
+      userId: randomUUID(),
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    });
+    for (const app of [readerApp, viewerApp]) {
+      const response = await request(app).get(detailPath);
+      expect(response.status).toBe(200);
+      expect(response.body.title).toBe("Safe routine detail");
+      expect(response.body.projectId).toBe(projectId);
+      expect(response.body.assignee).toEqual(expectedAssignee);
+      expect(Object.keys(response.body.assignee).sort()).toEqual(Object.keys(expectedAssignee).sort());
+      expect(JSON.stringify(response.body)).not.toContain(adapterSentinel);
+      expect(JSON.stringify(response.body)).not.toContain(runtimeSentinel);
+    }
+
+    const foreignApp = await createApp({
+      type: "agent",
+      agentId: foreignAgentId,
+      companyId: foreignCompanyId,
+    });
+    const foreignResponse = await request(foreignApp).get(detailPath);
+    expect(foreignResponse.status).toBe(404);
+    expect(foreignResponse.body).toEqual({ error: "Routine not found" });
+  }, 30_000);
+
   it("supports creating, scheduling, and manually running a routine through the API", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
     const app = await createApp({

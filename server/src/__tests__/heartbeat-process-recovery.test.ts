@@ -30,6 +30,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -105,6 +106,12 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "../services/issue-execution-policy.ts";
+import { recoveryService } from "../services/recovery/service.ts";
 import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
@@ -187,6 +194,61 @@ async function waitForValue<T>(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return latest ?? null;
+}
+
+function withCandidateSnapshotMutation(
+  db: ReturnType<typeof createDb>,
+  issueId: string,
+  onSelected: () => Promise<void>,
+) {
+  let candidateSelected = false;
+  const snapshotDb = new Proxy(db, {
+    get(target, property) {
+      if (property !== "select") {
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return (...args: unknown[]) => {
+        const builder = Reflect.apply(target.select, target, args);
+        return new Proxy(builder, {
+          get(builder, method) {
+            if (method !== "from") return Reflect.get(builder, method, builder);
+            return (table: unknown) => {
+              const fromQuery = Reflect.apply(builder.from, builder, [table]);
+              if (table !== issues || candidateSelected) return fromQuery;
+              return new Proxy(fromQuery, {
+                get(fromQuery, method) {
+                  if (method !== "where") return Reflect.get(fromQuery, method, fromQuery);
+                  return (condition: unknown) => {
+                    const whereQuery = Reflect.apply(fromQuery.where, fromQuery, [condition]);
+                    return new Proxy(whereQuery, {
+                      get(whereQuery, method) {
+                        if (method !== "then") return Reflect.get(whereQuery, method, whereQuery);
+                        return (
+                          onResolved: (rows: Array<typeof issues.$inferSelect>) => unknown,
+                          onRejected: (error: unknown) => unknown,
+                        ) => Reflect.apply(whereQuery.then, whereQuery, [
+                          async (rows: Array<typeof issues.$inferSelect>) => {
+                            if (rows.some((row) => row.id === issueId)) {
+                              candidateSelected = true;
+                              await onSelected();
+                            }
+                            return onResolved(rows);
+                          },
+                          onRejected,
+                        ]);
+                      },
+                    });
+                  };
+                },
+              });
+            };
+          },
+        });
+      };
+    },
+  });
+  return { snapshotDb, wasSelected: () => candidateSelected };
 }
 
 async function waitForHeartbeatIdle(
@@ -4635,6 +4697,170 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_review");
     expect(issue?.assigneeAgentId).toBe(agentId);
+  });
+
+  it.each(["issue_terminal_status", "issue_dependencies_blocked"] as const)(
+    "HELA-18354 keeps an approved review done after a stale %s recovery candidate",
+    async (cancelCode) => {
+      const { companyId, agentId, issueId, runId, stageId } =
+        await seedInReviewParticipantRunFixture({
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+        });
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId }] }],
+      })!;
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, issueId));
+
+      if (cancelCode === "issue_dependencies_blocked") {
+        const blockerId = randomUUID();
+        await db.insert(issues).values({
+          id: blockerId,
+          companyId,
+          title: "Open prerequisite",
+          status: "todo",
+          priority: "medium",
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+
+      const heartbeat = heartbeatService(db);
+      const approveLastStage = async () => {
+        const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const transition = applyIssueExecutionPolicyTransition({
+          issue: source!,
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId },
+          commentBody: "Approved final review stage",
+        });
+        expect(transition.decision).toMatchObject({ outcome: "approved", stageId });
+        const decisionId = randomUUID();
+        await db.transaction(async (tx) => {
+          const updated = await issueService(db).update(issueId, {
+            status: "done",
+            executionState: {
+              ...(transition.patch.executionState as Record<string, unknown>),
+              lastDecisionId: decisionId,
+            },
+          }, tx);
+          expect(updated?.status).toBe("done");
+          await tx.insert(issueExecutionDecisions).values({
+            id: decisionId,
+            companyId,
+            issueId,
+            stageId,
+            stageType: "review",
+            actorAgentId: agentId,
+            outcome: "approved",
+            body: "Approved final review stage",
+          });
+        });
+      };
+      const cancelQueuedRecovery = async () => {
+        await heartbeat.resumeQueuedRuns();
+        const cancelled = await waitForRunToSettle(heartbeat, runId, 8_000);
+        expect(cancelled).toMatchObject({ status: "cancelled", errorCode: cancelCode });
+      };
+
+      // The sweep retains its in_review/pending candidate while a real stage
+      // decision and heartbeat cancellation commit newer state.
+      const { snapshotDb, wasSelected } = withCandidateSnapshotMutation(db, issueId, async () => {
+        if (cancelCode === "issue_terminal_status") {
+          await approveLastStage();
+          await cancelQueuedRecovery();
+        } else {
+          await cancelQueuedRecovery();
+          await approveLastStage();
+        }
+      });
+
+      const enqueueWakeup = vi.fn(async () => null);
+      const result = await recoveryService(snapshotDb, { enqueueWakeup })
+        .reconcileStrandedAssignedIssues();
+      expect(wasSelected()).toBe(true);
+      expect(result.escalated).toBe(0);
+      expect(result.reviewParticipantRequeued).toBe(0);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+
+      const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(source).toMatchObject({ status: "done" });
+      expect(source?.executionState).toMatchObject({
+        status: "completed",
+        lastDecisionOutcome: "approved",
+      });
+      const actions = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actions).toEqual([]);
+      const activity = await db.select().from(activityLog)
+        .where(eq(activityLog.entityId, issueId));
+      expect(activity.some((event) =>
+        (event.details as Record<string, unknown> | null)?.source ===
+          "recovery.reconcile_execution_review_participant",
+      )).toBe(false);
+    },
+  );
+
+  it("HELA-18354 does not create a recovery action when approval wins a failed-review escalation race", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } =
+      await seedInReviewParticipantRunFixture({
+        wakeReason: "execution_review_participant_recovery",
+        retryReason: "execution_review_participant_recovery",
+      });
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "failed",
+      finishedAt: new Date(),
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const { snapshotDb, wasSelected } = withCandidateSnapshotMutation(db, issueId, async () => {
+      const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+      await issueService(db).update(issueId, {
+        status: "done",
+        executionState: {
+          ...(source!.executionState as Record<string, unknown>),
+          status: "completed",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          lastDecisionOutcome: "approved",
+        },
+      });
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+    const result = await recoveryService(snapshotDb, { enqueueWakeup })
+      .reconcileStrandedAssignedIssues();
+    expect(wasSelected()).toBe(true);
+    expect(result.escalated).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source).toMatchObject({ status: "done" });
+    expect(source?.executionState).toMatchObject({
+      status: "completed",
+      lastDecisionOutcome: "approved",
+    });
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toEqual([]);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.some((event) =>
+      (event.details as Record<string, unknown> | null)?.source ===
+        "recovery.reconcile_execution_review_participant",
+    )).toBe(false);
   });
 
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {

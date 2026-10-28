@@ -35,7 +35,7 @@ import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -325,6 +325,16 @@ function didAutomaticRecoveryFail(
   expectedRetryReason: "assignment_recovery" | "issue_continuation_needed" | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
 ) {
   if (!latestRun) return false;
+
+  // These cancellations describe a source issue that cannot run, not a reviewer
+  // that failed to submit a decision. In particular, a final approval can
+  // terminalize the issue before its already queued recovery wake is claimed.
+  if (
+    expectedRetryReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON &&
+    latestRun.status === "cancelled" &&
+    (latestRun.errorCode === "issue_terminal_status" ||
+      latestRun.errorCode === "issue_dependencies_blocked")
+  ) return false;
 
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
@@ -2870,7 +2880,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  }, store: Db = db) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
@@ -2880,7 +2890,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     });
     const ownerAgentId = routing.ownerAgentId;
     const now = new Date();
-    const action = await recoveryActionsSvc.upsertSourceScoped({
+    const action = await (store === db ? recoveryActionsSvc : issueRecoveryActionService(store)).upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
       kind: strandedRecoveryActionKind(recoveryCause),
@@ -3298,7 +3308,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
-  async function escalateStrandedAssignedIssue(input: {
+  type StrandedAssignedEscalationInput = {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
@@ -3307,7 +3317,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  };
+
+  function isCurrentPendingReviewCandidate(
+    current: typeof issues.$inferSelect | null,
+    candidate: typeof issues.$inferSelect,
+  ) {
+    if (!current || current.status !== "in_review" || current.assigneeAgentId !== candidate.assigneeAgentId) {
+      return false;
+    }
+    const expected = parseIssueExecutionState(candidate.executionState);
+    const actual = parseIssueExecutionState(current.executionState);
+    return expected?.status === "pending" && actual?.status === "pending" &&
+      expected.currentStageId === actual.currentStageId &&
+      JSON.stringify(expected.currentParticipant) === JSON.stringify(actual.currentParticipant);
+  }
+
+  async function escalateStrandedAssignedIssue(input: StrandedAssignedEscalationInput) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -3316,6 +3342,56 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
+    if (input.issue.status === "in_review" &&
+        parseIssueExecutionState(input.issue.executionState)?.status === "pending") {
+      // The candidate list was read before the reviewer could approve. Hold the
+      // issue row through the recovery action, status, comment and activity
+      // writes so a completed review cannot be reopened by this sweep.
+      const publications: ActivityPublication[] = [];
+      const outcome = await db.transaction(async (tx) => {
+        const current = await tx.select().from(issues)
+          .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!isCurrentPendingReviewCandidate(current, input.issue)) return null;
+        return escalateStrandedAssignedIssueCore(
+          { ...input, issue: current! },
+          tx as unknown as Db,
+          true,
+          publications,
+        );
+      });
+      if (!outcome) return null;
+      for (const publication of publications) publishActivity(publication);
+
+      // enqueueWakeup owns another issue-row transaction, so it must run after
+      // our lock is released. Recheck the committed state first; its own gate
+      // also rejects a terminal issue if approval wins this later race.
+      const current = await db.select().from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (current?.status === "blocked" &&
+          current.assigneeAgentId === outcome.recoveryAction.ownerAgentId) {
+        await enqueueSourceScopedStrandedRecoveryWake({
+          action: outcome.recoveryAction,
+          issue: current,
+          latestRun: input.latestRun,
+          recoveryCause: resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause),
+        });
+      }
+      return outcome.updated;
+    }
+
+    const outcome = await escalateStrandedAssignedIssueCore(input, db, false);
+    return outcome?.updated ?? null;
+  }
+
+  async function escalateStrandedAssignedIssueCore(
+    input: StrandedAssignedEscalationInput,
+    store: Db,
+    guardedReview: boolean,
+    postCommitPublications?: ActivityPublication[],
+  ) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -3324,7 +3400,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-    });
+    }, store);
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
       Boolean(recoveryAction.returnOwnerAgentId);
@@ -3341,16 +3417,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       status: "blocked",
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
-    });
+    }, store);
     if (!updated) return null;
-    if (isProviderQuotaWait) return updated;
+    if (isProviderQuotaWait) return { updated, recoveryAction };
 
     const recoveryOwner = recoveryAction.ownerAgentId ? await getAgent(recoveryAction.ownerAgentId) : null;
     const sourceAssignee = input.issue.assigneeAgentId ? await getAgent(input.issue.assigneeAgentId) : null;
     let notice: SuccessfulRunHandoffNotice | null = null;
     if (input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON && input.successfulRunHandoffEvidence) {
       const [sourceRun] = input.successfulRunHandoffEvidence.sourceRunId
-        ? await db
+        ? await store
           .select({
             id: heartbeatRuns.id,
             status: heartbeatRuns.status,
@@ -3404,7 +3480,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
-      const hasEscalationComment = await db
+      const hasEscalationComment = await store
         .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
         .from(issueComments)
         .where(
@@ -3426,18 +3502,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             authorType: "system",
             presentation: notice.presentation,
             metadata: notice.metadata,
-          });
+          }, store);
         } else {
           await issuesSvc.addComment(input.issue.id, escalationNotice.body, {}, {
             authorType: "system",
             presentation: escalationNotice.presentation,
             metadata: escalationNotice.metadata,
-          });
+          }, store);
         }
       }
     }
 
-    await logActivity(db, {
+    await logActivity(store, {
       companyId: input.issue.companyId,
       actorType: "system",
       actorId: "system",
@@ -3471,16 +3547,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
         blockerIssueIds: blockerIds,
       },
-    });
+    }, postCommitPublications);
 
-    await enqueueSourceScopedStrandedRecoveryWake({
-      action: recoveryAction,
-      issue: input.issue,
-      latestRun: input.latestRun,
-      recoveryCause,
-    });
+    if (!guardedReview) {
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: recoveryAction,
+        issue: input.issue,
+        latestRun: input.latestRun,
+        recoveryCause,
+      });
+    }
 
-    if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
+    if (!guardedReview && recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
       const [currentIssue] = await db
         .select({
           status: issues.status,
@@ -3499,11 +3577,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           blockedByIssueIds: blockerIds,
           assigneeAgentId: recoveryAction.ownerAgentId,
         });
-        if (reblocked) return reblocked;
+        if (reblocked) return { updated: reblocked, recoveryAction };
       }
     }
 
-    return updated;
+    return { updated, recoveryAction };
   }
 
   async function persistAdapterFailureRecoveryClassification(
@@ -3554,8 +3632,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     issue: typeof issues.$inferSelect;
     latestRun: NonNullable<LatestIssueRun>;
     classification: Extract<NonNullable<AdapterFailureRecoveryClassification>, { kind: "provider_quota" }>;
-  }) {
+  }, store: Db = db, postCommitPublications?: ActivityPublication[]): Promise<Awaited<ReturnType<typeof issuesSvc.update>>> {
     if (input.issue.status !== "in_progress" && input.issue.status !== "in_review") return null;
+
+    if (store === db && input.issue.status === "in_review" &&
+        parseIssueExecutionState(input.issue.executionState)?.status === "pending") {
+      const publications: ActivityPublication[] = [];
+      const updated = await db.transaction(async (tx) => {
+        const current = await tx.select().from(issues)
+          .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.issue.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!isCurrentPendingReviewCandidate(current, input.issue)) return null;
+        return scheduleProviderQuotaRecoveryMonitor(
+          { ...input, issue: current! },
+          tx as unknown as Db,
+          publications,
+        );
+      });
+      for (const publication of publications) publishActivity(publication);
+      return updated;
+    }
 
     const targetAgentId = getAdapterFailureRecoveryTargetAgentId(input.issue);
     if (!targetAgentId || input.latestRun.agentId !== targetAgentId) return null;
@@ -3592,10 +3689,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const updated = await issuesSvc.update(input.issue.id, {
       ...transition.patch,
       executionPolicy: policy,
-    });
+    }, store);
     if (!updated) return null;
 
-    await logActivity(db, {
+    await logActivity(store, {
       companyId: input.issue.companyId,
       actorType: "system",
       actorId: "recovery",
@@ -3613,7 +3710,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         parsedResetTime: input.classification.parsedResetTime,
         targetAgentId,
       },
-    });
+    }, postCommitPublications);
 
     return updated;
   }
@@ -3674,6 +3771,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const issue of candidates) {
+      if (parseObject(issue.executionState).status === "completed") {
+        result.skipped += 1;
+        continue;
+      }
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -3899,6 +4000,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
+        if (participantLatestRun?.status === "cancelled" &&
+            (participantLatestRun.errorCode === "issue_terminal_status" ||
+              participantLatestRun.errorCode === "issue_dependencies_blocked")) {
+          result.skipped += 1;
+          continue;
+        }
+
         if (!participantLatestRun || !isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
@@ -4009,6 +4117,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // The candidate may have been approved while this sweep inspected the
+        // run and budget. A terminal or completed stage has no recovery wake.
+        const current = await db.select().from(issues)
+          .where(eq(issues.id, issue.id))
+          .then((rows) => rows[0] ?? null);
+        if (!isCurrentPendingReviewCandidate(current, issue)) {
           result.skipped += 1;
           continue;
         }

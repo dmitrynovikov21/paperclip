@@ -3347,7 +3347,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const expected = parseIssueExecutionState(candidate.executionState);
     const actual = parseIssueExecutionState(current.executionState);
     return expected?.status === "pending" && actual?.status === "pending" &&
+      expected.currentStageType === actual.currentStageType &&
       expected.currentStageId === actual.currentStageId &&
+      expected.lastDecisionId === actual.lastDecisionId &&
       JSON.stringify(expected.currentParticipant) === JSON.stringify(actual.currentParticipant);
   }
 

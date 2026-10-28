@@ -2488,6 +2488,11 @@ interface WakeupOptions {
     assigneeAgentId: string | null;
     lastDecisionId: string | null;
   };
+  expectedSourceScopedRecoveryAction?: {
+    actionId: string;
+    ownerAgentId: string;
+    attemptCount: number;
+  };
 }
 
 type UsageTotals = {
@@ -17735,6 +17740,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               state.currentParticipant.agentId !== expected.participantAgentId ||
               state.lastDecisionId !== expected.lastDecisionId ||
               agentId !== expected.participantAgentId) {
+            return { kind: "skipped" as const };
+          }
+        }
+
+        // Escalation commits before requesting the owner's recovery wake. A
+        // source update or action resolution can win between the post-commit
+        // read and this transaction; validate both rows before inserting work.
+        if (opts.expectedSourceScopedRecoveryAction) {
+          const expected = opts.expectedSourceScopedRecoveryAction;
+          if (issue.status !== "blocked" ||
+              issue.assigneeAgentId !== expected.ownerAgentId ||
+              parseIssueExecutionState(issue.executionState)?.status === "completed" ||
+              agentId !== expected.ownerAgentId) {
+            return { kind: "skipped" as const };
+          }
+          const action = await tx.select({
+            ownerAgentId: issueRecoveryActions.ownerAgentId,
+            attemptCount: issueRecoveryActions.attemptCount,
+          }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.id, expected.actionId),
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).for("update").then((rows) => rows[0] ?? null);
+          if (action?.ownerAgentId !== expected.ownerAgentId ||
+              action.attemptCount !== expected.attemptCount) {
             return { kind: "skipped" as const };
           }
         }

@@ -133,6 +133,11 @@ type RecoveryWakeupOptions = {
     assigneeAgentId: string | null;
     lastDecisionId: string | null;
   };
+  expectedSourceScopedRecoveryAction?: {
+    actionId: string;
+    ownerAgentId: string;
+    attemptCount: number;
+  };
 };
 
 type RecoveryWakeup = (
@@ -2987,6 +2992,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       triggerDetail: "system",
       reason: "source_scoped_recovery_action",
       idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
+      expectedSourceScopedRecoveryAction: input.recoveryCause === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON ? {
+        actionId: input.action.id,
+        ownerAgentId: input.action.ownerAgentId,
+        attemptCount: input.action.attemptCount,
+      } : undefined,
       payload: withRecoveryModelProfileHint({
         issueId: input.issue.id,
         sourceIssueId: input.issue.id,

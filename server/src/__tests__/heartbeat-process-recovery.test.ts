@@ -4937,6 +4937,76 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     )).toBe(false);
   });
 
+  it.each(["source_done", "action_cancelled", "owner_changed"] as const)(
+    "HELA-18354 does not queue a stale review recovery action wake after %s",
+    async (change) => {
+      const { agentId, issueId, runId, wakeupRequestId } =
+        await seedInReviewParticipantRunFixture({
+          wakeReason: "execution_review_participant_recovery",
+          retryReason: "execution_review_participant_recovery",
+        });
+      await db.update(heartbeatRuns).set({
+        status: "failed",
+        errorCode: "adapter_failed",
+        finishedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, runId));
+      await db.update(agentWakeupRequests).set({
+        status: "failed",
+        finishedAt: new Date(),
+      }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+      const heartbeat = heartbeatService(db);
+      let attemptedWake = false;
+      const result = await recoveryService(db, {
+        enqueueWakeup: async (targetAgentId, options) => {
+          // The escalation committed and reread blocked, but another actor can
+          // finish the issue or resolve its action before enqueueWakeup locks it.
+          attemptedWake = true;
+          const [action] = await db.select().from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+          expect(action?.status).toBe("active");
+          const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+          expect(source?.status).toBe("blocked");
+          expect(options?.expectedSourceScopedRecoveryAction).toMatchObject({
+            actionId: action!.id,
+            ownerAgentId: agentId,
+            attemptCount: 1,
+          });
+          if (change === "source_done") {
+            await issueService(db).update(issueId, {
+              status: "done",
+              executionState: {
+                ...(source!.executionState as Record<string, unknown>),
+                status: "completed",
+                currentStageId: null,
+                currentStageIndex: null,
+                currentStageType: null,
+                currentParticipant: null,
+                lastDecisionOutcome: "approved",
+              },
+            });
+          } else if (change === "action_cancelled") {
+            await db.update(issueRecoveryActions).set({ status: "cancelled" })
+              .where(eq(issueRecoveryActions.id, action!.id));
+          } else {
+            await db.update(issues).set({ assigneeAgentId: null })
+              .where(eq(issues.id, issueId));
+          }
+          return heartbeat.wakeup(targetAgentId, options);
+        },
+      }).reconcileStrandedAssignedIssues();
+
+      expect(attemptedWake).toBe(true);
+      expect(result.escalated).toBe(1);
+      const wakeups = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups).toHaveLength(1);
+      const runs = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+    },
+  );
+
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = heartbeatService(db);

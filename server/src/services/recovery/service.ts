@@ -127,6 +127,12 @@ type RecoveryWakeupOptions = {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  expectedReviewRecovery?: {
+    stageId: string;
+    participantAgentId: string;
+    assigneeAgentId: string | null;
+    lastDecisionId: string | null;
+  };
 };
 
 type RecoveryWakeup = (
@@ -1140,6 +1146,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    expectedReviewRecovery?: RecoveryWakeupOptions["expectedReviewRecovery"];
   }) {
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
@@ -1161,6 +1168,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
+      expectedReviewRecovery: input.expectedReviewRecovery,
     });
 
     if (queued && input.retryOfRunId) {
@@ -3994,7 +4002,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (issue.status === "in_review") {
-        if (!participantAgentId || !pendingExecutionState) {
+        if (!participantAgentId || !pendingExecutionState ||
+            pendingExecutionState.currentStageType !== "review" ||
+            !pendingExecutionState.currentStageId) {
           result.skipped += 1;
           continue;
         }
@@ -4138,6 +4148,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
           source: "issue.execution_review_recovery",
           retryOfRunId: participantLatestRun.id,
+          expectedReviewRecovery: {
+            stageId: pendingExecutionState.currentStageId,
+            participantAgentId,
+            assigneeAgentId: issue.assigneeAgentId,
+            lastDecisionId: pendingExecutionState.lastDecisionId,
+          },
           extraContext: {
             currentStageId: pendingExecutionState.currentStageId ?? null,
             currentStageType: pendingExecutionState.currentStageType ?? null,

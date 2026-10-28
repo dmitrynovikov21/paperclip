@@ -4807,6 +4807,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it("HELA-18354 does not queue a recovery wake when approval wins after the final candidate read", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({
+      status: "succeeded",
+      finishedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      status: "completed",
+      finishedAt: new Date(),
+    }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    const heartbeat = heartbeatService(db);
+    let attemptedWake = false;
+    const result = await recoveryService(db, {
+      enqueueWakeup: async (targetAgentId, options) => {
+        attemptedWake = true;
+        const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+        const transition = applyIssueExecutionPolicyTransition({
+          issue: source!,
+          policy,
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId },
+          commentBody: "Approved final review stage",
+        });
+        expect(transition.decision).toMatchObject({ outcome: "approved", stageId });
+        const decisionId = randomUUID();
+        await db.transaction(async (tx) => {
+          await issueService(db).update(issueId, {
+            status: "done",
+            executionState: {
+              ...(transition.patch.executionState as Record<string, unknown>),
+              lastDecisionId: decisionId,
+            },
+          }, tx);
+          await tx.insert(issueExecutionDecisions).values({
+            id: decisionId,
+            companyId,
+            issueId,
+            stageId,
+            stageType: "review",
+            actorAgentId: agentId,
+            outcome: "approved",
+            body: "Approved final review stage",
+          });
+        });
+        return heartbeat.wakeup(targetAgentId, options);
+      },
+    }).reconcileStrandedAssignedIssues();
+
+    expect(attemptedWake).toBe(true);
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(result.skipped).toBeGreaterThan(0);
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source).toMatchObject({ status: "done" });
+    expect(source?.executionState).toMatchObject({
+      status: "completed",
+      lastDecisionOutcome: "approved",
+    });
+    const wakeups = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toEqual([]);
+  });
+
   it("HELA-18354 does not create a recovery action when approval wins a failed-review escalation race", async () => {
     const { agentId, issueId, runId, wakeupRequestId } =
       await seedInReviewParticipantRunFixture({

@@ -2482,6 +2482,17 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  expectedReviewRecovery?: {
+    stageId: string;
+    participantAgentId: string;
+    assigneeAgentId: string | null;
+    lastDecisionId: string | null;
+  };
+  expectedSourceScopedRecoveryAction?: {
+    actionId: string;
+    ownerAgentId: string;
+    attemptCount: number;
+  };
 }
 
 type UsageTotals = {
@@ -17688,6 +17699,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             executionWorkspacePreference: issues.executionWorkspacePreference,
             executionWorkspaceSettings: issues.executionWorkspaceSettings,
             assigneeAgentId: issues.assigneeAgentId,
+            executionState: issues.executionState,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
             createdAt: issues.createdAt,
@@ -17711,6 +17723,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
+        }
+
+        // A recovery sweep can keep a pending-review snapshot after the final
+        // decision commits. Check the expected stage under the same row lock
+        // that protects the wake and run inserts below.
+        if (opts.expectedReviewRecovery) {
+          const expected = opts.expectedReviewRecovery;
+          const state = parseIssueExecutionState(issue.executionState);
+          if (issue.status !== "in_review" ||
+              issue.assigneeAgentId !== expected.assigneeAgentId ||
+              state?.status !== "pending" ||
+              state.currentStageType !== "review" ||
+              state.currentStageId !== expected.stageId ||
+              state.currentParticipant?.type !== "agent" ||
+              state.currentParticipant.agentId !== expected.participantAgentId ||
+              state.lastDecisionId !== expected.lastDecisionId ||
+              agentId !== expected.participantAgentId) {
+            return { kind: "skipped" as const };
+          }
+        }
+
+        // Escalation commits before requesting the owner's recovery wake. A
+        // source update or action resolution can win between the post-commit
+        // read and this transaction; validate both rows before inserting work.
+        if (opts.expectedSourceScopedRecoveryAction) {
+          const expected = opts.expectedSourceScopedRecoveryAction;
+          if (issue.status !== "blocked" ||
+              issue.assigneeAgentId !== expected.ownerAgentId ||
+              parseIssueExecutionState(issue.executionState)?.status === "completed" ||
+              agentId !== expected.ownerAgentId) {
+            return { kind: "skipped" as const };
+          }
+          const action = await tx.select({
+            ownerAgentId: issueRecoveryActions.ownerAgentId,
+            attemptCount: issueRecoveryActions.attemptCount,
+          }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.id, expected.actionId),
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).for("update").then((rows) => rows[0] ?? null);
+          if (action?.ownerAgentId !== expected.ownerAgentId ||
+              action.attemptCount !== expected.attemptCount) {
+            return { kind: "skipped" as const };
+          }
         }
 
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {

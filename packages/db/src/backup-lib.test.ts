@@ -4,7 +4,12 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  removeStaleBackupPartials,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -71,6 +76,86 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("removeStaleBackupPartials", () => {
+  const HOUR = 60 * 60 * 1000;
+  const STALE_AFTER_MS = 10 * 60 * 1000;
+
+  /** A file last written `ageMs` ago. */
+  function fileAged(dir: string, name: string, ageMs: number, content = ""): void {
+    const filePath = path.join(dir, name);
+    fs.writeFileSync(filePath, content);
+    const mtimeSeconds = (Date.now() - ageMs) / 1000;
+    fs.utimesSync(filePath, mtimeSeconds, mtimeSeconds);
+  }
+
+  it("removes only stale partial files of its own format", () => {
+    const dir = createTempDir("paperclip-partials-format-");
+    fileAged(dir, "paperclip-20261030-120000.sql.gz.partial", HOUR, "gzip");
+    fileAged(dir, "paperclip-20261030-120000.sql.partial", HOUR, "uncompressed sql");
+    const untouched = [
+      "paperclip-20261030-110000.sql.gz",
+      "paperclip-20261030-110000.sql",
+      "paperclip-manual.sql.gz.partial",
+      "other-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.gz.partial.bak",
+      "paperclip-20261030-120000.dump.partial",
+    ];
+    for (const name of untouched) fileAged(dir, name, HOUR, "x");
+    fs.mkdirSync(path.join(dir, "paperclip-20261030-130000.sql.gz.partial"));
+
+    const result = removeStaleBackupPartials({ backupDir: dir, staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.kept).toEqual([]);
+    const removed = result.removed
+      .map(({ name, sizeBytes, compressed }) => ({ name, sizeBytes, compressed }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    expect(removed).toEqual([
+      { name: "paperclip-20261030-120000.sql.gz.partial", sizeBytes: 4, compressed: true },
+      { name: "paperclip-20261030-120000.sql.partial", sizeBytes: 16, compressed: false },
+    ]);
+    expect(fs.readdirSync(dir).sort()).toEqual([...untouched, "paperclip-20261030-130000.sql.gz.partial"].sort());
+  });
+
+  it("keeps every file of a run that wrote to any of them recently", () => {
+    const dir = createTempDir("paperclip-partials-group-");
+    // Compressing: the SQL file is only read, the gzip output is still growing.
+    fileAged(dir, "paperclip-20261030-120000.sql.partial", HOUR, "sql");
+    fileAged(dir, "paperclip-20261030-120000.sql.gz.partial", 0, "gz");
+    fileAged(dir, "paperclip-20261030-090000.sql.gz.partial", HOUR, "old");
+
+    const result = removeStaleBackupPartials({ backupDir: dir, staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.removed.map((file) => file.name)).toEqual(["paperclip-20261030-090000.sql.gz.partial"]);
+    expect(result.kept.map((file) => file.name).sort()).toEqual([
+      "paperclip-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.partial",
+    ]);
+    expect(fs.readdirSync(dir).sort()).toEqual([
+      "paperclip-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.partial",
+    ]);
+  });
+
+  it("matches the file name prefix literally", () => {
+    const dir = createTempDir("paperclip-partials-prefix-");
+    fileAged(dir, "a.b-20261030-120000.sql.gz.partial", HOUR);
+    fileAged(dir, "aXb-20261030-120000.sql.gz.partial", HOUR);
+
+    const result = removeStaleBackupPartials({ backupDir: dir, filenamePrefix: "a.b", staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.removed.map((file) => file.name)).toEqual(["a.b-20261030-120000.sql.gz.partial"]);
+    expect(fs.readdirSync(dir)).toEqual(["aXb-20261030-120000.sql.gz.partial"]);
+  });
+
+  it("returns nothing for a missing directory", () => {
+    const dir = createTempDir("paperclip-partials-missing-");
+    expect(removeStaleBackupPartials({ backupDir: path.join(dir, "missing"), staleAfterMs: 0 })).toEqual({
+      removed: [],
+      kept: [],
+    });
   });
 });
 
@@ -151,6 +236,54 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         controller.abort(new Error("free space below reserve"));
         expect(await settled).toBeInstanceOf(Error);
         expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "leaves only .partial files mid-run, which the stale-partial sweep clears once the run is dead",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-killed-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'\nexec sleep 30");
+      const controller = new AbortController();
+      const filenamePrefix = "paperclip-killed-test";
+      const staleAfterMs = 10 * 60 * 1000;
+
+      try {
+        const settled = runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix,
+          backupEngine: "pg_dump",
+          signal: controller.signal,
+        }).catch((error: unknown) => error);
+
+        const partial = await waitForFile(backupDir, ".sql.gz.partial");
+        // What a SIGKILL at this point leaves behind: only .partial files, nothing retention takes for a backup.
+        const runFiles = [partial, partial.replace(/\.sql\.gz\.partial$/, ".sql.partial")].sort();
+        expect(fs.readdirSync(backupDir).sort()).toEqual(runFiles);
+
+        // While the run is alive, a sweep leaves it alone.
+        expect(removeStaleBackupPartials({ backupDir, filenamePrefix, staleAfterMs }).removed).toEqual([]);
+        expect(fs.readdirSync(backupDir).sort()).toEqual(runFiles);
+
+        // Once nothing has written to them for staleAfterMs, both are cleared.
+        const later = removeStaleBackupPartials({
+          backupDir,
+          filenamePrefix,
+          staleAfterMs,
+          nowMs: Date.now() + staleAfterMs + 1000,
+        });
+        expect(later.removed.map((file) => file.name).sort()).toEqual(runFiles);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+
+        controller.abort(new Error("stop"));
+        expect(await settled).toBeInstanceOf(Error);
       } finally {
         restorePgDump();
       }

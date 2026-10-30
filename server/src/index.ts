@@ -690,6 +690,7 @@ export async function startServer(): Promise<StartedServer> {
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
+  const databaseBackupFilenamePrefix = "paperclip";
   let databaseBackupInFlight = false;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
@@ -718,7 +719,7 @@ export async function startServer(): Promise<StartedServer> {
         connectionString: activeDatabaseConnectionString,
         backupDir: config.databaseBackupDir,
         retention,
-        filenamePrefix: "paperclip",
+        filenamePrefix: databaseBackupFilenamePrefix,
         signal: options.signal,
       });
       const finishedAt = new Date();
@@ -1380,6 +1381,7 @@ export async function startServer(): Promise<StartedServer> {
       backupDir: config.databaseBackupDir,
       intervalMs: backupIntervalMs,
       minFreeBytes: backupMinFreeBytes,
+      filenamePrefix: databaseBackupFilenamePrefix,
       runBackup: (signal) =>
         runServerDatabaseBackup("scheduled", { signal }).catch(() => {
           // runServerDatabaseBackup already logs the failure with context.
@@ -1398,6 +1400,12 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn(
           { freeBytes, floorBytes, writtenBytes, backupDir: config.databaseBackupDir },
           "Aborted scheduled database backup: free disk space fell below the reserve",
+        );
+      },
+      onPartialsRemoved: ({ files, bytes }) => {
+        logger.warn(
+          { files, bytes, backupDir: config.databaseBackupDir },
+          "Removed partial database backup files left by an interrupted run",
         );
       },
       onError: (err) => {

@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { removeStaleBackupPartials } from "@paperclipai/db";
 
 const GIB = 1024 * 1024 * 1024;
 // setTimeout clamps larger delays to 1ms; longer waits are re-checked at the tick.
@@ -17,6 +18,8 @@ export const DEFAULT_DATABASE_BACKUP_GUARD_MARGIN_BYTES = 512 * 1024 * 1024;
 const DEFAULT_WARMUP_DELAY_MS = 10 * 60 * 1000;
 const DEFAULT_RETRY_DELAY_MS = 60 * 60 * 1000;
 const DEFAULT_GUARD_INTERVAL_MS = 5 * 1000;
+/** Partial files of a run untouched this long were left by a run that died. */
+const DEFAULT_PARTIAL_STALE_AFTER_MS = 10 * 60 * 1000;
 const SIZE_ESTIMATE_MARGIN = 1.25;
 
 export type DatabaseBackupSuccess = {
@@ -46,6 +49,10 @@ export type DatabaseBackupSchedulerOptions = {
   guardMarginBytes?: number;
   /** How often free space is re-measured while a backup is running. */
   guardIntervalMs?: number;
+  /** File name prefix `runBackup` writes with; partial files of a killed run are matched by it. */
+  filenamePrefix?: string;
+  /** A run whose partial files were not written to for this long counts as dead. */
+  partialStaleAfterMs?: number;
   now?: () => Date;
   /** Bytes available to the service user on the volume holding `dir`. */
   measureFreeBytes?: (dir: string) => number;
@@ -54,6 +61,7 @@ export type DatabaseBackupSchedulerOptions = {
   onScheduled?: (delayMs: number) => void;
   onSkippedForLowSpace?: (info: { freeBytes: number; requiredBytes: number; sizeEstimateBytes: number }) => void;
   onAbortedForLowSpace?: (info: { freeBytes: number; floorBytes: number; writtenBytes: number }) => void;
+  onPartialsRemoved?: (info: { files: string[]; bytes: number }) => void;
   onError?: (err: unknown) => void;
 };
 
@@ -195,6 +203,8 @@ function availableBytes(dir: string): number {
  * backup, so restarts don't push the next run out by a full interval. Free space
  * is checked before a run and re-checked while it writes: the run is skipped or
  * aborted instead of eating into the reserve, and every outcome reschedules.
+ * Partial files of a run that died with its process are cleared at start and
+ * before every run.
  */
 export function startDatabaseBackupScheduler(
   opts: DatabaseBackupSchedulerOptions,
@@ -204,11 +214,35 @@ export function startDatabaseBackupScheduler(
     (opts.minFreeBytes ?? DEFAULT_DATABASE_BACKUP_MIN_FREE_BYTES) +
     (opts.guardMarginBytes ?? DEFAULT_DATABASE_BACKUP_GUARD_MARGIN_BYTES);
   const guardIntervalMs = opts.guardIntervalMs ?? DEFAULT_GUARD_INTERVAL_MS;
+  const partialStaleAfterMs = opts.partialStaleAfterMs ?? DEFAULT_PARTIAL_STALE_AFTER_MS;
   const now = opts.now ?? (() => new Date());
   const measureFreeBytes = opts.measureFreeBytes ?? availableBytes;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let running: AbortController | null = null;
   let stopped = false;
+
+  /**
+   * Removes the partial files a killed run left behind, which nothing else
+   * would ever delete, and keeps their size in the estimate: the killed run
+   * wrote at least that much, so the next run isn't sized from zero.
+   */
+  const sweepPartials = () => {
+    const { removed, kept } = removeStaleBackupPartials({
+      backupDir: opts.backupDir,
+      filenamePrefix: opts.filenamePrefix,
+      staleAfterMs: partialStaleAfterMs,
+      nowMs: now().getTime(),
+    });
+    const compressedBytes = [...removed, ...kept].filter((file) => file.compressed).map((file) => file.sizeBytes);
+    const writtenBytes = Math.max(0, ...compressedBytes);
+    if (writtenBytes > 0) recordSizeLowerBound(opts.backupDir, writtenBytes);
+    if (removed.length > 0) {
+      opts.onPartialsRemoved?.({
+        files: removed.map((file) => file.name),
+        bytes: removed.reduce((sum, file) => sum + file.sizeBytes, 0),
+      });
+    }
+  };
 
   const scheduleNext = (delayMs: number) => {
     if (stopped) return;
@@ -252,6 +286,8 @@ export function startDatabaseBackupScheduler(
     if (stopped) return;
     let nextDelayMs = retryDelayMs;
     try {
+      // Before the estimate and the free-space check, so both see the cleared space.
+      sweepPartials();
       const remainingMs = msUntilNextBackup(opts.backupDir, opts.intervalMs, now().getTime());
       if (remainingMs !== null) {
         // A backup finished since this tick was scheduled (e.g. a manual run).
@@ -290,6 +326,12 @@ export function startDatabaseBackupScheduler(
     }
   };
 
+  try {
+    // A run killed with the previous process left its partial files behind.
+    sweepPartials();
+  } catch (err) {
+    opts.onError?.(err);
+  }
   scheduleNext(
     computeNextBackupDelayMs({
       backupDir: opts.backupDir,

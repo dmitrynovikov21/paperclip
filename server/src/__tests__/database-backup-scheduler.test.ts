@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -19,7 +19,8 @@ import {
 } from "../services/database-backup-scheduler.js";
 
 const GIB = 1024 * 1024 * 1024;
-const HOUR = 60 * 60 * 1000;
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 const FLOOR = DEFAULT_DATABASE_BACKUP_MIN_FREE_BYTES + DEFAULT_DATABASE_BACKUP_GUARD_MARGIN_BYTES;
 
@@ -42,6 +43,14 @@ function writeBackupFile(name: string, content = "x"): string {
   return path;
 }
 
+/** A partial file last written `ageMs` ago, as a run killed at that moment leaves it. */
+function partialFile(name: string, ageMs: number, content = ""): string {
+  const path = writeBackupFile(name, content);
+  const mtimeSeconds = (Date.now() - ageMs) / 1000;
+  utimesSync(path, mtimeSeconds, mtimeSeconds);
+  return path;
+}
+
 /** A backup that finished `ageMs` ago, recorded the way the server records it. */
 function confirmedBackup(name: string, ageMs: number, content = "x"): string {
   const path = writeBackupFile(name, content);
@@ -57,6 +66,7 @@ function startScheduler(
     errors: [] as unknown[],
     skipped: [] as Array<{ freeBytes: number; requiredBytes: number; sizeEstimateBytes: number }>,
     aborted: [] as Array<{ freeBytes: number; floorBytes: number; writtenBytes: number }>,
+    partialsRemoved: [] as Array<{ files: string[]; bytes: number }>,
   };
   const handle = startDatabaseBackupScheduler({
     backupDir: dir,
@@ -68,6 +78,7 @@ function startScheduler(
     onError: (err) => events.errors.push(err),
     onSkippedForLowSpace: (info) => events.skipped.push(info),
     onAbortedForLowSpace: (info) => events.aborted.push(info),
+    onPartialsRemoved: (info) => events.partialsRemoved.push(info),
     ...overrides,
   });
   handles.push(handle);
@@ -295,6 +306,78 @@ describe("startDatabaseBackupScheduler", () => {
 
     expect(runBackup).not.toHaveBeenCalled();
     expect(events.scheduled.at(-1)).toBe(DAY - 1000);
+  });
+
+  it("clears what a run killed with the previous process left and sizes the next run from it", async () => {
+    // A JavaScript-engine run killed while compressing: its catch cleanup never ran.
+    const sql = partialFile("paperclip-20261030-120000.sql.partial", 15 * MINUTE, "s".repeat(8192));
+    const dump = partialFile("paperclip-20261030-120000.sql.gz.partial", 15 * MINUTE, "d".repeat(4096));
+    const requiredBytes = requiredFreeBytes(4096, FLOOR);
+    const runBackup = vi.fn(async () => null);
+    const { events } = startScheduler({ runBackup, measureFreeBytes: () => requiredBytes - 1 });
+
+    // Cleared at start, before any run; only the gzip output sizes the next backup.
+    expect(existsSync(sql)).toBe(false);
+    expect(existsSync(dump)).toBe(false);
+    expect(events.partialsRemoved).toHaveLength(1);
+    expect(events.partialsRemoved[0]?.files.sort()).toEqual([basename(dump), basename(sql)]);
+    expect(events.partialsRemoved[0]?.bytes).toBe(8192 + 4096);
+    expect(estimateDatabaseBackupSizeBytes(dir)).toBe(4096);
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // The estimate did not drop to zero, so a run that would cut into the reserve is not started.
+    expect(runBackup).not.toHaveBeenCalled();
+    expect(events.skipped).toEqual([{ freeBytes: requiredBytes - 1, requiredBytes, sizeEstimateBytes: 4096 }]);
+    expect(events.errors).toEqual([]);
+  });
+
+  it("leaves a partial file that may still be written alone until it goes stale", async () => {
+    const dump = partialFile("paperclip-20261030-120000.sql.gz.partial", 0, "d".repeat(4096));
+    const presentWhenMeasured: boolean[] = [];
+    const runBackup = vi.fn(async () => null);
+    const { events } = startScheduler({
+      runBackup,
+      measureFreeBytes: () => {
+        presentWhenMeasured.push(existsSync(dump));
+        return FLOOR - 1;
+      },
+    });
+
+    // Possibly a live run: kept, but already counted in the estimate.
+    expect(existsSync(dump)).toBe(true);
+    expect(estimateDatabaseBackupSizeBytes(dir)).toBe(4096);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    // Nothing has written to it for an hour: removed before free space is measured.
+    await vi.advanceTimersByTimeAsync(HOUR);
+
+    expect(presentWhenMeasured).toEqual([true, false]);
+    expect(events.partialsRemoved).toEqual([{ files: [basename(dump)], bytes: 4096 }]);
+    expect(estimateDatabaseBackupSizeBytes(dir)).toBe(4096);
+    expect(runBackup).not.toHaveBeenCalled();
+  });
+
+  it("matches partial files by the configured file name prefix", async () => {
+    const own = partialFile("custom-20261030-120000.sql.gz.partial", HOUR, "d");
+    const foreign = partialFile("paperclip-20261030-120000.sql.gz.partial", HOUR, "d");
+
+    startScheduler({ runBackup: vi.fn(async () => null), filenamePrefix: "custom", measureFreeBytes: () => FLOOR - 1 });
+
+    expect(existsSync(own)).toBe(false);
+    expect(existsSync(foreign)).toBe(true);
+  });
+
+  it("keeps rescheduling when the backup directory can't be listed", async () => {
+    const notADirectory = writeBackupFile("not-a-directory");
+    const runBackup = vi.fn(async () => null);
+    const { events } = startScheduler({ backupDir: notADirectory, runBackup });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(runBackup).not.toHaveBeenCalled();
+    expect(events.errors.map((err) => (err as NodeJS.ErrnoException).code)).toEqual(["ENOTDIR", "ENOTDIR"]);
+    expect(events.scheduled).toEqual([1000, HOUR]);
   });
 
   it("aborts its running backup on stop()", async () => {

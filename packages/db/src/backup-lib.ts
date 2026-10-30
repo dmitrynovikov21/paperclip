@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -36,11 +36,27 @@ export type RunDatabaseBackupOptions = {
 };
 
 /**
- * Suffix of the file a backup is written to before it is complete. The final
- * `.sql.gz` name only appears after a successful rename, so a killed or failed
- * run never leaves a truncated file under a name that looks like a backup.
+ * Suffix of every file a backup run writes before it is complete: the gzip
+ * output and the JavaScript engine's uncompressed SQL. The final `.sql.gz` name
+ * only appears after a successful rename, so a killed or failed run never
+ * leaves a truncated file under a name that looks like a backup.
  */
 export const PARTIAL_BACKUP_SUFFIX = ".partial";
+
+export type BackupPartialFile = {
+  /** File name inside the backup directory. */
+  name: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  /** Gzip output of the dump, as opposed to the JavaScript engine's uncompressed SQL. */
+  compressed: boolean;
+};
+
+export type RemoveStaleBackupPartialsResult = {
+  removed: BackupPartialFile[];
+  /** Files of runs that may still be writing, or that could not be removed. */
+  kept: BackupPartialFile[];
+};
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -195,6 +211,66 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   }
 
   return toDelete.length;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Removes the partial files of backup runs that died without cleaning up: the
+ * `catch` cleanup in runDatabaseBackup never runs after SIGKILL or a crash.
+ * Only regular files of this module's own format
+ * (`<prefix>-<YYYYMMDD-HHMMSS>.sql[.gz].partial`) are considered. A run's files
+ * are judged together by their newest mtime, and the run counts as dead only
+ * when none of them was written to within `staleAfterMs`, so a backup still
+ * being written by another run or process is left alone.
+ */
+export function removeStaleBackupPartials(opts: {
+  backupDir: string;
+  filenamePrefix?: string;
+  staleAfterMs: number;
+  nowMs?: number;
+}): RemoveStaleBackupPartialsResult {
+  const result: RemoveStaleBackupPartialsResult = { removed: [], kept: [] };
+  if (!existsSync(opts.backupDir)) return result;
+
+  const pattern = new RegExp(
+    `^(${escapeRegExp(opts.filenamePrefix ?? "paperclip")}-\\d{8}-\\d{6})\\.sql(\\.gz)?${escapeRegExp(PARTIAL_BACKUP_SUFFIX)}$`,
+  );
+  const runs = new Map<string, BackupPartialFile[]>();
+  for (const name of readdirSync(opts.backupDir)) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    let stat;
+    try {
+      stat = lstatSync(resolve(opts.backupDir, name));
+    } catch {
+      continue; // Gone since the listing, e.g. its run just finished.
+    }
+    if (!stat.isFile()) continue;
+    const files = runs.get(match[1]) ?? [];
+    files.push({ name, sizeBytes: stat.size, mtimeMs: stat.mtimeMs, compressed: match[2] !== undefined });
+    runs.set(match[1], files);
+  }
+
+  const nowMs = opts.nowMs ?? Date.now();
+  for (const files of runs.values()) {
+    const lastWriteMs = Math.max(...files.map((file) => file.mtimeMs));
+    if (nowMs - lastWriteMs < opts.staleAfterMs) {
+      result.kept.push(...files);
+      continue;
+    }
+    for (const file of files) {
+      try {
+        unlinkSync(resolve(opts.backupDir, file.name));
+        result.removed.push(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") result.kept.push(file);
+      }
+    }
+  }
+  return result;
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -564,9 +640,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupStem = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}`);
+  const backupFile = `${backupStem}.sql.gz`;
   const partialBackupFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
+  // The JavaScript engine's uncompressed SQL; never a finished backup.
+  const sqlFile = `${backupStem}.sql${PARTIAL_BACKUP_SUFFIX}`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {

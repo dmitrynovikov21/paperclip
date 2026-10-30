@@ -1,5 +1,19 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
@@ -28,6 +42,34 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Aborts the backup in flight. Partial output is removed and the "auto"
+   * engine does not fall back to the JavaScript engine after an abort.
+   */
+  signal?: AbortSignal;
+};
+
+/**
+ * Suffix of every file a backup run writes before it is complete: the gzip
+ * output and the JavaScript engine's uncompressed SQL. The final `.sql.gz` name
+ * only appears after a successful rename, so a killed or failed run never
+ * leaves a truncated file under a name that looks like a backup.
+ */
+export const PARTIAL_BACKUP_SUFFIX = ".partial";
+
+export type BackupPartialFile = {
+  /** File name inside the backup directory. */
+  name: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  /** Gzip output of the dump, as opposed to the JavaScript engine's uncompressed SQL. */
+  compressed: boolean;
+};
+
+export type RemoveStaleBackupPartialsResult = {
+  removed: BackupPartialFile[];
+  /** Files of runs that may still be writing, or that could not be removed. */
+  kept: BackupPartialFile[];
 };
 
 export type RunDatabaseBackupResult = {
@@ -185,6 +227,66 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   return toDelete.length;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Removes the partial files of backup runs that died without cleaning up: the
+ * `catch` cleanup in runDatabaseBackup never runs after SIGKILL or a crash.
+ * Only regular files of this module's own format
+ * (`<prefix>-<YYYYMMDD-HHMMSS>.sql[.gz].partial`) are considered. A run's files
+ * are judged together by their newest mtime, and the run counts as dead only
+ * when none of them was written to within `staleAfterMs`, so a backup still
+ * being written by another run or process is left alone.
+ */
+export function removeStaleBackupPartials(opts: {
+  backupDir: string;
+  filenamePrefix?: string;
+  staleAfterMs: number;
+  nowMs?: number;
+}): RemoveStaleBackupPartialsResult {
+  const result: RemoveStaleBackupPartialsResult = { removed: [], kept: [] };
+  if (!existsSync(opts.backupDir)) return result;
+
+  const pattern = new RegExp(
+    `^(${escapeRegExp(opts.filenamePrefix ?? "paperclip")}-\\d{8}-\\d{6})\\.sql(\\.gz)?${escapeRegExp(PARTIAL_BACKUP_SUFFIX)}$`,
+  );
+  const runs = new Map<string, BackupPartialFile[]>();
+  for (const name of readdirSync(opts.backupDir)) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    let stat;
+    try {
+      stat = lstatSync(resolve(opts.backupDir, name));
+    } catch {
+      continue; // Gone since the listing, e.g. its run just finished.
+    }
+    if (!stat.isFile()) continue;
+    const files = runs.get(match[1]) ?? [];
+    files.push({ name, sizeBytes: stat.size, mtimeMs: stat.mtimeMs, compressed: match[2] !== undefined });
+    runs.set(match[1], files);
+  }
+
+  const nowMs = opts.nowMs ?? Date.now();
+  for (const files of runs.values()) {
+    const lastWriteMs = Math.max(...files.map((file) => file.mtimeMs));
+    if (nowMs - lastWriteMs < opts.staleAfterMs) {
+      result.kept.push(...files);
+      continue;
+    }
+    for (const file of files) {
+      try {
+        unlinkSync(resolve(opts.backupDir, file.name));
+        result.removed.push(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") result.kept.push(file);
+      }
+    }
+  }
+  return result;
+}
+
 function formatBackupSize(sizeBytes: number): string {
   if (sizeBytes < 1024) return `${sizeBytes}B`;
   if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)}K`;
@@ -317,72 +419,178 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+type PgCliConnection = {
+  /** Value for `--dbname`: the connection URL without its password. */
+  dbname: string;
+  env: NodeJS.ProcessEnv;
+  /** Removes the temporary password file. */
+  cleanup: () => void;
+};
+
+// libpq URI: postgres[ql]://[user[:password]@][hosts][/dbname][?params]. As in
+// libpq, the user info is whatever precedes the first "@" before any "/".
+const PG_CONNECTION_URI = /^(postgres(?:ql)?:\/\/)(?:([^@/]*)@)?([^?]*)(?:\?(.*))?$/s;
+
+function decodePgUriPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // The value may be the password, so the message must not carry it.
+    throw new Error("The database connection URL has malformed percent-encoding");
+  }
+}
+
+/**
+ * Connection settings for `pg_dump`/`psql` that keep the database password off
+ * their command line: `/proc/<pid>/cmdline` is readable by every local user.
+ * The password goes to a temporary password file instead, mode 0600 in a
+ * private directory (libpq ignores a file others can read). Call `cleanup`
+ * once the client is done.
+ */
+function preparePgCliConnection(connectionString: string, env: NodeJS.ProcessEnv): PgCliConnection {
+  const match = PG_CONNECTION_URI.exec(connectionString);
+  if (!match) {
+    throw new Error("PostgreSQL command-line clients need a postgres:// connection URL");
+  }
+  const [, scheme, userInfo, location, query] = match;
+  let user = userInfo;
+  let password = "";
+  let hasPassword = false;
+  const passwordAt = userInfo?.indexOf(":") ?? -1;
+  if (userInfo !== undefined && passwordAt !== -1) {
+    user = userInfo.slice(0, passwordAt);
+    password = decodePgUriPart(userInfo.slice(passwordAt + 1));
+    hasPassword = true;
+  }
+  // libpq also reads `password` and `passfile` from the query, and a query
+  // value wins. Other parameters keep their raw encoding.
+  const params: Array<{ raw: string; passfile: boolean }> = [];
+  for (const raw of query === undefined ? [] : query.split("&")) {
+    const equalsAt = raw.indexOf("=");
+    const key = decodePgUriPart(equalsAt === -1 ? raw : raw.slice(0, equalsAt));
+    if (key === "password") {
+      password = decodePgUriPart(equalsAt === -1 ? "" : raw.slice(equalsAt + 1));
+      hasPassword = true;
+    } else {
+      params.push({ raw, passfile: key === "passfile" });
+    }
+  }
+  if (!hasPassword) {
+    return { dbname: connectionString, env, cleanup: () => {} };
+  }
+
+  // A `passfile` parameter would override the file given below.
+  const keptParams = params.filter((param) => !(password && param.passfile)).map((param) => param.raw);
+  const dbname = `${scheme}${user === undefined ? "" : `${user}@`}${location}${
+    keptParams.length > 0 ? `?${keptParams.join("&")}` : ""
+  }`;
+  if (!password) {
+    return { dbname, env, cleanup: () => {} };
+  }
+  if (/[\r\n]/.test(password)) {
+    throw new Error("The database password contains a line break, which a PostgreSQL password file cannot hold");
+  }
+
+  const passfileDir = mkdtempSync(join(tmpdir(), "paperclip-pgpass-"));
+  const cleanup = () => {
+    try {
+      rmSync(passfileDir, { recursive: true, force: true });
+    } catch {
+      // Preserve the client's own failure if this cleanup fails too.
+    }
+  };
+  try {
+    const passfile = join(passfileDir, "pgpass");
+    // `*` fields match whatever the URL connects to.
+    writeFileSync(passfile, `*:*:*:*:${password.replace(/[\\:]/g, "\\$&")}\n`, { mode: 0o600, flag: "wx" });
+    const childEnv: NodeJS.ProcessEnv = { ...env, PGPASSFILE: passfile };
+    // A password from the environment would win over the file.
+    delete childEnv.PGPASSWORD;
+    return { dbname, env: childEnv, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
-  const child = spawn(
-    pgDumpBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--format=plain",
-      "--clean",
-      "--if-exists",
-      "--no-owner",
-      "--no-privileges",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+  const connection = preparePgCliConnection(opts.connectionString, {
+    ...process.env,
+    PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+  });
+  try {
+    const child = spawn(
+      pgDumpBin,
+      [
+        `--dbname=${connection.dbname}`,
+        "--format=plain",
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-privileges",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: connection.env,
+        signal: opts.signal,
       },
-    },
-  );
+    );
 
-  if (!child.stdout) {
-    throw new Error("pg_dump did not expose stdout");
+    if (!child.stdout) {
+      throw new Error("pg_dump did not expose stdout");
+    }
+
+    await Promise.all([
+      pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
+      waitForChildExit(child, pgDumpBin),
+    ]);
+  } finally {
+    connection.cleanup();
   }
-
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
-  const child = spawn(
-    psqlBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--set=ON_ERROR_STOP=1",
-      "--quiet",
-      "--no-psqlrc",
-    ],
-    {
-      stdio: ["pipe", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(connectTimeout),
+  const connection = preparePgCliConnection(opts.connectionString, {
+    ...process.env,
+    PGCONNECT_TIMEOUT: String(connectTimeout),
+  });
+  try {
+    const child = spawn(
+      psqlBin,
+      [
+        `--dbname=${connection.dbname}`,
+        "--set=ON_ERROR_STOP=1",
+        "--quiet",
+        "--no-psqlrc",
+      ],
+      {
+        stdio: ["pipe", "ignore", "pipe"],
+        env: connection.env,
       },
-    },
-  );
+    );
 
-  if (!child.stdin) {
-    throw new Error("psql did not expose stdin");
+    if (!child.stdin) {
+      throw new Error("psql did not expose stdin");
+    }
+
+    const input = opts.backupFile.endsWith(".gz")
+      ? createReadStream(opts.backupFile).pipe(createGunzip())
+      : createReadStream(opts.backupFile);
+
+    await Promise.all([
+      pipeline(input, child.stdin),
+      waitForChildExit(child, psqlBin),
+    ]);
+  } finally {
+    connection.cleanup();
   }
-
-  const input = opts.backupFile.endsWith(".gz")
-    ? createReadStream(opts.backupFile).pipe(createGunzip())
-    : createReadStream(opts.backupFile);
-
-  await Promise.all([
-    pipeline(input, child.stdin),
-    waitForChildExit(child, psqlBin),
-  ]);
 }
 
 async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
@@ -524,7 +732,17 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 }
 
+function unlinkIfExists(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original backup failure if cleanup also fails.
+  }
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
+  opts.signal?.throwIfAborted();
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
@@ -540,8 +758,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupStem = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}`);
+  const backupFile = `${backupStem}.sql.gz`;
+  const partialBackupFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
+  // The JavaScript engine's uncompressed SQL; never a finished backup.
+  const sqlFile = `${backupStem}.sql${PARTIAL_BACKUP_SUFFIX}`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -551,9 +772,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialBackupFile,
           connectTimeout,
+          signal: opts.signal,
         });
+        renameSync(partialBackupFile, backupFile);
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -563,10 +786,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
-        if (backupEngine === "pg_dump") {
+        unlinkIfExists(partialBackupFile);
+        unlinkIfExists(backupFile);
+        if (backupEngine === "pg_dump" || opts.signal?.aborted) {
           throw error;
         }
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
@@ -576,7 +798,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await sql`SELECT 1`;
 
-    const emit = (line: string) => writer.emit(line);
+    const emit = (line: string) => {
+      opts.signal?.throwIfAborted();
+      writer.emit(line);
+    };
     const emitStatement = (statement: string) => {
       emit(statement);
       emit(STATEMENT_BREAKPOINT);
@@ -911,6 +1136,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
             .readable();
           for await (const chunk of copyStream) {
+            opts.signal?.throwIfAborted();
             await writer.writeRaw(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
           }
         } finally {
@@ -963,9 +1189,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    const gzWriteStream = createWriteStream(partialBackupFile);
+    await pipeline(sqlReadStream, createGzip(), gzWriteStream, { signal: opts.signal });
     unlinkSync(sqlFile);
+    renameSync(partialBackupFile, backupFile);
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -977,12 +1204,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
+    unlinkIfExists(partialBackupFile);
+    unlinkIfExists(backupFile);
+    unlinkIfExists(sqlFile);
     throw error;
   } finally {
     await closeSql();

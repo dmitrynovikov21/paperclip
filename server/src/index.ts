@@ -91,6 +91,11 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+import {
+  recordDatabaseBackupSuccess,
+  resolveDatabaseBackupMinFreeBytes,
+  startDatabaseBackupScheduler,
+} from "./services/database-backup-scheduler.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -685,9 +690,11 @@ export async function startServer(): Promise<StartedServer> {
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
+  const databaseBackupFilenamePrefix = "paperclip";
   let databaseBackupInFlight = false;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
+    options: { signal?: AbortSignal } = {},
   ): Promise<InstanceDatabaseBackupRunResult | null> => {
     if (databaseBackupInFlight) {
       const message = "Database backup already in progress";
@@ -712,7 +719,8 @@ export async function startServer(): Promise<StartedServer> {
         connectionString: activeDatabaseConnectionString,
         backupDir: config.databaseBackupDir,
         retention,
-        filenamePrefix: "paperclip",
+        filenamePrefix: databaseBackupFilenamePrefix,
+        signal: options.signal,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -765,6 +773,12 @@ export async function startServer(): Promise<StartedServer> {
         const result = await runServerDatabaseBackup("manual");
         if (!result) {
           throw conflict("Database backup already in progress");
+        }
+        try {
+          // A finished manual backup also moves the automatic schedule.
+          recordDatabaseBackupSuccess(config.databaseBackupDir, result, new Date(result.finishedAt));
+        } catch (err) {
+          logger.warn({ err, backupDir: config.databaseBackupDir }, "Failed to record manual database backup");
         }
         return result;
       },
@@ -1352,20 +1366,52 @@ export async function startServer(): Promise<StartedServer> {
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
+    const backupMinFreeBytes = resolveDatabaseBackupMinFreeBytes(process.env.PAPERCLIP_DB_BACKUP_MIN_FREE_GIB);
 
     logger.info(
       {
         intervalMinutes: config.databaseBackupIntervalMinutes,
         retentionSource: "instance-settings-db",
         backupDir: config.databaseBackupDir,
+        minFreeBytes: backupMinFreeBytes,
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
-      void runServerDatabaseBackup("scheduled").catch(() => {
-        // runServerDatabaseBackup already logs the failure with context.
-      });
-    }, backupIntervalMs);
+    startDatabaseBackupScheduler({
+      backupDir: config.databaseBackupDir,
+      intervalMs: backupIntervalMs,
+      minFreeBytes: backupMinFreeBytes,
+      filenamePrefix: databaseBackupFilenamePrefix,
+      runBackup: (signal) =>
+        runServerDatabaseBackup("scheduled", { signal }).catch(() => {
+          // runServerDatabaseBackup already logs the failure with context.
+          return null;
+        }),
+      onScheduled: (delayMs) => {
+        logger.info({ delayMs, backupDir: config.databaseBackupDir }, "Next automatic database backup scheduled");
+      },
+      onSkippedForLowSpace: ({ freeBytes, requiredBytes, sizeEstimateBytes }) => {
+        logger.warn(
+          { freeBytes, requiredBytes, sizeEstimateBytes, backupDir: config.databaseBackupDir },
+          "Skipping scheduled database backup: not enough free disk space",
+        );
+      },
+      onAbortedForLowSpace: ({ freeBytes, floorBytes, writtenBytes }) => {
+        logger.warn(
+          { freeBytes, floorBytes, writtenBytes, backupDir: config.databaseBackupDir },
+          "Aborted scheduled database backup: free disk space fell below the reserve",
+        );
+      },
+      onPartialsRemoved: ({ files, bytes }) => {
+        logger.warn(
+          { files, bytes, backupDir: config.databaseBackupDir },
+          "Removed partial database backup files left by an interrupted run",
+        );
+      },
+      onError: (err) => {
+        logger.error({ err, backupDir: config.databaseBackupDir }, "Automatic database backup scheduler error");
+      },
+    });
   }
   
   // Wait for external adapters to finish loading before accepting requests.

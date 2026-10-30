@@ -1,10 +1,17 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { inspect } from "node:util";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  removeStaleBackupPartials,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -74,7 +81,300 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+describe("removeStaleBackupPartials", () => {
+  const HOUR = 60 * 60 * 1000;
+  const STALE_AFTER_MS = 10 * 60 * 1000;
+
+  /** A file last written `ageMs` ago. */
+  function fileAged(dir: string, name: string, ageMs: number, content = ""): void {
+    const filePath = path.join(dir, name);
+    fs.writeFileSync(filePath, content);
+    const mtimeSeconds = (Date.now() - ageMs) / 1000;
+    fs.utimesSync(filePath, mtimeSeconds, mtimeSeconds);
+  }
+
+  it("removes only stale partial files of its own format", () => {
+    const dir = createTempDir("paperclip-partials-format-");
+    fileAged(dir, "paperclip-20261030-120000.sql.gz.partial", HOUR, "gzip");
+    fileAged(dir, "paperclip-20261030-120000.sql.partial", HOUR, "uncompressed sql");
+    const untouched = [
+      "paperclip-20261030-110000.sql.gz",
+      "paperclip-20261030-110000.sql",
+      "paperclip-manual.sql.gz.partial",
+      "other-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.gz.partial.bak",
+      "paperclip-20261030-120000.dump.partial",
+    ];
+    for (const name of untouched) fileAged(dir, name, HOUR, "x");
+    fs.mkdirSync(path.join(dir, "paperclip-20261030-130000.sql.gz.partial"));
+
+    const result = removeStaleBackupPartials({ backupDir: dir, staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.kept).toEqual([]);
+    const removed = result.removed
+      .map(({ name, sizeBytes, compressed }) => ({ name, sizeBytes, compressed }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    expect(removed).toEqual([
+      { name: "paperclip-20261030-120000.sql.gz.partial", sizeBytes: 4, compressed: true },
+      { name: "paperclip-20261030-120000.sql.partial", sizeBytes: 16, compressed: false },
+    ]);
+    expect(fs.readdirSync(dir).sort()).toEqual([...untouched, "paperclip-20261030-130000.sql.gz.partial"].sort());
+  });
+
+  it("keeps every file of a run that wrote to any of them recently", () => {
+    const dir = createTempDir("paperclip-partials-group-");
+    // Compressing: the SQL file is only read, the gzip output is still growing.
+    fileAged(dir, "paperclip-20261030-120000.sql.partial", HOUR, "sql");
+    fileAged(dir, "paperclip-20261030-120000.sql.gz.partial", 0, "gz");
+    fileAged(dir, "paperclip-20261030-090000.sql.gz.partial", HOUR, "old");
+
+    const result = removeStaleBackupPartials({ backupDir: dir, staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.removed.map((file) => file.name)).toEqual(["paperclip-20261030-090000.sql.gz.partial"]);
+    expect(result.kept.map((file) => file.name).sort()).toEqual([
+      "paperclip-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.partial",
+    ]);
+    expect(fs.readdirSync(dir).sort()).toEqual([
+      "paperclip-20261030-120000.sql.gz.partial",
+      "paperclip-20261030-120000.sql.partial",
+    ]);
+  });
+
+  it("matches the file name prefix literally", () => {
+    const dir = createTempDir("paperclip-partials-prefix-");
+    fileAged(dir, "a.b-20261030-120000.sql.gz.partial", HOUR);
+    fileAged(dir, "aXb-20261030-120000.sql.gz.partial", HOUR);
+
+    const result = removeStaleBackupPartials({ backupDir: dir, filenamePrefix: "a.b", staleAfterMs: STALE_AFTER_MS });
+
+    expect(result.removed.map((file) => file.name)).toEqual(["a.b-20261030-120000.sql.gz.partial"]);
+    expect(fs.readdirSync(dir)).toEqual(["aXb-20261030-120000.sql.gz.partial"]);
+  });
+
+  it("returns nothing for a missing directory", () => {
+    const dir = createTempDir("paperclip-partials-missing-");
+    expect(removeStaleBackupPartials({ backupDir: path.join(dir, "missing"), staleAfterMs: 0 })).toEqual({
+      removed: [],
+      kept: [],
+    });
+  });
+});
+
+function useEnv(name: string, value: string): () => void {
+  const original = process.env[name];
+  process.env[name] = value;
+  return () => {
+    if (original === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = original;
+    }
+  };
+}
+
+function useFakePgClient(envName: "PAPERCLIP_PG_DUMP_PATH" | "PAPERCLIP_PSQL_PATH", script: string): () => void {
+  const binDir = createTempDir("paperclip-fake-pg-client-");
+  const fakeClient = path.join(binDir, envName === "PAPERCLIP_PG_DUMP_PATH" ? "pg_dump" : "psql");
+  fs.writeFileSync(fakeClient, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  return useEnv(envName, fakeClient);
+}
+
+function useFakePgDump(script: string): () => void {
+  return useFakePgClient("PAPERCLIP_PG_DUMP_PATH", script);
+}
+
+// Every character here needs escaping in a URL or in a PostgreSQL password file.
+const CLIENT_SECRET = "s3cr:et\\pa@ss/wo#rd%";
+// Present in the secret however it is encoded.
+const CLIENT_SECRET_MARK = "s3cr";
+const CLIENT_ROLE = "backup_client";
+
+async function createClientRole(connectionString: string): Promise<{ url: string; port: string }> {
+  const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`CREATE ROLE ${CLIENT_ROLE} LOGIN SUPERUSER PASSWORD '${CLIENT_SECRET}'`);
+  } finally {
+    await sql.end();
+  }
+  const { port } = new URL(connectionString);
+  return { url: `postgres://${CLIENT_ROLE}:${encodeURIComponent(CLIENT_SECRET)}@127.0.0.1:${port}/paperclip`, port };
+}
+
+// Shell lines for a fake client that records what it was started with.
+function recordPgClient(recordDir: string): string {
+  return [
+    `printf '%s\\n' "$@" > '${recordDir}/argv'`,
+    `printf '%s' "\${PGPASSWORD-}" > '${recordDir}/pgpassword'`,
+    `printf '%s' "$PGPASSFILE" > '${recordDir}/passfile-path'`,
+    `ls -ln "$PGPASSFILE" > '${recordDir}/passfile-mode'`,
+    `ls -lnd "$(dirname "$PGPASSFILE")" > '${recordDir}/passdir-mode'`,
+    `cat "$PGPASSFILE" > '${recordDir}/passfile'`,
+    `: > '${recordDir}/done'`,
+  ].join("\n");
+}
+
+function readPgClientRecord(recordDir: string) {
+  const read = (name: string) => fs.readFileSync(path.join(recordDir, name), "utf8");
+  return {
+    argv: read("argv"),
+    pgpassword: read("pgpassword"),
+    passfilePath: read("passfile-path"),
+    passfileMode: read("passfile-mode"),
+    passdirMode: read("passdir-mode"),
+    passfile: read("passfile"),
+  };
+}
+
+function findRealPsql(): string | null {
+  if (process.env.PAPERCLIP_PSQL_PATH) return process.env.PAPERCLIP_PSQL_PATH;
+  const found = spawnSync("sh", ["-c", "command -v psql"], { encoding: "utf8" });
+  return found.status === 0 && found.stdout.trim() ? found.stdout.trim() : null;
+}
+
+const realPsql = findRealPsql();
+const itWithPsql = realPsql ? it : it.skip;
+
+async function waitForFile(dir: string, suffix: string, timeoutMs = 15_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const name = fs.readdirSync(dir).find((entry) => entry.endsWith(suffix));
+    if (name) return name;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`No *${suffix} file appeared in ${dir}`);
+}
+
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it(
+    "publishes pg_dump output under the final name only after it completes",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-publish-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'");
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-publish-test",
+          backupEngine: "pg_dump",
+        });
+
+        expect(result.backupFile.endsWith(".sql.gz")).toBe(true);
+        expect(gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8")).toBe("SELECT 1;\n");
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes partial pg_dump output and does not fall back to the JavaScript engine when aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-abort-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'\nexec sleep 30");
+      const controller = new AbortController();
+
+      try {
+        const backup = runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-abort-test",
+          backupEngine: "auto",
+          signal: controller.signal,
+        });
+        const settled = backup.catch((error: unknown) => error);
+
+        const partial = await waitForFile(backupDir, ".sql.gz.partial");
+        expect(fs.existsSync(path.join(backupDir, partial.slice(0, -".partial".length)))).toBe(false);
+
+        controller.abort(new Error("free space below reserve"));
+        expect(await settled).toBeInstanceOf(Error);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "leaves only .partial files mid-run, which the stale-partial sweep clears once the run is dead",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-killed-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'\nexec sleep 30");
+      const controller = new AbortController();
+      const filenamePrefix = "paperclip-killed-test";
+      const staleAfterMs = 10 * 60 * 1000;
+
+      try {
+        const settled = runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix,
+          backupEngine: "pg_dump",
+          signal: controller.signal,
+        }).catch((error: unknown) => error);
+
+        const partial = await waitForFile(backupDir, ".sql.gz.partial");
+        // What a SIGKILL at this point leaves behind: only .partial files, nothing retention takes for a backup.
+        const runFiles = [partial, partial.replace(/\.sql\.gz\.partial$/, ".sql.partial")].sort();
+        expect(fs.readdirSync(backupDir).sort()).toEqual(runFiles);
+
+        // While the run is alive, a sweep leaves it alone.
+        expect(removeStaleBackupPartials({ backupDir, filenamePrefix, staleAfterMs }).removed).toEqual([]);
+        expect(fs.readdirSync(backupDir).sort()).toEqual(runFiles);
+
+        // Once nothing has written to them for staleAfterMs, both are cleared.
+        const later = removeStaleBackupPartials({
+          backupDir,
+          filenamePrefix,
+          staleAfterMs,
+          nowMs: Date.now() + staleAfterMs + 1000,
+        });
+        expect(later.removed.map((file) => file.name).sort()).toEqual(runFiles);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+
+        controller.abort(new Error("stop"));
+        expect(await settled).toBeInstanceOf(Error);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes partial output when a JavaScript-engine backup is aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-js-abort-");
+      const controller = new AbortController();
+
+      const backup = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-js-abort-test",
+        backupEngine: "javascript",
+        signal: controller.signal,
+      });
+      controller.abort(new Error("free space below reserve"));
+
+      await expect(backup).rejects.toThrow("free space below reserve");
+      expect(fs.readdirSync(backupDir)).toEqual([]);
+    },
+    30_000,
+  );
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
@@ -567,4 +867,174 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     20_000,
   );
+});
+
+describeEmbeddedPostgres("PostgreSQL client credentials", () => {
+  const retention = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+
+  it(
+    "gives pg_dump the password through a private password file, not its command line",
+    async () => {
+      const { url, port } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(`${recordPgClient(recordDir)}\nprintf 'SELECT 1;\\n'`);
+      // Would win over the password file if it reached pg_dump.
+      const restorePgPassword = useEnv("PGPASSWORD", "stale-env-password");
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-test",
+          backupEngine: "pg_dump",
+        });
+
+        expect(gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8")).toBe("SELECT 1;\n");
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv.split("\n")[0]).toBe(`--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip`);
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(record.pgpassword).toBe("");
+        expect(record.passfileMode).toMatch(/^-rw------- /);
+        expect(record.passdirMode).toMatch(/^drwx------ /);
+        expect(record.passfile).toBe("*:*:*:*:s3cr\\:et\\\\pa@ss/wo#rd%\n");
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+      } finally {
+        restorePgPassword();
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "keeps the password out of a failed pg_dump's error and removes the password file",
+    async () => {
+      const { url, port } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-fail-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(
+        `${recordPgClient(recordDir)}\necho "pg_dump: error: $* PGPASSWORD=\${PGPASSWORD-}" >&2\nexit 3`,
+      );
+
+      try {
+        const error = await runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-fail-test",
+          backupEngine: "pg_dump",
+        }).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("failed with exit code 3");
+        expect((error as Error).message).toContain(`--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip`);
+        expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(path.dirname(readPgClientRecord(recordDir).passfilePath))).toBe(false);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes the password file when a pg_dump backup is aborted",
+    async () => {
+      const { url } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-abort-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(`${recordPgClient(recordDir)}\nprintf 'SELECT 1;\\n'\nexec sleep 30`);
+      const controller = new AbortController();
+
+      try {
+        const settled = runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-abort-test",
+          backupEngine: "pg_dump",
+          signal: controller.signal,
+        }).catch((caught: unknown) => caught);
+
+        await waitForFile(recordDir, "done");
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(record.passfilePath)).toBe(true);
+
+        controller.abort(new Error("free space below reserve"));
+        const error = await settled;
+        expect(error).toBeInstanceOf(Error);
+        expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  itWithPsql(
+    "restores with the real psql through the password file when the URL query carries the password",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const { port } = await createClientRole(connectionString);
+      // libpq reads `password` from the query too; a `passfile` there would override ours.
+      const url =
+        `postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip?application_name=paperclip%20restore` +
+        `&password=${encodeURIComponent(CLIENT_SECRET)}&passfile=%2Fnonexistent%2Fpgpass`;
+      const backupFile = path.join(createTempDir("paperclip-db-restore-creds-"), "plain.sql");
+      // Without statement breakpoints a psql failure fails the restore instead of falling back.
+      fs.writeFileSync(backupFile, "CREATE TABLE public.psql_creds_test (id integer);\nINSERT INTO public.psql_creds_test VALUES (7);\n");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePsql = useFakePgClient("PAPERCLIP_PSQL_PATH", `${recordPgClient(recordDir)}\nexec '${realPsql}' "$@"`);
+      // Wrong on purpose: psql must not get it, or it would fail to log in.
+      const restorePgPassword = useEnv("PGPASSWORD", "stale-env-password");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await runDatabaseRestore({ connectionString: url, backupFile });
+
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv.split("\n")[0]).toBe(
+          `--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip?application_name=paperclip%20restore`,
+        );
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(record.pgpassword).toBe("");
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+        expect(await sql.unsafe("SELECT id FROM public.psql_creds_test")).toEqual([{ id: 7 }]);
+      } finally {
+        await sql.end();
+        restorePgPassword();
+        restorePsql();
+      }
+    },
+    30_000,
+  );
+});
+
+describe("PostgreSQL client connection strings", () => {
+  it("refuses a connection string that is not a postgres:// URL instead of passing it to psql", async () => {
+    const backupFile = path.join(createTempDir("paperclip-db-restore-conninfo-"), "plain.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+    const recordDir = createTempDir("paperclip-pg-client-record-");
+    const restorePsql = useFakePgClient("PAPERCLIP_PSQL_PATH", recordPgClient(recordDir));
+
+    try {
+      const error = await runDatabaseRestore({
+        connectionString: `host=127.0.0.1 dbname=paperclip password=${CLIENT_SECRET}`,
+        backupFile,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("need a postgres:// connection URL");
+      expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+      expect(fs.readdirSync(recordDir)).toEqual([]);
+    } finally {
+      restorePsql();
+    }
+  });
 });

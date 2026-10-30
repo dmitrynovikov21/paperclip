@@ -439,6 +439,49 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     expect(JSON.stringify(foreignDetail.body)).not.toContain(routineSentinel);
   }, 30_000);
 
+  it("keeps routine env in revisions from board viewers and delegated viewers", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const routineSentinel = "SYNTHETIC_REVISION_ENV_SENTINEL";
+    const boardApp = await createApp({
+      type: "board", userId, source: "session", isInstanceAdmin: false, companyIds: [companyId],
+    });
+    const created = await request(boardApp)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        title: "Revision env routine",
+        projectId,
+        assigneeAgentId: agentId,
+        env: { ROUTINE_TOKEN: { type: "plain", value: routineSentinel } },
+      });
+    expect(created.status).toBe(201);
+    const revisionsPath = `/api/routines/${created.body.id}/revisions`;
+
+    const assignedApp = await createApp({ type: "agent", agentId, companyId });
+    for (const app of [boardApp, assignedApp]) {
+      const response = await request(app).get(revisionsPath);
+      expect(response.status).toBe(200);
+      expect(response.body[0].snapshot.routine.env)
+        .toEqual({ ROUTINE_TOKEN: { type: "plain", value: routineSentinel } });
+    }
+
+    const viewerApp = await createApp({
+      type: "board", userId: randomUUID(), source: "session", isInstanceAdmin: false,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    });
+    const delegatedViewerApp = await createApp({
+      type: "agent", agentId, companyId, onBehalfOfUserId: randomUUID(),
+      onBehalfOfMemberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    });
+    for (const app of [viewerApp, delegatedViewerApp]) {
+      const response = await request(app).get(revisionsPath);
+      expect(response.status).toBe(403);
+      expect(response.body).not.toHaveProperty("env");
+      expect(JSON.stringify(response.body)).not.toContain("ROUTINE_TOKEN");
+      expect(JSON.stringify(response.body)).not.toContain(routineSentinel);
+    }
+  }, 30_000);
+
   it("supports creating, scheduling, and manually running a routine through the API", async () => {
     const { companyId, agentId, projectId, userId } = await seedFixture();
     const app = await createApp({

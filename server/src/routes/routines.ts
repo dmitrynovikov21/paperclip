@@ -18,7 +18,7 @@ import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAcc
 import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { routineForRead } from "./routine-read-visibility.js";
+import { canReadRoutineEnv, routineForRead } from "./routine-read-visibility.js";
 
 export function routineRoutes(
   db: Db,
@@ -211,6 +211,9 @@ export function routineRoutes(
     if (!routine) {
       res.status(404).json({ error: "Routine not found" });
       return;
+    }
+    if (!canReadRoutineEnv(req, routine)) {
+      throw forbidden("Cannot read routine revisions");
     }
     const revisions = await svc.listRevisions(routine.id);
     res.json(revisions);

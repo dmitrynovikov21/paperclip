@@ -1389,6 +1389,16 @@ const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<stri
   ]),
 };
 
+// These are server configuration, not run configuration. In particular an
+// adapter env binding must not reintroduce one after the host projection.
+const ACPX_SERVER_CONFIG_ENV_KEYS: ReadonlySet<string> = new Set([
+  "PAPERCLIP_SECRETS_PROVIDER",
+  "PAPERCLIP_LISTEN_HOST",
+  "PAPERCLIP_LISTEN_PORT",
+  "PAPERCLIP_MIGRATION_AUTO_APPLY",
+  "PAPERCLIP_HEARTBEAT_GLOBAL_CONCURRENCY_LIMIT",
+]);
+
 export function projectAcpxInheritedHostEnvironment(
   inheritedEnv: NodeJS.ProcessEnv,
   acpxAgent: string,
@@ -1419,7 +1429,9 @@ export function buildAcpxLaunchEnvironment(
   return Object.fromEntries(
     Object.entries(merged).filter(
       (entry): entry is [string, string] =>
-        typeof entry[1] === "string" && !isPaperclipServerOnlyEnvKey(entry[0]),
+        typeof entry[1] === "string" &&
+        !isPaperclipServerOnlyEnvKey(entry[0]) &&
+        !ACPX_SERVER_CONFIG_ENV_KEYS.has(entry[0].toUpperCase()),
     ),
   );
 }

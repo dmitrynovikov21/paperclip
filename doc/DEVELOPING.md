@@ -116,6 +116,21 @@ pnpm dev:stop
 
 ## Hot-Restart Deploys
 
+Before activating a release that reuses a `node_modules` tree, run the ACPX
+environment probe against the exact adapter-utils package resolved by that
+release. The probe uses synthetic credentials and checks the spawned agent,
+its terminal and its shell, including the run-scoped API key. A source test or
+a new `app/dist` directory does not verify an older linked dependency tree.
+
+```sh
+node scripts/smoke/adapter-utils-acpx-tarball.mjs \
+  --installed-package /path/to/staged/app/node_modules/@paperclipai/adapter-utils
+```
+
+Stop the activation if this command fails. Run it again against the active
+release after restart. The ordinary release script also probes the packed
+adapter-utils package before publication.
+
 Primary-instance rebuilds that restart `paperclip.service` can request one-shot live-run adoption instead of using the normal graceful shutdown drain. Before restarting the service, write the marker from the newly staged app with the current service PID:
 
 ```sh

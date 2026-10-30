@@ -43,6 +43,10 @@ test("published packages preserve the patched ACPX runtime", () => {
   assert.equal(cliEsbuildConfig.external.includes("acpx"), false);
 });
 
+test("release verifies the packed ACPX environment before publication", () => {
+  assert.match(releaseScript, /node "\$REPO_ROOT\/scripts\/smoke\/adapter-utils-acpx-tarball\.mjs"/);
+});
+
 test("published packages preserve the patched embedded-postgres runtime", () => {
   assert.equal(
     rootPackage.pnpm.patchedDependencies["embedded-postgres@18.1.0-beta.16"],

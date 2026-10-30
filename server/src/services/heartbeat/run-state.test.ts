@@ -97,6 +97,17 @@ describe("heartbeat run state module", () => {
     expect(raw.columns[0].resultJson).toBe(heartbeatRuns.resultJson);
   });
 
+  it.each(["UTF8", "SQL_ASCII"])("keeps execution-wait reads company scoped with %s text handling", async encoding => {
+    const reader = readingDatabase(encoding), state = extracted.createHeartbeatRunState(reader.db);
+    expect(await state.getRunExecutionWait("company", "run")).toBeNull();
+    expect(await state.getRunExecutionWait("other-company", "run")).toBeNull();
+    expect(reader.scopes).toEqual([["company", "run"], ["other-company", "run"]]);
+    expect(reader.execute).toHaveBeenCalledTimes(1);
+    if (encoding === "UTF8") expect(reader.columns[0].error).toBe(heartbeatRuns.error);
+    else expect(new PgDialect().sqlToQuery((reader.columns[0].error as SQL.Aliased).sql).sql).toBe("NULL");
+    expect(new PgDialect().sqlToQuery((reader.columns[0].resultJson as SQL.Aliased).sql).sql).toContain("startupPreparationSettledAt");
+  });
+
   it("loads current run status without large fields or an encoding probe", async () => {
     const binding = { id: "run", companyId: "company", agentId: "agent", status: "running" };
     const reader = readingDatabase("SQL_ASCII", [binding], []);
@@ -158,6 +169,56 @@ describePostgres("heartbeat run state database wiring", () => {
     const [issue] = await db.insert(issues).values({ companyId, title: "Session task", assigneeAgentId: agent.id }).returning();
     return { companyId, agent, issue, state: extracted.createHeartbeatRunState(db) };
   }
+
+  it("reads current execution-wait evidence without transferring saved input or output", async () => {
+    const { companyId, agent, issue } = await fixture();
+    const payload = randomBytes(128 * 1024).toString("base64");
+    const context = { issueId: issue.id, connectionIntentResolution: "existing_connection", source: "connection_intent.resolved",
+      interactionKind: "connection_intent", interactionStatus: "expired", mutation: "interaction", interactionId: randomUUID() };
+    const result = { startupCancellation: { beforeNativeSelection: true, futureProof: { version: 2 } },
+      startupPreparationSettledAt: "2020-01-01T00:00:00Z", cancellation: { source: "provider", expected: false,
+        initiator: { type: "provider" }, reason: "Cancelled", recordedAt: "2020-01-01T00:00:00Z" },
+      acpToolInventoryComplete: true, acpPendingToolCount: 0, stdout: payload };
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled", runtimeMode: "legacy",
+      startedAt: new Date("2020-01-01T00:00:00Z"), finishedAt: new Date("2020-01-01T00:01:00Z"),
+      contextSnapshot: { ...context, prompt: payload }, resultJson: result,
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner", adapterConfig: { prompt: payload } }, savedInput: payload },
+      stdoutExcerpt: payload, stderrExcerpt: payload,
+    }).returning();
+    const observed = createDb(database.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(observed, { heartbeatRuns }, capture);
+    try {
+      const state = extracted.createHeartbeatRunState(observed);
+      const read = await state.getRunExecutionWait(companyId, run.id);
+      capture.flush();
+      const summary = events.find(event => event.event === "paperclip.db_response_capture.summary.v1")!;
+      expect(summary.completedQueries).toBe(2);
+      expect(summary.responseValueBytes).toBeLessThan(4096);
+      expect(read).toMatchObject({ id: run.id, companyId, agentId: agent.id, status: "cancelled", contextSnapshot: context,
+        runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+        resultJson: { startupCancellation: result.startupCancellation, cancellation: result.cancellation,
+          acpToolInventoryComplete: true, acpPendingToolCount: 0 } });
+      expect(JSON.stringify(read)).not.toContain(payload.slice(0, 64));
+      expect(read).not.toHaveProperty("stdoutExcerpt");
+      expect(read).not.toHaveProperty("stderrExcerpt");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]).toEqual(run);
+      await db.update(heartbeatRuns).set({ status: "running", resultJson: { ...result, acpPendingToolCount: 1 },
+        runnerProfileJson: { adapterDispatch: { adapterType: "process" }, savedInput: payload },
+      }).where(eq(heartbeatRuns.id, run.id));
+      expect(await state.getRunExecutionWait(companyId, run.id)).toMatchObject({ status: "running",
+        resultJson: { acpPendingToolCount: 1 }, runnerProfileJson: { adapterDispatch: { adapterType: "process" } } });
+      expect(await state.getRunExecutionWait(randomUUID(), run.id)).toBeNull();
+      expect(await state.getRunExecutionWait(companyId, randomUUID())).toBeNull();
+      for (const value of [null, false, 42, [], {}, { nested: true }, "task"]) {
+        await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, issueId: value },
+          runnerProfileJson: { adapterDispatch: { adapterType: value } },
+        }).where(eq(heartbeatRuns.id, run.id));
+        expect(await state.getRunExecutionWait(companyId, run.id)).toMatchObject({ contextSnapshot: { issueId: value },
+          runnerProfileJson: { adapterDispatch: { adapterType: value } } });
+      }
+    } finally { capture.flush(); await observed.$client.end(); }
+  });
 
   it("reads current workspace access without execution snapshots and retains JSON types", async () => {
     const { companyId, agent, issue } = await fixture();
@@ -252,7 +313,7 @@ describePostgres("heartbeat run state database wiring", () => {
     const [run] = await db.insert(heartbeatRuns).values({
       companyId, agentId: agent.id, issueId: issue.id, runtimeMode: "native", status: "failed",
       errorCode: "provider_transport_failed", error: "Retain saved files", nativePhase: "terminal_failure",
-      runnerProfileJson: { nativeWorkspaceSync: sync, savedInput: bulk },
+      runnerProfileJson: { nativeWorkspaceSync: sync, nativeResourceDisposition: "keep_running", savedInput: bulk },
       resultJson: { workspaceExportRetry: { requestId: "retry-source" }, stdout: bulk },
       contextSnapshot: { timerClaimWasFirstHeartbeat: true, savedInput: bulk },
       stdoutExcerpt: bulk, stderrExcerpt: bulk,
@@ -268,7 +329,7 @@ describePostgres("heartbeat run state database wiring", () => {
     });
     expect(await state.getRunWorkspaceSettlement(run.id)).toEqual({
       id: run.id, status: run.status, error: run.error,
-      runnerProfileJson: { nativeWorkspaceSync: sync },
+      runnerProfileJson: { nativeWorkspaceSync: sync, nativeResourceDisposition: "keep_running" },
       resultJson: { workspaceExportRetry: { requestId: "retry-source" } },
       contextSnapshot: { timerClaimWasFirstHeartbeat: true },
     });

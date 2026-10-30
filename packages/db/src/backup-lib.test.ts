@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { inspect } from "node:util";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
@@ -159,20 +161,79 @@ describe("removeStaleBackupPartials", () => {
   });
 });
 
-function useFakePgDump(script: string): () => void {
-  const binDir = createTempDir("paperclip-fake-pg-dump-");
-  const fakePgDump = path.join(binDir, "pg_dump");
-  fs.writeFileSync(fakePgDump, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-  const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
-  process.env.PAPERCLIP_PG_DUMP_PATH = fakePgDump;
+function useEnv(name: string, value: string): () => void {
+  const original = process.env[name];
+  process.env[name] = value;
   return () => {
-    if (originalPgDumpPath === undefined) {
-      delete process.env.PAPERCLIP_PG_DUMP_PATH;
+    if (original === undefined) {
+      delete process.env[name];
     } else {
-      process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+      process.env[name] = original;
     }
   };
 }
+
+function useFakePgClient(envName: "PAPERCLIP_PG_DUMP_PATH" | "PAPERCLIP_PSQL_PATH", script: string): () => void {
+  const binDir = createTempDir("paperclip-fake-pg-client-");
+  const fakeClient = path.join(binDir, envName === "PAPERCLIP_PG_DUMP_PATH" ? "pg_dump" : "psql");
+  fs.writeFileSync(fakeClient, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  return useEnv(envName, fakeClient);
+}
+
+function useFakePgDump(script: string): () => void {
+  return useFakePgClient("PAPERCLIP_PG_DUMP_PATH", script);
+}
+
+// Every character here needs escaping in a URL or in a PostgreSQL password file.
+const CLIENT_SECRET = "s3cr:et\\pa@ss/wo#rd%";
+// Present in the secret however it is encoded.
+const CLIENT_SECRET_MARK = "s3cr";
+const CLIENT_ROLE = "backup_client";
+
+async function createClientRole(connectionString: string): Promise<{ url: string; port: string }> {
+  const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+  try {
+    await sql.unsafe(`CREATE ROLE ${CLIENT_ROLE} LOGIN SUPERUSER PASSWORD '${CLIENT_SECRET}'`);
+  } finally {
+    await sql.end();
+  }
+  const { port } = new URL(connectionString);
+  return { url: `postgres://${CLIENT_ROLE}:${encodeURIComponent(CLIENT_SECRET)}@127.0.0.1:${port}/paperclip`, port };
+}
+
+// Shell lines for a fake client that records what it was started with.
+function recordPgClient(recordDir: string): string {
+  return [
+    `printf '%s\\n' "$@" > '${recordDir}/argv'`,
+    `printf '%s' "\${PGPASSWORD-}" > '${recordDir}/pgpassword'`,
+    `printf '%s' "$PGPASSFILE" > '${recordDir}/passfile-path'`,
+    `ls -ln "$PGPASSFILE" > '${recordDir}/passfile-mode'`,
+    `ls -lnd "$(dirname "$PGPASSFILE")" > '${recordDir}/passdir-mode'`,
+    `cat "$PGPASSFILE" > '${recordDir}/passfile'`,
+    `: > '${recordDir}/done'`,
+  ].join("\n");
+}
+
+function readPgClientRecord(recordDir: string) {
+  const read = (name: string) => fs.readFileSync(path.join(recordDir, name), "utf8");
+  return {
+    argv: read("argv"),
+    pgpassword: read("pgpassword"),
+    passfilePath: read("passfile-path"),
+    passfileMode: read("passfile-mode"),
+    passdirMode: read("passdir-mode"),
+    passfile: read("passfile"),
+  };
+}
+
+function findRealPsql(): string | null {
+  if (process.env.PAPERCLIP_PSQL_PATH) return process.env.PAPERCLIP_PSQL_PATH;
+  const found = spawnSync("sh", ["-c", "command -v psql"], { encoding: "utf8" });
+  return found.status === 0 && found.stdout.trim() ? found.stdout.trim() : null;
+}
+
+const realPsql = findRealPsql();
+const itWithPsql = realPsql ? it : it.skip;
 
 async function waitForFile(dir: string, suffix: string, timeoutMs = 15_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
@@ -806,4 +867,174 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     20_000,
   );
+});
+
+describeEmbeddedPostgres("PostgreSQL client credentials", () => {
+  const retention = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+
+  it(
+    "gives pg_dump the password through a private password file, not its command line",
+    async () => {
+      const { url, port } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(`${recordPgClient(recordDir)}\nprintf 'SELECT 1;\\n'`);
+      // Would win over the password file if it reached pg_dump.
+      const restorePgPassword = useEnv("PGPASSWORD", "stale-env-password");
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-test",
+          backupEngine: "pg_dump",
+        });
+
+        expect(gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8")).toBe("SELECT 1;\n");
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv.split("\n")[0]).toBe(`--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip`);
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(record.pgpassword).toBe("");
+        expect(record.passfileMode).toMatch(/^-rw------- /);
+        expect(record.passdirMode).toMatch(/^drwx------ /);
+        expect(record.passfile).toBe("*:*:*:*:s3cr\\:et\\\\pa@ss/wo#rd%\n");
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+      } finally {
+        restorePgPassword();
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "keeps the password out of a failed pg_dump's error and removes the password file",
+    async () => {
+      const { url, port } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-fail-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(
+        `${recordPgClient(recordDir)}\necho "pg_dump: error: $* PGPASSWORD=\${PGPASSWORD-}" >&2\nexit 3`,
+      );
+
+      try {
+        const error = await runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-fail-test",
+          backupEngine: "pg_dump",
+        }).catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("failed with exit code 3");
+        expect((error as Error).message).toContain(`--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip`);
+        expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(path.dirname(readPgClientRecord(recordDir).passfilePath))).toBe(false);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes the password file when a pg_dump backup is aborted",
+    async () => {
+      const { url } = await createClientRole(await createTempDatabase());
+      const backupDir = createTempDir("paperclip-db-backup-creds-abort-");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePgDump = useFakePgDump(`${recordPgClient(recordDir)}\nprintf 'SELECT 1;\\n'\nexec sleep 30`);
+      const controller = new AbortController();
+
+      try {
+        const settled = runDatabaseBackup({
+          connectionString: url,
+          backupDir,
+          retention,
+          filenamePrefix: "paperclip-creds-abort-test",
+          backupEngine: "pg_dump",
+          signal: controller.signal,
+        }).catch((caught: unknown) => caught);
+
+        await waitForFile(recordDir, "done");
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(record.passfilePath)).toBe(true);
+
+        controller.abort(new Error("free space below reserve"));
+        const error = await settled;
+        expect(error).toBeInstanceOf(Error);
+        expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  itWithPsql(
+    "restores with the real psql through the password file when the URL query carries the password",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const { port } = await createClientRole(connectionString);
+      // libpq reads `password` from the query too; a `passfile` there would override ours.
+      const url =
+        `postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip?application_name=paperclip%20restore` +
+        `&password=${encodeURIComponent(CLIENT_SECRET)}&passfile=%2Fnonexistent%2Fpgpass`;
+      const backupFile = path.join(createTempDir("paperclip-db-restore-creds-"), "plain.sql");
+      // Without statement breakpoints a psql failure fails the restore instead of falling back.
+      fs.writeFileSync(backupFile, "CREATE TABLE public.psql_creds_test (id integer);\nINSERT INTO public.psql_creds_test VALUES (7);\n");
+      const recordDir = createTempDir("paperclip-pg-client-record-");
+      const restorePsql = useFakePgClient("PAPERCLIP_PSQL_PATH", `${recordPgClient(recordDir)}\nexec '${realPsql}' "$@"`);
+      // Wrong on purpose: psql must not get it, or it would fail to log in.
+      const restorePgPassword = useEnv("PGPASSWORD", "stale-env-password");
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await runDatabaseRestore({ connectionString: url, backupFile });
+
+        const record = readPgClientRecord(recordDir);
+        expect(record.argv.split("\n")[0]).toBe(
+          `--dbname=postgres://${CLIENT_ROLE}@127.0.0.1:${port}/paperclip?application_name=paperclip%20restore`,
+        );
+        expect(record.argv).not.toContain(CLIENT_SECRET_MARK);
+        expect(record.pgpassword).toBe("");
+        expect(fs.existsSync(path.dirname(record.passfilePath))).toBe(false);
+        expect(await sql.unsafe("SELECT id FROM public.psql_creds_test")).toEqual([{ id: 7 }]);
+      } finally {
+        await sql.end();
+        restorePgPassword();
+        restorePsql();
+      }
+    },
+    30_000,
+  );
+});
+
+describe("PostgreSQL client connection strings", () => {
+  it("refuses a connection string that is not a postgres:// URL instead of passing it to psql", async () => {
+    const backupFile = path.join(createTempDir("paperclip-db-restore-conninfo-"), "plain.sql");
+    fs.writeFileSync(backupFile, "SELECT 1;\n");
+    const recordDir = createTempDir("paperclip-pg-client-record-");
+    const restorePsql = useFakePgClient("PAPERCLIP_PSQL_PATH", recordPgClient(recordDir));
+
+    try {
+      const error = await runDatabaseRestore({
+        connectionString: `host=127.0.0.1 dbname=paperclip password=${CLIENT_SECRET}`,
+        backupFile,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("need a postgres:// connection URL");
+      expect(inspect(error)).not.toContain(CLIENT_SECRET_MARK);
+      expect(fs.readdirSync(recordDir)).toEqual([]);
+    } finally {
+      restorePsql();
+    }
+  });
 });

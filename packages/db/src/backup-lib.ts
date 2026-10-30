@@ -1,5 +1,19 @@
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
@@ -405,6 +419,100 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+type PgCliConnection = {
+  /** Value for `--dbname`: the connection URL without its password. */
+  dbname: string;
+  env: NodeJS.ProcessEnv;
+  /** Removes the temporary password file. */
+  cleanup: () => void;
+};
+
+// libpq URI: postgres[ql]://[user[:password]@][hosts][/dbname][?params]. As in
+// libpq, the user info is whatever precedes the first "@" before any "/".
+const PG_CONNECTION_URI = /^(postgres(?:ql)?:\/\/)(?:([^@/]*)@)?([^?]*)(?:\?(.*))?$/s;
+
+function decodePgUriPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // The value may be the password, so the message must not carry it.
+    throw new Error("The database connection URL has malformed percent-encoding");
+  }
+}
+
+/**
+ * Connection settings for `pg_dump`/`psql` that keep the database password off
+ * their command line: `/proc/<pid>/cmdline` is readable by every local user.
+ * The password goes to a temporary password file instead, mode 0600 in a
+ * private directory (libpq ignores a file others can read). Call `cleanup`
+ * once the client is done.
+ */
+function preparePgCliConnection(connectionString: string, env: NodeJS.ProcessEnv): PgCliConnection {
+  const match = PG_CONNECTION_URI.exec(connectionString);
+  if (!match) {
+    throw new Error("PostgreSQL command-line clients need a postgres:// connection URL");
+  }
+  const [, scheme, userInfo, location, query] = match;
+  let user = userInfo;
+  let password = "";
+  let hasPassword = false;
+  const passwordAt = userInfo?.indexOf(":") ?? -1;
+  if (userInfo !== undefined && passwordAt !== -1) {
+    user = userInfo.slice(0, passwordAt);
+    password = decodePgUriPart(userInfo.slice(passwordAt + 1));
+    hasPassword = true;
+  }
+  // libpq also reads `password` and `passfile` from the query, and a query
+  // value wins. Other parameters keep their raw encoding.
+  const params: Array<{ raw: string; passfile: boolean }> = [];
+  for (const raw of query === undefined ? [] : query.split("&")) {
+    const equalsAt = raw.indexOf("=");
+    const key = decodePgUriPart(equalsAt === -1 ? raw : raw.slice(0, equalsAt));
+    if (key === "password") {
+      password = decodePgUriPart(equalsAt === -1 ? "" : raw.slice(equalsAt + 1));
+      hasPassword = true;
+    } else {
+      params.push({ raw, passfile: key === "passfile" });
+    }
+  }
+  if (!hasPassword) {
+    return { dbname: connectionString, env, cleanup: () => {} };
+  }
+
+  // A `passfile` parameter would override the file given below.
+  const keptParams = params.filter((param) => !(password && param.passfile)).map((param) => param.raw);
+  const dbname = `${scheme}${user === undefined ? "" : `${user}@`}${location}${
+    keptParams.length > 0 ? `?${keptParams.join("&")}` : ""
+  }`;
+  if (!password) {
+    return { dbname, env, cleanup: () => {} };
+  }
+  if (/[\r\n]/.test(password)) {
+    throw new Error("The database password contains a line break, which a PostgreSQL password file cannot hold");
+  }
+
+  const passfileDir = mkdtempSync(join(tmpdir(), "paperclip-pgpass-"));
+  const cleanup = () => {
+    try {
+      rmSync(passfileDir, { recursive: true, force: true });
+    } catch {
+      // Preserve the client's own failure if this cleanup fails too.
+    }
+  };
+  try {
+    const passfile = join(passfileDir, "pgpass");
+    // `*` fields match whatever the URL connects to.
+    writeFileSync(passfile, `*:*:*:*:${password.replace(/[\\:]/g, "\\$&")}\n`, { mode: 0o600, flag: "wx" });
+    const childEnv: NodeJS.ProcessEnv = { ...env, PGPASSFILE: passfile };
+    // A password from the environment would win over the file.
+    delete childEnv.PGPASSWORD;
+    return { dbname, env: childEnv, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
@@ -412,67 +520,77 @@ async function runPgDumpBackup(opts: {
   signal?: AbortSignal;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
-  const child = spawn(
-    pgDumpBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--format=plain",
-      "--clean",
-      "--if-exists",
-      "--no-owner",
-      "--no-privileges",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+  const connection = preparePgCliConnection(opts.connectionString, {
+    ...process.env,
+    PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+  });
+  try {
+    const child = spawn(
+      pgDumpBin,
+      [
+        `--dbname=${connection.dbname}`,
+        "--format=plain",
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-privileges",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: connection.env,
+        signal: opts.signal,
       },
-      signal: opts.signal,
-    },
-  );
+    );
 
-  if (!child.stdout) {
-    throw new Error("pg_dump did not expose stdout");
+    if (!child.stdout) {
+      throw new Error("pg_dump did not expose stdout");
+    }
+
+    await Promise.all([
+      pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
+      waitForChildExit(child, pgDumpBin),
+    ]);
+  } finally {
+    connection.cleanup();
   }
-
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
-    waitForChildExit(child, pgDumpBin),
-  ]);
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
-  const child = spawn(
-    psqlBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--set=ON_ERROR_STOP=1",
-      "--quiet",
-      "--no-psqlrc",
-    ],
-    {
-      stdio: ["pipe", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(connectTimeout),
+  const connection = preparePgCliConnection(opts.connectionString, {
+    ...process.env,
+    PGCONNECT_TIMEOUT: String(connectTimeout),
+  });
+  try {
+    const child = spawn(
+      psqlBin,
+      [
+        `--dbname=${connection.dbname}`,
+        "--set=ON_ERROR_STOP=1",
+        "--quiet",
+        "--no-psqlrc",
+      ],
+      {
+        stdio: ["pipe", "ignore", "pipe"],
+        env: connection.env,
       },
-    },
-  );
+    );
 
-  if (!child.stdin) {
-    throw new Error("psql did not expose stdin");
+    if (!child.stdin) {
+      throw new Error("psql did not expose stdin");
+    }
+
+    const input = opts.backupFile.endsWith(".gz")
+      ? createReadStream(opts.backupFile).pipe(createGunzip())
+      : createReadStream(opts.backupFile);
+
+    await Promise.all([
+      pipeline(input, child.stdin),
+      waitForChildExit(child, psqlBin),
+    ]);
+  } finally {
+    connection.cleanup();
   }
-
-  const input = opts.backupFile.endsWith(".gz")
-    ? createReadStream(opts.backupFile).pipe(createGunzip())
-    : createReadStream(opts.backupFile);
-
-  await Promise.all([
-    pipeline(input, child.stdin),
-    waitForChildExit(child, psqlBin),
-  ]);
 }
 
 async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {

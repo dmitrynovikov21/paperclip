@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -28,7 +28,19 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Aborts the backup in flight. Partial output is removed and the "auto"
+   * engine does not fall back to the JavaScript engine after an abort.
+   */
+  signal?: AbortSignal;
 };
+
+/**
+ * Suffix of the file a backup is written to before it is complete. The final
+ * `.sql.gz` name only appears after a successful rename, so a killed or failed
+ * run never leaves a truncated file under a name that looks like a backup.
+ */
+export const PARTIAL_BACKUP_SUFFIX = ".partial";
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -321,6 +333,7 @@ async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const child = spawn(
@@ -339,6 +352,7 @@ async function runPgDumpBackup(opts: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
+      signal: opts.signal,
     },
   );
 
@@ -347,7 +361,7 @@ async function runPgDumpBackup(opts: {
   }
 
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
     waitForChildExit(child, pgDumpBin),
   ]);
 }
@@ -524,7 +538,17 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 }
 
+function unlinkIfExists(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the original backup failure if cleanup also fails.
+  }
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
+  opts.signal?.throwIfAborted();
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
@@ -542,6 +566,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   mkdirSync(opts.backupDir, { recursive: true });
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
+  const partialBackupFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -551,9 +576,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialBackupFile,
           connectTimeout,
+          signal: opts.signal,
         });
+        renameSync(partialBackupFile, backupFile);
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -563,10 +590,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
-        if (backupEngine === "pg_dump") {
+        unlinkIfExists(partialBackupFile);
+        unlinkIfExists(backupFile);
+        if (backupEngine === "pg_dump" || opts.signal?.aborted) {
           throw error;
         }
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
@@ -576,7 +602,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await sql`SELECT 1`;
 
-    const emit = (line: string) => writer.emit(line);
+    const emit = (line: string) => {
+      opts.signal?.throwIfAborted();
+      writer.emit(line);
+    };
     const emitStatement = (statement: string) => {
       emit(statement);
       emit(STATEMENT_BREAKPOINT);
@@ -911,6 +940,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
             .readable();
           for await (const chunk of copyStream) {
+            opts.signal?.throwIfAborted();
             await writer.writeRaw(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
           }
         } finally {
@@ -963,9 +993,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    const gzWriteStream = createWriteStream(partialBackupFile);
+    await pipeline(sqlReadStream, createGzip(), gzWriteStream, { signal: opts.signal });
     unlinkSync(sqlFile);
+    renameSync(partialBackupFile, backupFile);
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -977,12 +1008,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
+    unlinkIfExists(partialBackupFile);
+    unlinkIfExists(backupFile);
+    unlinkIfExists(sqlFile);
     throw error;
   } finally {
     await closeSql();

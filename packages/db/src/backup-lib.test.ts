@@ -74,7 +74,113 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+function useFakePgDump(script: string): () => void {
+  const binDir = createTempDir("paperclip-fake-pg-dump-");
+  const fakePgDump = path.join(binDir, "pg_dump");
+  fs.writeFileSync(fakePgDump, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+  process.env.PAPERCLIP_PG_DUMP_PATH = fakePgDump;
+  return () => {
+    if (originalPgDumpPath === undefined) {
+      delete process.env.PAPERCLIP_PG_DUMP_PATH;
+    } else {
+      process.env.PAPERCLIP_PG_DUMP_PATH = originalPgDumpPath;
+    }
+  };
+}
+
+async function waitForFile(dir: string, suffix: string, timeoutMs = 15_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const name = fs.readdirSync(dir).find((entry) => entry.endsWith(suffix));
+    if (name) return name;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`No *${suffix} file appeared in ${dir}`);
+}
+
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it(
+    "publishes pg_dump output under the final name only after it completes",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-publish-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'");
+
+      try {
+        const result = await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-publish-test",
+          backupEngine: "pg_dump",
+        });
+
+        expect(result.backupFile.endsWith(".sql.gz")).toBe(true);
+        expect(gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8")).toBe("SELECT 1;\n");
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes partial pg_dump output and does not fall back to the JavaScript engine when aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-abort-");
+      const restorePgDump = useFakePgDump("printf 'SELECT 1;\\n'\nexec sleep 30");
+      const controller = new AbortController();
+
+      try {
+        const backup = runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-abort-test",
+          backupEngine: "auto",
+          signal: controller.signal,
+        });
+        const settled = backup.catch((error: unknown) => error);
+
+        const partial = await waitForFile(backupDir, ".sql.gz.partial");
+        expect(fs.existsSync(path.join(backupDir, partial.slice(0, -".partial".length)))).toBe(false);
+
+        controller.abort(new Error("free space below reserve"));
+        expect(await settled).toBeInstanceOf(Error);
+        expect(fs.readdirSync(backupDir)).toEqual([]);
+      } finally {
+        restorePgDump();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "removes partial output when a JavaScript-engine backup is aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-js-abort-");
+      const controller = new AbortController();
+
+      const backup = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        filenamePrefix: "paperclip-js-abort-test",
+        backupEngine: "javascript",
+        signal: controller.signal,
+      });
+      controller.abort(new Error("free space below reserve"));
+
+      await expect(backup).rejects.toThrow("free space below reserve");
+      expect(fs.readdirSync(backupDir)).toEqual([]);
+    },
+    30_000,
+  );
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {

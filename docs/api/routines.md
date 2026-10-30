@@ -13,6 +13,8 @@ GET /api/companies/{companyId}/routines
 
 Returns all routines in the company.
 
+The response omits `env` for routines the caller cannot manage.
+
 ## Get Routine
 
 ```
@@ -20,6 +22,8 @@ GET /api/routines/{routineId}
 ```
 
 Returns routine details including triggers.
+
+The response omits `env` unless the caller can manage the routine. The `project` field is `null` when the caller lacks `project:read` for that project. A visible project summary never includes `env`.
 
 ## Create Routine
 
@@ -89,6 +93,7 @@ GET /api/routines/{routineId}/revisions
 ```
 
 Returns append-only routine definition revisions newest first. Snapshots include routine fields and safe trigger metadata only; webhook secret values and `secretId` are never returned.
+Revision snapshots include routine env bindings, so only actors allowed to manage the routine can read this endpoint. Board viewers and agents acting for a viewer receive `403`.
 
 ## Restore Revision
 

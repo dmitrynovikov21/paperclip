@@ -724,6 +724,46 @@ describeEmbeddedPostgres("pipeline routes", () => {
     });
   });
 
+  it("does not expose another agent's routine env through pipeline detail", async () => {
+    const company = await seedCompany();
+    const board = request(app(boardActor));
+    const assigned = await seedAutomationAgent(company.id);
+    const reader = await seedAutomationAgent(company.id);
+    const sentinel = "SYNTHETIC_PIPELINE_ROUTINE_ENV_SENTINEL";
+    const pipeline = await board
+      .post(`/api/companies/${company.id}/pipelines`)
+      .send({ key: "routine-env-boundary", name: "Routine env boundary" })
+      .expect(201);
+    const stageId = pipeline.body.stages.find((stage: { key: string }) => stage.key === "in_progress").id as string;
+    await board
+      .patch(`/api/pipelines/${pipeline.body.id}/stages/${stageId}`)
+      .send({ config: { automation: { assigneeAgentId: assigned.id, instructionsBody: "Run the routine." } } })
+      .expect(200);
+    const initial = await board.get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+    const routineId = initial.body.stages.find((stage: { key: string }) => stage.key === "in_progress")
+      .config.automation.routineId as string;
+    await db.update(routines).set({ env: { PRIVATE_TOKEN: sentinel } }).where(eq(routines.id, routineId));
+
+    const readerHttp = request(app({ type: "agent", agentId: reader.id, companyId: company.id }));
+    const readerResponse = await readerHttp.get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+    const readerAutomation = readerResponse.body.stages.find((stage: { key: string }) => stage.key === "in_progress")
+      .config.automation;
+    expect(readerAutomation.routineId).toBe(routineId);
+    expect(readerAutomation).not.toHaveProperty("env");
+    expect(JSON.stringify(readerResponse.body)).not.toContain(sentinel);
+    const readerList = await readerHttp.get(`/api/companies/${company.id}/pipelines`).expect(200);
+    const readerHealth = await readerHttp.get(`/api/pipelines/${pipeline.body.id}/health`).expect(200);
+    expect(JSON.stringify(readerList.body)).not.toContain(sentinel);
+    expect(JSON.stringify(readerHealth.body)).not.toContain(sentinel);
+
+    for (const actor of [boardActor, { type: "agent" as const, agentId: assigned.id, companyId: company.id }]) {
+      const response = await request(app(actor)).get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+      const automation = response.body.stages.find((stage: { key: string }) => stage.key === "in_progress")
+        .config.automation;
+      expect(automation.env).toEqual({ PRIVATE_TOKEN: sentinel });
+    }
+  });
+
   it("paginates and caps case event responses", async () => {
     const company = await seedCompany();
     const http = request(app(boardActor));

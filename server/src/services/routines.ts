@@ -1977,7 +1977,14 @@ export function routineService(
       if (!row) return null;
       const [project, assigneeRow, parentIssue, descriptionDocument, triggers, recentRuns, activeIssue, managedByRoutine] = await Promise.all([
         row.projectId
-          ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
+          ? db.select({
+              id: projects.id,
+              name: projects.name,
+              description: projects.description,
+              status: projects.status,
+              goalId: projects.goalId,
+            }).from(projects).where(and(eq(projects.id, row.projectId), eq(projects.companyId, row.companyId)))
+              .then((rows) => rows[0] ?? null)
           : null,
         row.assigneeAgentId
           ? db.select({

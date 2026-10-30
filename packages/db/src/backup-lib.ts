@@ -11,7 +11,9 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  type WriteStream,
 } from "node:fs";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -107,6 +109,11 @@ type ExtensionDefinition = {
   extension_name: string;
   schema_name: string;
 };
+
+// A backup holds the whole database. The umask can only clear mode bits, so
+// these stay owner-only whatever it is.
+const BACKUP_FILE_MODE = 0o600;
+const BACKUP_DIR_MODE = 0o700;
 
 const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
@@ -515,7 +522,8 @@ function preparePgCliConnection(connectionString: string, env: NodeJS.ProcessEnv
 
 async function runPgDumpBackup(opts: {
   connectionString: string;
-  backupFile: string;
+  /** From createBackupOutputStream; the gzip output goes here. */
+  output: WriteStream;
   connectTimeout: number;
   signal?: AbortSignal;
 }): Promise<void> {
@@ -547,7 +555,7 @@ async function runPgDumpBackup(opts: {
     }
 
     await Promise.all([
-      pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
+      pipeline(child.stdout, createGzip(), opts.output, { signal: opts.signal }),
       waitForChildExit(child, pgDumpBin),
     ]);
   } finally {
@@ -651,7 +659,11 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
 }
 
 export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+  // Like every backup output: owner-only, and `wx` refuses a file or symlink
+  // already under the name instead of writing the SQL into it.
+  const filePromise = openFile(filePath, "wx", BACKUP_FILE_MODE);
+  // A failed open surfaces on the first write or close, not as an unhandled rejection.
+  filePromise.catch(() => {});
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -677,6 +689,9 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
     const chunk = firstChunk ? chunkBody : `\n${chunkBody}`;
     firstChunk = false;
     pendingWrite = pendingWrite.then(() => writeChunk(chunk));
+    // Nothing awaits this write yet: a failure (e.g. the open refused a taken
+    // name) surfaces in drain(), writeRaw() or close(), not as an unhandled rejection.
+    pendingWrite.catch(() => {});
   };
 
   return {
@@ -714,13 +729,18 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       const file = await filePromise;
       await file.close();
     },
+    /**
+     * Stops writing and removes the file, also after close(). A file this
+     * writer did not create (its open failed, e.g. on a taken name) stays.
+     */
     async abort() {
-      if (closed) return;
       closed = true;
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      await filePromise.then((file) => file.close()).catch(() => {});
+      const file = await filePromise.catch(() => null);
+      if (!file) return;
+      await file.close().catch(() => {});
       if (existsSync(filePath)) {
         try {
           unlinkSync(filePath);
@@ -741,6 +761,28 @@ function unlinkIfExists(filePath: string): void {
   }
 }
 
+/**
+ * Creates the gzip output of a backup run: owner-only, and `wx` refuses a file
+ * or symlink already under the name, so the dump never goes into a file with
+ * wider permissions or out of the backup directory. Resolves once created.
+ */
+async function createBackupOutputStream(filePath: string): Promise<WriteStream> {
+  const stream = createWriteStream(filePath, { flags: "wx", mode: BACKUP_FILE_MODE });
+  await once(stream, "open");
+  return stream;
+}
+
+/**
+ * Refuses a final backup name already taken, e.g. by the backup of a run in the
+ * same second or of a clock set back, which rename() would replace. A symbolic
+ * link counts as taken whether or not its target exists.
+ */
+function refuseTakenBackupName(backupFile: string): void {
+  if (lstatSync(backupFile, { throwIfNoEntry: false })) {
+    throw Object.assign(new Error(`Backup file already exists: ${backupFile}`), { code: "EEXIST" });
+  }
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   opts.signal?.throwIfAborted();
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
@@ -757,26 +799,56 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  mkdirSync(opts.backupDir, { recursive: true });
+  // A directory created here (with any missing parents) is owner-only; an
+  // existing one keeps the mode it has.
+  mkdirSync(opts.backupDir, { recursive: true, mode: BACKUP_DIR_MODE });
   const backupStem = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}`);
   const backupFile = `${backupStem}.sql.gz`;
   const partialBackupFile = `${backupFile}${PARTIAL_BACKUP_SUFFIX}`;
   // The JavaScript engine's uncompressed SQL; never a finished backup.
   const sqlFile = `${backupStem}.sql${PARTIAL_BACKUP_SUFFIX}`;
   const writer = createBufferedTextFileWriter(sqlFile);
+  // Cleanup removes only what this run created. A file already under one of
+  // its names (a run in the same second, a leftover, a planted link) stays.
+  let partialCreated = false;
+  let backupPublished = false;
+  const createPartialOutput = async () => {
+    const output = await createBackupOutputStream(partialBackupFile);
+    partialCreated = true;
+    return output;
+  };
+  const publishBackup = () => {
+    // Only a run holding the gzip partial name, created with `wx`, publishes
+    // under this name, so no other run does between the check and the rename.
+    refuseTakenBackupName(backupFile);
+    renameSync(partialBackupFile, backupFile);
+    partialCreated = false;
+    backupPublished = true;
+  };
+  const removeOutput = () => {
+    if (partialCreated) unlinkIfExists(partialBackupFile);
+    if (backupPublished) unlinkIfExists(backupFile);
+    partialCreated = false;
+    backupPublished = false;
+  };
 
   try {
+    // Checked again on publishing; here it spares writing out the whole dump first.
+    refuseTakenBackupName(backupFile);
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
       await sql`SELECT 1`;
+      // Outside the fallback below: the JavaScript engine would fail on the
+      // same taken name, only after writing out the whole SQL.
+      const output = await createPartialOutput();
       try {
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile: partialBackupFile,
+          output,
           connectTimeout,
           signal: opts.signal,
         });
-        renameSync(partialBackupFile, backupFile);
+        publishBackup();
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -786,9 +858,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
-        unlinkIfExists(partialBackupFile);
-        unlinkIfExists(backupFile);
-        if (backupEngine === "pg_dump" || opts.signal?.aborted) {
+        // Closes the file if pg_dump failed before writing to it.
+        output.destroy();
+        removeOutput();
+        // A taken name (EEXIST) is just as taken for the JavaScript engine.
+        if (backupEngine === "pg_dump" || opts.signal?.aborted || (error as NodeJS.ErrnoException).code === "EEXIST") {
           throw error;
         }
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
@@ -1188,11 +1262,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await writer.close();
 
     // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(partialBackupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream, { signal: opts.signal });
+    const gzWriteStream = await createPartialOutput();
+    await pipeline(createReadStream(sqlFile), createGzip(), gzWriteStream, { signal: opts.signal });
     unlinkSync(sqlFile);
-    renameSync(partialBackupFile, backupFile);
+    publishBackup();
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -1203,10 +1276,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       prunedCount,
     };
   } catch (error) {
+    // Also removes the SQL file after close(), if this run created it.
     await writer.abort();
-    unlinkIfExists(partialBackupFile);
-    unlinkIfExists(backupFile);
-    unlinkIfExists(sqlFile);
+    removeOutput();
     throw error;
   } finally {
     await closeSql();

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -240,6 +240,30 @@ describe("startDatabaseBackupScheduler", () => {
     expect(runBackup).toHaveBeenCalledTimes(1);
     expect(existsSync(backupDir)).toBe(true);
     expect(readDatabaseBackupSuccess(backupDir)?.backupFile).toBe("paperclip-1.sql.gz");
+  });
+
+  it("creates the backup directory and its missing parents owner-only under umask 0022", async () => {
+    const originalUmask = process.umask(0o022);
+    try {
+      // A parent every local user can enter, like /var/backups.
+      chmodSync(dir, 0o755);
+      const backupDir = join(dir, "var", "backups", "paperclip");
+      const runBackup = vi.fn(async () => null);
+      const { events } = startScheduler({ backupDir, runBackup, minFreeBytes: 0, guardMarginBytes: 0 });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(events.errors).toEqual([]);
+      expect(runBackup).toHaveBeenCalledTimes(1);
+      const modeOf = (path: string) => (statSync(path).mode & 0o777).toString(8);
+      for (const created of [join(dir, "var"), join(dir, "var", "backups"), backupDir]) {
+        expect(modeOf(created)).toBe("700");
+      }
+      // An existing directory keeps its mode.
+      expect(modeOf(dir)).toBe("755");
+    } finally {
+      process.umask(originalUmask);
+    }
   });
 
   it("keeps rescheduling when the backup directory can't be created", async () => {

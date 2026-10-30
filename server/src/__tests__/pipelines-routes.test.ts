@@ -744,13 +744,17 @@ describeEmbeddedPostgres("pipeline routes", () => {
       .config.automation.routineId as string;
     await db.update(routines).set({ env: { PRIVATE_TOKEN: sentinel } }).where(eq(routines.id, routineId));
 
-    const readerResponse = await request(app({ type: "agent", agentId: reader.id, companyId: company.id }))
-      .get(`/api/pipelines/${pipeline.body.id}`).expect(200);
+    const readerHttp = request(app({ type: "agent", agentId: reader.id, companyId: company.id }));
+    const readerResponse = await readerHttp.get(`/api/pipelines/${pipeline.body.id}`).expect(200);
     const readerAutomation = readerResponse.body.stages.find((stage: { key: string }) => stage.key === "in_progress")
       .config.automation;
     expect(readerAutomation.routineId).toBe(routineId);
     expect(readerAutomation).not.toHaveProperty("env");
     expect(JSON.stringify(readerResponse.body)).not.toContain(sentinel);
+    const readerList = await readerHttp.get(`/api/companies/${company.id}/pipelines`).expect(200);
+    const readerHealth = await readerHttp.get(`/api/pipelines/${pipeline.body.id}/health`).expect(200);
+    expect(JSON.stringify(readerList.body)).not.toContain(sentinel);
+    expect(JSON.stringify(readerHealth.body)).not.toContain(sentinel);
 
     for (const actor of [boardActor, { type: "agent" as const, agentId: assigned.id, companyId: company.id }]) {
       const response = await request(app(actor)).get(`/api/pipelines/${pipeline.body.id}`).expect(200);

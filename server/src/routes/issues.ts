@@ -28,6 +28,7 @@ import {
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  addGuardedIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
@@ -11041,6 +11042,83 @@ export function issueRoutes(
       return;
     }
     res.json(bundle);
+  });
+
+  router.post("/issues/:id/comments/guarded", validate(addGuardedIssueCommentSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    // Host watchdogs must not turn a stale SQL snapshot into a reassignment or
+    // reopen. Lock the issue through the comment insert, then wake the owner
+    // observed under that lock. This path never changes issue status or owner.
+    assertBoard(req);
+    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
+    if (closedExecutionWorkspace) {
+      respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
+      return;
+    }
+    const actor = getActorInfo(req);
+    const guarded = await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({
+          companyId: issueRows.companyId,
+          status: issueRows.status,
+          assigneeAgentId: issueRows.assigneeAgentId,
+        })
+        .from(issueRows)
+        .where(eq(issueRows.id, id))
+        .for("update");
+      if (
+        !current ||
+        current.companyId !== issue.companyId ||
+        current.status !== req.body.ifIssue.status ||
+        current.assigneeAgentId !== req.body.ifIssue.assigneeAgentId
+      ) return null;
+      const comment = await svc.addComment(
+        id,
+        req.body.body,
+        { userId: actor.actorId, runId: actor.runId },
+        { authorType: "user" },
+        tx,
+      );
+      return { comment, assigneeAgentId: current.assigneeAgentId };
+    });
+    if (!guarded) {
+      res.status(409).json({ error: "Issue status or assignee changed before comment" });
+      return;
+    }
+    await issueReferencesSvc.syncComment(guarded.comment.id);
+    await externalObjectsSvc.syncCommentSafely(guarded.comment.id);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issue.id,
+      details: { commentId: guarded.comment.id, identifier: issue.identifier, conditional: true },
+    });
+    void heartbeat.wakeup(guarded.assigneeAgentId!, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: id, commentId: guarded.comment.id, mutation: "comment" },
+      requestedByActorType: actor.actorType,
+      requestedByActorId: actor.actorId,
+      expectedIssueComment: req.body.ifIssue,
+      contextSnapshot: {
+        issueId: id,
+        taskId: id,
+        commentId: guarded.comment.id,
+        wakeCommentId: guarded.comment.id,
+        source: "issue.comment",
+        wakeReason: "issue_commented",
+      },
+    }).catch((err) => logger.warn({ err, issueId: id }, "conditional issue comment wake failed"));
+    res.status(201).json(guarded.comment);
   });
 
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {

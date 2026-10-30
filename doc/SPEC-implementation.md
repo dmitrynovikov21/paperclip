@@ -269,6 +269,13 @@ Invariants:
 - `author_user_id` uuid fk `users.id` null
 - `body` text not null
 
+Board automations may submit `POST /api/issues/:id/comments/guarded` with `ifIssue: {status,
+assigneeAgentId}`. The server accepts it only while the open status and owner
+match under an issue-row lock held through comment insertion. A mismatch returns
+409 without writing a comment or changing issue state. This path never reopens
+or reassigns an issue. Its wake rechecks the owner and status under a row lock
+and skips the wake if either field changed after comment insertion.
+
 ## 7.8 `heartbeat_runs`
 
 - `id` uuid pk

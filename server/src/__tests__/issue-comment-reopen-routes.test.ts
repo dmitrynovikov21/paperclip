@@ -38,8 +38,13 @@ const mockAgentService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues })));
+const mockTxSelectForUpdate = vi.hoisted(() => vi.fn());
+const mockTxSelectWhere = vi.hoisted(() => vi.fn(() => ({ for: mockTxSelectForUpdate })));
+const mockTxSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockTxSelectWhere })));
+const mockTxSelect = vi.hoisted(() => vi.fn(() => ({ from: mockTxSelectFrom })));
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
+  select: mockTxSelect,
 }));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
@@ -299,6 +304,10 @@ describe.sequential("issue comment reopen routes", () => {
     mockCrossIssueInfluenceRunContextError.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
+    mockTxSelectForUpdate.mockReset();
+    mockTxSelectWhere.mockReset();
+    mockTxSelectFrom.mockReset();
+    mockTxSelect.mockReset();
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
@@ -306,6 +315,9 @@ describe.sequential("issue comment reopen routes", () => {
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
+    mockTxSelectWhere.mockImplementation(() => ({ for: mockTxSelectForUpdate }));
+    mockTxSelectFrom.mockImplementation(() => ({ where: mockTxSelectWhere }));
+    mockTxSelect.mockImplementation(() => ({ from: mockTxSelectFrom }));
     mockDbSelectOrderBy.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,
@@ -566,7 +578,7 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "hello" });
 
-    expect(res.status).toBe(201);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
@@ -580,6 +592,79 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("adds a conditional comment under the issue row lock and wakes the locked owner", async () => {
+    const issue = makeIssue("in_review");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockTxSelectForUpdate.mockResolvedValue([{
+      companyId: issue.companyId,
+      status: issue.status,
+      assigneeAgentId: issue.assigneeAgentId,
+    }]);
+
+    const res = await request(await installActor(createApp()))
+      .post(`/api/issues/${issue.id}/comments/guarded`)
+      .send({ body: "watchdog tick", ifIssue: {
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+      } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockTxSelectForUpdate).toHaveBeenCalledWith("update");
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "watchdog tick",
+      expect.objectContaining({ userId: "local-board" }),
+      { authorType: "user" },
+      mockTx,
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      issue.assigneeAgentId,
+      expect.objectContaining({
+        reason: "issue_commented",
+        expectedIssueComment: {
+          status: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+        },
+      }),
+    ));
+  });
+
+  it.each([
+    ["a new owner", { status: "in_review", assigneeAgentId: "44444444-4444-4444-8444-444444444444" }],
+    ["a closed issue", { status: "done", assigneeAgentId: "22222222-2222-4222-8222-222222222222" }],
+  ])("rejects a conditional comment after %s without changing the issue", async (_reason, locked) => {
+    const snapshot = makeIssue("in_review");
+    mockIssueService.getById.mockResolvedValue(snapshot);
+    mockTxSelectForUpdate.mockResolvedValue([{ companyId: snapshot.companyId, ...locked }]);
+
+    const res = await request(await installActor(createApp()))
+      .post(`/api/issues/${snapshot.id}/comments/guarded`)
+      .send({ body: "stale watchdog tick", ifIssue: {
+        status: snapshot.status,
+        assigneeAgentId: snapshot.assigneeAgentId,
+      } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(mockTxSelectForUpdate).toHaveBeenCalledWith("update");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("denies agent-authored guarded comments", async () => {
+    const issue = makeIssue("in_review");
+    mockIssueService.getById.mockResolvedValue(issue);
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post(`/api/issues/${issue.id}/comments/guarded`)
+      .send({ body: "watchdog tick", ifIssue: {
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+      } });
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockDb.transaction).not.toHaveBeenCalled();
   });
 
   it("allows default-open non-assignee POST comments on closed issues without reopening", async () => {

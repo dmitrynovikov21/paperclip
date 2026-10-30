@@ -677,6 +677,16 @@ export const addIssueCommentSchema = z.object({
   interrupt: z.boolean().optional(),
 });
 
+// The guarded route has a distinct URL so older servers reject it instead of
+// silently discarding the precondition and accepting an ordinary comment.
+export const addGuardedIssueCommentSchema = z.object({
+  body: multilineTextSchema.pipe(z.string().min(1)),
+  ifIssue: z.object({
+    status: z.enum(["todo", "in_progress", "in_review"]),
+    assigneeAgentId: z.string().uuid(),
+  }).strict(),
+}).strict();
+
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
 
 export const issueThreadInteractionStatusSchema = z.enum(ISSUE_THREAD_INTERACTION_STATUSES);

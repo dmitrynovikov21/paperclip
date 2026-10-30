@@ -1705,6 +1705,7 @@ export {
   issueCommentMetadataSectionSchema,
   issueCommentMetadataSchema,
   addIssueCommentSchema,
+  addGuardedIssueCommentSchema,
   issueThreadInteractionStatusSchema,
   issueThreadInteractionKindSchema,
   issueThreadInteractionContinuationPolicySchema,

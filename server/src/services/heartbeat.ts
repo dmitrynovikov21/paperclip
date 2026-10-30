@@ -2488,6 +2488,10 @@ interface WakeupOptions {
     assigneeAgentId: string | null;
     lastDecisionId: string | null;
   };
+  expectedIssueComment?: {
+    status: "todo" | "in_progress" | "in_review";
+    assigneeAgentId: string;
+  };
   expectedSourceScopedRecoveryAction?: {
     actionId: string;
     ownerAgentId: string;
@@ -17722,6 +17726,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
+          return { kind: "skipped" as const };
+        }
+
+        // A guarded comment may commit just before a reassignment or closure.
+        // Only enqueue its wake while the issue still belongs to that owner.
+        if (opts.expectedIssueComment && (
+          issue.status !== opts.expectedIssueComment.status ||
+          issue.assigneeAgentId !== opts.expectedIssueComment.assigneeAgentId ||
+          agentId !== opts.expectedIssueComment.assigneeAgentId
+        )) {
           return { kind: "skipped" as const };
         }
 

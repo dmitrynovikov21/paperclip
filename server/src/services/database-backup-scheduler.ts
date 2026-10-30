@@ -295,7 +295,8 @@ export function startDatabaseBackupScheduler(
         return;
       }
 
-      mkdirSync(opts.backupDir, { recursive: true });
+      // Owner-only like the dumps that go in it; an existing directory keeps its mode.
+      mkdirSync(opts.backupDir, { recursive: true, mode: 0o700 });
       const sizeEstimateBytes = estimateDatabaseBackupSizeBytes(opts.backupDir);
       const requiredBytes = requiredFreeBytes(sizeEstimateBytes, floorBytes);
       const freeAtStartBytes = measureFreeBytes(opts.backupDir);

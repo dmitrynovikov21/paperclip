@@ -30,6 +30,29 @@ function createTempDir(prefix: string): string {
   return dir;
 }
 
+/** A directory everyone can read and enter, like /var/backups. */
+function createPublicTempDir(prefix: string): string {
+  const dir = createTempDir(prefix);
+  fs.chmodSync(dir, 0o755);
+  return dir;
+}
+
+/** Sets the process umask until the end of the test. */
+function useUmask(mask: number): void {
+  const original = process.umask(mask);
+  cleanups.push(() => {
+    process.umask(original);
+  });
+}
+
+/** Permission bits in octal, so a failed assertion shows the mode and nothing of the file. */
+function modeOf(filePath: string): string {
+  return (fs.lstatSync(filePath).mode & 0o777).toString(8);
+}
+
+// Content of a file that is not the backup run's own.
+const FOREIGN_CONTENT = "not this backup run's file\n";
+
 async function createTempDatabase(): Promise<string> {
   const db = await startEmbeddedPostgresTestDatabase("paperclip-db-backup-");
   cleanups.push(db.cleanup);
@@ -78,6 +101,46 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+
+  it("creates the file owner-only under umask 0022", async () => {
+    useUmask(0o022);
+    const outputPath = path.join(createPublicTempDir("paperclip-buffered-writer-mode-"), "backup.sql.partial");
+    const writer = createBufferedTextFileWriter(outputPath, 16);
+    writer.emit("SELECT 1;");
+    await writer.close();
+
+    expect(modeOf(outputPath)).toBe("600");
+  });
+
+  it("refuses a file or symbolic link already under its name and leaves it as it was", async () => {
+    useUmask(0o022);
+    const dir = createPublicTempDir("paperclip-buffered-writer-taken-");
+    const linkTarget = path.join(dir, "elsewhere.txt");
+    fs.writeFileSync(linkTarget, FOREIGN_CONTENT, { mode: 0o644 });
+    const takenFile = path.join(dir, "taken-file.sql.partial");
+    fs.writeFileSync(takenFile, FOREIGN_CONTENT, { mode: 0o644 });
+    const takenLink = path.join(dir, "taken-link.sql.partial");
+    fs.symlinkSync(linkTarget, takenLink);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+
+    for (const taken of [takenFile, takenLink]) {
+      const writer = createBufferedTextFileWriter(taken, 16);
+      // The refused open, and then a write past the flush threshold, must wait
+      // for close() rather than crash the process as unhandled rejections.
+      await settle();
+      writer.emit("INSERT INTO probe VALUES (1);");
+      writer.emit("INSERT INTO probe VALUES (2);");
+      await settle();
+      await expect(writer.close()).rejects.toMatchObject({ code: "EEXIST" });
+      await writer.abort();
+    }
+
+    for (const file of [takenFile, linkTarget]) {
+      expect(fs.readFileSync(file, "utf8")).toBe(FOREIGN_CONTENT);
+      expect(modeOf(file)).toBe("644");
+    }
+    expect(fs.readlinkSync(takenLink)).toBe(linkTarget);
   });
 });
 
@@ -243,6 +306,95 @@ async function waitForFile(dir: string, suffix: string, timeoutMs = 15_000): Pro
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`No *${suffix} file appeared in ${dir}`);
+}
+
+/** A fake pg_dump that writes some SQL, then waits for `release()` and exits with `exitCode`. */
+function useHeldFakePgDump(exitCode = 0) {
+  const controlDir = createTempDir("paperclip-fake-pg-dump-control-");
+  const restorePgDump = useFakePgDump(
+    [
+      `: > '${controlDir}/started'`,
+      "printf 'SELECT 1;\\n'",
+      // Bounded, so a failed test leaves no process behind.
+      `i=0; while [ ! -e '${controlDir}/release' ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done`,
+      `exit ${exitCode}`,
+    ].join("\n"),
+  );
+  const release = () => fs.writeFileSync(path.join(controlDir, "release"), "");
+  cleanups.push(restorePgDump, release);
+  return { started: () => fs.existsSync(path.join(controlDir, "started")), release };
+}
+
+/**
+ * Holds an ACCESS EXCLUSIVE lock on a new table, so a JavaScript-engine run
+ * stops at that table's data, with its SQL file open, until `release()`.
+ */
+async function holdBackupAtNewTable(connectionString: string) {
+  const sql = postgres(connectionString, { max: 2, onnotice: () => {} });
+  await sql.unsafe("CREATE TABLE public.backup_lock_probe (id integer)");
+  let unlock!: () => void;
+  const unlocked = new Promise<void>((resolve) => {
+    unlock = resolve;
+  });
+  let locked!: () => void;
+  const lockTaken = new Promise<void>((resolve) => {
+    locked = resolve;
+  });
+  const transaction = sql.begin(async (tx) => {
+    await tx.unsafe("LOCK TABLE public.backup_lock_probe IN ACCESS EXCLUSIVE MODE");
+    locked();
+    await unlocked;
+  });
+  await Promise.race([lockTaken, transaction]);
+  let released: Promise<void> | null = null;
+  const release = () => {
+    released ??= (async () => {
+      unlock();
+      await transaction.catch(() => {});
+      await sql.end();
+    })();
+    return released;
+  };
+  cleanups.push(release);
+  return {
+    release,
+    /** Resolves once a backup run waits for the lock. */
+    async waitForBackup(timeoutMs = 15_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const [{ waiting }] = await sql<{ waiting: number }[]>`
+          SELECT count(*)::int AS waiting FROM pg_locks
+          WHERE NOT granted AND relation = 'public.backup_lock_probe'::regclass
+        `;
+        if (waiting > 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error("No backup run waited for the table lock");
+    },
+  };
+}
+
+/**
+ * Plants `plant(path)` under every `<prefix>-<YYYYMMDD-HHMMSS><suffix>` name a
+ * run started within the next minute can use, so the run finds its name taken.
+ */
+function takeUpcomingBackupNames(
+  backupDir: string,
+  prefix: string,
+  suffix: string,
+  plant: (filePath: string) => void,
+): string[] {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const startMs = Date.now();
+  const taken: string[] = [];
+  for (let second = -1; second <= 60; second += 1) {
+    const d = new Date(startMs + second * 1000);
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const filePath = path.join(backupDir, `${prefix}-${stamp}${suffix}`);
+    plant(filePath);
+    taken.push(filePath);
+  }
+  return taken;
 }
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
@@ -1014,6 +1166,278 @@ describeEmbeddedPostgres("PostgreSQL client credentials", () => {
     },
     30_000,
   );
+});
+
+// A backup holds the whole database. Under umask 0022 (as paperclip.service
+// runs) and a parent every local user can enter, only the owner may read it.
+describeEmbeddedPostgres("backup file permissions", () => {
+  const retention = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+
+  it(
+    "keeps pg_dump output owner-only from the partial files to the published backup",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const pgDump = useHeldFakePgDump();
+      useUmask(0o022);
+      const parentDir = createPublicTempDir("paperclip-db-backup-mode-pgdump-");
+      const backupDir = path.join(parentDir, "var", "backups", "paperclip");
+
+      const backup = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-mode-pgdump-test",
+        backupEngine: "pg_dump",
+      });
+      backup.catch(() => {});
+
+      // What a run killed now leaves behind until the stale-partial sweep.
+      const partial = await waitForFile(backupDir, ".sql.gz.partial");
+      expect(modeOf(path.join(backupDir, partial))).toBe("600");
+      expect(modeOf(path.join(backupDir, partial.replace(/\.gz\.partial$/, ".partial")))).toBe("600");
+      // The backup directory and the parents the run created for it.
+      for (const dir of ["var", "var/backups", "var/backups/paperclip"]) {
+        expect(modeOf(path.join(parentDir, dir))).toBe("700");
+      }
+
+      pgDump.release();
+      const result = await backup;
+      expect(modeOf(result.backupFile)).toBe("600");
+      expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+      // An existing directory keeps its mode.
+      expect(modeOf(parentDir)).toBe("755");
+    },
+    30_000,
+  );
+
+  it(
+    "removes the owner-only pg_dump output when the run is aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      useHeldFakePgDump();
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-mode-pgdump-abort-"), "backups");
+      const controller = new AbortController();
+
+      const settled = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-mode-pgdump-abort-test",
+        backupEngine: "pg_dump",
+        signal: controller.signal,
+      }).catch((error: unknown) => error);
+
+      const partial = await waitForFile(backupDir, ".sql.gz.partial");
+      expect(modeOf(path.join(backupDir, partial))).toBe("600");
+
+      controller.abort(new Error("free space below reserve"));
+      expect(await settled).toBeInstanceOf(Error);
+      expect(fs.readdirSync(backupDir)).toEqual([]);
+    },
+    30_000,
+  );
+
+  it(
+    "keeps the backup owner-only when pg_dump fails mid-run and the JavaScript engine takes over",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const pgDump = useHeldFakePgDump(3);
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-mode-fallback-"), "backups");
+
+      const backup = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-mode-fallback-test",
+        backupEngine: "auto",
+      });
+      backup.catch(() => {});
+
+      const partial = await waitForFile(backupDir, ".sql.gz.partial");
+      expect(modeOf(path.join(backupDir, partial))).toBe("600");
+
+      pgDump.release();
+      const result = await backup;
+      expect(path.basename(result.backupFile)).toBe(partial.slice(0, -".partial".length));
+      // Written by the JavaScript engine, not the failed pg_dump.
+      expect(gunzipSync(fs.readFileSync(result.backupFile)).subarray(0, 28).toString("utf8")).toBe(
+        "-- Paperclip database backup",
+      );
+      expect(modeOf(result.backupFile)).toBe("600");
+      expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+    },
+    60_000,
+  );
+
+  it(
+    "keeps JavaScript-engine output owner-only from the SQL file to the published backup",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const tableLock = await holdBackupAtNewTable(connectionString);
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-mode-js-"), "backups");
+
+      const backup = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-mode-js-test",
+        backupEngine: "javascript",
+      });
+      backup.catch(() => {});
+
+      // What a run killed now leaves behind until the stale-partial sweep.
+      await tableLock.waitForBackup();
+      const sqlPartial = await waitForFile(backupDir, ".sql.partial");
+      expect(modeOf(path.join(backupDir, sqlPartial))).toBe("600");
+      expect(modeOf(backupDir)).toBe("700");
+
+      await tableLock.release();
+      const result = await backup;
+      // The gzip output under its final name.
+      expect(modeOf(result.backupFile)).toBe("600");
+      expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+    },
+    60_000,
+  );
+
+  it(
+    "removes the owner-only JavaScript-engine output when the run is aborted",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const tableLock = await holdBackupAtNewTable(connectionString);
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-mode-js-abort-"), "backups");
+      const controller = new AbortController();
+
+      const settled = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-mode-js-abort-test",
+        backupEngine: "javascript",
+        signal: controller.signal,
+      }).catch((error: unknown) => error);
+
+      await tableLock.waitForBackup();
+      const sqlPartial = await waitForFile(backupDir, ".sql.partial");
+      expect(modeOf(path.join(backupDir, sqlPartial))).toBe("600");
+
+      controller.abort(new Error("free space below reserve"));
+      await tableLock.release();
+      expect(await settled).toMatchObject({ message: "free space below reserve" });
+      expect(fs.readdirSync(backupDir)).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "refuses a taken .sql.gz.partial name without starting pg_dump and leaves the file as it was",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const pgDump = useHeldFakePgDump();
+      // Should pg_dump start after all, it finishes at once and the assertions catch it.
+      pgDump.release();
+      useUmask(0o022);
+      // Set up beforehand, as an administrator would; it keeps its mode.
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-gz-"), "backups");
+      fs.mkdirSync(backupDir, { mode: 0o755 });
+      const filenamePrefix = "paperclip-taken-gz-test";
+      const taken = takeUpcomingBackupNames(backupDir, filenamePrefix, ".sql.gz.partial", (filePath) =>
+        fs.writeFileSync(filePath, FOREIGN_CONTENT, { mode: 0o644 }),
+      );
+
+      const error = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix,
+        backupEngine: "auto",
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code: "EEXIST" });
+      expect(pgDump.started()).toBe(false);
+      expect(fs.readdirSync(backupDir).sort()).toEqual(taken.map((filePath) => path.basename(filePath)).sort());
+      for (const filePath of taken) {
+        expect(fs.readFileSync(filePath, "utf8")).toBe(FOREIGN_CONTENT);
+        expect(modeOf(filePath)).toBe("644");
+      }
+      expect(modeOf(backupDir)).toBe("755");
+    },
+    30_000,
+  );
+
+  it(
+    "runs pg_dump past a taken .sql.partial name and leaves the file as it was",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const pgDump = useHeldFakePgDump();
+      pgDump.release();
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-sql-pgdump-"), "backups");
+      fs.mkdirSync(backupDir);
+      const filenamePrefix = "paperclip-taken-sql-pgdump-test";
+      const taken = takeUpcomingBackupNames(backupDir, filenamePrefix, ".sql.partial", (filePath) =>
+        fs.writeFileSync(filePath, FOREIGN_CONTENT, { mode: 0o644 }),
+      );
+
+      const result = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix,
+        backupEngine: "pg_dump",
+      });
+
+      expect(modeOf(result.backupFile)).toBe("600");
+      expect(fs.readdirSync(backupDir).sort()).toEqual(
+        [...taken, result.backupFile].map((filePath) => path.basename(filePath)).sort(),
+      );
+      for (const filePath of taken) {
+        expect(fs.readFileSync(filePath, "utf8")).toBe(FOREIGN_CONTENT);
+        expect(modeOf(filePath)).toBe("644");
+      }
+    },
+    30_000,
+  );
+
+  for (const suffix of [".sql.partial", ".sql.gz.partial"]) {
+    it(
+      `does not follow a symbolic link under a taken ${suffix} name in the JavaScript engine`,
+      async () => {
+        const connectionString = await createTempDatabase();
+        useUmask(0o022);
+        const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-link-"), "backups");
+        fs.mkdirSync(backupDir);
+        const linkTarget = path.join(createTempDir("paperclip-db-backup-link-target-"), "elsewhere.txt");
+        fs.writeFileSync(linkTarget, FOREIGN_CONTENT, { mode: 0o644 });
+        const filenamePrefix = "paperclip-taken-link-test";
+        const links = takeUpcomingBackupNames(backupDir, filenamePrefix, suffix, (filePath) =>
+          fs.symlinkSync(linkTarget, filePath),
+        );
+
+        const error = await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention,
+          filenamePrefix,
+          backupEngine: "javascript",
+        }).catch((caught: unknown) => caught);
+
+        expect(error).toMatchObject({ code: "EEXIST" });
+        expect(fs.readFileSync(linkTarget, "utf8")).toBe(FOREIGN_CONTENT);
+        expect(modeOf(linkTarget)).toBe("644");
+        // Nothing of the run is left beside the links, and every link is as it was.
+        expect(fs.readdirSync(backupDir).sort()).toEqual(links.map((filePath) => path.basename(filePath)).sort());
+        for (const link of links) {
+          expect(fs.readlinkSync(link)).toBe(linkTarget);
+        }
+      },
+      60_000,
+    );
+  }
 });
 
 describe("PostgreSQL client connection strings", () => {

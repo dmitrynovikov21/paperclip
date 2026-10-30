@@ -91,6 +91,7 @@ import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
+import { startDatabaseBackupScheduler } from "./services/database-backup-scheduler.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -1361,11 +1362,24 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
-      void runServerDatabaseBackup("scheduled").catch(() => {
-        // runServerDatabaseBackup already logs the failure with context.
-      });
-    }, backupIntervalMs);
+    startDatabaseBackupScheduler({
+      backupDir: config.databaseBackupDir,
+      intervalMs: backupIntervalMs,
+      runBackup: () =>
+        runServerDatabaseBackup("scheduled").catch(() => {
+          // runServerDatabaseBackup already logs the failure with context.
+          return null;
+        }),
+      onScheduled: (delayMs) => {
+        logger.info({ delayMs, backupDir: config.databaseBackupDir }, "Next automatic database backup scheduled");
+      },
+      onSkippedForLowSpace: ({ freeBytes, requiredBytes }) => {
+        logger.warn(
+          { freeBytes, requiredBytes, backupDir: config.databaseBackupDir },
+          "Skipping scheduled database backup: not enough free disk space",
+        );
+      },
+    });
   }
   
   // Wait for external adapters to finish loading before accepting requests.

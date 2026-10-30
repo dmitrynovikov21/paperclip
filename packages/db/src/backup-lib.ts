@@ -772,6 +772,17 @@ async function createBackupOutputStream(filePath: string): Promise<WriteStream> 
   return stream;
 }
 
+/**
+ * Refuses a final backup name already taken, e.g. by the backup of a run in the
+ * same second or of a clock set back, which rename() would replace. A symbolic
+ * link counts as taken whether or not its target exists.
+ */
+function refuseTakenBackupName(backupFile: string): void {
+  if (lstatSync(backupFile, { throwIfNoEntry: false })) {
+    throw Object.assign(new Error(`Backup file already exists: ${backupFile}`), { code: "EEXIST" });
+  }
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   opts.signal?.throwIfAborted();
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
@@ -807,6 +818,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     return output;
   };
   const publishBackup = () => {
+    // Only a run holding the gzip partial name, created with `wx`, publishes
+    // under this name, so no other run does between the check and the rename.
+    refuseTakenBackupName(backupFile);
     renameSync(partialBackupFile, backupFile);
     partialCreated = false;
     backupPublished = true;
@@ -819,6 +833,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   };
 
   try {
+    // Checked again on publishing; here it spares writing out the whole dump first.
+    refuseTakenBackupName(backupFile);
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
       await sql`SELECT 1`;
       // Outside the fallback below: the JavaScript engine would fail on the
@@ -845,7 +861,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         // Closes the file if pg_dump failed before writing to it.
         output.destroy();
         removeOutput();
-        if (backupEngine === "pg_dump" || opts.signal?.aborted) {
+        // A taken name (EEXIST) is just as taken for the JavaScript engine.
+        if (backupEngine === "pg_dump" || opts.signal?.aborted || (error as NodeJS.ErrnoException).code === "EEXIST") {
           throw error;
         }
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });

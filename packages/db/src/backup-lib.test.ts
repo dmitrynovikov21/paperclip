@@ -1438,6 +1438,148 @@ describeEmbeddedPostgres("backup file permissions", () => {
       60_000,
     );
   }
+
+  for (const backupEngine of ["auto", "javascript"] as const) {
+    it(
+      `refuses a backup already under the final name before dumping (${backupEngine} engine) and leaves it as it was`,
+      async () => {
+        const connectionString = await createTempDatabase();
+        // A dump would show: pg_dump starts, or the JavaScript engine waits at this table.
+        const tableLock = await holdBackupAtNewTable(connectionString);
+        const pgDump = useHeldFakePgDump();
+        pgDump.release();
+        useUmask(0o022);
+        const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-final-"), "backups");
+        fs.mkdirSync(backupDir);
+        const filenamePrefix = `paperclip-taken-final-${backupEngine}-test`;
+        // Backups of a run earlier in the same second, or from before the clock was set back.
+        const taken = takeUpcomingBackupNames(backupDir, filenamePrefix, ".sql.gz", (filePath) =>
+          fs.writeFileSync(filePath, FOREIGN_CONTENT, { mode: 0o644 }),
+        );
+
+        const outcome = await Promise.race([
+          runDatabaseBackup({
+            connectionString,
+            backupDir,
+            retention,
+            filenamePrefix,
+            backupEngine,
+          }).catch((caught: unknown) => caught),
+          tableLock.waitForBackup().then(() => "dumping with the JavaScript engine"),
+        ]);
+
+        expect(outcome).toMatchObject({ code: "EEXIST" });
+        expect(pgDump.started()).toBe(false);
+        expect(fs.readdirSync(backupDir).sort()).toEqual(taken.map((filePath) => path.basename(filePath)).sort());
+        for (const filePath of taken) {
+          expect(fs.readFileSync(filePath, "utf8")).toBe(FOREIGN_CONTENT);
+          expect(modeOf(filePath)).toBe("644");
+        }
+      },
+      60_000,
+    );
+  }
+
+  it(
+    "refuses a symbolic link under the final name, also a dangling one, before starting pg_dump",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const pgDump = useHeldFakePgDump();
+      pgDump.release();
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-final-link-"), "backups");
+      fs.mkdirSync(backupDir);
+      const missingTarget = path.join(createTempDir("paperclip-db-backup-link-target-"), "missing.sql.gz");
+      const filenamePrefix = "paperclip-taken-final-link-test";
+      const links = takeUpcomingBackupNames(backupDir, filenamePrefix, ".sql.gz", (filePath) =>
+        fs.symlinkSync(missingTarget, filePath),
+      );
+
+      const error = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix,
+        backupEngine: "pg_dump",
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code: "EEXIST" });
+      expect(pgDump.started()).toBe(false);
+      expect(fs.existsSync(missingTarget)).toBe(false);
+      expect(fs.readdirSync(backupDir).sort()).toEqual(links.map((filePath) => path.basename(filePath)).sort());
+      for (const link of links) {
+        expect(fs.readlinkSync(link)).toBe(missingTarget);
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "keeps a backup published under the final name while pg_dump ran, without a JavaScript-engine fallback",
+    async () => {
+      const connectionString = await createTempDatabase();
+      // The JavaScript engine would wait at this table, so a fallback shows.
+      const tableLock = await holdBackupAtNewTable(connectionString);
+      const pgDump = useHeldFakePgDump();
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-final-pgdump-"), "backups");
+
+      const settled = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-taken-final-pgdump-test",
+        backupEngine: "auto",
+      }).catch((caught: unknown) => caught);
+
+      // As another run in the same second would publish its backup.
+      const partial = await waitForFile(backupDir, ".sql.gz.partial");
+      const backupFile = path.join(backupDir, partial.slice(0, -".partial".length));
+      fs.writeFileSync(backupFile, FOREIGN_CONTENT, { mode: 0o644 });
+      pgDump.release();
+
+      const outcome = await Promise.race([
+        settled,
+        tableLock.waitForBackup().then(() => "fell back to the JavaScript engine"),
+      ]);
+      expect(outcome).toMatchObject({ code: "EEXIST" });
+      expect(fs.readFileSync(backupFile, "utf8")).toBe(FOREIGN_CONTENT);
+      expect(modeOf(backupFile)).toBe("644");
+      expect(fs.readdirSync(backupDir)).toEqual([path.basename(backupFile)]);
+    },
+    60_000,
+  );
+
+  it(
+    "keeps a backup published under the final name while the JavaScript engine ran",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const tableLock = await holdBackupAtNewTable(connectionString);
+      useUmask(0o022);
+      const backupDir = path.join(createPublicTempDir("paperclip-db-backup-taken-final-js-"), "backups");
+
+      const settled = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: "paperclip-taken-final-js-test",
+        backupEngine: "javascript",
+      }).catch((caught: unknown) => caught);
+
+      // As another run in the same second, e.g. one with pg_dump, would publish its backup.
+      await tableLock.waitForBackup();
+      const sqlPartial = await waitForFile(backupDir, ".sql.partial");
+      const backupFile = path.join(backupDir, sqlPartial.replace(/\.sql\.partial$/, ".sql.gz"));
+      fs.writeFileSync(backupFile, FOREIGN_CONTENT, { mode: 0o644 });
+      await tableLock.release();
+
+      expect(await settled).toMatchObject({ code: "EEXIST" });
+      expect(fs.readFileSync(backupFile, "utf8")).toBe(FOREIGN_CONTENT);
+      expect(modeOf(backupFile)).toBe("644");
+      expect(fs.readdirSync(backupDir)).toEqual([path.basename(backupFile)]);
+    },
+    60_000,
+  );
 });
 
 describe("PostgreSQL client connection strings", () => {

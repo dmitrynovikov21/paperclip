@@ -18,6 +18,7 @@ import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAcc
 import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { routineForRead } from "./routine-read-visibility.js";
 
 export function routineRoutes(
   db: Db,
@@ -151,7 +152,7 @@ export function routineRoutes(
     assertCompanyAccess(req, companyId);
     const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
     const result = await svc.list(companyId, { projectId });
-    res.json(result);
+    res.json(result.map((routine) => routineForRead(req, routine)));
   });
 
   router.post("/companies/:companyId/routines", validate(createRoutineSchema), async (req, res) => {
@@ -194,7 +195,15 @@ export function routineRoutes(
   router.get("/routines/:id", async (req, res) => {
     const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string), "Routine not found");
     if (!detail) return;
-    res.json(detail);
+    const projectAllowed = detail.project && (await access.decide({
+      actor: req.actor,
+      action: "project:read",
+      resource: { type: "project", companyId: detail.companyId, projectId: detail.project.id },
+    })).allowed;
+    res.json({
+      ...routineForRead(req, detail),
+      project: projectAllowed ? detail.project : null,
+    });
   });
 
   router.get("/routines/:id/revisions", async (req, res) => {

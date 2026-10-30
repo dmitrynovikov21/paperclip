@@ -56,6 +56,7 @@ import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
 import { assertCompanyAccess } from "./authz.js";
+import { canReadRoutineEnv } from "./routine-read-visibility.js";
 import {
   computePipelineHealth,
   deriveCaseType,
@@ -268,7 +269,7 @@ function withDerivedStageAutomation(
     assigneeAgentId: string | null;
     title: string;
     description: string | null;
-    env: PipelineStageAutomation["env"];
+    env?: PipelineStageAutomation["env"];
     latestRevisionId: string | null;
     latestRevisionNumber: number;
   }>,
@@ -289,7 +290,7 @@ function withDerivedStageAutomation(
         titleTemplate: routine.title,
         instructionsBody: routine.description ?? "",
         ...stageAutomationContext(config),
-        env: routine.env ?? null,
+        ...(routine.env !== undefined ? { env: routine.env } : {}),
         latestRoutineRevisionId: routine.latestRevisionId,
         latestRoutineRevisionNumber: routine.latestRevisionNumber,
       },
@@ -1003,7 +1004,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         assigneeAgentId: row.assigneeAgentId,
         title: row.title,
         description: row.description,
-        env: row.env,
+        env: canReadRoutineEnv(req, { companyId, assigneeAgentId: row.assigneeAgentId }) ? row.env : undefined,
         latestRevisionId: row.latestRevisionId,
         latestRevisionNumber: row.latestRevisionNumber,
       },
@@ -1095,7 +1096,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
         assigneeAgentId: row.assigneeAgentId,
         title: row.title,
         description: row.description,
-        env: row.env,
+        env: canReadRoutineEnv(req, { companyId, assigneeAgentId: row.assigneeAgentId }) ? row.env : undefined,
         latestRevisionId: row.latestRevisionId,
         latestRevisionNumber: row.latestRevisionNumber,
       },

@@ -29,6 +29,9 @@ import {
   routineTriggers,
 } from "@paperclipai/db";
 import {
+  LOW_TRUST_REVIEW_PRESET,
+} from "@paperclipai/shared";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -152,8 +155,9 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   async function createApp(actor: Record<string, unknown>) {
-    const [{ routineRoutes }, { errorHandler }] = await Promise.all([
+    const [{ routineRoutes }, { projectRoutes }, { errorHandler }] = await Promise.all([
       import("../routes/routines.js"),
+      import("../routes/projects.js"),
       import("../middleware/index.js"),
     ]);
     const app = express();
@@ -163,6 +167,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       next();
     });
     app.use("/api", routineRoutes(db));
+    app.use("/api", projectRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -313,6 +318,125 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const foreignResponse = await request(foreignApp).get(detailPath);
     expect(foreignResponse.status).toBe(404);
     expect(foreignResponse.body).toEqual({ error: "Routine not found" });
+  }, 30_000);
+
+  it("keeps routine and project env inside their read boundaries", async () => {
+    const { companyId, agentId, projectId, userId } = await seedFixture();
+    const readerAgentId = randomUUID();
+    const projectReaderAgentId = randomUUID();
+    const allowedProjectId = randomUUID();
+    const projectSentinel = "SYNTHETIC_PROJECT_ENV_SENTINEL";
+    const routineSentinel = "SYNTHETIC_ROUTINE_ENV_SENTINEL";
+
+    await db.insert(projects).values({
+      id: allowedProjectId,
+      companyId,
+      name: "Allowed project",
+      status: "in_progress",
+    });
+    await db.update(projects).set({ env: { PROJECT_TOKEN: projectSentinel } }).where(eq(projects.id, projectId));
+    await db.insert(agents).values([
+      {
+        id: readerAgentId,
+        companyId,
+        name: "Low trust reader",
+        role: "engineer",
+        status: "active",
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [allowedProjectId], allowedAgentIds: [] },
+          },
+        },
+      },
+      {
+        id: projectReaderAgentId,
+        companyId,
+        name: "Project reader",
+        role: "engineer",
+        status: "active",
+      },
+    ]);
+
+    const boardApp = await createApp({
+      type: "board", userId, source: "session", isInstanceAdmin: false, companyIds: [companyId],
+    });
+    const created = await request(boardApp)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({ title: "Private env routine", projectId, assigneeAgentId: agentId });
+    expect(created.status).toBe(201);
+    const routineId = created.body.id as string;
+    await db.update(routines).set({ env: { ROUTINE_TOKEN: routineSentinel } }).where(eq(routines.id, routineId));
+
+    const lowTrustApp = await createApp({ type: "agent", agentId: readerAgentId, companyId, source: "agent_key" });
+    const directProject = await request(lowTrustApp).get(`/api/projects/${projectId}`);
+    expect(directProject.status).toBe(403);
+    const lowTrustDetail = await request(lowTrustApp).get(`/api/routines/${routineId}`);
+    expect(lowTrustDetail.status).toBe(200);
+    expect(lowTrustDetail.body).toMatchObject({ id: routineId, projectId, title: "Private env routine" });
+    expect(lowTrustDetail.body.project).toBeNull();
+    expect(lowTrustDetail.body).not.toHaveProperty("env");
+    const lowTrustList = await request(lowTrustApp).get(`/api/companies/${companyId}/routines`);
+    expect(lowTrustList.status).toBe(200);
+    const listed = lowTrustList.body.find((routine: { id: string }) => routine.id === routineId);
+    expect(listed).toBeDefined();
+    expect(listed).not.toHaveProperty("env");
+    expect(JSON.stringify([lowTrustDetail.body, lowTrustList.body])).not.toContain(projectSentinel);
+    expect(JSON.stringify([lowTrustDetail.body, lowTrustList.body])).not.toContain(routineSentinel);
+
+    const projectReaderApp = await createApp({ type: "agent", agentId: projectReaderAgentId, companyId });
+    expect((await request(projectReaderApp).get(`/api/projects/${projectId}`)).status).toBe(200);
+    const projectReaderDetail = await request(projectReaderApp).get(`/api/routines/${routineId}`);
+    expect(projectReaderDetail.status).toBe(200);
+    expect(projectReaderDetail.body.project).toMatchObject({ id: projectId, name: "Routine Project" });
+    expect(projectReaderDetail.body.project).not.toHaveProperty("env");
+    expect(projectReaderDetail.body).not.toHaveProperty("env");
+    expect(JSON.stringify(projectReaderDetail.body)).not.toContain(projectSentinel);
+    expect(JSON.stringify(projectReaderDetail.body)).not.toContain(routineSentinel);
+
+    const viewerApp = await createApp({
+      type: "board", userId: randomUUID(), source: "session", isInstanceAdmin: false,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    });
+    const viewerDetail = await request(viewerApp).get(`/api/routines/${routineId}`);
+    expect(viewerDetail.status).toBe(200);
+    expect(viewerDetail.body).not.toHaveProperty("env");
+
+    const delegatedViewerApp = await createApp({
+      type: "agent", agentId, companyId, onBehalfOfUserId: randomUUID(),
+      onBehalfOfMemberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+    });
+    const delegatedViewerDetail = await request(delegatedViewerApp).get(`/api/routines/${routineId}`);
+    expect(delegatedViewerDetail.status).toBe(200);
+    expect(delegatedViewerDetail.body).not.toHaveProperty("env");
+
+    const assignedApp = await createApp({ type: "agent", agentId, companyId });
+    for (const app of [boardApp, assignedApp]) {
+      const detail = await request(app).get(`/api/routines/${routineId}`);
+      expect(detail.status).toBe(200);
+      expect(detail.body.env).toEqual({ ROUTINE_TOKEN: routineSentinel });
+      expect(detail.body.project).not.toHaveProperty("env");
+      const list = await request(app).get(`/api/companies/${companyId}/routines`);
+      expect(list.status).toBe(200);
+      expect(list.body.find((routine: { id: string }) => routine.id === routineId).env)
+        .toEqual({ ROUTINE_TOKEN: routineSentinel });
+    }
+
+    const foreignCompanyId = randomUUID();
+    const foreignAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: foreignCompanyId, name: "Foreign company",
+      issuePrefix: `F${foreignCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: foreignAgentId, companyId: foreignCompanyId, name: "Foreign reader",
+      role: "engineer", status: "active",
+    });
+    const foreignApp = await createApp({ type: "agent", agentId: foreignAgentId, companyId: foreignCompanyId });
+    const foreignDetail = await request(foreignApp).get(`/api/routines/${routineId}`);
+    expect(foreignDetail.status).toBe(404);
+    expect(JSON.stringify(foreignDetail.body)).not.toContain(routineSentinel);
   }, 30_000);
 
   it("supports creating, scheduling, and manually running a routine through the API", async () => {

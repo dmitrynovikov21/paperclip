@@ -9022,6 +9022,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
+  // A run moved to a terminal status outside the heartbeat finalization path
+  // (e.g. the host watchdog's direct `UPDATE heartbeat_runs ... status = 'failed'`)
+  // never reaches the normal finalization `setWakeupStatus`, so its wake stays
+  // `claimed`, which liveness checks count as a live path. Close it from the
+  // persisted terminal run status with the same mapping as normal finalization
+  // (succeeded -> completed, otherwise the run status). The WHERE clause pins the
+  // wake<->run linkage and the `claimed` status, so a repeat call or a race with
+  // the run's own finalization is a no-op (HELA-18814).
+  async function closeClaimedWakeOfTerminalRun(run: typeof heartbeatRuns.$inferSelect) {
+    if (!run.wakeupRequestId || !isHeartbeatRunTerminalStatus(run.status)) return false;
+    const now = new Date();
+    const closed = await db
+      .update(agentWakeupRequests)
+      .set({
+        status: run.status === "succeeded" ? "completed" : run.status,
+        finishedAt: run.finishedAt ?? now,
+        error: run.error ?? null,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.runId, run.id),
+        eq(agentWakeupRequests.status, "claimed"),
+      ))
+      .returning({ id: agentWakeupRequests.id });
+    return closed.length > 0;
+  }
+
   async function addContinuationExhaustedCommentOnce(input: {
     run: typeof heartbeatRuns.$inferSelect;
     issueId: string;
@@ -13384,14 +13413,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const runId of runIdsToPromote) {
         const referencedRun = referencedRuns.find((run) => run.id === runId);
         if (!referencedRun) continue;
-        await releaseIssueExecutionAndPromote(referencedRun, { suppressImmediateRecovery: true }).catch(
-          (releaseError) => {
-            logger.warn(
-              { err: releaseError, runId: referencedRun.id, status: referencedRun.status },
-              "failed to release/promote issue locks for a terminal run ahead of the stale-lock sweep",
-            );
-          },
-        );
+        try {
+          await closeClaimedWakeOfTerminalRun(referencedRun);
+          await releaseIssueExecutionAndPromote(referencedRun, {
+            suppressImmediateRecovery: true,
+            holdDeferredWhileDependenciesBlocked: true,
+          });
+        } catch (releaseError) {
+          logger.warn(
+            { err: releaseError, runId: referencedRun.id, status: referencedRun.status },
+            "failed to release/promote issue locks for a terminal run ahead of the stale-lock sweep",
+          );
+        }
       }
       if (cleanableIssues.length > 0) {
         const clearedRows = await db
@@ -16018,16 +16051,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // "running" by a side door. Run it now, idempotently — it only touches
         // issues whose lock columns still point at this run id, so a repeat call
         // (or a call racing this run's own normal finalization elsewhere) is a
-        // no-op once the locks are cleared.
-        if (observedStatus && isHeartbeatRunTerminalStatus(observedStatus)) {
-          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }).catch(
-            (lateReleaseError) => {
-              logger.warn(
-                { err: lateReleaseError, runId: run.id, currentStatus: observedStatus },
-                "failed to release/promote issue locks for a run finalized outside the heartbeat path",
-              );
-            },
-          );
+        // no-op once the locks are cleared. The run's own wake is closed first,
+        // as normal finalization does, and a deferred wake behind a live blocker
+        // stays parked instead of being promoted into a run that claimQueuedRun
+        // would cancel.
+        const terminalRun = persistedRunWrite.run;
+        if (terminalRun && isHeartbeatRunTerminalStatus(terminalRun.status)) {
+          try {
+            await closeClaimedWakeOfTerminalRun(terminalRun);
+            await releaseIssueExecutionAndPromote(terminalRun, {
+              suppressImmediateRecovery: true,
+              holdDeferredWhileDependenciesBlocked: true,
+            });
+          } catch (lateReleaseError) {
+            logger.warn(
+              { err: lateReleaseError, runId: run.id, currentStatus: observedStatus },
+              "failed to release/promote issue locks for a run finalized outside the heartbeat path",
+            );
+          }
         }
         return;
       }
@@ -16541,6 +16582,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       suppressImmediateRecovery?: boolean;
       reconcile?: DeferredReviewWakeReconcile;
       deferDispatchUntilAgentLockReleased?: boolean;
+      // Automatic backstops for a run that left `running` outside normal
+      // finalization: keep deferred wakes parked while the issue has unresolved
+      // blockers instead of promoting them into a run claimQueuedRun would cancel.
+      holdDeferredWhileDependenciesBlocked?: boolean;
     } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
@@ -16701,15 +16746,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ) {
             throw conflict("Issue execution is already locked by another run");
           }
-          if (target.status === "blocked") {
-            const dependencyReadiness = await issuesSvc
-              .listDependencyReadiness(target.companyId, [target.id], tx)
-              .then((rows) => rows.get(target.id) ?? null);
-            if (dependencyReadiness && !dependencyReadiness.isDependencyReady) {
-              throw conflict("Issue is still blocked by unresolved dependencies");
-            }
-          }
           const wakeContext = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
+          const dependencyReadiness = await issuesSvc
+            .listDependencyReadiness(target.companyId, [target.id], tx)
+            .then((rows) => rows.get(target.id) ?? null);
+          // A `blocked` issue needs every dependency ready. Any issue with an
+          // unresolved blocker would also have the promoted run cancelled by
+          // claimQueuedRun and this wake marked `skipped`, so refuse that too.
+          if (
+            (target.status === "blocked" && dependencyReadiness && !dependencyReadiness.isDependencyReady) ||
+            ((dependencyReadiness?.unresolvedBlockerCount ?? 0) > 0 && !allowsIssueInteractionWake(wakeContext))
+          ) {
+            throw conflict("Issue is still blocked by unresolved dependencies");
+          }
           if (
             !wake ||
             readNonEmptyString(wakePayload.issueId) !== target.id ||
@@ -16865,6 +16914,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
 
+      const heldDeferredWakeIds: string[] = [];
+      let unresolvedBlockerCountForHold: number | null = null;
       while (true) {
         const deferred = await tx
           .select()
@@ -16875,6 +16926,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
               options.reconcile ? eq(agentWakeupRequests.id, options.reconcile.wakeId) : undefined,
+              heldDeferredWakeIds.length > 0 ? notInArray(agentWakeupRequests.id, heldDeferredWakeIds) : undefined,
             ),
           )
           .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -16969,6 +17021,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, deferred.id));
           continue;
+        }
+
+        // Same gate as claimQueuedRun: a promoted run for an issue with unresolved
+        // blockers is cancelled there and this very wake is marked `skipped`, so
+        // the parked event would be lost. Automatic backstops leave it parked as
+        // `deferred_issue_execution`, untouched, for the next release of this issue
+        // (or a board executor reconcile) once the blockers resolve (HELA-18814).
+        if (options.holdDeferredWhileDependenciesBlocked && !allowsIssueInteractionWake(deferredContextSeed)) {
+          if (unresolvedBlockerCountForHold === null) {
+            const holdIssueId = issue.id;
+            const readiness = await issuesSvc.listDependencyReadiness(issue.companyId, [holdIssueId], tx);
+            unresolvedBlockerCountForHold = readiness.get(holdIssueId)?.unresolvedBlockerCount ?? 0;
+          }
+          if ((unresolvedBlockerCountForHold ?? 0) > 0) {
+            heldDeferredWakeIds.push(deferred.id);
+            continue;
+          }
         }
 
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };

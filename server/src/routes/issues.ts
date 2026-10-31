@@ -10154,7 +10154,7 @@ export function issueRoutes(
     "/issues/:id/deferred-wakes/:wakeId/reconcile",
     validate(z.object({
       expectedHolderRunId: z.string().uuid(),
-      expectedStageId: z.string().uuid(),
+      expectedStageId: z.string().uuid().optional(),
     }).strict()),
     async (req, res) => {
       assertBoard(req);
@@ -10163,12 +10163,17 @@ export function issueRoutes(
       const wakeId = req.params.wakeId as string;
       if (!isUuidLike(wakeId)) throw badRequest("wakeId must be a UUID");
 
+      // `expectedStageId` present selects the original review-handoff reconcile
+      // path; its absence selects the executor backstop (HELA-18814), which has
+      // no review stage to pin against.
+      const expectedStageId: string | undefined = req.body.expectedStageId;
       const receipt = await heartbeat.reconcileDeferredReviewWake({
         companyId: issue.companyId,
         issueId: issue.id,
         wakeId,
         expectedHolderRunId: req.body.expectedHolderRunId,
-        expectedStageId: req.body.expectedStageId,
+        mode: expectedStageId ? "review" : "executor",
+        expectedStageId,
       });
       if (receipt.outcome === "promoted") {
         const actor = getActorInfo(req);

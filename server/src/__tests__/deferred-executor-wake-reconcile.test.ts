@@ -253,6 +253,37 @@ describePostgres("deferred executor wake reconciliation (HELA-18814)", () => {
     expect(resolved.body.outcome).toBe("promoted");
   });
 
+  it("refuses an unblocked-status issue that still has an open blocker, since the promoted run would be cancelled and the wake skipped", async () => {
+    const fixture = await seedExecutorFixture(db);
+    const blockerId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: fixture.companyId,
+      title: "Open blocker",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: blockerId,
+      relatedIssueId: fixture.issueId,
+      type: "blocks",
+    });
+
+    const path = `/api/issues/${fixture.issueId}/deferred-wakes/${fixture.wakeId}/reconcile`;
+    const response = await request(createApp(db, boardActor(fixture.companyId)))
+      .post(path)
+      .send({ expectedHolderRunId: fixture.holderRunId });
+    expect(response.status).toBe(409);
+
+    const state = await snapshot(db, fixture);
+    expect(state.issue?.status).toBe("in_progress");
+    expect(state.wake?.status).toBe("deferred_issue_execution");
+    expect(state.wake?.runId).toBeNull();
+    expect(state.runs).toHaveLength(1);
+    expect(state.wakes).toHaveLength(2);
+  });
+
   it("rejects closed issues, locked issues, review-shaped wakes, competing runs, and subtree holds without consuming the wake", async () => {
     const fixture = await seedExecutorFixture(db);
     const path = `/api/issues/${fixture.issueId}/deferred-wakes/${fixture.wakeId}/reconcile`;

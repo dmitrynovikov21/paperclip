@@ -9030,10 +9030,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // (succeeded -> completed, otherwise the run status). The WHERE clause pins the
   // wake<->run linkage and the `claimed` status, so a repeat call or a race with
   // the run's own finalization is a no-op (HELA-18814).
-  async function closeClaimedWakeOfTerminalRun(run: typeof heartbeatRuns.$inferSelect) {
+  async function closeClaimedWakeOfTerminalRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    client: Pick<Db, "update"> = db,
+  ) {
     if (!run.wakeupRequestId || !isHeartbeatRunTerminalStatus(run.status)) return false;
     const now = new Date();
-    const closed = await db
+    const closed = await client
       .update(agentWakeupRequests)
       .set({
         status: run.status === "succeeded" ? "completed" : run.status,
@@ -16677,11 +16680,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const target = candidateIssues.find((candidate) => candidate.id === expected.issueId);
         if (!target) throw conflict("Issue no longer belongs to the expected holder");
         const currentHolder = await tx
-          .select({
-            status: heartbeatRuns.status,
-            createdAt: heartbeatRuns.createdAt,
-            finishedAt: heartbeatRuns.finishedAt,
-          })
+          .select()
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, target.companyId)))
           .then((rows) => rows[0] ?? null);
@@ -16772,6 +16771,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ) {
             throw conflict("Deferred wake no longer matches the expected holder run");
           }
+          // A holder finalized outside the server never closed its own wake. Once
+          // the lock is cleared the stale-lock sweep no longer selects this issue,
+          // and a reaped process may never reach late finalization, so liveness
+          // checks would keep counting that `claimed` wake as a live path for this
+          // issue. Close it in this transaction, before the promoted run can start;
+          // a 409 below rolls it back, and a repeat finds nothing left to close.
+          await closeClaimedWakeOfTerminalRun(currentHolder, tx);
           ownerAgentId = target.assigneeAgentId;
         }
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
   agents,
@@ -17,6 +17,37 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+
+const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
+
+// A promoted run is dispatched in the background. Its adapter execution waits on
+// this gate, so the run stays live while a test asserts, no real adapter process
+// is spawned, and afterEach opens the gate and drains every run before teardown.
+const adapterGate = vi.hoisted(() => ({ open: () => {}, opened: Promise.resolve() }));
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: async () => {
+        await adapterGate.opened;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Promoted executor wake test run.",
+          provider: "test",
+          model: "test-model",
+        };
+      },
+    })),
+  };
+});
+
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -60,7 +91,8 @@ async function seedExecutorFixture(db: Db, issueStatus: "in_progress" | "blocked
   const holderCreatedAt = new Date(Date.now() - 20_000);
   // The holder run left `running` without ever reaching the server's normal
   // finalization path -- a host watchdog `UPDATE` reaped it directly, which is
-  // the HELA-12358 scenario this reconcile mode exists for.
+  // the HELA-12358 scenario this reconcile mode exists for. Its own wake is
+  // therefore still `claimed`, and the issue's lock columns are already empty.
   const holderFinishedAt = new Date(Date.now() - 5_000);
   const parkedAt = new Date(Date.now() - 10_000);
 
@@ -102,7 +134,7 @@ async function seedExecutorFixture(db: Db, issueStatus: "in_progress" | "blocked
     triggerDetail: "system",
     reason: "issue_blockers_resolved",
     payload: { issueId },
-    status: "skipped",
+    status: "claimed",
   });
   await db.insert(heartbeatRuns).values({
     id: holderRunId,
@@ -115,6 +147,7 @@ async function seedExecutorFixture(db: Db, issueStatus: "in_progress" | "blocked
     createdAt: holderCreatedAt,
     startedAt: holderCreatedAt,
     finishedAt: holderFinishedAt,
+    error: "reaped hung run (>240min) by watchdog",
     errorCode: "reaped_hung_run",
   });
   await db.update(agentWakeupRequests).set({ runId: holderRunId }).where(eq(agentWakeupRequests.id, holderWakeId));
@@ -138,17 +171,18 @@ async function seedExecutorFixture(db: Db, issueStatus: "in_progress" | "blocked
     requestedAt: parkedAt,
   });
 
-  return { companyId, holderAgentId, assigneeAgentId, issueId, holderRunId, wakeId };
+  return { companyId, holderAgentId, assigneeAgentId, issueId, holderWakeId, holderRunId, holderFinishedAt, wakeId };
 }
 
 async function snapshot(db: Db, fixture: Awaited<ReturnType<typeof seedExecutorFixture>>) {
-  const [wake, issue, runs, wakes] = await Promise.all([
+  const [wake, holderWake, issue, runs, wakes] = await Promise.all([
     db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fixture.wakeId)).then((rows) => rows[0]),
+    db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, fixture.holderWakeId)).then((rows) => rows[0]),
     db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]),
     db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId)),
     db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, fixture.companyId)),
   ]);
-  return { wake, issue, runs, wakes };
+  return { wake, holderWake, issue, runs, wakes };
 }
 
 describePostgres("deferred executor wake reconciliation (HELA-18814)", () => {
@@ -162,6 +196,17 @@ describePostgres("deferred executor wake reconciliation (HELA-18814)", () => {
 
   afterAll(async () => {
     await testDb?.cleanup();
+  });
+
+  beforeEach(() => {
+    adapterGate.opened = new Promise<void>((resolve) => {
+      adapterGate.open = resolve;
+    });
+  });
+
+  afterEach(async () => {
+    adapterGate.open();
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
   });
 
   it("promotes the orphaned executor wake directly, without a review stage, via the service call", async () => {
@@ -219,6 +264,44 @@ describePostgres("deferred executor wake reconciliation (HELA-18814)", () => {
     expect(state.wake?.runId).toBe(first.body.runId);
     expect(state.issue?.executionRunId).toBe(first.body.runId);
     expect(state.wakes).toHaveLength(2);
+  });
+
+  it("closes the reaped holder's still-claimed wake with the promotion when the lock is already cleared, and a repeat changes nothing", async () => {
+    const fixture = await seedExecutorFixture(db);
+    const before = await snapshot(db, fixture);
+    expect(before.holderWake?.status).toBe("claimed");
+    expect(before.issue?.executionRunId).toBeNull();
+    expect(before.issue?.checkoutRunId).toBeNull();
+
+    const path = `/api/issues/${fixture.issueId}/deferred-wakes/${fixture.wakeId}/reconcile`;
+    const body = { expectedHolderRunId: fixture.holderRunId };
+    const reconcile = () => request(createApp(db, boardActor(fixture.companyId))).post(path).send(body);
+
+    const first = await reconcile();
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ outcome: "promoted", mode: "executor", wakeId: fixture.wakeId });
+
+    const promoted = await snapshot(db, fixture);
+    // Closed from the persisted terminal holder run, as normal finalization would.
+    expect(promoted.holderWake).toMatchObject({
+      status: "failed",
+      runId: fixture.holderRunId,
+      error: "reaped hung run (>240min) by watchdog",
+    });
+    expect(promoted.holderWake?.finishedAt?.getTime()).toBe(fixture.holderFinishedAt.getTime());
+    expect(promoted.wake).toMatchObject({ reason: "issue_execution_promoted", runId: first.body.runId });
+    expect(promoted.runs.find((run) => run.id === first.body.runId)?.wakeupRequestId).toBe(fixture.wakeId);
+    expect(promoted.runs).toHaveLength(2);
+    expect(promoted.wakes).toHaveLength(2);
+
+    const repeat = await reconcile();
+    expect(repeat.status).toBe(200);
+    expect(repeat.body).toMatchObject({ outcome: "already_promoted", wakeId: fixture.wakeId, runId: first.body.runId });
+
+    const repeated = await snapshot(db, fixture);
+    expect(repeated.holderWake).toEqual(promoted.holderWake);
+    expect(repeated.runs).toHaveLength(2);
+    expect(repeated.wakes).toHaveLength(2);
   });
 
   it("promotes a blocked issue only once its dependencies are ready", async () => {
@@ -334,6 +417,9 @@ describePostgres("deferred executor wake reconciliation (HELA-18814)", () => {
     const state = await snapshot(db, fixture);
     expect(state.wake?.status).toBe("deferred_issue_execution");
     expect(state.wake?.runId).toBeNull();
+    // Refusals after the holder-wake close (competing run, paused owner, subtree
+    // hold) roll it back with the rest of the transaction.
+    expect(state.holderWake?.status).toBe("claimed");
     expect(state.wakes).toHaveLength(2);
   });
 });

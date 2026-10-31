@@ -9022,6 +9022,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
+  // A run moved to a terminal status outside the heartbeat finalization path
+  // (e.g. the host watchdog's direct `UPDATE heartbeat_runs ... status = 'failed'`)
+  // never reaches the normal finalization `setWakeupStatus`, so its wake stays
+  // `claimed`, which liveness checks count as a live path. Close it from the
+  // persisted terminal run status with the same mapping as normal finalization
+  // (succeeded -> completed, otherwise the run status). The WHERE clause pins the
+  // wake<->run linkage and the `claimed` status, so a repeat call or a race with
+  // the run's own finalization is a no-op (HELA-18814).
+  async function closeClaimedWakeOfTerminalRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    client: Pick<Db, "update"> = db,
+  ) {
+    if (!run.wakeupRequestId || !isHeartbeatRunTerminalStatus(run.status)) return false;
+    const now = new Date();
+    const closed = await client
+      .update(agentWakeupRequests)
+      .set({
+        status: run.status === "succeeded" ? "completed" : run.status,
+        finishedAt: run.finishedAt ?? now,
+        error: run.error ?? null,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.runId, run.id),
+        eq(agentWakeupRequests.status, "claimed"),
+      ))
+      .returning({ id: agentWakeupRequests.id });
+    return closed.length > 0;
+  }
+
   async function addContinuationExhaustedCommentOnce(input: {
     run: typeof heartbeatRuns.$inferSelect;
     issueId: string;
@@ -13336,7 +13368,112 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+    // Before the raw backstop sweep clears lock columns directly, give every
+    // terminal run it is about to disarm a chance to go through the normal
+    // release/promote path first (HELA-18814 REQ-2б part 2). Without this, a run
+    // that reached a terminal status outside the heartbeat path (e.g. the host
+    // watchdog's direct `UPDATE heartbeat_runs ... status = 'failed'`) has its
+    // issue lock wiped by the raw sweep below, but any deferred wake parked on
+    // that issue (review or executor) is never closed and never promoted — the
+    // lock looks clean, yet nothing wakes the next participant. Resolving the
+    // same runs through `releaseIssueExecutionAndPromote` first is idempotent
+    // (it only touches lock columns still pointing at the given run id) and a
+    // no-op for runs the normal finalization path already released.
+    const lockedIssues = await db
+      .select({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`);
+    const preClearedIssueIds: string[] = [];
+    const referencedRunIds = [
+      ...new Set(
+        lockedIssues.flatMap((issue) => [issue.checkoutRunId, issue.executionRunId]).filter(
+          (id): id is string => !!id,
+        ),
+      ),
+    ];
+    if (referencedRunIds.length > 0) {
+      const referencedRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, referencedRunIds));
+      const statusByRunId = new Map(referencedRuns.map((run) => [run.id, run.status]));
+      // Only promote through a run whose issue is fully cleanable, i.e. BOTH its
+      // lock columns are either unset or point at a terminal run. An issue with
+      // one terminal column and one still-running column (a retry in flight) must
+      // keep both locks untouched — releaseIssueExecutionAndPromote clears columns
+      // per-run-id, so calling it for the terminal column alone would release that
+      // column early and diverge from the raw sweep's own all-or-nothing rule.
+      const isCleanable = (runId: string | null) =>
+        !runId || isHeartbeatRunTerminalStatus(statusByRunId.get(runId));
+      const cleanableIssues = lockedIssues.filter(
+        (issue) => isCleanable(issue.checkoutRunId) && isCleanable(issue.executionRunId),
+      );
+      const runIdsToPromote = new Set(
+        cleanableIssues
+          .flatMap((issue) => [issue.checkoutRunId, issue.executionRunId])
+          .filter((id): id is string => !!id && isHeartbeatRunTerminalStatus(statusByRunId.get(id))),
+      );
+      for (const runId of runIdsToPromote) {
+        const referencedRun = referencedRuns.find((run) => run.id === runId);
+        if (!referencedRun) continue;
+        try {
+          await closeClaimedWakeOfTerminalRun(referencedRun);
+          await releaseIssueExecutionAndPromote(referencedRun, {
+            suppressImmediateRecovery: true,
+            holdDeferredWhileDependenciesBlocked: true,
+          });
+        } catch (releaseError) {
+          logger.warn(
+            { err: releaseError, runId: referencedRun.id, status: referencedRun.status },
+            "failed to release/promote issue locks for a terminal run ahead of the stale-lock sweep",
+          );
+        }
+      }
+      if (cleanableIssues.length > 0) {
+        const clearedRows = await db
+          .select({ id: issues.id, companyId: issues.companyId })
+          .from(issues)
+          .where(
+            and(
+              inArray(issues.id, cleanableIssues.map((issue) => issue.id)),
+              isNull(issues.checkoutRunId),
+              isNull(issues.executionRunId),
+            ),
+          );
+        for (const clearedRow of clearedRows) {
+          const original = cleanableIssues.find((issue) => issue.id === clearedRow.id);
+          preClearedIssueIds.push(clearedRow.id);
+          await logActivity(db, {
+            companyId: clearedRow.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.stale_lock_cleared",
+            entityType: "issue",
+            entityId: clearedRow.id,
+            details: {
+              source: "heartbeat.sweep_stale_issue_locks.early_promote",
+              clearedCheckoutRunId: original?.checkoutRunId ?? null,
+              clearedExecutionRunId: original?.executionRunId ?? null,
+            },
+          }).catch((logError) => {
+            logger.warn(
+              { err: logError, issueId: clearedRow.id },
+              "failed to record stale-lock-cleared activity for an early-promoted issue",
+            );
+          });
+        }
+      }
+    }
+    const rawResult = await recovery.sweepStaleIssueLocks();
+    if (preClearedIssueIds.length === 0) return rawResult;
+    const mergedIssueIds = [...new Set([...preClearedIssueIds, ...rawResult.issueIds])];
+    return {
+      ...rawResult,
+      cleared: mergedIssueIds.length,
+      issueIds: mergedIssueIds,
+    };
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -15899,14 +16036,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logCompressed: logSummary?.compressed ?? false,
       });
       if (!persistedRunWrite.updated) {
+        const observedStatus = persistedRunWrite.run?.status ?? null;
         logger.info(
           {
             runId: run.id,
             attemptedStatus: status,
-            currentStatus: persistedRunWrite.run?.status ?? null,
+            currentStatus: observedStatus,
           },
           "skipping late run finalization because the run already left running state",
         );
+        // Something outside this finalization path (e.g. the host watchdog's
+        // direct `UPDATE heartbeat_runs ... status = 'failed'`) already moved the
+        // run to a terminal status, so the write above was a no-op. Normal
+        // finalization never ran for this run: its execution/checkout locks and
+        // any deferred wake parked on its issue stay orphaned forever, because
+        // nothing else calls releaseIssueExecutionAndPromote for a run that left
+        // "running" by a side door. Run it now, idempotently — it only touches
+        // issues whose lock columns still point at this run id, so a repeat call
+        // (or a call racing this run's own normal finalization elsewhere) is a
+        // no-op once the locks are cleared. The run's own wake is closed first,
+        // as normal finalization does, and a deferred wake behind a live blocker
+        // stays parked instead of being promoted into a run that claimQueuedRun
+        // would cancel.
+        const terminalRun = persistedRunWrite.run;
+        if (terminalRun && isHeartbeatRunTerminalStatus(terminalRun.status)) {
+          try {
+            await closeClaimedWakeOfTerminalRun(terminalRun);
+            await releaseIssueExecutionAndPromote(terminalRun, {
+              suppressImmediateRecovery: true,
+              holdDeferredWhileDependenciesBlocked: true,
+            });
+          } catch (lateReleaseError) {
+            logger.warn(
+              { err: lateReleaseError, runId: run.id, currentStatus: observedStatus },
+              "failed to release/promote issue locks for a run finalized outside the heartbeat path",
+            );
+          }
+        }
         return;
       }
 
@@ -16409,7 +16575,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     issueId: string;
     wakeId: string;
     expectedHolderRunId: string;
-    expectedStageId: string;
+    mode: "review" | "executor";
+    expectedStageId?: string;
   };
 
   async function releaseIssueExecutionAndPromote(
@@ -16418,6 +16585,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       suppressImmediateRecovery?: boolean;
       reconcile?: DeferredReviewWakeReconcile;
       deferDispatchUntilAgentLockReleased?: boolean;
+      // Automatic backstops for a run that left `running` outside normal
+      // finalization: keep deferred wakes parked while the issue has unresolved
+      // blockers instead of promoting them into a run claimQueuedRun would cancel.
+      holdDeferredWhileDependenciesBlocked?: boolean;
     } = {},
   ) {
     const runContext = parseObject(run.contextSnapshot);
@@ -16509,11 +16680,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const target = candidateIssues.find((candidate) => candidate.id === expected.issueId);
         if (!target) throw conflict("Issue no longer belongs to the expected holder");
         const currentHolder = await tx
-          .select({
-            status: heartbeatRuns.status,
-            createdAt: heartbeatRuns.createdAt,
-            finishedAt: heartbeatRuns.finishedAt,
-          })
+          .select()
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, target.companyId)))
           .then((rows) => rows[0] ?? null);
@@ -16521,8 +16688,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           throw conflict("Expected holder is not terminal");
         }
 
-        const stage = parseIssueExecutionState(target.executionState);
-        const participant = stage?.currentParticipant;
         const wake = await tx
           .select()
           .from(agentWakeupRequests)
@@ -16532,56 +16697,114 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ))
           .then((rows) => rows[0] ?? null);
         const wakePayload = parseObject(wake?.payload);
-        const wakeContext = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
-        const wakeStage = parseObject(wakeContext.executionStage);
-        const wakeParticipant = parseObject(wakeStage.currentParticipant);
-        if (
-          target.status !== "in_review" ||
-          stage?.status !== "pending" ||
-          stage.currentStageType !== "review" ||
-          stage.currentStageId !== expected.expectedStageId ||
-          participant?.type !== "agent" ||
-          !participant.agentId ||
-          target.assigneeAgentId !== participant.agentId ||
-          target.assigneeUserId ||
-          !wake ||
-          readNonEmptyString(wakePayload.issueId) !== target.id ||
-          wake.agentId !== participant.agentId ||
-          !currentHolder.finishedAt ||
-          new Date(wake.requestedAt).getTime() < new Date(currentHolder.createdAt).getTime() ||
-          new Date(wake.requestedAt).getTime() > new Date(currentHolder.finishedAt).getTime() ||
-          readNonEmptyString(wakeContext.wakeReason) !== "execution_review_requested" ||
-          readNonEmptyString(wakeStage.stageId) !== expected.expectedStageId ||
-          readNonEmptyString(wakeStage.stageType) !== "review" ||
-          readNonEmptyString(wakeParticipant.agentId) !== participant.agentId
-        ) {
-          throw conflict("Deferred reviewer wake no longer matches the expected review stage");
+
+        let ownerAgentId: string;
+        if (expected.mode === "review") {
+          const stage = parseIssueExecutionState(target.executionState);
+          const participant = stage?.currentParticipant;
+          const wakeContext = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
+          const wakeStage = parseObject(wakeContext.executionStage);
+          const wakeParticipant = parseObject(wakeStage.currentParticipant);
+          if (
+            target.status !== "in_review" ||
+            stage?.status !== "pending" ||
+            stage.currentStageType !== "review" ||
+            stage.currentStageId !== expected.expectedStageId ||
+            participant?.type !== "agent" ||
+            !participant.agentId ||
+            target.assigneeAgentId !== participant.agentId ||
+            target.assigneeUserId ||
+            !wake ||
+            readNonEmptyString(wakePayload.issueId) !== target.id ||
+            wake.agentId !== participant.agentId ||
+            !currentHolder.finishedAt ||
+            new Date(wake.requestedAt).getTime() < new Date(currentHolder.createdAt).getTime() ||
+            new Date(wake.requestedAt).getTime() > new Date(currentHolder.finishedAt).getTime() ||
+            readNonEmptyString(wakeContext.wakeReason) !== "execution_review_requested" ||
+            readNonEmptyString(wakeStage.stageId) !== expected.expectedStageId ||
+            readNonEmptyString(wakeStage.stageType) !== "review" ||
+            readNonEmptyString(wakeParticipant.agentId) !== participant.agentId
+          ) {
+            throw conflict("Deferred reviewer wake no longer matches the expected review stage");
+          }
+          ownerAgentId = participant.agentId;
+        } else {
+          // Executor mode promotes a deferred wake orphaned by a holder run that
+          // was finalized outside the server (e.g. a host watchdog UPDATE), not a
+          // review handoff: the issue has no execution/review stage to match, so
+          // validate against the issue's plain assignment and lock state instead.
+          if (target.status === "done" || target.status === "cancelled") {
+            throw conflict("Issue is already closed");
+          }
+          // A repeat request can observe the lock the first request's commit just
+          // took: that lock is this same wake's own promoted run, not a competitor,
+          // so defer to the already_promoted check below instead of rejecting here.
+          if (
+            (target.executionRunId && target.executionRunId !== wake?.runId) ||
+            (target.checkoutRunId && target.checkoutRunId !== wake?.runId)
+          ) {
+            throw conflict("Issue execution is already locked by another run");
+          }
+          const wakeContext = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
+          const dependencyReadiness = await issuesSvc
+            .listDependencyReadiness(target.companyId, [target.id], tx)
+            .then((rows) => rows.get(target.id) ?? null);
+          // A `blocked` issue needs every dependency ready. Any issue with an
+          // unresolved blocker would also have the promoted run cancelled by
+          // claimQueuedRun and this wake marked `skipped`, so refuse that too.
+          if (
+            (target.status === "blocked" && dependencyReadiness && !dependencyReadiness.isDependencyReady) ||
+            ((dependencyReadiness?.unresolvedBlockerCount ?? 0) > 0 && !allowsIssueInteractionWake(wakeContext))
+          ) {
+            throw conflict("Issue is still blocked by unresolved dependencies");
+          }
+          if (
+            !wake ||
+            readNonEmptyString(wakePayload.issueId) !== target.id ||
+            !target.assigneeAgentId ||
+            target.assigneeUserId ||
+            wake.agentId !== target.assigneeAgentId ||
+            !currentHolder.finishedAt ||
+            new Date(wake.requestedAt).getTime() < new Date(currentHolder.createdAt).getTime() ||
+            new Date(wake.requestedAt).getTime() > new Date(currentHolder.finishedAt).getTime() ||
+            readNonEmptyString(wakeContext.wakeReason) === "execution_review_requested"
+          ) {
+            throw conflict("Deferred wake no longer matches the expected holder run");
+          }
+          // A holder finalized outside the server never closed its own wake. Once
+          // the lock is cleared the stale-lock sweep no longer selects this issue,
+          // and a reaped process may never reach late finalization, so liveness
+          // checks would keep counting that `claimed` wake as a live path for this
+          // issue. Close it in this transaction, before the promoted run can start;
+          // a 409 below rolls it back, and a repeat finds nothing left to close.
+          await closeClaimedWakeOfTerminalRun(currentHolder, tx);
+          ownerAgentId = target.assigneeAgentId;
         }
 
-        // A second request can arrive after the first committed and the reviewer
+        // A second request can arrive after the first committed and the owner
         // run has already started. Return the original linkage, never enqueue again.
-        if (wake.runId) {
-          if (wake.reason !== "issue_execution_promoted") {
+        if (wake!.runId) {
+          if (wake!.reason !== "issue_execution_promoted") {
             throw conflict("Wake was not promoted from deferred issue execution");
           }
           const linkedRun = await tx
             .select()
             .from(heartbeatRuns)
-            .where(and(eq(heartbeatRuns.id, wake.runId), eq(heartbeatRuns.companyId, target.companyId)))
+            .where(and(eq(heartbeatRuns.id, wake!.runId), eq(heartbeatRuns.companyId, target.companyId)))
             .then((rows) => rows[0] ?? null);
-          if (!linkedRun || linkedRun.wakeupRequestId !== wake.id ||
+          if (!linkedRun || linkedRun.wakeupRequestId !== wake!.id ||
               readNonEmptyString(parseObject(linkedRun.contextSnapshot).issueId) !== target.id) {
             throw conflict("Wake has an inconsistent run linkage");
           }
           return { kind: "already_promoted" as const, run: linkedRun };
         }
-        if (wake.status !== "deferred_issue_execution" || target.executionRunId || target.checkoutRunId) {
+        if (wake!.status !== "deferred_issue_execution" || target.executionRunId || target.checkoutRunId) {
           throw conflict("Wake is not parked on an unlocked issue");
         }
-        const reviewer = await tx
+        const owner = await tx
           .select()
           .from(agents)
-          .where(and(eq(agents.id, wake.agentId), eq(agents.companyId, target.companyId)))
+          .where(and(eq(agents.id, ownerAgentId), eq(agents.companyId, target.companyId)))
           .then((rows) => rows[0] ?? null);
         const companyAgents = await tx
           .select({
@@ -16593,14 +16816,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           })
           .from(agents)
           .where(eq(agents.companyId, target.companyId));
-        if (!reviewer || !evaluateAgentInvokability(reviewer, companyAgents).invokable) {
-          throw conflict("Current reviewer is not invokable");
+        if (!owner || !evaluateAgentInvokability(owner, companyAgents).invokable) {
+          throw conflict("Current wake owner is not invokable");
         }
-        const budgetBlock = await budgets.getInvocationBlock(target.companyId, reviewer.id, {
+        const budgetBlock = await budgets.getInvocationBlock(target.companyId, owner.id, {
           issueId: target.id,
           projectId: target.projectId,
         });
-        if (budgetBlock) throw conflict("Reviewer invocation is paused by a budget gate");
+        if (budgetBlock) throw conflict("Owner invocation is paused by a budget gate");
         if (await treeControlSvc.getActivePauseHoldGate(target.companyId, target.id)) {
           throw conflict("Issue is held by an active subtree pause hold");
         }
@@ -16697,6 +16920,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
 
+      const heldDeferredWakeIds: string[] = [];
+      let unresolvedBlockerCountForHold: number | null = null;
       while (true) {
         const deferred = await tx
           .select()
@@ -16707,6 +16932,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.status, "deferred_issue_execution"),
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
               options.reconcile ? eq(agentWakeupRequests.id, options.reconcile.wakeId) : undefined,
+              heldDeferredWakeIds.length > 0 ? notInArray(agentWakeupRequests.id, heldDeferredWakeIds) : undefined,
             ),
           )
           .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -16801,6 +17027,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             })
             .where(eq(agentWakeupRequests.id, deferred.id));
           continue;
+        }
+
+        // Same gate as claimQueuedRun: a promoted run for an issue with unresolved
+        // blockers is cancelled there and this very wake is marked `skipped`, so
+        // the parked event would be lost. Automatic backstops leave it parked as
+        // `deferred_issue_execution`, untouched, for the next release of this issue
+        // (or a board executor reconcile) once the blockers resolve (HELA-18814).
+        if (options.holdDeferredWhileDependenciesBlocked && !allowsIssueInteractionWake(deferredContextSeed)) {
+          if (unresolvedBlockerCountForHold === null) {
+            const holdIssueId = issue.id;
+            const readiness = await issuesSvc.listDependencyReadiness(issue.companyId, [holdIssueId], tx);
+            unresolvedBlockerCountForHold = readiness.get(holdIssueId)?.unresolvedBlockerCount ?? 0;
+          }
+          if ((unresolvedBlockerCountForHold ?? 0) > 0) {
+            heldDeferredWakeIds.push(deferred.id);
+            continue;
+          }
         }
 
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
@@ -17302,6 +17545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (promotionResult?.kind === "already_promoted") {
       return {
         outcome: "already_promoted" as const,
+        mode: options.reconcile!.mode,
         issueId: options.reconcile!.issueId,
         wakeId: options.reconcile!.wakeId,
         holderRunId: run.id,
@@ -17379,6 +17623,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (options.reconcile) {
       return {
         outcome: "promoted" as const,
+        mode: options.reconcile.mode,
         issueId: options.reconcile.issueId,
         wakeId: options.reconcile.wakeId,
         holderRunId: run.id,

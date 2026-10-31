@@ -13336,7 +13336,108 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function sweepStaleIssueLocks() {
-    return recovery.sweepStaleIssueLocks();
+    // Before the raw backstop sweep clears lock columns directly, give every
+    // terminal run it is about to disarm a chance to go through the normal
+    // release/promote path first (HELA-18814 REQ-2б part 2). Without this, a run
+    // that reached a terminal status outside the heartbeat path (e.g. the host
+    // watchdog's direct `UPDATE heartbeat_runs ... status = 'failed'`) has its
+    // issue lock wiped by the raw sweep below, but any deferred wake parked on
+    // that issue (review or executor) is never closed and never promoted — the
+    // lock looks clean, yet nothing wakes the next participant. Resolving the
+    // same runs through `releaseIssueExecutionAndPromote` first is idempotent
+    // (it only touches lock columns still pointing at the given run id) and a
+    // no-op for runs the normal finalization path already released.
+    const lockedIssues = await db
+      .select({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(sql`(${issues.checkoutRunId} is not null or ${issues.executionRunId} is not null)`);
+    const preClearedIssueIds: string[] = [];
+    const referencedRunIds = [
+      ...new Set(
+        lockedIssues.flatMap((issue) => [issue.checkoutRunId, issue.executionRunId]).filter(
+          (id): id is string => !!id,
+        ),
+      ),
+    ];
+    if (referencedRunIds.length > 0) {
+      const referencedRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, referencedRunIds));
+      const statusByRunId = new Map(referencedRuns.map((run) => [run.id, run.status]));
+      // Only promote through a run whose issue is fully cleanable, i.e. BOTH its
+      // lock columns are either unset or point at a terminal run. An issue with
+      // one terminal column and one still-running column (a retry in flight) must
+      // keep both locks untouched — releaseIssueExecutionAndPromote clears columns
+      // per-run-id, so calling it for the terminal column alone would release that
+      // column early and diverge from the raw sweep's own all-or-nothing rule.
+      const isCleanable = (runId: string | null) =>
+        !runId || isHeartbeatRunTerminalStatus(statusByRunId.get(runId));
+      const cleanableIssues = lockedIssues.filter(
+        (issue) => isCleanable(issue.checkoutRunId) && isCleanable(issue.executionRunId),
+      );
+      const runIdsToPromote = new Set(
+        cleanableIssues
+          .flatMap((issue) => [issue.checkoutRunId, issue.executionRunId])
+          .filter((id): id is string => !!id && isHeartbeatRunTerminalStatus(statusByRunId.get(id))),
+      );
+      for (const runId of runIdsToPromote) {
+        const referencedRun = referencedRuns.find((run) => run.id === runId);
+        if (!referencedRun) continue;
+        await releaseIssueExecutionAndPromote(referencedRun, { suppressImmediateRecovery: true }).catch(
+          (releaseError) => {
+            logger.warn(
+              { err: releaseError, runId: referencedRun.id, status: referencedRun.status },
+              "failed to release/promote issue locks for a terminal run ahead of the stale-lock sweep",
+            );
+          },
+        );
+      }
+      if (cleanableIssues.length > 0) {
+        const clearedRows = await db
+          .select({ id: issues.id, companyId: issues.companyId })
+          .from(issues)
+          .where(
+            and(
+              inArray(issues.id, cleanableIssues.map((issue) => issue.id)),
+              isNull(issues.checkoutRunId),
+              isNull(issues.executionRunId),
+            ),
+          );
+        for (const clearedRow of clearedRows) {
+          const original = cleanableIssues.find((issue) => issue.id === clearedRow.id);
+          preClearedIssueIds.push(clearedRow.id);
+          await logActivity(db, {
+            companyId: clearedRow.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.stale_lock_cleared",
+            entityType: "issue",
+            entityId: clearedRow.id,
+            details: {
+              source: "heartbeat.sweep_stale_issue_locks.early_promote",
+              clearedCheckoutRunId: original?.checkoutRunId ?? null,
+              clearedExecutionRunId: original?.executionRunId ?? null,
+            },
+          }).catch((logError) => {
+            logger.warn(
+              { err: logError, issueId: clearedRow.id },
+              "failed to record stale-lock-cleared activity for an early-promoted issue",
+            );
+          });
+        }
+      }
+    }
+    const rawResult = await recovery.sweepStaleIssueLocks();
+    if (preClearedIssueIds.length === 0) return rawResult;
+    const mergedIssueIds = [...new Set([...preClearedIssueIds, ...rawResult.issueIds])];
+    return {
+      ...rawResult,
+      cleared: mergedIssueIds.length,
+      issueIds: mergedIssueIds,
+    };
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {

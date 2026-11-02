@@ -279,6 +279,57 @@ describe("redaction", () => {
     }
   });
 
+  it("keeps a split header across a separate metadata event", () => {
+    for (const [header, split] of [["Cookie", 3], ["Set-Cookie", 6], ["Authorization", 7]] as const) {
+      for (const stream of ["stderr", "stdout", "system", null, "unknown"]) {
+        for (const metadataInFirstEvent of [false, true]) {
+          const redactor = createSensitiveHeaderEventRedactor();
+          const first = redactor.write({
+            stream,
+            message: header.slice(0, split),
+            payload: metadataInFirstEvent ? { toolName: "playwright" } : null,
+          });
+          const otherStream = stream === "stdout" ? "stderr" : "stdout";
+          const unrelated = redactor.write({ stream: otherStream, message: "status: worker alive" });
+          const metadata = metadataInFirstEvent
+            ? null
+            : redactor.write({ stream, payload: { toolName: "playwright" } });
+          const value = `synthetic-metadata-event-${header}-${stream}-${metadataInFirstEvent}`;
+          const last = redactor.write({
+            stream,
+            payload: { detail: `${header.slice(split)}: session=${value}\nRequest failed after 30000 ms` },
+          });
+          const sanitized = redactEventPayload(last.payload);
+          expect(JSON.stringify([first, unrelated, metadata, last, sanitized]), `${header} ${stream} ${metadataInFirstEvent}`)
+            .not.toContain(value);
+          expect(last.payload?.detail).toContain("Request failed after 30000 ms");
+          expect(redactor.write({ stream, message: "safe after closed header" }).message)
+            .toBe("safe after closed header");
+        }
+      }
+    }
+  });
+
+  it("keeps a split header across an unrelated message in the same stream", () => {
+    for (const [header, split] of [["Cookie", 3], ["Set-Cookie", 6], ["Authorization", 7]] as const) {
+      for (const stream of ["stderr", "stdout", "system", null, "unknown"]) {
+        const redactor = createSensitiveHeaderEventRedactor();
+        redactor.write({ stream, message: header.slice(0, split) });
+        const middle = redactor.write({ stream, message: "status: worker alive", payload: { toolName: "playwright" } });
+        const value = `synthetic-same-stream-${header}-${stream}`;
+        const last = redactor.write({
+          stream,
+          payload: { detail: `${header.slice(split)}: session=${value}\nRequest failed after 30000 ms` },
+        });
+        expect(JSON.stringify([last, redactEventPayload(last.payload)]), `${header} ${stream}`).not.toContain(value);
+        expect(middle.message).toBe("status: worker alive");
+        expect(last.payload?.detail).toContain("Request failed after 30000 ms");
+        expect(redactor.write({ stream, message: "safe after closed header" }).message)
+          .toBe("safe after closed header");
+      }
+    }
+  });
+
   it("masks a header split between payload fields with metadata in between", () => {
     const redactor = createSensitiveHeaderEventRedactor();
     const result = redactor.write({

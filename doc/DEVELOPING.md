@@ -448,7 +448,8 @@ Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
 new run logs and run events before storage, including headers split across
 output chunks and JSON array values. Run events keep header state separately
 for `system`, `stdout`, and `stderr`, so interleaved streams cannot reset an
-unfinished header. The run-log API also masks these values when it reads older
+unfinished header. Independent messages and payload metadata preserve a split
+header across adjacent events. The run-log API also masks these values when it reads older
 log records, including requests whose byte offset starts
 inside a value or whose header spans adjacent records. Reads beyond the bounded
 512 KiB context return masked content when an older multiline value cannot be

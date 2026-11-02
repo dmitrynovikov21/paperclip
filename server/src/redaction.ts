@@ -345,15 +345,17 @@ export function createSensitiveHeaderEventRedactor() {
   const maxStates = 64;
   const failedClosed = new Set<"system" | "stdout" | "stderr">();
 
-  function redactAgainstStates(text: string, states: HeaderStreamRedactor[]): string {
+  function redactAgainstStates(text: string, states: HeaderStreamRedactor[]): { text: string; candidates: string[] } {
     const output = text.split("");
+    const candidates: string[] = [];
     for (const state of states) {
       const candidate = state.write(text);
+      candidates.push(candidate);
       for (let index = 0; index < output.length; index += 1) {
         if (candidate[index] !== text[index]) output[index] = "*";
       }
     }
-    return output.join("");
+    return { text: output.join(""), candidates };
   }
 
   function uniqueStates(states: HeaderStreamRedactor[]): HeaderStreamRedactor[] {
@@ -372,26 +374,42 @@ export function createSensitiveHeaderEventRedactor() {
             : event.payload,
         };
       }
-      // Payload properties are independent text carriers, not one ordered
-      // stream. Keep every possible continuation so metadata before a detail
-      // field cannot consume a split header name or value.
+      // Message and payload properties can be independent text carriers.
+      // Keep possible continuations across unrelated metadata and events.
       const states = headerRedactors[stream];
-      const message = typeof event.message === "string"
-        ? redactAgainstStates(event.message, states)
-        : event.message;
       let overflow = false;
       let candidateStates: HeaderStreamRedactor[] = [];
+      const resolvedStateKeys = new Set<string>();
+      const redactField = (text: string): string => {
+        if (overflow) return REDACTED_EVENT_VALUE;
+        const priorStates = uniqueStates([...states, ...candidateStates]);
+        const branches = priorStates.map((state) => state.fork());
+        const result = redactAgainstStates(text, branches);
+        const fresh = createSensitiveHeaderStreamRedactor();
+        const freshText = fresh.write(text);
+        for (let index = 0; index < priorStates.length; index += 1) {
+          // Retire a branch only when this field closes a header continuation
+          // that a fresh scanner would not have found on its own.
+          if (result.candidates[index] !== freshText && branches[index]!.stateKey() === fresh.stateKey()) {
+            resolvedStateKeys.add(priorStates[index]!.stateKey());
+          }
+        }
+        candidateStates = uniqueStates([
+          ...candidateStates.filter((state) => !resolvedStateKeys.has(state.stateKey())),
+          ...branches,
+        ]);
+        if (candidateStates.length > maxStates) overflow = true;
+        return result.text;
+      };
+      const message = typeof event.message === "string" ? redactField(event.message) : event.message;
       const payload = event.payload
-        ? redactEventStrings(event.payload, (text) => {
-          if (overflow) return REDACTED_EVENT_VALUE;
-          const branches = uniqueStates([...states, ...candidateStates]).map((state) => state.fork());
-          const redacted = redactAgainstStates(text, branches);
-          candidateStates = uniqueStates([...candidateStates, ...branches]);
-          if (candidateStates.length > maxStates) overflow = true;
-          return redacted;
-        }) as Record<string, unknown>
+        ? redactEventStrings(event.payload, redactField) as Record<string, unknown>
         : event.payload;
-      if (overflow) {
+      const nextStates = uniqueStates([
+        ...states.filter((state) => !resolvedStateKeys.has(state.stateKey())),
+        ...candidateStates,
+      ]);
+      if (overflow || nextStates.length > maxStates) {
         failedClosed.add(stream);
         return {
           ...event,
@@ -401,7 +419,7 @@ export function createSensitiveHeaderEventRedactor() {
             : event.payload,
         };
       }
-      headerRedactors[stream] = candidateStates.length > 0 ? candidateStates : uniqueStates(states);
+      headerRedactors[stream] = nextStates;
       return {
         ...event,
         message,

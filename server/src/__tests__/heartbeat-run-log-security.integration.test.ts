@@ -29,12 +29,19 @@ const crossStreamValue = "fake-e2e-cross-stream";
 const oldCrossStreamValue = "fake-e2e-old-cross-stream";
 const metadataOrderValue = "fake-e2e-metadata-order";
 const oldMetadataOrderValue = "fake-e2e-old-metadata-order";
+const metadataBridgeCases = [
+  { eventType: "tool.metadata_bridge", value: "fake-e2e-metadata-bridge", metadataInFirstEvent: false, sameStreamMessage: false },
+  { eventType: "tool.metadata_first", value: "fake-e2e-metadata-first", metadataInFirstEvent: true, sameStreamMessage: false },
+  { eventType: "tool.metadata_message", value: "fake-e2e-metadata-message", metadataInFirstEvent: false, sameStreamMessage: true },
+] as const;
+const oldMetadataBridgeValue = "fake-e2e-old-metadata-bridge";
 const cookieValues = [
   "fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf",
   "fake-e2e-split", "fake-e2e-array", "fake-e2e-quoted",
   "fake-e2e-pretty", "fake-e2e-event", "fake-e2e-old-event",
   nestedArrayValue, oldShortEventValue, crossStreamValue, oldCrossStreamValue,
   metadataOrderValue, oldMetadataOrderValue,
+  ...metadataBridgeCases.map(({ value }) => value), oldMetadataBridgeValue,
   ...splitEventCases.map(({ value }) => value),
 ];
 const toolOutput = `Playwright GET timed out\nCookie: __Host-hp_access=${cookieValues[0]}; __Host-hp_refresh=${cookieValues[1]}; __Host-hp_csrf=${cookieValues[2]}\nRequest failed after 30000 ms`;
@@ -118,6 +125,29 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
           payload: { toolName: "playwright", detail: `kie: session=${metadataOrderValue}\nRequest failed after 30000 ms` },
         });
         await ctx.onEvent?.({ eventType: "tool.metadata_order", stream: "stderr", message: "safe after metadata cookie" });
+        for (const { eventType, value, metadataInFirstEvent, sameStreamMessage } of metadataBridgeCases) {
+          await ctx.onEvent?.({
+            eventType,
+            stream: "stderr",
+            message: "Coo",
+            ...(metadataInFirstEvent ? { payload: { toolName: "playwright" } } : {}),
+          });
+          await ctx.onEvent?.({ eventType, stream: "stdout", message: "status: other stream alive" });
+          if (!metadataInFirstEvent) {
+            await ctx.onEvent?.({
+              eventType,
+              stream: "stderr",
+              ...(sameStreamMessage ? { message: "status: metadata event alive" } : {}),
+              payload: { toolName: "playwright" },
+            });
+          }
+          await ctx.onEvent?.({
+            eventType,
+            stream: "stderr",
+            payload: { detail: `kie: session=${value}\nRequest failed after 30000 ms` },
+          });
+          await ctx.onEvent?.({ eventType, stream: "stderr", message: "safe after metadata bridge" });
+        }
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic tool output" };
       },
     });
@@ -187,6 +217,9 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(events.some((event) => event.eventType === "tool.cross_stream" && event.message === "status: worker alive")).toBe(true);
     expect(events.some((event) => event.eventType === "tool.cross_stream" && event.message === "safe after cookie")).toBe(true);
     expect(events.some((event) => event.eventType === "tool.metadata_order" && event.message === "safe after metadata cookie")).toBe(true);
+    for (const { eventType } of metadataBridgeCases) {
+      expect(events.some((event) => event.eventType === eventType && event.message === "safe after metadata bridge")).toBe(true);
+    }
 
     const lastSeq = Math.max(...events.map((event) => event.seq));
     await db.insert(heartbeatRunEvents).values([
@@ -202,6 +235,11 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 10, eventType: "tool.old_metadata_order", stream: "stdout", message: "status: metadata stream alive (historical)" },
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 11, eventType: "tool.old_metadata_order", stream: "stderr", payload: { toolName: "playwright", detail: `kie: session=${oldMetadataOrderValue}\nTimeout after 30000 ms` } },
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 12, eventType: "tool.old_metadata_order", stream: "stderr", message: "safe after historical metadata cookie" },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 13, eventType: "tool.old_metadata_bridge", stream: "stderr", message: "Coo" },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 14, eventType: "tool.old_metadata_bridge", stream: "stdout", message: "status: other historical stream alive" },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 15, eventType: "tool.old_metadata_bridge", stream: "stderr", payload: { toolName: "playwright" } },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 16, eventType: "tool.old_metadata_bridge", stream: "stderr", payload: { detail: `kie: session=${oldMetadataBridgeValue}\nRequest failed after 30000 ms` } },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 17, eventType: "tool.old_metadata_bridge", stream: "stderr", message: "safe after historical metadata bridge" },
     ]);
 
     const app = express();
@@ -234,6 +272,15 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(JSON.stringify(metadataOrderPage.body)).not.toContain(metadataOrderValue);
     expect(JSON.stringify(metadataOrderPage.body)).toContain("status: metadata stream alive");
     expect(JSON.stringify(metadataOrderPage.body)).toContain("safe after metadata cookie");
+    for (const { eventType, value, sameStreamMessage } of metadataBridgeCases) {
+      const start = events.find((event) => event.eventType === eventType && event.message === "Coo");
+      expect(start).toBeDefined();
+      const page = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${start!.seq}`);
+      expect(page.status).toBe(200);
+      expect(JSON.stringify(page.body)).not.toContain(value);
+      expect(JSON.stringify(page.body)).toContain("safe after metadata bridge");
+      if (sameStreamMessage) expect(JSON.stringify(page.body)).toContain("status: metadata event alive");
+    }
     const oldEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
     expect(oldEventPage.status).toBe(200);
     expect(JSON.stringify(oldEventPage.body)).not.toContain(cookieValues[8]);
@@ -250,6 +297,10 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(JSON.stringify(oldMetadataOrderPage.body)).not.toContain(oldMetadataOrderValue);
     expect(JSON.stringify(oldMetadataOrderPage.body)).toContain("status: metadata stream alive (historical)");
     expect(JSON.stringify(oldMetadataOrderPage.body)).toContain("safe after historical metadata cookie");
+    const oldMetadataBridgePage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 13}`);
+    expect(oldMetadataBridgePage.status).toBe(200);
+    expect(JSON.stringify(oldMetadataBridgePage.body)).not.toContain(oldMetadataBridgeValue);
+    expect(JSON.stringify(oldMetadataBridgePage.body)).toContain("safe after historical metadata bridge");
 
     // Simulate a historical line written before the new writer guard. Keep the
     // raw fixture on disk so the HTTP reader itself must close the offset gap.

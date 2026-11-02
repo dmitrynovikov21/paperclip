@@ -15214,11 +15214,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         payload?: Record<string, unknown> | null;
       }>(input: T, carrier: "log" | "event"): T => {
         const stream = input.stream === "stdout" || input.stream === "stderr" ? input.stream : "system";
-        const callbackWasPending = callbackRedactor.hasPendingHeader(stream);
         const logBridgeSeed = stream !== "system" && carrier === "event"
-          && lastCallback[stream] === "log" && callbackWasPending
+          && lastCallback[stream] === "log" && logRedactor.hasPendingHeader(stream)
           && !crossCallbackBridges[stream].log
-          ? callbackRedactor.forkEventRedactor()
+          ? logRedactor.fork()
           : null;
         const own = (carrier === "log" ? logRedactor : adapterEventRedactor).write(input);
         let safe = mergeSensitiveHeaderEventRedactions(input, own, callbackRedactor.write(input));

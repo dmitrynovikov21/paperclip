@@ -16,6 +16,7 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 const support = await getEmbeddedPostgresTestSupport();
 const describeWithDb = support.supported ? describe : describe.skip;
 const adapterType = "synthetic_cookie_output";
+let syntheticRunMode: "logs" | "events" = "logs";
 const splitEventCases = ["Cookie", "Authorization"].flatMap((header) =>
   Array.from({ length: header.length - 1 }, (_, index) => ({
     header,
@@ -101,15 +102,18 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     registerServerAdapter({
       type: adapterType,
       execute: async (ctx) => {
-        await ctx.onLog("stderr", toolOutput);
-        await ctx.onLog("stderr", "Cook");
-        await ctx.onLog("stderr", "ie: ");
-        await ctx.onLog("stderr", `session=${cookieValues[3]}\nRequest failed after 30000 ms\n`);
-        await ctx.onLog("stderr", String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` + "\n");
-        await ctx.onLog("stderr", '{"Cookie": [\n');
-        await ctx.onLog("stderr", `  "session=${cookieValues[6]}",\n  "other"\n], "safe": "visible"}\n`);
-        await ctx.onLog("stderr", '{"Cookie": ["' + "x".repeat(160) + ' Authorization: Bearer synthetic-inner-001');
-        await ctx.onLog("stderr", `",\n"session=${nestedArrayValue}"]}\nTimeout after 30000 ms`);
+        if (syntheticRunMode === "logs") {
+          await ctx.onLog("stderr", toolOutput);
+          await ctx.onLog("stderr", "Cook");
+          await ctx.onLog("stderr", "ie: ");
+          await ctx.onLog("stderr", `session=${cookieValues[3]}\nRequest failed after 30000 ms\n`);
+          await ctx.onLog("stderr", String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` + "\n");
+          await ctx.onLog("stderr", '{"Cookie": [\n');
+          await ctx.onLog("stderr", `  "session=${cookieValues[6]}",\n  "other"\n], "safe": "visible"}\n`);
+          await ctx.onLog("stderr", '{"Cookie": ["' + "x".repeat(160) + ' Authorization: Bearer synthetic-inner-001');
+          await ctx.onLog("stderr", `",\n"session=${nestedArrayValue}"]}\nTimeout after 30000 ms`);
+          return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic log output" };
+        }
         await ctx.onEvent?.({
           eventType: "tool.output",
           stream: "stderr",
@@ -238,13 +242,19 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     const liveEvents: unknown[] = [];
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => liveEvents.push(event));
     const heartbeat = heartbeatService(db);
+    syntheticRunMode = "logs";
+    const logQueued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
+    expect(logQueued).not.toBeNull();
+    const logRun = await waitForRun(heartbeat, logQueued!.id);
+    expect(logRun.status).toBe("succeeded");
+    syntheticRunMode = "events";
     const queued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
     const run = await waitForRun(heartbeat, queued!.id);
     unsubscribe();
     expect(run.status).toBe("succeeded");
-    expect(run.logRef).toBeTruthy();
-    const filePath = path.join(home, "run-logs", run.logRef!);
+    expect(logRun.logRef).toBeTruthy();
+    const filePath = path.join(home, "run-logs", logRun.logRef!);
     const persisted = await fs.readFile(filePath, "utf8");
     expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
     expect(persisted).toContain("Request failed after 30000 ms");
@@ -327,7 +337,7 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     app.use("/api", agentRoutes(db));
     app.use(errorHandler);
 
-    const full = await request(app).get(`/api/heartbeat-runs/${run.id}/log`);
+    const full = await request(app).get(`/api/heartbeat-runs/${logRun.id}/log`);
     expect(full.status).toBe(200);
     expect(full.body.content).toContain("Request failed after 30000 ms");
     for (const value of cookieValues) expect(JSON.stringify(full.body)).not.toContain(value);
@@ -400,7 +410,7 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     await fs.appendFile(filePath, oldLine);
     const offset = oldStart + oldLine.indexOf(cookieValues[1]!) + 4;
     const offsetResponse = await request(app)
-      .get(`/api/heartbeat-runs/${run.id}/log?offset=${offset}&limitBytes=8`);
+      .get(`/api/heartbeat-runs/${logRun.id}/log?offset=${offset}&limitBytes=8`);
     expect(offsetResponse.status).toBe(200);
     expect(offsetResponse.body.content).toBe("********");
     expect(offsetResponse.body.nextOffset).toBe(offset + 8);
@@ -414,10 +424,111 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     await fs.appendFile(filePath, historicalSplit);
     const splitOffset = splitStart + historicalSplit.indexOf(cookieValues[3]!) + 5;
     const splitResponse = await request(app)
-      .get(`/api/heartbeat-runs/${run.id}/log?offset=${splitOffset}&limitBytes=8`);
+      .get(`/api/heartbeat-runs/${logRun.id}/log?offset=${splitOffset}&limitBytes=8`);
     expect(splitResponse.status).toBe(200);
     expect(splitResponse.body.content).toBe("********");
   }, 30_000);
+
+  it("masks header continuations across log and event callbacks with unrelated output", async () => {
+    const crossAdapterType = "synthetic_cross_callback_headers";
+    const scenarios = (["Cookie", "Set-Cookie", "Authorization"] as const).flatMap((header) =>
+      (["stderr", "stdout"] as const).flatMap((stream) =>
+        (["name", "json"] as const).map((variant) => ({ header, stream, variant })),
+      ),
+    );
+    let currentScenario: (typeof scenarios)[number] | null = null;
+    registerServerAdapter({
+      type: crossAdapterType,
+      execute: async (ctx) => {
+        if (!currentScenario) throw new Error("Synthetic scenario is missing");
+        const { header, stream, variant } = currentScenario;
+        const prefix = header === "Authorization" ? "OAuth " : "session=";
+        const value = `synthetic-${variant}-${header.toLowerCase()}-${stream}`;
+        if (variant === "name") {
+          const split = header === "Cookie" ? 3 : header === "Set-Cookie" ? 6 : 4;
+          await ctx.onLog(stream, header.slice(0, split));
+          await ctx.onLog(stream, "status: worker alive\n");
+          await ctx.onEvent?.({ eventType: "tool.cross_callback", stream, payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({
+            eventType: "tool.cross_callback", stream,
+            payload: { detail: `${header.slice(split)}: ${prefix}${value}\nRequest failed after 30000 ms` },
+          });
+        } else {
+          await ctx.onLog(stream, `{"${header}":["${prefix}`);
+          await ctx.onLog(stream, '"]}\n');
+          await ctx.onEvent?.({ eventType: "tool.cross_callback", stream, payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({
+            eventType: "tool.cross_callback", stream,
+            payload: { detail: `${value}  "]}\nRequest failed after 30000 ms` },
+          });
+        }
+        const otherStream = stream === "stderr" ? "stdout" : "stderr";
+        await ctx.onEvent?.({ eventType: "tool.other_stream", stream: otherStream, message: "independent stream is live" });
+        return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic cross-callback output" };
+      },
+    });
+    try {
+      const companyId = randomUUID();
+      const writerId = randomUUID();
+      const readerId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId, name: "Synthetic Cross Callback Security",
+        issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values([writerId, readerId].map((id) => ({
+        id, companyId, name: id === writerId ? "Callback Writer" : "Callback Reader",
+        role: "engineer", status: "idle" as const, adapterType: crossAdapterType,
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      })));
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "agent", agentId: readerId, companyId };
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      const heartbeat = heartbeatService(db);
+      for (const scenario of scenarios) {
+        currentScenario = scenario;
+        const { header, stream, variant } = scenario;
+        const value = `synthetic-${variant}-${header.toLowerCase()}-${stream}`;
+        const liveEvents: unknown[] = [];
+        const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => liveEvents.push(event));
+        try {
+          const queued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
+          expect(queued).not.toBeNull();
+          const run = await waitForRun(heartbeat, queued!.id);
+          expect(run.status).toBe("succeeded");
+          const persisted = await fs.readFile(path.join(home, "run-logs", run.logRef!), "utf8");
+          const events = await heartbeat.listEvents(run.id, 0, 100);
+          const detailEvent = events.find((event) => event.eventType === "tool.cross_callback"
+            && typeof event.payload?.detail === "string");
+          expect(detailEvent, `${header} ${stream} ${variant} event`).toBeDefined();
+          expect(detailEvent?.payload?.detail).toContain("Request failed after 30000 ms");
+          expect(events.some((event) => event.eventType === "tool.other_stream"
+            && event.message === "independent stream is live")).toBe(true);
+          for (const content of [persisted, JSON.stringify(run), JSON.stringify(events), JSON.stringify(liveEvents)]) {
+            expect(content, `${header} ${stream} ${variant} persisted/live`).not.toContain(value);
+          }
+          const eventPage = await request(app)
+            .get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${detailEvent!.seq - 1}`);
+          const logPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log`);
+          expect(eventPage.status).toBe(200);
+          expect(logPage.status).toBe(200);
+          expect(JSON.stringify(eventPage.body), `${header} ${stream} ${variant} HTTP events`).not.toContain(value);
+          expect(JSON.stringify(logPage.body), `${header} ${stream} ${variant} HTTP log`).not.toContain(value);
+          expect(JSON.stringify(eventPage.body)).toContain("Request failed after 30000 ms");
+        } finally {
+          unsubscribe();
+        }
+      }
+    } finally {
+      unregisterServerAdapter(crossAdapterType);
+    }
+  }, 60_000);
 
   it("masks JSON credential tails after unrelated adapter output in live, stored and historical reads", async () => {
     const jsonAdapterType = "synthetic_json_cookie_output";

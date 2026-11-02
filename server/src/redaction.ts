@@ -378,19 +378,6 @@ export function createSensitiveHeaderCallbackRedactor() {
     stderr: createSensitiveHeaderStreamRedactor(),
   };
   return {
-    hasPendingHeader(stream: "system" | "stdout" | "stderr"): boolean {
-      return byStream[stream].hasPendingHeader();
-    },
-    forkEventRedactor(): SensitiveHeaderEventRedactor {
-      return makeSensitiveHeaderEventRedactor({
-        redactors: {
-          system: [byStream.system.fork()],
-          stdout: [byStream.stdout.fork()],
-          stderr: [byStream.stderr.fork()],
-        },
-        failedClosed: new Set(),
-      });
-    },
     write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
       const stream = event.stream === "stdout" || event.stream === "stderr" ? event.stream : "system";
       const scanner = byStream[stream];

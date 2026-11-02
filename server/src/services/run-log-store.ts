@@ -5,6 +5,7 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import { redactRunLogTextPreservingBytes, redactSensitiveText } from "../redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -198,7 +199,43 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    // Existing directories may have been created with the old default mode.
+    for (let current = dir; current !== path.resolve(basePath); current = path.dirname(current)) {
+      await fs.chmod(current, 0o700);
+    }
+  }
+
+  const redactionContextBytes = 512 * 1024;
+
+  function protectedRange(
+    bytes: Buffer,
+    windowStart: number,
+    start: number,
+    endExclusive: number,
+    total: number,
+  ): RunLogReadResult {
+    if (start >= endExclusive) return { content: "", nextOffset: start < total ? start : undefined };
+    const relativeStart = start - windowStart;
+    const relativeEnd = endExclusive - windowStart;
+    const precedingNewline = relativeStart === 0 ? -1 : bytes.lastIndexOf(10, relativeStart - 1);
+    const followingNewline = bytes.indexOf(10, relativeEnd - 1);
+    const recordStart = precedingNewline + 1;
+    const recordEnd = followingNewline < 0 ? bytes.length : followingNewline + 1;
+    const hasWholeRecords = (precedingNewline >= 0 || windowStart === 0)
+      && (followingNewline >= 0 || windowStart + bytes.length === total);
+
+    // A malformed legacy record longer than the bounded context must never
+    // expose a slice from the middle of a header value.
+    let content = "*".repeat(endExclusive - start);
+    if (hasWholeRecords) {
+      const rawRecords = bytes.subarray(recordStart, recordEnd);
+      const redacted = Buffer.from(redactRunLogTextPreservingBytes(rawRecords.toString("utf8")), "utf8");
+      if (redacted.length === rawRecords.length) {
+        content = redacted.subarray(relativeStart - recordStart, relativeEnd - recordStart).toString("utf8");
+      }
+    }
+    return { content, nextOffset: endExclusive < total ? endExclusive : undefined };
   }
 
   async function readLocalRange(
@@ -209,13 +246,16 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat) return null;
     const start = Math.max(0, Math.min(offset, stat.size));
+    if (start >= stat.size) return { content: "", nextOffset: undefined };
     const end = Math.max(start, Math.min(start + limitBytes - 1, stat.size - 1));
-    if (start > end) return { content: "", nextOffset: start };
+
+    const windowStart = Math.max(0, start - redactionContextBytes);
+    const windowEnd = Math.min(stat.size - 1, end + redactionContextBytes);
 
     const chunks: Buffer[] = [];
     try {
       await new Promise<void>((resolve, reject) => {
-        const stream = createReadStream(filePath, { start, end });
+        const stream = createReadStream(filePath, { start: windowStart, end: windowEnd });
         stream.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
         stream.on("error", reject);
         stream.on("end", () => resolve());
@@ -227,9 +267,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
       throw err;
     }
-    const content = Buffer.concat(chunks).toString("utf8");
-    const nextOffset = end + 1 < stat.size ? end + 1 : undefined;
-    return { content, nextOffset };
+    return protectedRange(Buffer.concat(chunks), windowStart, start, end + 1, stat.size);
   }
 
   async function readS3Range(
@@ -243,19 +281,20 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     if (!head.exists) throw notFound("Run log not found");
     const total = head.contentLength ?? 0;
     const start = Math.max(0, Math.min(offset, total));
+    if (start >= total) return { content: "", nextOffset: undefined };
     const end = Math.max(start, Math.min(start + limitBytes - 1, total - 1));
-    if (start > end || total === 0) return { content: "", nextOffset: start < total ? start : undefined };
 
-    const result = await s3.provider.getObject({ objectKey: key, range: { start, end } });
+    const windowStart = Math.max(0, start - redactionContextBytes);
+    const windowEnd = Math.min(total - 1, end + redactionContextBytes);
+
+    const result = await s3.provider.getObject({ objectKey: key, range: { start: windowStart, end: windowEnd } });
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
       result.stream.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
       result.stream.on("error", reject);
       result.stream.on("end", () => resolve());
     });
-    const content = Buffer.concat(chunks).toString("utf8");
-    const nextOffset = end + 1 < total ? end + 1 : undefined;
-    return { content, nextOffset };
+    return protectedRange(Buffer.concat(chunks), windowStart, start, end + 1, total);
   }
 
   async function sha256File(filePath: string): Promise<string> {
@@ -276,7 +315,12 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       const relPath = path.join(relDir, `${runId}.ndjson`);
       await ensureDir(relDir);
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
+      const file = await fs.open(absPath, "w", 0o600);
+      try {
+        await file.chmod(0o600);
+      } finally {
+        await file.close();
+      }
       await retireInflightMirror(relPath);
       return { store: "local_file", logRef: relPath };
     },
@@ -287,14 +331,14 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSensitiveText(event.chunk),
         // Monotonic per-run sequence so readers can dedupe and order records
         // even when several identical chunks share the same millisecond ts
         // (common for ACP-style token deltas).
         ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
       });
       const persisted = `${line}\n`;
-      await fs.appendFile(absPath, persisted, "utf8");
+      await fs.appendFile(absPath, persisted, { encoding: "utf8", mode: 0o600 });
       noteInflightAppend(handle.logRef);
       return Buffer.byteLength(persisted, "utf8");
     },

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactEventPayload,
+  redactRunLogTextPreservingBytes,
+  redactSensitiveText,
+  sanitizeRecord,
+} from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -99,6 +105,39 @@ describe("redaction", () => {
     expect(result).not.toContain("paperclip-shell-secret");
     expect(result).not.toContain(githubToken);
     expect(result).not.toContain(jwt);
+  });
+
+  it("redacts HTTP credential headers in plain and JSON-escaped tool output", () => {
+    const input = [
+      "Playwright GET timed out",
+      "Cookie: __Host-hp_access=fake-access-001; __Host-hp_refresh=fake-refresh-002; __Host-hp_csrf=fake-csrf-003",
+      "Set-Cookie: session=fake-session-004; HttpOnly",
+      "Authorization: Basic fake-basic-005",
+      String.raw`{\"Cookie\":\"session=fake-json-cookie-006\",\"Set-Cookie\":\"session=fake-json-set-cookie-007\",\"Authorization\":\"Bearer fake-json-auth-008\"}`,
+      "Request failed after 30000 ms",
+    ].join("\n");
+
+    for (const result of [redactSensitiveText(input), redactRunLogTextPreservingBytes(input)]) {
+      expect(result).toContain("Playwright GET timed out");
+      expect(result).toContain("Request failed after 30000 ms");
+      for (const value of [
+        "fake-access-001", "fake-refresh-002", "fake-csrf-003", "fake-session-004",
+        "fake-basic-005", "fake-json-cookie-006", "fake-json-set-cookie-007", "fake-json-auth-008",
+      ]) {
+        expect(result).not.toContain(value);
+      }
+    }
+    expect(Buffer.byteLength(redactRunLogTextPreservingBytes(input))).toBe(Buffer.byteLength(input));
+  });
+
+  it("redacts headers inside ordinary event payload strings", () => {
+    const payload = redactEventPayload({
+      detail: "Cookie: session=fake-payload-cookie\\nTimeout after 30000 ms",
+      nested: { error: "Authorization: Basic fake-payload-auth" },
+    });
+    expect(JSON.stringify(payload)).not.toContain("fake-payload-cookie");
+    expect(JSON.stringify(payload)).not.toContain("fake-payload-auth");
+    expect(JSON.stringify(payload)).toContain("Timeout after 30000 ms");
   });
 
   it("redacts inline secrets from command metadata without hiding safe command text", () => {

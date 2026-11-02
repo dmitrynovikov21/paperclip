@@ -66,6 +66,65 @@ describe("createDurableRunLogStore", () => {
     expect(handle.store).toBe("local_file");
   });
 
+  it("uses private modes for new local log files and directories", async () => {
+    const store = createDurableRunLogStore({ basePath: baseDir });
+    const handle = await store.begin(begin);
+    const filePath = path.join(baseDir, handle.logRef);
+    expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(path.dirname(filePath))).mode & 0o777).toBe(0o700);
+    expect((await fs.stat(path.dirname(path.dirname(filePath)))).mode & 0o777).toBe(0o700);
+    expect(await store.read(handle)).toEqual({ content: "", nextOffset: undefined });
+  });
+
+  it("redacts synthetic tool headers before writing the local NDJSON log", async () => {
+    const store = createDurableRunLogStore({ basePath: baseDir });
+    const handle = await store.begin(begin);
+    await store.append(handle, {
+      stream: "stderr",
+      chunk: "Playwright timeout\\nCookie: __Host-hp_access=fake-write-access; __Host-hp_refresh=fake-write-refresh; __Host-hp_csrf=fake-write-csrf\\nRequest failed after 30000 ms",
+      ts: "t1",
+    });
+    const persisted = await fs.readFile(path.join(baseDir, handle.logRef), "utf8");
+    expect(persisted).toContain("Request failed after 30000 ms");
+    for (const value of ["fake-write-access", "fake-write-refresh", "fake-write-csrf"]) {
+      expect(persisted).not.toContain(value);
+    }
+  });
+
+  it("masks historical header values across local and S3 offset reads", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const raw = `${JSON.stringify({
+      ts: "t1",
+      stream: "stderr",
+      chunk: "Playwright timeout\\nCookie: __Host-hp_access=fake-read-access; __Host-hp_refresh=fake-read-refresh; __Host-hp_csrf=fake-read-csrf\\nRequest failed after 30000 ms",
+    })}\n`;
+    await fs.writeFile(path.join(baseDir, handle.logRef), raw);
+    await store.finalize(handle);
+
+    for (const remote of [false, true]) {
+      if (remote) await fs.rm(baseDir, { recursive: true, force: true });
+      const offset = Buffer.byteLength(raw.slice(0, raw.indexOf("fake-read-refresh") + 5));
+      const midValue = await store.read(handle, { offset, limitBytes: 5 });
+      expect(midValue.content).toBe("*****");
+      expect(midValue.nextOffset).toBe(offset + 5);
+
+      let cursor = 0;
+      let assembled = "";
+      while (cursor < Buffer.byteLength(raw)) {
+        const page = await store.read(handle, { offset: cursor, limitBytes: 17 });
+        assembled += page.content;
+        cursor = page.nextOffset ?? Buffer.byteLength(raw);
+      }
+      expect(Buffer.byteLength(assembled)).toBe(Buffer.byteLength(raw));
+      expect(assembled).toContain("Request failed after 30000 ms");
+      for (const value of ["fake-read-access", "fake-read-refresh", "fake-read-csrf"]) {
+        expect(assembled).not.toContain(value);
+      }
+    }
+  });
+
   it("appends locally and reads back during a run WITHOUT hitting S3 (fast live tail)", async () => {
     const { provider, calls } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

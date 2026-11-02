@@ -85,7 +85,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactEventPayload } from "../redaction.js";
+import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import {
@@ -3968,6 +3968,7 @@ export function agentRoutes(
     const redactedEvents = events.map((event) =>
       redactCurrentUserValue({
         ...event,
+        message: typeof event.message === "string" ? redactSensitiveText(event.message) : event.message,
         payload: redactEventPayload(event.payload),
       }, currentUserRedactionOptions),
     );

@@ -442,6 +442,16 @@ Agent, project, environment, secret, skill, and workspace config edits are sampl
 
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
+## Run log credential handling
+
+Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
+new run logs and run events before storage. The run-log API also masks these
+values when it reads older log records, including requests whose byte offset
+starts inside a value. New local run-log files use mode `0600`; their company
+and agent directories use mode `0700`. Existing log files are not rewritten.
+If a credential was exposed before this guard, revoke it separately and retain
+the historical log according to the incident retention decision.
+
 ## Worktree-local Instances
 
 When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.

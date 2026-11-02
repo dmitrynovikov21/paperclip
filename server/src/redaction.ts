@@ -15,13 +15,16 @@ const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\r\n]+((?:"|'))`,
+  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))([^"'` + "`" + String.raw`\r\n]+)((?:"|'))`,
   "gi",
 );
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
+  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))([^\\\r\n]+)((?:\\"))`,
   "gi",
 );
+// A header can follow a literal "\\n" inside serialized tool output. In that
+// form the character before "Cookie" is the word character "n".
+const SENSITIVE_HEADER_PREFIX_RE = /(?:^|\\[rn]|[^A-Za-z0-9_-])(?:Cookie|Set-Cookie|Authorization)\s*:\s*/gi;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -57,6 +60,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
+  if (typeof value === "string") return redactSensitiveText(value);
   if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) return value;
   if (isUserSecretRefBinding(value)) return value;
@@ -141,9 +145,52 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
-    input
-      .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
+    redactSensitiveHeaders(input, () => REDACTED_EVENT_VALUE)
+      .replace(JSON_SECRET_FIELD_TEXT_RE, (_match, prefix: string, _value: string, suffix: string) =>
+        `${prefix}${REDACTED_EVENT_VALUE}${suffix}`)
+      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, (_match, prefix: string, _value: string, suffix: string) =>
+        `${prefix}${REDACTED_EVENT_VALUE}${suffix}`),
     REDACTED_EVENT_VALUE,
   );
+}
+
+function redactSensitiveHeaders(input: string, replacement: (value: string) => string): string {
+  let result = "";
+  let cursor = 0;
+  SENSITIVE_HEADER_PREFIX_RE.lastIndex = 0;
+  for (const match of input.matchAll(SENSITIVE_HEADER_PREFIX_RE)) {
+    const start = match.index + match[0].length;
+    if (start < cursor) continue;
+    let end = start;
+    while (end < input.length) {
+      const char = input[end];
+      if (char === "\r" || char === "\n") break;
+      if (char === "\\") {
+        let next = end + 1;
+        while (input[next] === "\\") next += 1;
+        if (input[next] === "r" || input[next] === "n") break;
+        if (input[next] === '"') {
+          end = next + 1;
+          continue;
+        }
+      }
+      if (char === '"' && (end + 1 === input.length || /[,}\]\r\n]/.test(input[end + 1]!))) break;
+      end += 1;
+    }
+    result += input.slice(cursor, start) + replacement(input.slice(start, end));
+    cursor = end;
+  }
+  return result + input.slice(cursor);
+}
+
+// Run-log reads can start in the middle of a header value. Keep the byte
+// length stable so the HTTP offset still addresses the persisted file.
+export function redactRunLogTextPreservingBytes(input: string): string {
+  if (!maybeContainsSecretText(input)) return input;
+  const mask = (value: string) => "*".repeat(Buffer.byteLength(value, "utf8"));
+  return redactSensitiveHeaders(input, mask)
+    .replace(JSON_SECRET_FIELD_TEXT_RE, (_match, prefix: string, value: string, suffix: string) =>
+      `${prefix}${mask(value)}${suffix}`)
+    .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, (_match, prefix: string, value: string, suffix: string) =>
+      `${prefix}${mask(value)}${suffix}`);
 }

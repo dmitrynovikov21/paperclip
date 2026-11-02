@@ -259,6 +259,57 @@ describe("redaction", () => {
     }
   });
 
+  it("checks every payload text field against a split header regardless of metadata order", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const stream of ["stderr", "stdout", "system", null, "unknown"]) {
+        const redactor = createSensitiveHeaderEventRedactor();
+        redactor.write({ stream, message: header.slice(0, 3), payload: null });
+        const value = `synthetic-${header.toLowerCase()}-${stream}`;
+        const result = redactor.write({
+          stream,
+          message: null,
+          payload: { toolName: "playwright", detail: `${header.slice(3)}: session=${value}\nRequest failed after 30000 ms` },
+        });
+        expect(JSON.stringify(result), `${header} ${stream}`).not.toContain(value);
+        expect(result.payload?.toolName).toBe("playwright");
+        expect(result.payload?.detail).toContain("Request failed after 30000 ms");
+        expect(redactor.write({ stream, message: "safe after closed header", payload: null }).message)
+          .toBe("safe after closed header");
+      }
+    }
+  });
+
+  it("masks a header split between payload fields with metadata in between", () => {
+    const redactor = createSensitiveHeaderEventRedactor();
+    const result = redactor.write({
+      stream: "stderr",
+      message: null,
+      payload: {
+        first: "Coo",
+        toolName: "playwright",
+        detail: "kie: session=synthetic-payload-fields\nTimeout after 30000 ms",
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("synthetic-payload-fields");
+    expect(result.payload?.detail).toContain("Timeout after 30000 ms");
+  });
+
+  it("masks a header that begins in a tool name and continues in output", () => {
+    for (const adjacent of [true, false]) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      const first = redactor.write({
+        stream: "stderr",
+        payload: { toolName: "Coo", detail: adjacent ? "kie: session=synthetic-toolname-adjacent\n" : "safe output" },
+      });
+      if (adjacent) {
+        expect(JSON.stringify(first)).not.toContain("synthetic-toolname-adjacent");
+      } else {
+        const second = redactor.write({ stream: "stderr", payload: { detail: "kie: session=synthetic-toolname-later\n" } });
+        expect(JSON.stringify(second)).not.toContain("synthetic-toolname-later");
+      }
+    }
+  });
+
   it("preserves safe event text after an unconfirmed header prefix", () => {
     const redactor = createSensitiveHeaderEventRedactor();
     expect(redactor.write({ message: "Cook" }).message).toBe("Cook");

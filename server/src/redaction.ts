@@ -262,10 +262,32 @@ export function sensitiveHeaderRanges(input: string): Array<{ start: number; val
   return scanSensitiveHeaderRanges(input).map(({ start, valueStart, end }) => ({ start, valueStart, end }));
 }
 
-/** Remembers prior output so a header name and value can cross chunk boundaries. */
-export function createSensitiveHeaderStreamRedactor() {
+type HeaderStreamState = { tail: string; active: HeaderValueState | null };
+type HeaderStreamRedactor = { write(chunk: string): string; fork(): HeaderStreamRedactor; stateKey(): string };
+const SENSITIVE_HEADER_NAMES = ["Cookie", "Set-Cookie", "Authorization"] as const;
+
+function pendingHeaderTail(input: string): string {
   let tail = "";
-  let active: HeaderValueState | null = null;
+  for (const name of SENSITIVE_HEADER_NAMES) {
+    for (let length = 1; length < name.length; length += 1) {
+      const suffix = input.slice(-length);
+      if (suffix.toLowerCase() === name.slice(0, length).toLowerCase() && length > tail.length) tail = suffix;
+    }
+    const fullName = new RegExp(`${name}(?:\\\\*["']?)?\\s*$`, "i").exec(input)?.[0] ?? "";
+    if (fullName.length > tail.length) tail = fullName;
+  }
+  return tail;
+}
+
+function cloneHeaderValueState(state: HeaderValueState | null): HeaderValueState | null {
+  if (!state) return null;
+  return state.kind === "container" ? { ...state, brackets: [...state.brackets] } : { ...state };
+}
+
+/** Remembers prior output so a header name and value can cross chunk boundaries. */
+function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderStreamRedactor {
+  let tail = initial.tail;
+  let active = cloneHeaderValueState(initial.active);
   return {
     write(chunk: string): string {
       const output = chunk.split("");
@@ -278,7 +300,7 @@ export function createSensitiveHeaderStreamRedactor() {
         mask(0, scanned.end);
         if (scanned.continuation) {
           active = scanned.continuation;
-          tail = (tail + chunk).slice(-128);
+          tail = "";
           return output.join("");
         }
         cursor = scanned.end + scanned.delimiterLength;
@@ -292,10 +314,16 @@ export function createSensitiveHeaderStreamRedactor() {
         if (end > start) mask(start, end);
         if (range.continuation) active = range.continuation;
       }
-      tail = (tail + chunk.slice(cursor)).slice(-128);
+      tail = active ? "" : pendingHeaderTail(tail + chunk.slice(cursor));
       return output.join("");
     },
+    fork: () => makeSensitiveHeaderStreamRedactor({ tail, active }),
+    stateKey: () => JSON.stringify({ tail, active }),
   };
+}
+
+export function createSensitiveHeaderStreamRedactor(): HeaderStreamRedactor {
+  return makeSensitiveHeaderStreamRedactor({ tail: "", active: null });
 }
 
 function redactEventStrings(value: unknown, redact: (text: string) => string): unknown {
@@ -309,23 +337,75 @@ function redactEventStrings(value: unknown, redact: (text: string) => string): u
 
 /** Redact values even when adjacent adapter events carry one split header. */
 export function createSensitiveHeaderEventRedactor() {
-  const headerRedactors = {
-    system: createSensitiveHeaderStreamRedactor(),
-    stdout: createSensitiveHeaderStreamRedactor(),
-    stderr: createSensitiveHeaderStreamRedactor(),
+  const headerRedactors: Record<"system" | "stdout" | "stderr", HeaderStreamRedactor[]> = {
+    system: [createSensitiveHeaderStreamRedactor()],
+    stdout: [createSensitiveHeaderStreamRedactor()],
+    stderr: [createSensitiveHeaderStreamRedactor()],
   };
+  const maxStates = 64;
+  const failedClosed = new Set<"system" | "stdout" | "stderr">();
+
+  function redactAgainstStates(text: string, states: HeaderStreamRedactor[]): string {
+    const output = text.split("");
+    for (const state of states) {
+      const candidate = state.write(text);
+      for (let index = 0; index < output.length; index += 1) {
+        if (candidate[index] !== text[index]) output[index] = "*";
+      }
+    }
+    return output.join("");
+  }
+
+  function uniqueStates(states: HeaderStreamRedactor[]): HeaderStreamRedactor[] {
+    return [...new Map(states.map((state) => [state.stateKey(), state])).values()];
+  }
+
   return {
     write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
-      // Feed message and payload strings in delivery order. Only credential
-      // values are masked; other streams cannot change an unfinished header.
       const stream = event.stream === "stdout" || event.stream === "stderr" ? event.stream : "system";
-      const headerRedactor = headerRedactors[stream];
+      if (failedClosed.has(stream)) {
+        return {
+          ...event,
+          message: typeof event.message === "string" ? REDACTED_EVENT_VALUE : event.message,
+          payload: event.payload
+            ? redactEventStrings(event.payload, () => REDACTED_EVENT_VALUE) as Record<string, unknown>
+            : event.payload,
+        };
+      }
+      // Payload properties are independent text carriers, not one ordered
+      // stream. Keep every possible continuation so metadata before a detail
+      // field cannot consume a split header name or value.
+      const states = headerRedactors[stream];
+      const message = typeof event.message === "string"
+        ? redactAgainstStates(event.message, states)
+        : event.message;
+      let overflow = false;
+      let candidateStates: HeaderStreamRedactor[] = [];
+      const payload = event.payload
+        ? redactEventStrings(event.payload, (text) => {
+          if (overflow) return REDACTED_EVENT_VALUE;
+          const branches = uniqueStates([...states, ...candidateStates]).map((state) => state.fork());
+          const redacted = redactAgainstStates(text, branches);
+          candidateStates = uniqueStates([...candidateStates, ...branches]);
+          if (candidateStates.length > maxStates) overflow = true;
+          return redacted;
+        }) as Record<string, unknown>
+        : event.payload;
+      if (overflow) {
+        failedClosed.add(stream);
+        return {
+          ...event,
+          message: typeof message === "string" ? REDACTED_EVENT_VALUE : message,
+          payload: event.payload
+            ? redactEventStrings(event.payload, () => REDACTED_EVENT_VALUE) as Record<string, unknown>
+            : event.payload,
+        };
+      }
+      headerRedactors[stream] = candidateStates.length > 0 ? candidateStates : uniqueStates(states);
       return {
         ...event,
-        message: typeof event.message === "string" ? headerRedactor.write(event.message) : event.message,
-        payload: event.payload
-          ? redactEventStrings(event.payload, headerRedactor.write) as Record<string, unknown>
-          : event.payload,
+        message,
+        payload,
       };
     },
   };

@@ -237,6 +237,28 @@ describe("redaction", () => {
     }
   });
 
+  it("keeps split header state when another event stream arrives between fragments", () => {
+    for (const [source, other] of [["stderr", "stdout"], ["stdout", "stderr"], ["stderr", "system"]] as const) {
+      for (const [header, split] of [["Cookie", 3], ["Set-Cookie", 6], ["Authorization", 7]] as const) {
+        for (const target of ["message", "payload"] as const) {
+          const redactor = createSensitiveHeaderEventRedactor();
+          const first = redactor.write({ stream: source, message: header.slice(0, split), payload: null });
+          const middle = redactor.write({ stream: other, message: "status: worker alive", payload: null });
+          const fragment = `${header.slice(split)}: session=synthetic-cross-stream-001\n`;
+          const last = redactor.write({
+            stream: source,
+            message: target === "message" ? fragment : null,
+            payload: target === "payload" ? { detail: fragment } : null,
+          });
+          expect(JSON.stringify([first, middle, last])).not.toContain("synthetic-cross-stream-001");
+          expect(middle.message).toBe("status: worker alive");
+          expect(redactor.write({ stream: source, message: "Timeout after 30000 ms", payload: null }).message)
+            .toBe("Timeout after 30000 ms");
+        }
+      }
+    }
+  });
+
   it("preserves safe event text after an unconfirmed header prefix", () => {
     const redactor = createSensitiveHeaderEventRedactor();
     expect(redactor.write({ message: "Cook" }).message).toBe("Cook");

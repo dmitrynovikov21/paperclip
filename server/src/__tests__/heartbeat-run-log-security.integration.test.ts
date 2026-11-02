@@ -25,11 +25,14 @@ const splitEventCases = ["Cookie", "Authorization"].flatMap((header) =>
 );
 const nestedArrayValue = "fake-e2e-nested-array";
 const oldShortEventValue = "fake-e2e-old-short-event";
+const crossStreamValue = "fake-e2e-cross-stream";
+const oldCrossStreamValue = "fake-e2e-old-cross-stream";
 const cookieValues = [
   "fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf",
   "fake-e2e-split", "fake-e2e-array", "fake-e2e-quoted",
   "fake-e2e-pretty", "fake-e2e-event", "fake-e2e-old-event",
-  nestedArrayValue, oldShortEventValue, ...splitEventCases.map(({ value }) => value),
+  nestedArrayValue, oldShortEventValue, crossStreamValue, oldCrossStreamValue,
+  ...splitEventCases.map(({ value }) => value),
 ];
 const toolOutput = `Playwright GET timed out\nCookie: __Host-hp_access=${cookieValues[0]}; __Host-hp_refresh=${cookieValues[1]}; __Host-hp_csrf=${cookieValues[2]}\nRequest failed after 30000 ms`;
 
@@ -96,6 +99,14 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
           });
           await ctx.onEvent?.({ eventType: "tool.output", stream: "stderr", message: "Timeout after 30000 ms" });
         }
+        await ctx.onEvent?.({ eventType: "tool.cross_stream", stream: "stderr", message: "Coo" });
+        await ctx.onEvent?.({ eventType: "tool.cross_stream", stream: "stdout", message: "status: worker alive" });
+        await ctx.onEvent?.({
+          eventType: "tool.cross_stream",
+          stream: "stderr",
+          payload: { detail: `kie: session=${crossStreamValue}\n` },
+        });
+        await ctx.onEvent?.({ eventType: "tool.cross_stream", stream: "stderr", message: "safe after cookie" });
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic tool output" };
       },
     });
@@ -162,6 +173,8 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(eventText).toContain("Request failed after 30000 ms");
     for (const value of cookieValues) expect(eventText).not.toContain(value);
     expect(events.some((event) => event.eventType === "tool.output" && event.message === "Timeout after 30000 ms")).toBe(true);
+    expect(events.some((event) => event.eventType === "tool.cross_stream" && event.message === "status: worker alive")).toBe(true);
+    expect(events.some((event) => event.eventType === "tool.cross_stream" && event.message === "safe after cookie")).toBe(true);
 
     const lastSeq = Math.max(...events.map((event) => event.seq));
     await db.insert(heartbeatRunEvents).values([
@@ -169,6 +182,10 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 2, eventType: "tool.output", stream: "stderr", payload: { detail: `session=${cookieValues[8]}\nTimeout after 30000 ms` } },
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 3, eventType: "tool.output", stream: "stderr", message: "Coo" },
       { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 4, eventType: "tool.output", stream: "stderr", payload: { detail: `kie: session=${oldShortEventValue}\n` } },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 5, eventType: "tool.old_cross_stream", stream: "stderr", message: "Coo" },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 6, eventType: "tool.old_cross_stream", stream: "stdout", message: "status: worker alive (historical)" },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 7, eventType: "tool.old_cross_stream", stream: "stderr", payload: { detail: `kie: session=${oldCrossStreamValue}\n` } },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 8, eventType: "tool.old_cross_stream", stream: "stderr", message: "safe after historical cookie" },
     ]);
 
     const app = express();
@@ -187,12 +204,24 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     const eventResponse = await request(app).get(`/api/heartbeat-runs/${run.id}/events`);
     expect(eventResponse.status).toBe(200);
     for (const value of cookieValues) expect(JSON.stringify(eventResponse.body)).not.toContain(value);
+    const crossStreamStart = events.find((event) => event.eventType === "tool.cross_stream" && event.message === "Coo");
+    expect(crossStreamStart).toBeDefined();
+    const crossStreamPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${crossStreamStart!.seq}`);
+    expect(crossStreamPage.status).toBe(200);
+    expect(JSON.stringify(crossStreamPage.body)).not.toContain(crossStreamValue);
+    expect(JSON.stringify(crossStreamPage.body)).toContain("status: worker alive");
+    expect(JSON.stringify(crossStreamPage.body)).toContain("safe after cookie");
     const oldEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
     expect(oldEventPage.status).toBe(200);
     expect(JSON.stringify(oldEventPage.body)).not.toContain(cookieValues[8]);
     const oldShortEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 3}`);
     expect(oldShortEventPage.status).toBe(200);
     expect(JSON.stringify(oldShortEventPage.body)).not.toContain(oldShortEventValue);
+    const oldCrossStreamPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 5}`);
+    expect(oldCrossStreamPage.status).toBe(200);
+    expect(JSON.stringify(oldCrossStreamPage.body)).not.toContain(oldCrossStreamValue);
+    expect(JSON.stringify(oldCrossStreamPage.body)).toContain("status: worker alive (historical)");
+    expect(JSON.stringify(oldCrossStreamPage.body)).toContain("safe after historical cookie");
 
     // Simulate a historical line written before the new writer guard. Keep the
     // raw fixture on disk so the HTTP reader itself must close the offset gap.

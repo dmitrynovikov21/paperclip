@@ -309,11 +309,17 @@ function redactEventStrings(value: unknown, redact: (text: string) => string): u
 
 /** Redact values even when adjacent adapter events carry one split header. */
 export function createSensitiveHeaderEventRedactor() {
-  const headerRedactor = createSensitiveHeaderStreamRedactor();
+  const headerRedactors = {
+    system: createSensitiveHeaderStreamRedactor(),
+    stdout: createSensitiveHeaderStreamRedactor(),
+    stderr: createSensitiveHeaderStreamRedactor(),
+  };
   return {
     write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
       // Feed message and payload strings in delivery order. Only credential
-      // values are masked; safe text later in the same event remains visible.
+      // values are masked; other streams cannot change an unfinished header.
+      const stream = event.stream === "stdout" || event.stream === "stderr" ? event.stream : "system";
+      const headerRedactor = headerRedactors[stream];
       return {
         ...event,
         message: typeof event.message === "string" ? headerRedactor.write(event.message) : event.message,

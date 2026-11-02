@@ -216,6 +216,32 @@ describe("redaction", () => {
     }
   });
 
+  it("masks unknown Authorization schemes split across event fields", () => {
+    for (const scheme of ["ApiKey", "OAuth", "Foo", "custom"]) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      redactor.write({ stream: "stderr", message: "Authorization: " });
+      const metadata = redactor.write({ stream: "stderr", payload: { toolName: "playwright" } });
+      const diagnostic = redactor.write({ stream: "stderr", message: "status: worker alive\n" });
+      const credential = `synthetic-${scheme}-credential`;
+      const continuation = redactor.write({
+        stream: "stderr",
+        payload: { detail: `${scheme} ${credential}\nRequest failed after 30000 ms` },
+      });
+      expect(metadata.payload?.toolName).toBe("playwright");
+      expect(diagnostic.message).toBe("status: worker alive\n");
+      expect(JSON.stringify(continuation), scheme).not.toContain(credential);
+      expect(continuation.payload?.detail).toContain("Request failed after 30000 ms");
+      expect(redactor.write({ stream: "stderr", message: "safe diagnostic after value" }).message)
+        .toBe("safe diagnostic after value");
+
+      const withTrailingWhitespace = createSensitiveHeaderEventRedactor();
+      withTrailingWhitespace.write({ stream: "stderr", message: "Authorization: " });
+      expect(JSON.stringify(withTrailingWhitespace.write({
+        stream: "stderr", payload: { detail: `${scheme} ${credential}  \n` },
+      }))).not.toContain(credential);
+    }
+  });
+
   it("masks every header-name split across message and payload events, then releases safe events", () => {
     for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
       for (let split = 1; split < header.length; split += 1) {
@@ -367,7 +393,9 @@ describe("redaction", () => {
             const last = redactor.write({ eventType: "tool.output", stream, payload });
             expect(JSON.stringify([middle, last]), `${header} ${stream} ${independent} ${detailFirst}`).not.toContain(value);
             expect(last.payload?.detail).toContain("Request failed after 30000 ms");
-            if (independent === "worker alive\n") expect(middle.message).toBe(independent);
+            if (independent === "worker alive\n" && header !== "Authorization") {
+              expect(middle.message).toBe(independent);
+            }
             expect(redactor.write({ eventType: "tool.output", stream, message: "safe diagnostic after value" }).message)
               .toBe("safe diagnostic after value");
           }

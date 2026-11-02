@@ -268,11 +268,8 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       expect(events.some((event) => event.eventType === eventType && event.message === "status: worker alive\n")).toBe(true);
       expect(events.some((event) => event.eventType === eventType && event.message === "safe after interrupted header")).toBe(true);
     }
-    for (const { eventType, independent } of startedValueCases) {
+    for (const { eventType } of startedValueCases) {
       expect(events.some((event) => event.eventType === eventType && event.message === "safe diagnostic after value")).toBe(true);
-      if (independent === "worker alive\n") {
-        expect(events.some((event) => event.eventType === eventType && event.message === independent)).toBe(true);
-      }
     }
 
     const lastSeq = Math.max(...events.map((event) => event.seq));
@@ -388,13 +385,12 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       expect(JSON.stringify(page.body)).toContain("status: worker alive\\n");
       expect(JSON.stringify(page.body)).toContain("safe after interrupted header");
     }
-    for (const [{ oldValue, independent }, index] of startedValueCases.entries()) {
+    for (const [{ oldValue }, index] of startedValueCases.entries()) {
       const startSeq = lastSeq + 18 + interruptedHeaderCases.length * 5 + index * 5;
       const page = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${startSeq}`);
       expect(page.status).toBe(200);
       expect(JSON.stringify(page.body)).not.toContain(oldValue);
       expect(JSON.stringify(page.body)).toContain("safe diagnostic after value");
-      if (independent === "worker alive\n") expect(JSON.stringify(page.body)).toContain("worker alive\\n");
     }
 
     // Simulate a historical line written before the new writer guard. Keep the
@@ -537,6 +533,92 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       expect(logPage.body.content).toBe("********");
     } finally {
       unregisterServerAdapter(jsonAdapterType);
+    }
+  }, 30_000);
+
+  it("masks unknown Authorization schemes through adapter events, log writer and HTTP readers", async () => {
+    for (const scheme of ["ApiKey", "OAuth"] as const) {
+      const authAdapterType = `synthetic_auth_scheme_${scheme.toLowerCase()}`;
+      const value = `synthetic-${scheme}-integration-credential`;
+      registerServerAdapter({
+        type: authAdapterType,
+        execute: async (ctx) => {
+          await ctx.onEvent?.({ eventType: "tool.auth", stream: "stderr", message: "Authorization: " });
+          await ctx.onEvent?.({ eventType: "tool.auth", stream: "stderr", payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({ eventType: "tool.auth", stream: "stderr", message: "status: worker alive\n" });
+          await ctx.onEvent?.({
+            eventType: "tool.auth", stream: "stderr",
+            payload: { detail: `${scheme} ${value}\nRequest failed after 30000 ms` },
+          });
+          await ctx.onLog("stdout", "Authorization: ");
+          await ctx.onLog("stdout", "status: worker alive\n");
+          await ctx.onLog("stdout", `${scheme} ${value}\nRequest failed after 30000 ms`);
+          return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic auth output" };
+        },
+      });
+      try {
+        const companyId = randomUUID();
+        const writerId = randomUUID();
+        const readerId = randomUUID();
+        await db.insert(companies).values({
+          id: companyId,
+          name: `Synthetic ${scheme} Log Security`,
+          issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+          requireBoardApprovalForNewAgents: false,
+          defaultResponsibleUserId: "responsible-user",
+        });
+        await db.insert(agents).values([writerId, readerId].map((id) => ({
+          id, companyId, name: id === writerId ? "Auth Log Writer" : "Auth Log Reader",
+          role: "engineer", status: "idle" as const, adapterType: authAdapterType,
+          adapterConfig: {}, runtimeConfig: {}, permissions: {},
+        })));
+        const liveEvents: unknown[] = [];
+        const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => liveEvents.push(event));
+        const heartbeat = heartbeatService(db);
+        const queued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
+        expect(queued).not.toBeNull();
+        const run = await waitForRun(heartbeat, queued!.id);
+        unsubscribe();
+        expect(run.status).toBe("succeeded");
+        const filePath = path.join(home, "run-logs", run.logRef!);
+        const persisted = await fs.readFile(filePath, "utf8");
+        const events = await heartbeat.listEvents(run.id, 0, 100);
+        for (const content of [persisted, JSON.stringify(events), JSON.stringify(liveEvents)]) {
+          expect(content, `${scheme} writer/live`).not.toContain(value);
+          expect(content).toContain("Request failed after 30000 ms");
+        }
+
+        const lastSeq = Math.max(...events.map((event) => event.seq));
+        await db.insert(heartbeatRunEvents).values([
+          { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 1, eventType: "tool.old_auth", stream: "system", message: "Authorization: " },
+          { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 2, eventType: "tool.old_auth", stream: "system", payload: { detail: `${scheme} ${value}\nRequest failed after 30000 ms` } },
+        ]);
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => {
+          (req as any).actor = { type: "agent", agentId: readerId, companyId };
+          next();
+        });
+        app.use("/api", agentRoutes(db));
+        app.use(errorHandler);
+        const eventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events`);
+        expect(eventPage.status).toBe(200);
+        expect(JSON.stringify(eventPage.body)).not.toContain(value);
+        expect(JSON.stringify(eventPage.body)).toContain("Request failed after 30000 ms");
+        const oldEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
+        expect(oldEventPage.status).toBe(200);
+        expect(JSON.stringify(oldEventPage.body)).not.toContain(value);
+
+        const raw = ["Authorization: ", `${scheme} ${value}\nRequest failed after 30000 ms`]
+          .map((chunk) => `${JSON.stringify({ stream: "stderr", chunk })}\n`).join("");
+        const offset = Buffer.byteLength(persisted) + Buffer.byteLength(raw.slice(0, raw.indexOf(value) + 4));
+        await fs.appendFile(filePath, raw);
+        const logPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log?offset=${offset}&limitBytes=8`);
+        expect(logPage.status).toBe(200);
+        expect(logPage.body.content).toBe("********");
+      } finally {
+        unregisterServerAdapter(authAdapterType);
+      }
     }
   }, 30_000);
 });

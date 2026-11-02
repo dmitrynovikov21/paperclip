@@ -306,8 +306,13 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
     acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean {
       if (completesHeaderName || !active || active.kind !== "line") return true;
       const firstLine = chunk.split(/\r?\n|\\[rn]/, 1)[0]!.trimStart();
+      // Any HTTP auth-scheme may precede credentials. A two-token diagnostic
+      // is indistinguishable from that syntax after event boundaries, so mask
+      // it while an Authorization value is pending rather than guessing.
+      const authSchemeValue = active.headerName === "authorization"
+        && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]+\S+[ \t]*$/.test(firstLine);
       const plausibleValue = firstLine.includes("=")
-        || /^(?:Bearer|Basic|Digest|Token|Negotiate)[ \t]+\S+$/i.test(firstLine);
+        || authSchemeValue;
       // Tool identity normally carries only metadata. Do not consume a
       // waiting value with its name, but still redact credential-shaped text.
       if (fieldKey === "toolName" && active.awaitingValue && !plausibleValue) return false;

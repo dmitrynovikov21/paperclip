@@ -376,6 +376,35 @@ describe("redaction", () => {
     }
   });
 
+  it("retains split JSON credential values after an independent event closes a candidate", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const stream of ["stderr", "stdout", "system"] as const) {
+        for (const jsonArray of [false, true]) {
+          for (const detailFirst of [false, true]) {
+            const redactor = createSensitiveHeaderEventRedactor();
+            const value = `synthetic-json-tail-${header}-${stream}-${jsonArray}-${detailFirst}`;
+            const prefix = header === "Authorization" ? "Bearer " : "session=";
+            const opening = jsonArray ? `{"${header}":["${prefix}` : `{"${header}":"${prefix}`;
+            const independent = jsonArray ? 'worker "] alive\n' : 'worker "alive"\n';
+            const closing = jsonArray ? '"]}' : '"}';
+            redactor.write({ stream, message: opening });
+            redactor.write({ stream, payload: { toolName: "playwright" } });
+            redactor.write({ stream, message: independent });
+            const detail = `${value}${closing}\nRequest failed after 30000 ms`;
+            const payload = detailFirst ? { detail, toolName: "playwright" } : { toolName: "playwright", detail };
+            const last = redactor.write({ stream, payload });
+            expect(JSON.stringify([last, redactEventPayload(last.payload)]), `${header} ${stream} ${jsonArray} ${detailFirst}`)
+              .not.toContain(value);
+            expect(last.payload?.detail).toContain("Request failed after 30000 ms");
+            const otherStream = stream === "stdout" ? "stderr" : "stdout";
+            expect(redactor.write({ stream: otherStream, message: "other stream visible" }).message)
+              .toBe("other stream visible");
+          }
+        }
+      }
+    }
+  });
+
   it("does not retire an unfinished header after an ambiguous cookie-shaped field", () => {
     for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
       const redactor = createSensitiveHeaderEventRedactor();

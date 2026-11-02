@@ -143,6 +143,46 @@ describe("createDurableRunLogStore", () => {
     expect(objects.get(handle.logRef)?.toString("utf8")).toBe(persisted);
   });
 
+  it("keeps JSON credential tails private when independent log chunks contain closing delimiters", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const jsonArray of [false, true]) {
+        const handle = await store.begin({ ...begin, runId: `json-${header}-${jsonArray}` });
+        const value = `synthetic-json-log-tail-${header}-${jsonArray}`;
+        const prefix = header === "Authorization" ? "Bearer " : "session=";
+        const chunks = [
+          jsonArray ? `{"${header}":["${prefix}` : `{"${header}":"${prefix}`,
+          jsonArray ? 'worker "] alive\n' : 'worker "alive"\n',
+          `${value}${jsonArray ? '"]}' : '"}'}\nRequest failed after 30000 ms`,
+        ];
+        for (const [index, chunk] of chunks.entries()) {
+          await store.append(handle, { stream: "stderr", chunk, ts: `t${index}`, seq: index });
+        }
+        await store.finalize(handle);
+        const filePath = path.join(baseDir, handle.logRef);
+        const persisted = await fs.readFile(filePath, "utf8");
+        expect(persisted, `${header} ${jsonArray} local writer`).not.toContain(value);
+        expect(objects.get(handle.logRef)?.toString("utf8"), `${header} ${jsonArray} S3 writer`).not.toContain(value);
+        expect(persisted).toContain("Request failed after 30000 ms");
+
+        // A pre-fix file must also be guarded when read from either backend.
+        const raw = chunks.map((chunk, index) => `${JSON.stringify({ stream: "stderr", chunk, ts: `t${index}` })}\n`).join("");
+        await fs.writeFile(filePath, raw);
+        await store.finalize(handle);
+        const offset = Buffer.byteLength(raw.slice(0, raw.indexOf(value) + 4));
+        for (const remote of [false, true]) {
+          if (remote) await fs.rm(filePath);
+          const page = await store.read(handle, { offset, limitBytes: 8 });
+          expect(page.content, `${header} ${jsonArray} ${remote ? "S3" : "local"} offset`).toBe("********");
+          const full = await store.read(handle);
+          expect(full.content).not.toContain(value);
+          expect(full.content).toContain("Request failed after 30000 ms");
+        }
+      }
+    }
+  });
+
   it("keeps later JSON array elements out of local and S3 after an inner header and long chunk", async () => {
     const { provider, objects } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

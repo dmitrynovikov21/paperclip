@@ -446,10 +446,13 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 
 Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
 new run logs and run events before storage, including headers split across
-output chunks and JSON array values. Run events keep header state separately
+output chunks and JSON array values. Run logs and run events keep header state separately
 for `system`, `stdout`, and `stderr`, so interleaved streams cannot reset an
 unfinished header. Independent messages and payload metadata preserve a split
-header across adjacent events. The run-log API also masks these values when it reads older
+header across adjacent events. When an unrelated event contains a JSON closing
+quote or bracket, the possible credential continuation remains guarded; later
+content in that stream may be masked until the ambiguity is resolved. The run-log
+API also masks these values when it reads older
 log records, including requests whose byte offset starts
 inside a value or whose header spans adjacent records. Reads beyond the bounded
 512 KiB context return masked content when an older multiline value cannot be

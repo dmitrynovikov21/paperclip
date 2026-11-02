@@ -269,7 +269,7 @@ type HeaderStreamRedactor = {
   write(chunk: string): string;
   acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean;
   completesHeaderName(chunk: string): boolean;
-  hasActivePlainHeaderValue(): boolean;
+  hasActiveHeaderValue(): boolean;
   fork(): HeaderStreamRedactor;
   stateKey(): string;
 };
@@ -298,7 +298,7 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
   let tail = initial.tail;
   let active = cloneHeaderValueState(initial.active);
   return {
-    hasActivePlainHeaderValue: () => active?.kind === "line" && !active.jsonField,
+    hasActiveHeaderValue: () => active !== null,
     completesHeaderName(chunk: string): boolean {
       return tail.length > 0 && scanSensitiveHeaderRanges(tail + chunk)
         .some((range) => range.start < tail.length && range.valueStart > tail.length);
@@ -431,11 +431,11 @@ export function createSensitiveHeaderEventRedactor() {
           if (freshText[index] !== text[index]) output[index] = "*";
         }
         for (let index = 0; index < priorStates.length; index += 1) {
-          // A newline in another event may belong to an independent message,
-          // even after part of a plain credential header was seen. Keep that
+          // A closing delimiter in another event may belong to an independent
+          // message, even after a credential value has started. Keep that
           // branch so a later event cannot expose the actual continuation.
-          if (branches[index]!.stateKey() === fresh.stateKey() && !priorStates[index]!.hasActivePlainHeaderValue()
-            && result.candidates[index] !== freshText) {
+          if (branches[index]!.stateKey() === fresh.stateKey()
+            && !priorStates[index]!.hasActiveHeaderValue() && result.candidates[index] !== freshText) {
             resolvedStateKeys.add(priorStates[index]!.stateKey());
           }
         }

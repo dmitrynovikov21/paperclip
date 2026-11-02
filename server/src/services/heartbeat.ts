@@ -264,7 +264,7 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { createSensitiveHeaderEventRedactor, createSensitiveHeaderStreamRedactor, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createSensitiveHeaderEventRedactor, redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -15190,10 +15190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-      const logRedactors = {
-        stdout: createSensitiveHeaderStreamRedactor(),
-        stderr: createSensitiveHeaderStreamRedactor(),
-      };
+      const logRedactor = createSensitiveHeaderEventRedactor();
       const adapterEventRedactor = createSensitiveHeaderEventRedactor();
       const emitLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
@@ -15266,9 +15263,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitized = logRedactors[stream].write(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
-        );
+        const sanitized = logRedactor.write({
+          stream,
+          message: redactCurrentUserText(chunk, currentUserRedactionOptions),
+        }).message;
         if (sanitized) await emitLog(stream, sanitized);
       };
       if (runScopedMentionedSkillKeys.length > 0) {

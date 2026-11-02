@@ -422,4 +422,121 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(splitResponse.status).toBe(200);
     expect(splitResponse.body.content).toBe("********");
   }, 30_000);
+
+  it("masks JSON credential tails after unrelated adapter output in live, stored and historical reads", async () => {
+    const jsonAdapterType = "synthetic_json_cookie_output";
+    const cases = [
+      { header: "Cookie", stream: "stderr", jsonArray: false, detailFirst: false },
+      { header: "Set-Cookie", stream: "stdout", jsonArray: true, detailFirst: true },
+      { header: "Authorization", stream: "system", jsonArray: false, detailFirst: true },
+    ] as const;
+    const valueFor = (header: string) => `synthetic-json-event-${header.toLowerCase()}`;
+    const prefixFor = (header: string) => header === "Authorization" ? "Bearer " : "session=";
+    const openingFor = (header: string, jsonArray: boolean) =>
+      jsonArray ? `{"${header}":["${prefixFor(header)}` : `{"${header}":"${prefixFor(header)}`;
+    const middleFor = (jsonArray: boolean) => jsonArray ? 'worker "] alive\n' : 'worker "alive"\n';
+    const closingFor = (jsonArray: boolean) => jsonArray ? '"]}' : '"}';
+    registerServerAdapter({
+      type: jsonAdapterType,
+      execute: async (ctx) => {
+        for (const { header, stream, jsonArray, detailFirst } of cases) {
+          const eventType = `tool.json_${header.toLowerCase().replace("-", "_")}`;
+          await ctx.onEvent?.({ eventType, stream, message: openingFor(header, jsonArray) });
+          await ctx.onEvent?.({ eventType, stream, payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({ eventType, stream, message: middleFor(jsonArray) });
+          const detail = `${valueFor(header)}${closingFor(jsonArray)}\nRequest failed after 30000 ms`;
+          await ctx.onEvent?.({
+            eventType, stream,
+            payload: detailFirst ? { detail, toolName: "playwright" } : { toolName: "playwright", detail },
+          });
+          if (stream !== "system") {
+            await ctx.onLog(stream, openingFor(header, jsonArray));
+            await ctx.onLog(stream, middleFor(jsonArray));
+            await ctx.onLog(stream, `${valueFor(header)}${closingFor(jsonArray)}\nRequest failed after 30000 ms`);
+          }
+        }
+        return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic JSON tool output" };
+      },
+    });
+    try {
+      const companyId = randomUUID();
+      const writerId = randomUUID();
+      const readerId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Synthetic JSON Log Security",
+        issuePrefix: `J${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+        defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values([writerId, readerId].map((id) => ({
+        id, companyId, name: id === writerId ? "JSON Log Writer" : "JSON Log Reader",
+        role: "engineer", status: "idle" as const, adapterType: jsonAdapterType,
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      })));
+      const liveEvents: unknown[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => liveEvents.push(event));
+      const heartbeat = heartbeatService(db);
+      const queued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
+      expect(queued).not.toBeNull();
+      const run = await waitForRun(heartbeat, queued!.id);
+      unsubscribe();
+      expect(run.status).toBe("succeeded");
+      const filePath = path.join(home, "run-logs", run.logRef!);
+      const persisted = await fs.readFile(filePath, "utf8");
+      const events = await heartbeat.listEvents(run.id, 0, 200);
+      for (const { header } of cases) {
+        const value = valueFor(header);
+        expect(persisted).not.toContain(value);
+        expect(JSON.stringify(events)).not.toContain(value);
+        expect(JSON.stringify(liveEvents)).not.toContain(value);
+        const eventType = `tool.json_${header.toLowerCase().replace("-", "_")}`;
+        expect(events.some((event) => event.eventType === eventType &&
+          typeof event.payload?.detail === "string" && event.payload.detail.includes("Request failed after 30000 ms"))).toBe(true);
+      }
+
+      const lastSeq = Math.max(...events.map((event) => event.seq));
+      const legacyValue = "synthetic-json-legacy-tail";
+      await db.insert(heartbeatRunEvents).values([
+        { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 1, eventType: "tool.json_legacy", stream: "stderr", message: '{"Cookie":"session=' },
+        { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 2, eventType: "tool.json_legacy", stream: "stderr", payload: { toolName: "playwright" } },
+        { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 3, eventType: "tool.json_legacy", stream: "stderr", message: 'worker "alive"\n' },
+        { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 4, eventType: "tool.json_legacy", stream: "stderr", payload: { detail: `${legacyValue}"}\nRequest failed after 30000 ms` } },
+      ]);
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "agent", agentId: readerId, companyId };
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      const writtenEventsPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events`);
+      const writtenLogPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log`);
+      expect(writtenEventsPage.status).toBe(200);
+      expect(writtenLogPage.status).toBe(200);
+      for (const { header } of cases) {
+        expect(JSON.stringify(writtenEventsPage.body)).not.toContain(valueFor(header));
+        expect(JSON.stringify(writtenLogPage.body)).not.toContain(valueFor(header));
+      }
+      const eventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
+      expect(eventPage.status).toBe(200);
+      expect(JSON.stringify(eventPage.body)).not.toContain(legacyValue);
+      expect(JSON.stringify(eventPage.body)).toContain("Request failed after 30000 ms");
+
+      const oldRecords = [
+        { stream: "stderr", chunk: '{"Cookie":"session=' },
+        { stream: "stderr", chunk: 'worker "alive"\n' },
+        { stream: "stderr", chunk: `${legacyValue}"}\nRequest failed after 30000 ms` },
+      ].map((record) => `${JSON.stringify(record)}\n`).join("");
+      const oldStart = Buffer.byteLength(persisted);
+      await fs.appendFile(filePath, oldRecords);
+      const offset = oldStart + oldRecords.indexOf(legacyValue) + 4;
+      const logPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log?offset=${offset}&limitBytes=8`);
+      expect(logPage.status).toBe(200);
+      expect(logPage.body.content).toBe("********");
+    } finally {
+      unregisterServerAdapter(jsonAdapterType);
+    }
+  }, 30_000);
 });

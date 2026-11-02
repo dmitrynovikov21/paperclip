@@ -6,10 +6,9 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
 import {
-  createSensitiveHeaderStreamRedactor,
+  createSensitiveHeaderEventRedactor,
   redactRunLogTextPreservingBytes,
   redactSensitiveText,
-  sensitiveHeaderRanges,
 } from "../redaction.js";
 
 export type RunLogStoreType = "local_file";
@@ -68,7 +67,7 @@ function normalizeKeyPrefix(prefix: string | undefined): string {
 }
 
 function protectRunLogRecords(rawRecords: Buffer, uncertainStart: boolean, requestedStart: number, requestedEnd: number): Buffer {
-  type ParsedRecord = { start: number; end: number; valueStart: number; valueEnd: number; rawChunk: string; chunk: string; joinedStart: number; joinedEnd: number };
+  type ParsedRecord = { start: number; end: number; valueStart: number; valueEnd: number; rawChunk: string; chunk: string };
   const redacted = Buffer.from(rawRecords);
   const maskDecodedRange = (record: ParsedRecord, start: number, end: number) => {
     let rawIndex = 0;
@@ -116,8 +115,7 @@ function protectRunLogRecords(rawRecords: Buffer, uncertainStart: boolean, reque
         const valueStart = lineStart + Buffer.byteLength(line.slice(0, valueCharStart));
         const valueEnd = valueStart + Buffer.byteLength(field[1]!);
         const records = byStream.get(parsed.stream) ?? [];
-        const joinedStart = records.at(-1)?.joinedEnd ?? 0;
-        const record = { start: lineStart, end: lineEnd, valueStart, valueEnd, rawChunk: field[1]!, chunk: parsed.chunk, joinedStart, joinedEnd: joinedStart + parsed.chunk.length };
+        const record = { start: lineStart, end: lineEnd, valueStart, valueEnd, rawChunk: field[1]!, chunk: parsed.chunk };
         records.push(record);
         byStream.set(parsed.stream, records);
         const sanitized = redactRunLogTextPreservingBytes(parsed.chunk);
@@ -141,12 +139,22 @@ function protectRunLogRecords(rawRecords: Buffer, uncertainStart: boolean, reque
     lineStart = lineEnd;
   }
 
-  for (const records of byStream.values()) {
-    const joined = records.map((record) => record.chunk).join("");
-    for (const range of sensitiveHeaderRanges(joined)) {
-      const affected = records.filter((record) => record.joinedStart < range.end && record.joinedEnd > range.start);
-      for (const record of affected) {
-        maskDecodedRange(record, Math.max(0, range.valueStart - record.joinedStart), Math.min(record.chunk.length, range.end - record.joinedStart));
+  for (const [stream, records] of byStream) {
+    const redactor = createSensitiveHeaderEventRedactor();
+    for (const record of records) {
+      const sanitized = redactor.write({ stream, message: record.chunk }).message;
+      if (typeof sanitized !== "string" || sanitized.length !== record.chunk.length) {
+        redacted.fill(42, record.valueStart, record.valueEnd);
+      } else {
+        for (let index = 0; index < record.chunk.length;) {
+          if (sanitized[index] === record.chunk[index]) {
+            index += 1;
+            continue;
+          }
+          const start = index;
+          while (index < record.chunk.length && sanitized[index] !== record.chunk[index]) index += 1;
+          maskDecodedRange(record, start, index);
+        }
       }
     }
     if (uncertainStart) {
@@ -219,7 +227,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     upload: Promise<boolean> | null;
   }
   const inflightMirrors = new Map<string, InflightMirrorEntry>();
-  const streamRedactors = new Map<string, Map<"stdout" | "stderr" | "system", ReturnType<typeof createSensitiveHeaderStreamRedactor>>>();
+  const streamRedactors = new Map<string, ReturnType<typeof createSensitiveHeaderEventRedactor>>();
 
   async function persistLine(
     handle: RunLogHandle,
@@ -447,23 +455,18 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         await file.close();
       }
       await retireInflightMirror(relPath);
-      streamRedactors.set(relPath, new Map());
+      streamRedactors.set(relPath, createSensitiveHeaderEventRedactor());
       return { store: "local_file", logRef: relPath };
     },
 
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
-      let redactors = streamRedactors.get(handle.logRef);
-      if (!redactors) {
-        redactors = new Map();
-        streamRedactors.set(handle.logRef, redactors);
-      }
-      let redactor = redactors.get(event.stream);
+      let redactor = streamRedactors.get(handle.logRef);
       if (!redactor) {
-        redactor = createSensitiveHeaderStreamRedactor();
-        redactors.set(event.stream, redactor);
+        redactor = createSensitiveHeaderEventRedactor();
+        streamRedactors.set(handle.logRef, redactor);
       }
-      const chunk = redactor.write(event.chunk);
+      const chunk = redactor.write({ stream: event.stream, message: event.chunk }).message;
       return chunk ? persistLine(handle, { ...event, chunk }) : 0;
     },
 

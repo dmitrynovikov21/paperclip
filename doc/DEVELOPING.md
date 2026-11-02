@@ -442,6 +442,28 @@ Agent, project, environment, secret, skill, and workspace config edits are sampl
 
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
+## Run log credential handling
+
+Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
+new run logs and run events before storage, including headers split across
+output chunks and JSON array values. Run logs and run events keep header state separately
+for `system`, `stdout`, and `stderr`, so interleaved streams cannot reset an
+unfinished header. `onEvent` and `onLog` share a guard for each stream, including
+values split between the callbacks. Independent messages and payload metadata preserve a split
+header across adjacent events. When an unrelated event contains a JSON closing
+quote or bracket, the possible credential continuation remains guarded; later
+content in that stream may be masked until the ambiguity is resolved. The run-log
+API also masks these values when it reads older
+log records, including requests whose byte offset starts
+inside a value or whose header spans adjacent records. Reads beyond the bounded
+512 KiB context return masked content when an older multiline value cannot be
+ruled out. The event API also masks content on deep legacy pages with unknown
+preceding header state. New local run-log files
+use mode `0600`; their company
+and agent directories use mode `0700`. Existing log files are not rewritten.
+If a credential was exposed before this guard, revoke it separately and retain
+the historical log according to the incident retention decision.
+
 ## Worktree-local Instances
 
 When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.

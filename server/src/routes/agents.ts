@@ -85,7 +85,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactEventPayload } from "../redaction.js";
+import { createSensitiveHeaderEventRedactor, REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import {
@@ -3961,13 +3961,36 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
 
-    const afterSeq = Number(req.query.afterSeq ?? 0);
-    const limit = Number(req.query.limit ?? 200);
-    const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
+    const requestedAfterSeq = Number(req.query.afterSeq ?? 0);
+    const requestedLimit = Number(req.query.limit ?? 200);
+    const afterSeq = Number.isFinite(requestedAfterSeq) ? Math.max(0, Math.floor(requestedAfterSeq)) : 0;
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(Math.floor(requestedLimit), 1000)) : 200;
+    const headerRedactor = createSensitiveHeaderEventRedactor();
+    const events: Awaited<ReturnType<typeof heartbeat.listEvents>> = [];
+    if (afterSeq > 2000) {
+      // A page deep in a legacy run has unknown preceding header state. Keep
+      // metadata available while withholding content that cannot be proven safe.
+      const page = await heartbeat.listEvents(runId, afterSeq, limit);
+      events.push(...page.map((event) => ({ ...event, message: event.message ? REDACTED_EVENT_VALUE : event.message, payload: null })));
+    } else {
+      let cursor = 0;
+      while (events.length < limit) {
+        const page = await heartbeat.listEvents(runId, cursor, 1000);
+        if (page.length === 0) break;
+        for (const event of page) {
+          const safeEvent = headerRedactor.write(event);
+          if (event.seq > afterSeq) events.push(safeEvent);
+          if (events.length >= limit) break;
+        }
+        cursor = page.at(-1)!.seq;
+        if (page.length < 1000) break;
+      }
+    }
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const redactedEvents = events.map((event) =>
       redactCurrentUserValue({
         ...event,
+        message: typeof event.message === "string" ? redactSensitiveText(event.message) : event.message,
         payload: redactEventPayload(event.payload),
       }, currentUserRedactionOptions),
     );

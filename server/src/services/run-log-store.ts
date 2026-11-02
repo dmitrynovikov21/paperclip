@@ -5,6 +5,11 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import {
+  createSensitiveHeaderEventRedactor,
+  redactRunLogTextPreservingBytes,
+  redactSensitiveText,
+} from "../redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -59,6 +64,110 @@ function resolveWithin(basePath: string, relativePath: string) {
 function normalizeKeyPrefix(prefix: string | undefined): string {
   if (!prefix) return "";
   return prefix.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function protectRunLogRecords(rawRecords: Buffer, uncertainStart: boolean, requestedStart: number, requestedEnd: number): Buffer {
+  type ParsedRecord = { start: number; end: number; valueStart: number; valueEnd: number; rawChunk: string; chunk: string };
+  const redacted = Buffer.from(rawRecords);
+  const maskDecodedRange = (record: ParsedRecord, start: number, end: number) => {
+    let rawIndex = 0;
+    let rawByteOffset = 0;
+    let decodedIndex = 0;
+    while (rawIndex < record.rawChunk.length && decodedIndex < end) {
+      let rawLength = 1;
+      let decodedLength = 1;
+      if (record.rawChunk[rawIndex] === "\\") {
+        rawLength = record.rawChunk[rawIndex + 1] === "u" ? 6 : 2;
+      } else if ((record.rawChunk.codePointAt(rawIndex) ?? 0) > 0xffff) {
+        rawLength = 2;
+        decodedLength = 2;
+      }
+      const rawBytes = Buffer.byteLength(record.rawChunk.slice(rawIndex, rawIndex + rawLength));
+      if (decodedIndex < end && decodedIndex + decodedLength > start) {
+        redacted.fill(42, record.valueStart + rawByteOffset, record.valueStart + rawByteOffset + rawBytes);
+      }
+      rawIndex += rawLength;
+      rawByteOffset += rawBytes;
+      decodedIndex += decodedLength;
+    }
+  };
+  const byStream = new Map<string, ParsedRecord[]>();
+  let lineStart = 0;
+  while (lineStart < rawRecords.length) {
+    const newline = rawRecords.indexOf(10, lineStart);
+    const lineEnd = newline < 0 ? rawRecords.length : newline + 1;
+    const line = rawRecords.subarray(lineStart, lineEnd).toString("utf8");
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      redacted.fill(42, lineStart, lineEnd);
+      lineStart = lineEnd;
+      continue;
+    }
+    if (parsed && typeof parsed === "object" && typeof parsed.chunk === "string" && typeof parsed.stream === "string"
+      && Object.keys(parsed).every((key) => ["ts", "stream", "chunk", "seq"].includes(key))) {
+      const field = /"chunk"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(line);
+      if (!field) {
+        redacted.fill(42, lineStart, lineEnd);
+      } else {
+        const valueCharStart = field.index + field[0].length - field[1]!.length - 1;
+        const valueStart = lineStart + Buffer.byteLength(line.slice(0, valueCharStart));
+        const valueEnd = valueStart + Buffer.byteLength(field[1]!);
+        const records = byStream.get(parsed.stream) ?? [];
+        const record = { start: lineStart, end: lineEnd, valueStart, valueEnd, rawChunk: field[1]!, chunk: parsed.chunk };
+        records.push(record);
+        byStream.set(parsed.stream, records);
+        const sanitized = redactRunLogTextPreservingBytes(parsed.chunk);
+        if (sanitized.length !== parsed.chunk.length) {
+          redacted.fill(42, valueStart, valueEnd);
+        } else {
+          for (let index = 0; index < parsed.chunk.length;) {
+            if (sanitized[index] === parsed.chunk[index]) {
+              index += 1;
+              continue;
+            }
+            const start = index;
+            while (index < parsed.chunk.length && sanitized[index] !== parsed.chunk[index]) index += 1;
+            maskDecodedRange(record, start, index);
+          }
+        }
+      }
+    } else {
+      redacted.fill(42, lineStart, lineEnd);
+    }
+    lineStart = lineEnd;
+  }
+
+  for (const [stream, records] of byStream) {
+    const redactor = createSensitiveHeaderEventRedactor();
+    for (const record of records) {
+      const sanitized = redactor.write({ stream, message: record.chunk }).message;
+      if (typeof sanitized !== "string" || sanitized.length !== record.chunk.length) {
+        redacted.fill(42, record.valueStart, record.valueEnd);
+      } else {
+        for (let index = 0; index < record.chunk.length;) {
+          if (sanitized[index] === record.chunk[index]) {
+            index += 1;
+            continue;
+          }
+          const start = index;
+          while (index < record.chunk.length && sanitized[index] !== record.chunk[index]) index += 1;
+          maskDecodedRange(record, start, index);
+        }
+      }
+    }
+    if (uncertainStart) {
+      let knownLineStart = false;
+      for (const record of records) {
+        if (!knownLineStart && record.end > requestedStart && record.start < requestedEnd) {
+          redacted.fill(42, record.valueStart, record.valueEnd);
+        }
+        if (record.chunk.includes("\n") || record.chunk.includes("\r")) knownLineStart = true;
+      }
+    }
+  }
+  return redacted;
 }
 
 export interface DurableRunLogStoreOptions {
@@ -118,6 +227,24 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     upload: Promise<boolean> | null;
   }
   const inflightMirrors = new Map<string, InflightMirrorEntry>();
+  const streamRedactors = new Map<string, ReturnType<typeof createSensitiveHeaderEventRedactor>>();
+
+  async function persistLine(
+    handle: RunLogHandle,
+    event: { stream: "stdout" | "stderr" | "system"; chunk: string; ts: string; seq?: number },
+  ): Promise<number> {
+    const absPath = resolveWithin(basePath, handle.logRef);
+    const line = JSON.stringify({
+      ts: event.ts,
+      stream: event.stream,
+      chunk: redactSensitiveText(event.chunk),
+      ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
+    });
+    const persisted = `${line}\n`;
+    await fs.appendFile(absPath, persisted, { encoding: "utf8", mode: 0o600 });
+    noteInflightAppend(handle.logRef);
+    return Buffer.byteLength(persisted, "utf8");
+  }
 
   function mirrorInflightNow(logRef: string, entry: InflightMirrorEntry): Promise<boolean> {
     entry.dirty = false;
@@ -198,7 +325,50 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 
   async function ensureDir(relativeDir: string) {
     const dir = resolveWithin(basePath, relativeDir);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    // Existing directories may have been created with the old default mode.
+    for (let current = dir; current !== path.resolve(basePath); current = path.dirname(current)) {
+      await fs.chmod(current, 0o700);
+    }
+  }
+
+  const redactionContextBytes = 512 * 1024;
+
+  function protectedRange(
+    bytes: Buffer,
+    windowStart: number,
+    start: number,
+    endExclusive: number,
+    total: number,
+  ): RunLogReadResult {
+    if (start >= endExclusive) return { content: "", nextOffset: start < total ? start : undefined };
+    // A historical JSON array can span more than the bounded read context.
+    // Without its opening header we cannot prove that a later newline ended
+    // the credential value, so deep offset reads must fail closed.
+    if (windowStart > 0) {
+      return { content: "*".repeat(endExclusive - start), nextOffset: endExclusive < total ? endExclusive : undefined };
+    }
+    const relativeStart = start - windowStart;
+    const relativeEnd = endExclusive - windowStart;
+    const recordStart = windowStart === 0 ? 0 : bytes.indexOf(10) + 1;
+    const lastNewline = bytes.lastIndexOf(10);
+    const recordEnd = windowStart + bytes.length === total ? bytes.length : lastNewline + 1;
+    const hasWholeRecords = recordStart <= relativeStart && recordEnd >= relativeEnd && recordEnd > recordStart;
+
+    // A malformed legacy record longer than the bounded context must never
+    // expose a slice from the middle of a header value.
+    let content = "*".repeat(endExclusive - start);
+    if (hasWholeRecords) {
+      const rawRecords = bytes.subarray(recordStart, recordEnd);
+      const redacted = protectRunLogRecords(
+        rawRecords,
+        windowStart > 0,
+        relativeStart - recordStart,
+        relativeEnd - recordStart,
+      );
+      content = redacted.subarray(relativeStart - recordStart, relativeEnd - recordStart).toString("utf8");
+    }
+    return { content, nextOffset: endExclusive < total ? endExclusive : undefined };
   }
 
   async function readLocalRange(
@@ -209,13 +379,16 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat) return null;
     const start = Math.max(0, Math.min(offset, stat.size));
+    if (start >= stat.size) return { content: "", nextOffset: undefined };
     const end = Math.max(start, Math.min(start + limitBytes - 1, stat.size - 1));
-    if (start > end) return { content: "", nextOffset: start };
+
+    const windowStart = Math.max(0, start - redactionContextBytes);
+    const windowEnd = Math.min(stat.size - 1, end + redactionContextBytes);
 
     const chunks: Buffer[] = [];
     try {
       await new Promise<void>((resolve, reject) => {
-        const stream = createReadStream(filePath, { start, end });
+        const stream = createReadStream(filePath, { start: windowStart, end: windowEnd });
         stream.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
         stream.on("error", reject);
         stream.on("end", () => resolve());
@@ -227,9 +400,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
       throw err;
     }
-    const content = Buffer.concat(chunks).toString("utf8");
-    const nextOffset = end + 1 < stat.size ? end + 1 : undefined;
-    return { content, nextOffset };
+    return protectedRange(Buffer.concat(chunks), windowStart, start, end + 1, stat.size);
   }
 
   async function readS3Range(
@@ -243,19 +414,20 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     if (!head.exists) throw notFound("Run log not found");
     const total = head.contentLength ?? 0;
     const start = Math.max(0, Math.min(offset, total));
+    if (start >= total) return { content: "", nextOffset: undefined };
     const end = Math.max(start, Math.min(start + limitBytes - 1, total - 1));
-    if (start > end || total === 0) return { content: "", nextOffset: start < total ? start : undefined };
 
-    const result = await s3.provider.getObject({ objectKey: key, range: { start, end } });
+    const windowStart = Math.max(0, start - redactionContextBytes);
+    const windowEnd = Math.min(total - 1, end + redactionContextBytes);
+
+    const result = await s3.provider.getObject({ objectKey: key, range: { start: windowStart, end: windowEnd } });
     const chunks: Buffer[] = [];
     await new Promise<void>((resolve, reject) => {
       result.stream.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
       result.stream.on("error", reject);
       result.stream.on("end", () => resolve());
     });
-    const content = Buffer.concat(chunks).toString("utf8");
-    const nextOffset = end + 1 < total ? end + 1 : undefined;
-    return { content, nextOffset };
+    return protectedRange(Buffer.concat(chunks), windowStart, start, end + 1, total);
   }
 
   async function sha256File(filePath: string): Promise<string> {
@@ -276,31 +448,31 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       const relPath = path.join(relDir, `${runId}.ndjson`);
       await ensureDir(relDir);
       const absPath = resolveWithin(basePath, relPath);
-      await fs.writeFile(absPath, "", "utf8");
+      const file = await fs.open(absPath, "w", 0o600);
+      try {
+        await file.chmod(0o600);
+      } finally {
+        await file.close();
+      }
       await retireInflightMirror(relPath);
+      streamRedactors.set(relPath, createSensitiveHeaderEventRedactor());
       return { store: "local_file", logRef: relPath };
     },
 
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
-      const absPath = resolveWithin(basePath, handle.logRef);
-      const line = JSON.stringify({
-        ts: event.ts,
-        stream: event.stream,
-        chunk: event.chunk,
-        // Monotonic per-run sequence so readers can dedupe and order records
-        // even when several identical chunks share the same millisecond ts
-        // (common for ACP-style token deltas).
-        ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
-      });
-      const persisted = `${line}\n`;
-      await fs.appendFile(absPath, persisted, "utf8");
-      noteInflightAppend(handle.logRef);
-      return Buffer.byteLength(persisted, "utf8");
+      let redactor = streamRedactors.get(handle.logRef);
+      if (!redactor) {
+        redactor = createSensitiveHeaderEventRedactor();
+        streamRedactors.set(handle.logRef, redactor);
+      }
+      const chunk = redactor.write({ stream: event.stream, message: event.chunk }).message;
+      return chunk ? persistLine(handle, { ...event, chunk }) : 0;
     },
 
     async finalize(handle) {
       if (handle.store !== "local_file") return { bytes: 0, compressed: false };
+      streamRedactors.delete(handle.logRef);
       await retireInflightMirror(handle.logRef);
       const absPath = resolveWithin(basePath, handle.logRef);
       const stat = await fs.stat(absPath).catch(() => null);

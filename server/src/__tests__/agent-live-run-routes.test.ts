@@ -1,6 +1,10 @@
 import express from "express";
 import request from "supertest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDurableRunLogStore } from "../services/run-log-store.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -92,7 +96,13 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp(db: Record<string, unknown> = {}) {
+async function createApp(db: Record<string, unknown> = {}, actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -100,13 +110,7 @@ async function createApp(db: Record<string, unknown> = {}) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", agentRoutes(db as any));
@@ -373,6 +377,42 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+  });
+
+  it("does not expose a historical cookie from an offset log read to another same-company agent", async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-run-log-http-"));
+    try {
+      const store = createDurableRunLogStore({ basePath: baseDir });
+      const handle = await store.begin({ companyId: "company-1", agentId: "author-agent", runId: "run-1" });
+      const raw = `${JSON.stringify({
+        stream: "stderr",
+        chunk: "Playwright timeout\\nCookie: __Host-hp_access=fake-http-access; __Host-hp_refresh=fake-http-refresh; __Host-hp_csrf=fake-http-csrf\\nRequest failed",
+      })}\n`;
+      await fs.writeFile(path.join(baseDir, handle.logRef), raw);
+      mockHeartbeatService.readLog.mockImplementation(async (_run, opts) => ({
+        runId: "run-1",
+        store: "local_file",
+        logRef: handle.logRef,
+        ...await store.read(handle, opts),
+      }));
+      const offset = raw.indexOf("fake-http-refresh") + 4;
+      const actor = { type: "agent", agentId: routeAgentId, companyId: "company-1" };
+      const res = await requestApp(
+        await createApp({}, actor),
+        (baseUrl) => request(baseUrl).get(`/api/heartbeat-runs/run-1/log?offset=${offset}&limitBytes=8`),
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.content).toBe("********");
+      expect(res.body.nextOffset).toBe(offset + 8);
+
+      const crossCompany = await requestApp(
+        await createApp({}, { ...actor, companyId: "other-company" }),
+        (baseUrl) => request(baseUrl).get(`/api/heartbeat-runs/run-1/log?offset=${offset}&limitBytes=8`),
+      );
+      expect(crossCompany.status).toBe(404);
+    } finally {
+      await fs.rm(baseDir, { recursive: true, force: true });
+    }
   });
 
   it("caps company live run polling by default", async () => {

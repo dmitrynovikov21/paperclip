@@ -264,7 +264,13 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  createSensitiveHeaderCallbackRedactor,
+  createSensitiveHeaderEventRedactor,
+  mergeSensitiveHeaderEventRedactions,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -9636,7 +9642,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? redactSensitiveText(redactCurrentUserText(event.message, currentUserRedactionOptions))
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -15190,9 +15196,51 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-      const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+      // Keep each carrier's ambiguous event branches separate, while an
+      // ordered scanner also follows header fragments across both callbacks.
+      const logRedactor = createSensitiveHeaderEventRedactor();
+      const adapterEventRedactor = createSensitiveHeaderEventRedactor();
+      const callbackRedactor = createSensitiveHeaderCallbackRedactor();
+      type OutputStream = "stdout" | "stderr";
+      type OutputRedactor = ReturnType<typeof createSensitiveHeaderEventRedactor>;
+      const lastCallback: Partial<Record<OutputStream, "log" | "event">> = {};
+      const crossCallbackBridges: Record<OutputStream, { log?: OutputRedactor; event?: OutputRedactor }> = {
+        stdout: {},
+        stderr: {},
+      };
+      const redactAdapterOutput = <T extends {
+        stream?: string | null;
+        message?: string | null;
+        payload?: Record<string, unknown> | null;
+      }>(input: T, carrier: "log" | "event"): T => {
+        const stream = input.stream === "stdout" || input.stream === "stderr" ? input.stream : "system";
+        const logBridgeSeed = stream !== "system" && carrier === "event"
+          && lastCallback[stream] === "log" && logRedactor.hasPendingHeader(stream)
+          && !crossCallbackBridges[stream].log
+          ? logRedactor.fork()
+          : null;
+        const own = (carrier === "log" ? logRedactor : adapterEventRedactor).write(input);
+        let safe = mergeSensitiveHeaderEventRedactions(input, own, callbackRedactor.write(input));
+        if (stream === "system") return safe;
+
+        const bridges = crossCallbackBridges[stream];
+        if (logBridgeSeed) bridges.log = logBridgeSeed;
+        if (carrier === "log" && lastCallback[stream] === "event"
+          && adapterEventRedactor.hasPendingHeader(stream) && !bridges.event) {
+          bridges.event = adapterEventRedactor.fork();
+        }
+        for (const source of ["log", "event"] as const) {
+          const bridge = bridges[source];
+          if (!bridge) continue;
+          safe = mergeSensitiveHeaderEventRedactions(input, safe, bridge.write(input));
+          if (!bridge.hasPendingHeader(stream)) delete bridges[source];
+        }
+        lastCallback[stream] = carrier;
+        return safe;
+      };
+      const emitLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
+          chunk,
         );
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
@@ -15259,6 +15307,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             truncated: payloadChunk.length !== sanitizedChunk.length,
           },
         });
+      };
+      const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+        const input = {
+          stream,
+          message: redactCurrentUserText(chunk, currentUserRedactionOptions),
+        };
+        const sanitized = redactAdapterOutput(input, "log").message;
+        if (sanitized) await emitLog(stream, sanitized);
       };
       if (runScopedMentionedSkillKeys.length > 0) {
         await onLog(
@@ -15370,13 +15426,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        const safeEvent = redactAdapterOutput(event, "event");
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
-          stream: event.stream,
-          level: event.level,
-          color: event.color,
-          message: event.message,
-          payload: event.payload,
+          stream: safeEvent.stream,
+          level: safeEvent.level,
+          color: safeEvent.color,
+          message: safeEvent.message,
+          payload: safeEvent.payload,
         });
       };
 

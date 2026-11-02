@@ -330,6 +330,80 @@ describe("redaction", () => {
     }
   });
 
+  it("keeps an unfinished header across a complete independent status line", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const stream of ["stderr", "stdout", "system", null, "unknown"]) {
+        const redactor = createSensitiveHeaderEventRedactor();
+        redactor.write({ stream, message: `${header}: ` });
+        redactor.write({ stream, payload: { toolName: "playwright" } });
+        const status = redactor.write({ stream, message: "status: worker alive\n" });
+        const value = `synthetic-interrupted-${header}-${stream}`;
+        const last = redactor.write({
+          stream,
+          payload: { detail: `${header === "Authorization" ? "Bearer " : "session="}${value}\nRequest failed after 30000 ms` },
+        });
+        expect(status.message, `${header} ${stream}`).toBe("status: worker alive\n");
+        expect(JSON.stringify([last, redactEventPayload(last.payload)]), `${header} ${stream}`).not.toContain(value);
+        expect(last.payload?.detail).toContain("Request failed after 30000 ms");
+        expect(redactor.write({ stream, message: "safe after interrupted header" }).message)
+          .toBe("safe after interrupted header");
+      }
+    }
+  });
+
+  it("does not retire an unfinished header after an ambiguous cookie-shaped field", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      redactor.write({ stream: "stderr", message: `${header}: ` });
+      const ambiguous = redactor.write({ stream: "stderr", message: "status=worker-alive\n" });
+      const credential = redactor.write({ stream: "stderr", payload: { detail: "session=synthetic-later-credential\n" } });
+      expect(JSON.stringify(ambiguous)).not.toContain("worker-alive");
+      expect(JSON.stringify(credential), header).not.toContain("synthetic-later-credential");
+      expect(redactor.write({ stream: "stderr", message: "safe after closed header" }).message)
+        .toBe("safe after closed header");
+    }
+  });
+
+  it("still masks credential-shaped tool metadata after an unfinished header", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      redactor.write({ stream: "stderr", message: `${header}: ` });
+      const result = redactor.write({ stream: "stderr", payload: { toolName: "session=synthetic-toolname-credential\n" } });
+      expect(JSON.stringify(result), header).not.toContain("synthetic-toolname-credential");
+      expect(redactor.write({ stream: "stderr", message: "safe after tool metadata" }).message)
+        .toBe("safe after tool metadata");
+    }
+  });
+
+  it("scans a new complete header while an older header remains unfinished", () => {
+    const redactor = createSensitiveHeaderEventRedactor();
+    redactor.write({ stream: "stderr", message: "Cookie: " });
+    redactor.write({ stream: "stderr", message: "status: worker alive\n" });
+    const secondHeader = redactor.write({
+      stream: "stderr",
+      payload: { detail: "Authorization: Bearer synthetic-second-header\n" },
+    });
+    const firstValue = redactor.write({ stream: "stderr", payload: { detail: "session=synthetic-first-header\n" } });
+    expect(JSON.stringify(secondHeader)).not.toContain("synthetic-second-header");
+    expect(JSON.stringify(firstValue)).not.toContain("synthetic-first-header");
+    expect(redactor.write({ stream: "stderr", message: "safe diagnostic after both headers" }).message)
+      .toBe("safe diagnostic after both headers");
+  });
+
+  it("keeps short diagnostics visible after a cookie value while masking later cookie pairs", () => {
+    for (const header of ["Cookie", "Set-Cookie"]) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      redactor.write({ stream: "stderr", message: `${header}: ` });
+      const first = redactor.write({ stream: "stderr", payload: { detail: "session=synthetic-first-cookie\n" } });
+      expect(JSON.stringify(first)).not.toContain("synthetic-first-cookie");
+      expect(redactor.write({ stream: "stderr", message: "READY" }).message).toBe("READY");
+      expect(redactor.write({ stream: "stderr", message: "Timeout after 30000 ms" }).message)
+        .toBe("Timeout after 30000 ms");
+      const later = redactor.write({ stream: "stderr", payload: { detail: "other=synthetic-later-cookie\n" } });
+      expect(JSON.stringify(later)).not.toContain("synthetic-later-cookie");
+    }
+  });
+
   it("masks a header split between payload fields with metadata in between", () => {
     const redactor = createSensitiveHeaderEventRedactor();
     const result = redactor.write({

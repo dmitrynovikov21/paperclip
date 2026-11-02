@@ -168,7 +168,7 @@ function redactSensitiveHeaders(input: string, replacement: (value: string) => s
 }
 
 type HeaderValueState =
-  | { kind: "line"; jsonField: boolean; awaitingValue: boolean; quoteSlashes: number }
+  | { kind: "line"; headerName: "cookie" | "set-cookie" | "authorization"; jsonField: boolean; awaitingValue: boolean; quoteSlashes: number }
   | { kind: "quoted"; quote: string | null; quoteSlashes: number; slashRun: number }
   | { kind: "container"; brackets: string[]; quote: string | null; slashRun: number; quoteSlashes: number };
 
@@ -235,7 +235,7 @@ function scanHeaderValue(input: string, start: number, state: HeaderValueState):
       return { end: index, delimiterLength: 2, continuation: null };
     }
   }
-  return { end: input.length, delimiterLength: 0, continuation: { ...state, awaitingValue: false } };
+  return { end: input.length, delimiterLength: 0, continuation: { ...state, awaitingValue: state.awaitingValue && start === input.length } };
 }
 
 function scanSensitiveHeaderRanges(input: string): HeaderRange[] {
@@ -250,7 +250,9 @@ function scanSensitiveHeaderRanges(input: string): HeaderRange[] {
     const valueStart = match.index + match[0].length;
     const jsonField = /\\*["']\s*:\s*$/.test(match[0]);
     const quoteSlashes = jsonField ? (/(\\+)["']\s*:\s*$/.exec(match[0])?.[1]?.length ?? 0) : 0;
-    const state: HeaderValueState = { kind: "line", jsonField, awaitingValue: valueStart === input.length, quoteSlashes };
+    const headerName = /^(?:Set-Cookie|Cookie|Authorization)/i.exec(match[0])![0].toLowerCase() as
+      "cookie" | "set-cookie" | "authorization";
+    const state: HeaderValueState = { kind: "line", headerName, jsonField, awaitingValue: valueStart === input.length, quoteSlashes };
     const scanned = scanHeaderValue(input, valueStart, state);
     ranges.push({ start: match.index, valueStart, end: scanned.end, continuation: scanned.continuation });
     coveredUntil = scanned.end;
@@ -263,7 +265,15 @@ export function sensitiveHeaderRanges(input: string): Array<{ start: number; val
 }
 
 type HeaderStreamState = { tail: string; active: HeaderValueState | null };
-type HeaderStreamRedactor = { write(chunk: string): string; fork(): HeaderStreamRedactor; stateKey(): string };
+type HeaderStreamRedactor = {
+  write(chunk: string): string;
+  acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean;
+  completesHeaderName(chunk: string): boolean;
+  isAwaitingHeaderValue(): boolean;
+  hasActiveValue(): boolean;
+  fork(): HeaderStreamRedactor;
+  stateKey(): string;
+};
 const SENSITIVE_HEADER_NAMES = ["Cookie", "Set-Cookie", "Authorization"] as const;
 
 function pendingHeaderTail(input: string): string {
@@ -289,6 +299,32 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
   let tail = initial.tail;
   let active = cloneHeaderValueState(initial.active);
   return {
+    isAwaitingHeaderValue: () => active?.kind === "line" && active.awaitingValue,
+    hasActiveValue: () => active !== null,
+    completesHeaderName(chunk: string): boolean {
+      return tail.length > 0 && scanSensitiveHeaderRanges(tail + chunk)
+        .some((range) => range.start < tail.length && range.valueStart > tail.length);
+    },
+    acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean {
+      if (completesHeaderName || !active || active.kind !== "line" || active.jsonField) return true;
+      const firstLine = chunk.split(/\r?\n|\\[rn]/, 1)[0]!.trimStart();
+      const plausibleValue = firstLine.includes("=")
+        || /^[A-Za-z][\w+.-]*[ \t]+[A-Za-z0-9._~+/-]+={0,2}$/.test(firstLine);
+      // Tool identity normally carries only metadata. Do not consume a
+      // waiting value with its name, but still redact credential-shaped text.
+      if (fieldKey === "toolName" && active.awaitingValue && !plausibleValue) return false;
+      // A standalone diagnostic line is not the continuation of an unfinished
+      // credential header. Another branch may still complete a split header
+      // name with this field, so that case takes precedence above.
+      if (/^[A-Za-z][\w.-]*:\s/.test(firstLine)) return false;
+      if (SENSITIVE_HEADER_NAMES.some((name) => name.toLowerCase().startsWith(firstLine.toLowerCase()))) return false;
+      if (active.awaitingValue) {
+        // Keep the unresolved branch after a plausible cookie pair or auth
+        // value as well: a later field may still be the real continuation.
+        return plausibleValue || (active.headerName === "authorization" && !/\s/.test(firstLine));
+      }
+      return true;
+    },
     write(chunk: string): string {
       const output = chunk.split("");
       const mask = (start: number, end: number) => {
@@ -326,11 +362,11 @@ export function createSensitiveHeaderStreamRedactor(): HeaderStreamRedactor {
   return makeSensitiveHeaderStreamRedactor({ tail: "", active: null });
 }
 
-function redactEventStrings(value: unknown, redact: (text: string) => string): unknown {
-  if (typeof value === "string") return redact(value);
-  if (Array.isArray(value)) return value.map((item) => redactEventStrings(item, redact));
+function redactEventStrings(value: unknown, redact: (text: string, fieldKey?: string) => string, fieldKey?: string): unknown {
+  if (typeof value === "string") return redact(value, fieldKey);
+  if (Array.isArray(value)) return value.map((item) => redactEventStrings(item, redact, fieldKey));
   if (isPlainObject(value)) {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactEventStrings(item, redact)]));
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactEventStrings(item, redact, key)]));
   }
   return value;
 }
@@ -345,11 +381,12 @@ export function createSensitiveHeaderEventRedactor() {
   const maxStates = 64;
   const failedClosed = new Set<"system" | "stdout" | "stderr">();
 
-  function redactAgainstStates(text: string, states: HeaderStreamRedactor[]): { text: string; candidates: string[] } {
+  function redactAgainstStates(text: string, states: HeaderStreamRedactor[], fieldKey?: string): { text: string; candidates: string[] } {
     const output = text.split("");
     const candidates: string[] = [];
+    const completesHeaderName = states.some((state) => state.completesHeaderName(text));
     for (const state of states) {
-      const candidate = state.write(text);
+      const candidate = state.acceptsContinuation(text, completesHeaderName, fieldKey) ? state.write(text) : text;
       candidates.push(candidate);
       for (let index = 0; index < output.length; index += 1) {
         if (candidate[index] !== text[index]) output[index] = "*";
@@ -380,28 +417,34 @@ export function createSensitiveHeaderEventRedactor() {
       let overflow = false;
       let candidateStates: HeaderStreamRedactor[] = [];
       const resolvedStateKeys = new Set<string>();
-      const redactField = (text: string): string => {
+      const redactField = (text: string, fieldKey?: string): string => {
         if (overflow) return REDACTED_EVENT_VALUE;
         const priorStates = uniqueStates([...states, ...candidateStates]);
         const branches = priorStates.map((state) => state.fork());
-        const result = redactAgainstStates(text, branches);
+        const result = redactAgainstStates(text, branches, fieldKey);
         const fresh = createSensitiveHeaderStreamRedactor();
         const freshText = fresh.write(text);
+        const output = result.text.split("");
+        for (let index = 0; index < output.length; index += 1) {
+          if (freshText[index] !== text[index]) output[index] = "*";
+        }
         for (let index = 0; index < priorStates.length; index += 1) {
-          // Retire a branch only when this field closes a header continuation
-          // that a fresh scanner would not have found on its own.
-          if (result.candidates[index] !== freshText && branches[index]!.stateKey() === fresh.stateKey()) {
+          // Retire completed continuations and resolved name prefixes, while
+          // keeping a header that still awaits an unambiguous value.
+          if (branches[index]!.stateKey() === fresh.stateKey() && !priorStates[index]!.isAwaitingHeaderValue()
+            && (priorStates[index]!.hasActiveValue() || result.candidates[index] !== freshText)) {
             resolvedStateKeys.add(priorStates[index]!.stateKey());
           }
         }
         candidateStates = uniqueStates([
           ...candidateStates.filter((state) => !resolvedStateKeys.has(state.stateKey())),
           ...branches,
+          fresh,
         ]);
         if (candidateStates.length > maxStates) overflow = true;
-        return result.text;
+        return output.join("");
       };
-      const message = typeof event.message === "string" ? redactField(event.message) : event.message;
+      const message = typeof event.message === "string" ? redactField(event.message, "message") : event.message;
       const payload = event.payload
         ? redactEventStrings(event.payload, redactField) as Record<string, unknown>
         : event.payload;

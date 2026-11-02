@@ -445,9 +445,11 @@ When effective run config changes, Paperclip may intentionally skip a saved adap
 ## Run log credential handling
 
 Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
-new run logs and run events before storage. The run-log API also masks these
-values when it reads older log records, including requests whose byte offset
-starts inside a value. New local run-log files use mode `0600`; their company
+new run logs and run events before storage, including headers split across
+output chunks and JSON array values. The run-log API also masks these values
+when it reads older log records, including requests whose byte offset starts
+inside a value or whose header spans adjacent records. New local run-log files
+use mode `0600`; their company
 and agent directories use mode `0700`. Existing log files are not rewritten.
 If a credential was exposed before this guard, revoke it separately and retain
 the historical log according to the incident retention decision.

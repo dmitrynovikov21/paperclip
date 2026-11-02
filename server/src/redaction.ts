@@ -24,7 +24,7 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
 );
 // A header can follow a literal "\\n" inside serialized tool output. In that
 // form the character before "Cookie" is the word character "n".
-const SENSITIVE_HEADER_PREFIX_RE = /(?:^|\\[rn]|[^A-Za-z0-9_-])(?:Cookie|Set-Cookie|Authorization)\s*:\s*/gi;
+const SENSITIVE_HEADER_PREFIX_RE = /(?:Cookie|Set-Cookie|Authorization)(?:\\*["'])?\s*:\s*/gi;
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -157,30 +157,78 @@ export function redactSensitiveText(input: string): string {
 function redactSensitiveHeaders(input: string, replacement: (value: string) => string): string {
   let result = "";
   let cursor = 0;
-  SENSITIVE_HEADER_PREFIX_RE.lastIndex = 0;
-  for (const match of input.matchAll(SENSITIVE_HEADER_PREFIX_RE)) {
-    const start = match.index + match[0].length;
+  for (const range of sensitiveHeaderRanges(input)) {
+    const start = range.valueStart;
     if (start < cursor) continue;
-    let end = start;
-    while (end < input.length) {
-      const char = input[end];
-      if (char === "\r" || char === "\n") break;
-      if (char === "\\") {
-        let next = end + 1;
-        while (input[next] === "\\") next += 1;
-        if (input[next] === "r" || input[next] === "n") break;
-        if (input[next] === '"') {
-          end = next + 1;
-          continue;
-        }
-      }
-      if (char === '"' && (end + 1 === input.length || /[,}\]\r\n]/.test(input[end + 1]!))) break;
-      end += 1;
-    }
+    const end = range.end;
     result += input.slice(cursor, start) + replacement(input.slice(start, end));
     cursor = end;
   }
   return result + input.slice(cursor);
+}
+
+export function sensitiveHeaderRanges(input: string): Array<{ start: number; valueStart: number; end: number }> {
+  const ranges: Array<{ start: number; valueStart: number; end: number }> = [];
+  SENSITIVE_HEADER_PREFIX_RE.lastIndex = 0;
+  for (const match of input.matchAll(SENSITIVE_HEADER_PREFIX_RE)) {
+    const valueStart = match.index + match[0].length;
+    const jsonField = /\\*["']\s*:\s*$/.test(match[0]);
+    ranges.push({ start: match.index, valueStart, end: sensitiveHeaderValueEnd(input, valueStart, jsonField) });
+  }
+  return ranges;
+}
+
+function sensitiveHeaderValueEnd(input: string, start: number, jsonField: boolean): number {
+  let end = start;
+  while (end < input.length) {
+    if (input[end] === "\r" || input[end] === "\n") break;
+    // Plain headers in serialized output can be separated by a literal \\n.
+    // JSON values can themselves contain escaped newlines, so keep masking
+    // those values until a real line boundary.
+    if (!jsonField && input[end] === "\\" && /[rn]/.test(input[end + 1] ?? "")) break;
+    end += 1;
+  }
+  return end;
+}
+
+/** Remembers prior output so a header name and value can cross chunk boundaries. */
+export function createSensitiveHeaderStreamRedactor() {
+  let tail = "";
+  let masking = false;
+  let maskingJsonField = false;
+  return {
+    write(chunk: string): string {
+      const output = chunk.split("");
+      const mask = (start: number, end: number) => {
+        for (let index = start; index < end; index += 1) output[index] = "*";
+      };
+      let cursor = 0;
+      if (masking) {
+        const delimiter = chunk.search(maskingJsonField ? /[\r\n]/ : /[\r\n]|\\[rn]/);
+        if (delimiter < 0) {
+          mask(0, output.length);
+          tail = (tail + chunk).slice(-128);
+          return output.join("");
+        }
+        mask(0, delimiter);
+        cursor = delimiter + (chunk[delimiter] === "\\" ? 2 : 1);
+        masking = false;
+        tail = "";
+      }
+      const combined = tail + chunk.slice(cursor);
+      for (const range of sensitiveHeaderRanges(combined)) {
+        const start = Math.max(0, range.valueStart - tail.length) + cursor;
+        const end = Math.min(chunk.length, range.end - tail.length + cursor);
+        if (end > start) mask(start, end);
+        if (range.end === combined.length) {
+          masking = true;
+          maskingJsonField = /\\*["']\s*:\s*$/.test(combined.slice(range.start, range.valueStart));
+        }
+      }
+      tail = (tail + chunk.slice(cursor)).slice(-128);
+      return output.join("");
+    },
+  };
 }
 
 // Run-log reads can start in the middle of a header value. Keep the byte

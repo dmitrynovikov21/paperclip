@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createSensitiveHeaderStreamRedactor,
   REDACTED_EVENT_VALUE,
   redactEventPayload,
   redactRunLogTextPreservingBytes,
@@ -128,6 +129,37 @@ describe("redaction", () => {
       }
     }
     expect(Buffer.byteLength(redactRunLogTextPreservingBytes(input))).toBe(Buffer.byteLength(input));
+  });
+
+  it("redacts array-valued headers and escaped quotes inside JSON header values", () => {
+    const input = [
+      String.raw`{\"Cookie\":[\"session=fake-array-cookie\"],\"Set-Cookie\":[\"session=fake-array-set-cookie; HttpOnly\"],\"Authorization\":[\"Bearer fake-array-auth\"]}`,
+      String.raw`{\"Cookie\":\"a=\\\"; b=fake-quoted-cookie\"}`,
+    ].join("\n");
+    for (const result of [redactSensitiveText(input), redactRunLogTextPreservingBytes(input)]) {
+      for (const value of ["fake-array-cookie", "fake-array-set-cookie", "fake-array-auth", "fake-quoted-cookie"]) {
+        expect(result).not.toContain(value);
+      }
+    }
+    expect(Buffer.byteLength(redactRunLogTextPreservingBytes(input))).toBe(Buffer.byteLength(input));
+    expect(JSON.stringify(redactEventPayload({ detail: input }))).not.toContain("fake-array-cookie");
+    const legacyRecord = `${JSON.stringify({ stream: "stderr", chunk: String.raw`{\"Set-Cookie\":[\"session=fake-array-legacy\"]}` })}\n`;
+    expect(redactRunLogTextPreservingBytes(legacyRecord)).not.toContain("fake-array-legacy");
+  });
+
+  it("holds split header names and masks values across arbitrary stream chunks", () => {
+    for (const [first, second] of [
+      ["Cookie: ", "session=fake-split-cookie\nTimeout after 30000 ms"],
+      ["Cook", "ie: session=fake-split-name\nTimeout after 30000 ms"],
+      ["Set-Cookie:", " session=fake-split-set-cookie\nTimeout after 30000 ms"],
+      ["Authoriz", "ation: Bearer fake-split-auth\nTimeout after 30000 ms"],
+      [String.raw`{\"Cookie\":[`, String.raw`\"session=fake-split-array\"]}` + "\nTimeout after 30000 ms"],
+    ]) {
+      const redactor = createSensitiveHeaderStreamRedactor();
+      const result = redactor.write(first!) + redactor.write(second!);
+      expect(result).not.toContain("fake-split-");
+      expect(result).toContain("Timeout after 30000 ms");
+    }
   });
 
   it("redacts headers inside ordinary event payload strings", () => {

@@ -5,7 +5,12 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
-import { redactRunLogTextPreservingBytes, redactSensitiveText } from "../redaction.js";
+import {
+  createSensitiveHeaderStreamRedactor,
+  redactRunLogTextPreservingBytes,
+  redactSensitiveText,
+  sensitiveHeaderRanges,
+} from "../redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -60,6 +65,101 @@ function resolveWithin(basePath: string, relativePath: string) {
 function normalizeKeyPrefix(prefix: string | undefined): string {
   if (!prefix) return "";
   return prefix.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function protectRunLogRecords(rawRecords: Buffer, uncertainStart: boolean, requestedStart: number, requestedEnd: number): Buffer {
+  type ParsedRecord = { start: number; end: number; valueStart: number; valueEnd: number; rawChunk: string; chunk: string; joinedStart: number; joinedEnd: number };
+  const redacted = Buffer.from(rawRecords);
+  const maskDecodedRange = (record: ParsedRecord, start: number, end: number) => {
+    let rawIndex = 0;
+    let rawByteOffset = 0;
+    let decodedIndex = 0;
+    while (rawIndex < record.rawChunk.length && decodedIndex < end) {
+      let rawLength = 1;
+      let decodedLength = 1;
+      if (record.rawChunk[rawIndex] === "\\") {
+        rawLength = record.rawChunk[rawIndex + 1] === "u" ? 6 : 2;
+      } else if ((record.rawChunk.codePointAt(rawIndex) ?? 0) > 0xffff) {
+        rawLength = 2;
+        decodedLength = 2;
+      }
+      const rawBytes = Buffer.byteLength(record.rawChunk.slice(rawIndex, rawIndex + rawLength));
+      if (decodedIndex < end && decodedIndex + decodedLength > start) {
+        redacted.fill(42, record.valueStart + rawByteOffset, record.valueStart + rawByteOffset + rawBytes);
+      }
+      rawIndex += rawLength;
+      rawByteOffset += rawBytes;
+      decodedIndex += decodedLength;
+    }
+  };
+  const byStream = new Map<string, ParsedRecord[]>();
+  let lineStart = 0;
+  while (lineStart < rawRecords.length) {
+    const newline = rawRecords.indexOf(10, lineStart);
+    const lineEnd = newline < 0 ? rawRecords.length : newline + 1;
+    const line = rawRecords.subarray(lineStart, lineEnd).toString("utf8");
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      redacted.fill(42, lineStart, lineEnd);
+      lineStart = lineEnd;
+      continue;
+    }
+    if (parsed && typeof parsed === "object" && typeof parsed.chunk === "string" && typeof parsed.stream === "string"
+      && Object.keys(parsed).every((key) => ["ts", "stream", "chunk", "seq"].includes(key))) {
+      const field = /"chunk"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(line);
+      if (!field) {
+        redacted.fill(42, lineStart, lineEnd);
+      } else {
+        const valueCharStart = field.index + field[0].length - field[1]!.length - 1;
+        const valueStart = lineStart + Buffer.byteLength(line.slice(0, valueCharStart));
+        const valueEnd = valueStart + Buffer.byteLength(field[1]!);
+        const records = byStream.get(parsed.stream) ?? [];
+        const joinedStart = records.at(-1)?.joinedEnd ?? 0;
+        const record = { start: lineStart, end: lineEnd, valueStart, valueEnd, rawChunk: field[1]!, chunk: parsed.chunk, joinedStart, joinedEnd: joinedStart + parsed.chunk.length };
+        records.push(record);
+        byStream.set(parsed.stream, records);
+        const sanitized = redactRunLogTextPreservingBytes(parsed.chunk);
+        if (sanitized.length !== parsed.chunk.length) {
+          redacted.fill(42, valueStart, valueEnd);
+        } else {
+          for (let index = 0; index < parsed.chunk.length;) {
+            if (sanitized[index] === parsed.chunk[index]) {
+              index += 1;
+              continue;
+            }
+            const start = index;
+            while (index < parsed.chunk.length && sanitized[index] !== parsed.chunk[index]) index += 1;
+            maskDecodedRange(record, start, index);
+          }
+        }
+      }
+    } else {
+      redacted.fill(42, lineStart, lineEnd);
+    }
+    lineStart = lineEnd;
+  }
+
+  for (const records of byStream.values()) {
+    const joined = records.map((record) => record.chunk).join("");
+    for (const range of sensitiveHeaderRanges(joined)) {
+      const affected = records.filter((record) => record.joinedStart < range.end && record.joinedEnd > range.start);
+      for (const record of affected) {
+        maskDecodedRange(record, Math.max(0, range.valueStart - record.joinedStart), Math.min(record.chunk.length, range.end - record.joinedStart));
+      }
+    }
+    if (uncertainStart) {
+      let knownLineStart = false;
+      for (const record of records) {
+        if (!knownLineStart && record.end > requestedStart && record.start < requestedEnd) {
+          redacted.fill(42, record.valueStart, record.valueEnd);
+        }
+        if (record.chunk.includes("\n") || record.chunk.includes("\r")) knownLineStart = true;
+      }
+    }
+  }
+  return redacted;
 }
 
 export interface DurableRunLogStoreOptions {
@@ -119,6 +219,24 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     upload: Promise<boolean> | null;
   }
   const inflightMirrors = new Map<string, InflightMirrorEntry>();
+  const streamRedactors = new Map<string, Map<"stdout" | "stderr" | "system", ReturnType<typeof createSensitiveHeaderStreamRedactor>>>();
+
+  async function persistLine(
+    handle: RunLogHandle,
+    event: { stream: "stdout" | "stderr" | "system"; chunk: string; ts: string; seq?: number },
+  ): Promise<number> {
+    const absPath = resolveWithin(basePath, handle.logRef);
+    const line = JSON.stringify({
+      ts: event.ts,
+      stream: event.stream,
+      chunk: redactSensitiveText(event.chunk),
+      ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
+    });
+    const persisted = `${line}\n`;
+    await fs.appendFile(absPath, persisted, { encoding: "utf8", mode: 0o600 });
+    noteInflightAppend(handle.logRef);
+    return Buffer.byteLength(persisted, "utf8");
+  }
 
   function mirrorInflightNow(logRef: string, entry: InflightMirrorEntry): Promise<boolean> {
     entry.dirty = false;
@@ -218,22 +336,23 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     if (start >= endExclusive) return { content: "", nextOffset: start < total ? start : undefined };
     const relativeStart = start - windowStart;
     const relativeEnd = endExclusive - windowStart;
-    const precedingNewline = relativeStart === 0 ? -1 : bytes.lastIndexOf(10, relativeStart - 1);
-    const followingNewline = bytes.indexOf(10, relativeEnd - 1);
-    const recordStart = precedingNewline + 1;
-    const recordEnd = followingNewline < 0 ? bytes.length : followingNewline + 1;
-    const hasWholeRecords = (precedingNewline >= 0 || windowStart === 0)
-      && (followingNewline >= 0 || windowStart + bytes.length === total);
+    const recordStart = windowStart === 0 ? 0 : bytes.indexOf(10) + 1;
+    const lastNewline = bytes.lastIndexOf(10);
+    const recordEnd = windowStart + bytes.length === total ? bytes.length : lastNewline + 1;
+    const hasWholeRecords = recordStart <= relativeStart && recordEnd >= relativeEnd && recordEnd > recordStart;
 
     // A malformed legacy record longer than the bounded context must never
     // expose a slice from the middle of a header value.
     let content = "*".repeat(endExclusive - start);
     if (hasWholeRecords) {
       const rawRecords = bytes.subarray(recordStart, recordEnd);
-      const redacted = Buffer.from(redactRunLogTextPreservingBytes(rawRecords.toString("utf8")), "utf8");
-      if (redacted.length === rawRecords.length) {
-        content = redacted.subarray(relativeStart - recordStart, relativeEnd - recordStart).toString("utf8");
-      }
+      const redacted = protectRunLogRecords(
+        rawRecords,
+        windowStart > 0,
+        relativeStart - recordStart,
+        relativeEnd - recordStart,
+      );
+      content = redacted.subarray(relativeStart - recordStart, relativeEnd - recordStart).toString("utf8");
     }
     return { content, nextOffset: endExclusive < total ? endExclusive : undefined };
   }
@@ -322,29 +441,29 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         await file.close();
       }
       await retireInflightMirror(relPath);
+      streamRedactors.set(relPath, new Map());
       return { store: "local_file", logRef: relPath };
     },
 
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
-      const absPath = resolveWithin(basePath, handle.logRef);
-      const line = JSON.stringify({
-        ts: event.ts,
-        stream: event.stream,
-        chunk: redactSensitiveText(event.chunk),
-        // Monotonic per-run sequence so readers can dedupe and order records
-        // even when several identical chunks share the same millisecond ts
-        // (common for ACP-style token deltas).
-        ...(typeof event.seq === "number" && Number.isFinite(event.seq) ? { seq: event.seq } : {}),
-      });
-      const persisted = `${line}\n`;
-      await fs.appendFile(absPath, persisted, { encoding: "utf8", mode: 0o600 });
-      noteInflightAppend(handle.logRef);
-      return Buffer.byteLength(persisted, "utf8");
+      let redactors = streamRedactors.get(handle.logRef);
+      if (!redactors) {
+        redactors = new Map();
+        streamRedactors.set(handle.logRef, redactors);
+      }
+      let redactor = redactors.get(event.stream);
+      if (!redactor) {
+        redactor = createSensitiveHeaderStreamRedactor();
+        redactors.set(event.stream, redactor);
+      }
+      const chunk = redactor.write(event.chunk);
+      return chunk ? persistLine(handle, { ...event, chunk }) : 0;
     },
 
     async finalize(handle) {
       if (handle.store !== "local_file") return { bytes: 0, compressed: false };
+      streamRedactors.delete(handle.logRef);
       await retireInflightMirror(handle.logRef);
       const absPath = resolveWithin(basePath, handle.logRef);
       const stat = await fs.stat(absPath).catch(() => null);

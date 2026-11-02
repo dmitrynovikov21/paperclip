@@ -15,7 +15,10 @@ import { heartbeatService } from "../services/heartbeat.js";
 const support = await getEmbeddedPostgresTestSupport();
 const describeWithDb = support.supported ? describe : describe.skip;
 const adapterType = "synthetic_cookie_output";
-const cookieValues = ["fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf"];
+const cookieValues = [
+  "fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf",
+  "fake-e2e-split", "fake-e2e-array", "fake-e2e-quoted",
+];
 const toolOutput = `Playwright GET timed out\nCookie: __Host-hp_access=${cookieValues[0]}; __Host-hp_refresh=${cookieValues[1]}; __Host-hp_csrf=${cookieValues[2]}\nRequest failed after 30000 ms`;
 
 if (!support.supported) {
@@ -54,11 +57,15 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       type: adapterType,
       execute: async (ctx) => {
         await ctx.onLog("stderr", toolOutput);
+        await ctx.onLog("stderr", "Cook");
+        await ctx.onLog("stderr", "ie: ");
+        await ctx.onLog("stderr", `session=${cookieValues[3]}\nRequest failed after 30000 ms\n`);
+        await ctx.onLog("stderr", String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` + "\n");
         await ctx.onEvent?.({
           eventType: "tool.output",
           stream: "stderr",
-          message: toolOutput,
-          payload: { detail: toolOutput },
+          message: toolOutput + "\n" + String.raw`{\"Cookie\":\"a=\\\"; b=fake-e2e-quoted\"}`,
+          payload: { detail: toolOutput + "\n" + String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` },
         });
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic tool output" };
       },
@@ -148,5 +155,18 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect(offsetResponse.status).toBe(200);
     expect(offsetResponse.body.content).toBe("********");
     expect(offsetResponse.body.nextOffset).toBe(offset + 8);
+
+    const historicalSplit = [
+      { stream: "stderr", chunk: "Cook" },
+      { stream: "stderr", chunk: "ie: " },
+      { stream: "stderr", chunk: "session=fake-e2e-split\nRequest failed after 30000 ms" },
+    ].map((record) => `${JSON.stringify(record)}\n`).join("");
+    const splitStart = Buffer.byteLength(persisted + oldLine);
+    await fs.appendFile(filePath, historicalSplit);
+    const splitOffset = splitStart + historicalSplit.indexOf(cookieValues[3]!) + 5;
+    const splitResponse = await request(app)
+      .get(`/api/heartbeat-runs/${run.id}/log?offset=${splitOffset}&limitBytes=8`);
+    expect(splitResponse.status).toBe(200);
+    expect(splitResponse.body.content).toBe("********");
   }, 30_000);
 });

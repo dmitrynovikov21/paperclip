@@ -125,6 +125,51 @@ describe("createDurableRunLogStore", () => {
     }
   });
 
+  it("keeps split headers out of persisted local and S3 logs", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    for (const [chunk, seq] of [
+      ["Cook", 1],
+      ["ie: ", 2],
+      ["session=fake-write-split\nTimeout after 30000 ms", 3],
+    ] as const) {
+      await store.append(handle, { stream: "stderr", chunk, ts: "t1", seq });
+    }
+    await store.finalize(handle);
+    const persisted = await fs.readFile(path.join(baseDir, handle.logRef), "utf8");
+    expect(persisted).not.toContain("fake-write-split");
+    expect(persisted).toContain("Timeout after 30000 ms");
+    expect(objects.get(handle.logRef)?.toString("utf8")).toBe(persisted);
+  });
+
+  it("masks historical split headers at offsets in local and S3 reads", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const raw = [
+      { ts: "t1", stream: "stderr", chunk: "Cook" },
+      { ts: "t2", stream: "stderr", chunk: "ie: " },
+      { ts: "t3", stream: "stderr", chunk: "session=fake-read-split\nTimeout after 30000 ms" },
+      { ts: "t4", stream: "stderr", chunk: String.raw`{\"Set-Cookie\":[\"session=fake-read-array\"]}` },
+      { ts: "t5", stream: "stderr", chunk: String.raw`{\"Cookie\":\"a=\\\"; b=fake-read-quoted\"}` },
+    ].map((record) => `${JSON.stringify(record)}\n`).join("");
+    await fs.writeFile(path.join(baseDir, handle.logRef), raw);
+    await store.finalize(handle);
+    for (const remote of [false, true]) {
+      if (remote) await fs.rm(baseDir, { recursive: true, force: true });
+      for (const value of ["fake-read-split", "fake-read-array", "fake-read-quoted"]) {
+        const offset = Buffer.byteLength(raw.slice(0, raw.indexOf(value) + 5));
+        const page = await store.read(handle, { offset, limitBytes: 8 });
+        expect(page.content).toBe("********");
+      }
+      const full = await store.read(handle);
+      expect(full.content).toContain("Timeout after 30000 ms");
+      expect(full.content).not.toContain("fake-read-split");
+      expect(full.content.trim().split("\n").map((line) => JSON.parse(line))).toHaveLength(5);
+    }
+  });
+
   it("appends locally and reads back during a run WITHOUT hitting S3 (fast live tail)", async () => {
     const { provider, calls } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

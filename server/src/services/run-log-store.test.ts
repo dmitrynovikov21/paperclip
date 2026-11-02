@@ -170,6 +170,50 @@ describe("createDurableRunLogStore", () => {
     }
   });
 
+  it("masks multiline array headers across old records and local/S3 offset reads", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const raw = [
+      { stream: "stderr", chunk: '{"Cookie": [\n' },
+      { stream: "stderr", chunk: '  "session=fake-pretty-cookie",\n' },
+      { stream: "stderr", chunk: '  "second-value"\n], "safe": "visible"}\nTimeout after 30000 ms' },
+    ].map((record) => `${JSON.stringify(record)}\n`).join("");
+    await fs.writeFile(path.join(baseDir, handle.logRef), raw);
+    await store.finalize(handle);
+    for (const remote of [false, true]) {
+      if (remote) await fs.rm(baseDir, { recursive: true, force: true });
+      const offset = Buffer.byteLength(raw.slice(0, raw.indexOf("fake-pretty-cookie") + 5));
+      const page = await store.read(handle, { offset, limitBytes: 8 });
+      expect(page.content).toBe("********");
+      const full = await store.read(handle);
+      expect(full.content).not.toContain("fake-pretty-cookie");
+      expect(full.content).not.toContain("second-value");
+      expect(full.content).toContain("visible");
+      expect(full.content).toContain("Timeout after 30000 ms");
+    }
+  });
+
+  it("fails closed when a legacy array started before the bounded offset context", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const records = [
+      { stream: "stderr", chunk: '{"Cookie": [\n' },
+      ...Array.from({ length: 550 }, () => ({ stream: "stderr", chunk: `${"x".repeat(1024)}\n` })),
+      { stream: "stderr", chunk: '"session=fake-deep-value"\n]' },
+    ];
+    const raw = records.map((record) => `${JSON.stringify(record)}\n`).join("");
+    await fs.writeFile(path.join(baseDir, handle.logRef), raw);
+    await store.finalize(handle);
+    for (const remote of [false, true]) {
+      if (remote) await fs.rm(baseDir, { recursive: true, force: true });
+      const offset = Buffer.byteLength(raw.slice(0, raw.indexOf("fake-deep-value") + 5));
+      const page = await store.read(handle, { offset, limitBytes: 8 });
+      expect(page.content).toBe("********");
+    }
+  });
+
   it("appends locally and reads back during a run WITHOUT hitting S3 (fast live tail)", async () => {
     const { provider, calls } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

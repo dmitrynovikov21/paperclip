@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createSensitiveHeaderEventRedactor,
   createSensitiveHeaderStreamRedactor,
   REDACTED_EVENT_VALUE,
   redactEventPayload,
@@ -160,6 +161,59 @@ describe("redaction", () => {
       expect(result).not.toContain("fake-split-");
       expect(result).toContain("Timeout after 30000 ms");
     }
+  });
+
+  it("holds a pretty-printed JSON array value across physical lines and chunks", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      const value = `fake-pretty-${header.toLowerCase()}`;
+      const inputs = [
+        `{"${header}": [\n  "${value}]inside",\n  "second-value"\n], "safe": "visible"}\nTimeout after 30000 ms`,
+        `{\\"${header}\\": [\n  \\"${value}]inside\\",\n  \\"second-value\\"\n], \\"safe\\": \\"visible\\"}\nTimeout after 30000 ms`,
+      ];
+      for (const input of inputs) {
+        for (const result of [redactSensitiveText(input), redactRunLogTextPreservingBytes(input)]) {
+          expect(result).not.toContain(value);
+          expect(result).not.toContain("second-value");
+          expect(result).toContain("visible");
+          expect(result).toContain("Timeout after 30000 ms");
+        }
+        expect(Buffer.byteLength(redactRunLogTextPreservingBytes(input))).toBe(Buffer.byteLength(input));
+        for (let split = 1; split < input.length; split += 1) {
+          const redactor = createSensitiveHeaderStreamRedactor();
+          const result = redactor.write(input.slice(0, split)) + redactor.write(input.slice(split));
+          expect(result, `${header} split ${split}`).not.toContain(value);
+          expect(result, `${header} split ${split}`).not.toContain("second-value");
+        }
+      }
+    }
+  });
+
+  it("masks a value split across adjacent adapter events before persistence or live delivery", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const target of ["message", "payload"] as const) {
+        const redactor = createSensitiveHeaderEventRedactor();
+        const first = redactor.write({ stream: "stderr", message: `${header}: `, payload: null });
+        const second = redactor.write({
+          stream: "stderr",
+          message: target === "message" ? "session=fake-event-value\nTimeout after 30000 ms" : null,
+          payload: target === "payload" ? { detail: "session=fake-event-value\nTimeout after 30000 ms" } : null,
+        });
+        expect(JSON.stringify([first, second])).not.toContain("fake-event-value");
+        const after = redactor.write({ stream: "stderr", message: "safe later event", payload: null });
+        expect(after.message).toBe("safe later event");
+      }
+    }
+  });
+
+  it("keeps later array elements masked after a newline in another event", () => {
+    const redactor = createSensitiveHeaderEventRedactor();
+    const events = [
+      { stream: "stderr", message: '{"Cookie": [', payload: null },
+      { stream: "stderr", message: null, payload: { detail: '"session=fake-first-value",\n' } },
+      { stream: "stderr", message: '"session=fake-second-value"\n]', payload: null },
+    ].map((event) => redactor.write(event));
+    expect(JSON.stringify(events)).not.toContain("fake-first-value");
+    expect(JSON.stringify(events)).not.toContain("fake-second-value");
   });
 
   it("redacts headers inside ordinary event payload strings", () => {

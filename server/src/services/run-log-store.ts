@@ -334,6 +334,12 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     total: number,
   ): RunLogReadResult {
     if (start >= endExclusive) return { content: "", nextOffset: start < total ? start : undefined };
+    // A historical JSON array can span more than the bounded read context.
+    // Without its opening header we cannot prove that a later newline ended
+    // the credential value, so deep offset reads must fail closed.
+    if (windowStart > 0) {
+      return { content: "*".repeat(endExclusive - start), nextOffset: endExclusive < total ? endExclusive : undefined };
+    }
     const relativeStart = start - windowStart;
     const relativeEnd = endExclusive - windowStart;
     const recordStart = windowStart === 0 ? 0 : bytes.indexOf(10) + 1;

@@ -264,7 +264,7 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { createSensitiveHeaderStreamRedactor, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createSensitiveHeaderEventRedactor, createSensitiveHeaderStreamRedactor, redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -15194,6 +15194,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stdout: createSensitiveHeaderStreamRedactor(),
         stderr: createSensitiveHeaderStreamRedactor(),
       };
+      const adapterEventRedactor = createSensitiveHeaderEventRedactor();
       const emitLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
           chunk,
@@ -15380,13 +15381,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
+        const safeEvent = adapterEventRedactor.write(event);
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
-          stream: event.stream,
-          level: event.level,
-          color: event.color,
-          message: event.message,
-          payload: event.payload,
+          stream: safeEvent.stream,
+          level: safeEvent.level,
+          color: safeEvent.color,
+          message: safeEvent.message,
+          payload: safeEvent.payload,
         });
       };
 

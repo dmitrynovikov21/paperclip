@@ -167,35 +167,99 @@ function redactSensitiveHeaders(input: string, replacement: (value: string) => s
   return result + input.slice(cursor);
 }
 
-export function sensitiveHeaderRanges(input: string): Array<{ start: number; valueStart: number; end: number }> {
-  const ranges: Array<{ start: number; valueStart: number; end: number }> = [];
+type HeaderValueState =
+  | { kind: "line"; jsonField: boolean; awaitingValue: boolean; quoteSlashes: number }
+  | { kind: "quoted"; quote: string | null; quoteSlashes: number; slashRun: number }
+  | { kind: "container"; brackets: string[]; quote: string | null; slashRun: number; quoteSlashes: number };
+
+type HeaderRange = { start: number; valueStart: number; end: number; continuation: HeaderValueState | null };
+
+function scanHeaderValue(input: string, start: number, state: HeaderValueState): {
+  end: number;
+  delimiterLength: number;
+  continuation: HeaderValueState | null;
+} {
+  if (state.kind === "line" && state.jsonField) {
+    if (state.awaitingValue) {
+      while (start < input.length && /\s/.test(input[start]!)) start += 1;
+      if (start === input.length) return { end: input.length, delimiterLength: 0, continuation: state };
+    }
+    if (input[start] === "[" || input[start] === "{") {
+      state = { kind: "container", brackets: [], quote: null, slashRun: 0, quoteSlashes: state.quoteSlashes };
+    } else if (input[start] === '"' || input[start] === "'" || input[start] === "\\") {
+      state = { kind: "quoted", quote: null, slashRun: 0, quoteSlashes: state.quoteSlashes };
+    }
+  }
+  if (state.kind === "quoted") {
+    for (let index = start; index < input.length; index += 1) {
+      const char = input[index]!;
+      if (char === "\\") {
+        state.slashRun += 1;
+        continue;
+      }
+      if ((char === '"' || char === "'") && state.slashRun === state.quoteSlashes) {
+        if (state.quote === char) return { end: index + 1, delimiterLength: 0, continuation: null };
+        if (state.quote === null) state.quote = char;
+      }
+      state.slashRun = 0;
+    }
+    return { end: input.length, delimiterLength: 0, continuation: state };
+  }
+  if (state.kind === "container") {
+    for (let index = start; index < input.length; index += 1) {
+      const char = input[index]!;
+      if (char === "\\") {
+        state.slashRun += 1;
+        continue;
+      }
+      if ((char === '"' || char === "'") && state.slashRun === state.quoteSlashes) {
+        state.quote = state.quote === null ? char : state.quote === char ? null : state.quote;
+      } else if (state.quote === null) {
+        if (char === "[" || char === "{") state.brackets.push(char);
+        else if (char === "]" || char === "}") {
+          const opener = state.brackets.at(-1);
+          if ((char === "]" && opener === "[") || (char === "}" && opener === "{")) {
+            state.brackets.pop();
+            if (state.brackets.length === 0) return { end: index + 1, delimiterLength: 0, continuation: null };
+          }
+        }
+      }
+      state.slashRun = 0;
+    }
+    return { end: input.length, delimiterLength: 0, continuation: state };
+  }
+  for (let index = start; index < input.length; index += 1) {
+    const char = input[index]!;
+    if (char === "\r" || char === "\n") return { end: index, delimiterLength: 1, continuation: null };
+    if (!state.jsonField && char === "\\" && /[rn]/.test(input[index + 1] ?? "")) {
+      return { end: index, delimiterLength: 2, continuation: null };
+    }
+  }
+  return { end: input.length, delimiterLength: 0, continuation: { ...state, awaitingValue: false } };
+}
+
+function scanSensitiveHeaderRanges(input: string): HeaderRange[] {
+  const ranges: HeaderRange[] = [];
   SENSITIVE_HEADER_PREFIX_RE.lastIndex = 0;
   for (const match of input.matchAll(SENSITIVE_HEADER_PREFIX_RE)) {
     const valueStart = match.index + match[0].length;
     const jsonField = /\\*["']\s*:\s*$/.test(match[0]);
-    ranges.push({ start: match.index, valueStart, end: sensitiveHeaderValueEnd(input, valueStart, jsonField) });
+    const quoteSlashes = jsonField ? (/(\\+)["']\s*:\s*$/.exec(match[0])?.[1]?.length ?? 0) : 0;
+    const state: HeaderValueState = { kind: "line", jsonField, awaitingValue: valueStart === input.length, quoteSlashes };
+    const scanned = scanHeaderValue(input, valueStart, state);
+    ranges.push({ start: match.index, valueStart, end: scanned.end, continuation: scanned.continuation });
   }
   return ranges;
 }
 
-function sensitiveHeaderValueEnd(input: string, start: number, jsonField: boolean): number {
-  let end = start;
-  while (end < input.length) {
-    if (input[end] === "\r" || input[end] === "\n") break;
-    // Plain headers in serialized output can be separated by a literal \\n.
-    // JSON values can themselves contain escaped newlines, so keep masking
-    // those values until a real line boundary.
-    if (!jsonField && input[end] === "\\" && /[rn]/.test(input[end + 1] ?? "")) break;
-    end += 1;
-  }
-  return end;
+export function sensitiveHeaderRanges(input: string): Array<{ start: number; valueStart: number; end: number }> {
+  return scanSensitiveHeaderRanges(input).map(({ start, valueStart, end }) => ({ start, valueStart, end }));
 }
 
 /** Remembers prior output so a header name and value can cross chunk boundaries. */
 export function createSensitiveHeaderStreamRedactor() {
   let tail = "";
-  let masking = false;
-  let maskingJsonField = false;
+  let active: HeaderValueState | null = null;
   return {
     write(chunk: string): string {
       const output = chunk.split("");
@@ -203,30 +267,85 @@ export function createSensitiveHeaderStreamRedactor() {
         for (let index = start; index < end; index += 1) output[index] = "*";
       };
       let cursor = 0;
-      if (masking) {
-        const delimiter = chunk.search(maskingJsonField ? /[\r\n]/ : /[\r\n]|\\[rn]/);
-        if (delimiter < 0) {
-          mask(0, output.length);
+      if (active) {
+        const scanned = scanHeaderValue(chunk, 0, active);
+        mask(0, scanned.end);
+        if (scanned.continuation) {
+          active = scanned.continuation;
           tail = (tail + chunk).slice(-128);
           return output.join("");
         }
-        mask(0, delimiter);
-        cursor = delimiter + (chunk[delimiter] === "\\" ? 2 : 1);
-        masking = false;
+        cursor = scanned.end + scanned.delimiterLength;
+        active = null;
         tail = "";
       }
       const combined = tail + chunk.slice(cursor);
-      for (const range of sensitiveHeaderRanges(combined)) {
+      for (const range of scanSensitiveHeaderRanges(combined)) {
         const start = Math.max(0, range.valueStart - tail.length) + cursor;
         const end = Math.min(chunk.length, range.end - tail.length + cursor);
         if (end > start) mask(start, end);
-        if (range.end === combined.length) {
-          masking = true;
-          maskingJsonField = /\\*["']\s*:\s*$/.test(combined.slice(range.start, range.valueStart));
-        }
+        if (range.continuation) active = range.continuation;
       }
       tail = (tail + chunk.slice(cursor)).slice(-128);
       return output.join("");
+    },
+  };
+}
+
+function eventStringValues(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(eventStringValues);
+  if (isPlainObject(value)) return Object.values(value).flatMap(eventStringValues);
+  return [];
+}
+
+function maskEventStrings(value: unknown): unknown {
+  if (typeof value === "string") return REDACTED_EVENT_VALUE;
+  if (Array.isArray(value)) return value.map(maskEventStrings);
+  if (isPlainObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskEventStrings(item)]));
+  return value;
+}
+
+function danglingHeaderKind(value: string): "line" | "persistent" | null {
+  for (const range of scanSensitiveHeaderRanges(value)) {
+    if (range.continuation) {
+      return range.continuation.kind === "line" && !range.continuation.jsonField ? "line" : "persistent";
+    }
+  }
+  // A header name itself can be split across events. Require at least four
+  // letters and a word boundary to avoid tainting ordinary one-letter tails.
+  const tail = value.slice(-32).toLowerCase();
+  for (const name of ["cookie", "set-cookie", "authorization"]) {
+    for (let length = 4; length <= name.length; length += 1) {
+      const prefix = name.slice(0, length);
+      if (!tail.endsWith(prefix)) continue;
+      const previous = tail.at(-length - 1);
+      if (!previous || !/[a-z0-9_-]/.test(previous)) return "persistent";
+    }
+  }
+  return null;
+}
+
+/** Fail closed when adjacent adapter events carry one split header value. */
+export function createSensitiveHeaderEventRedactor() {
+  const pendingStreams = new Map<string, "line" | "persistent">();
+  return {
+    write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
+      const strings = eventStringValues(event.message).concat(eventStringValues(event.payload));
+      const danglingKinds = strings.map(danglingHeaderKind);
+      const dangling = danglingKinds.includes("persistent") ? "persistent" : danglingKinds.includes("line") ? "line" : null;
+      const tainted = pendingStreams.size > 0 || dangling !== null;
+      const stream = event.stream ?? "system";
+      if (pendingStreams.get(stream) === "line" && strings.length > 0 && strings.every((value) => /\r|\n|\\[rn]/.test(value))) {
+        pendingStreams.delete(stream);
+      }
+      if (dangling) pendingStreams.set(stream, pendingStreams.get(stream) === "persistent" ? "persistent" : dangling);
+      if (!tainted) return event;
+      return {
+        ...event,
+        message: typeof event.message === "string" ? REDACTED_EVENT_VALUE : event.message,
+        payload: event.payload ? maskEventStrings(event.payload) as Record<string, unknown> : event.payload,
+      };
     },
   };
 }

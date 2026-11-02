@@ -5,12 +5,13 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunEvents } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeWithDb = support.supported ? describe : describe.skip;
@@ -18,6 +19,7 @@ const adapterType = "synthetic_cookie_output";
 const cookieValues = [
   "fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf",
   "fake-e2e-split", "fake-e2e-array", "fake-e2e-quoted",
+  "fake-e2e-pretty", "fake-e2e-event", "fake-e2e-old-event",
 ];
 const toolOutput = `Playwright GET timed out\nCookie: __Host-hp_access=${cookieValues[0]}; __Host-hp_refresh=${cookieValues[1]}; __Host-hp_csrf=${cookieValues[2]}\nRequest failed after 30000 ms`;
 
@@ -61,12 +63,16 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
         await ctx.onLog("stderr", "ie: ");
         await ctx.onLog("stderr", `session=${cookieValues[3]}\nRequest failed after 30000 ms\n`);
         await ctx.onLog("stderr", String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` + "\n");
+        await ctx.onLog("stderr", '{"Cookie": [\n');
+        await ctx.onLog("stderr", `  "session=${cookieValues[6]}",\n  "other"\n], "safe": "visible"}\n`);
         await ctx.onEvent?.({
           eventType: "tool.output",
           stream: "stderr",
           message: toolOutput + "\n" + String.raw`{\"Cookie\":\"a=\\\"; b=fake-e2e-quoted\"}`,
           payload: { detail: toolOutput + "\n" + String.raw`{\"Set-Cookie\":[\"session=fake-e2e-array\"]}` },
         });
+        await ctx.onEvent?.({ eventType: "tool.output", stream: "stderr", message: "Cookie: " });
+        await ctx.onEvent?.({ eventType: "tool.output", stream: "stderr", payload: { detail: `session=${cookieValues[7]}\nTimeout after 30000 ms` } });
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic tool output" };
       },
     });
@@ -110,10 +116,13 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       permissions: {},
     })));
 
+    const liveEvents: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => liveEvents.push(event));
     const heartbeat = heartbeatService(db);
     const queued = await heartbeat.invoke(writerId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
     const run = await waitForRun(heartbeat, queued!.id);
+    unsubscribe();
     expect(run.status).toBe("succeeded");
     expect(run.logRef).toBeTruthy();
     const filePath = path.join(home, "run-logs", run.logRef!);
@@ -121,11 +130,18 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
     expect(persisted).toContain("Request failed after 30000 ms");
     for (const value of cookieValues) expect(persisted).not.toContain(value);
+    for (const value of cookieValues) expect(JSON.stringify(liveEvents)).not.toContain(value);
 
     const events = await heartbeat.listEvents(run.id, 0, 200);
     const eventText = JSON.stringify(events);
     expect(eventText).toContain("Request failed after 30000 ms");
     for (const value of cookieValues) expect(eventText).not.toContain(value);
+
+    const lastSeq = Math.max(...events.map((event) => event.seq));
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 1, eventType: "tool.output", stream: "stderr", message: "Set-Cookie: " },
+      { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 2, eventType: "tool.output", stream: "stderr", payload: { detail: `session=${cookieValues[8]}\nTimeout after 30000 ms` } },
+    ]);
 
     const app = express();
     app.use(express.json());
@@ -143,6 +159,9 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     const eventResponse = await request(app).get(`/api/heartbeat-runs/${run.id}/events`);
     expect(eventResponse.status).toBe(200);
     for (const value of cookieValues) expect(JSON.stringify(eventResponse.body)).not.toContain(value);
+    const oldEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
+    expect(oldEventPage.status).toBe(200);
+    expect(JSON.stringify(oldEventPage.body)).not.toContain(cookieValues[8]);
 
     // Simulate a historical line written before the new writer guard. Keep the
     // raw fixture on disk so the HTTP reader itself must close the offset gap.

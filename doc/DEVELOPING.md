@@ -448,7 +448,8 @@ Paperclip removes `Cookie`, `Set-Cookie`, and `Authorization` header values from
 new run logs and run events before storage, including headers split across
 output chunks and JSON array values. Run logs and run events keep header state separately
 for `system`, `stdout`, and `stderr`, so interleaved streams cannot reset an
-unfinished header. Independent messages and payload metadata preserve a split
+unfinished header. `onEvent` and `onLog` share a guard for each stream, including
+values split between the callbacks. Independent messages and payload metadata preserve a split
 header across adjacent events. When an unrelated event contains a JSON closing
 quote or bracket, the possible credential continuation remains guarded; later
 content in that stream may be masked until the ambiguity is resolved. The run-log

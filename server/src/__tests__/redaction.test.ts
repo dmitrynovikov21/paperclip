@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createSensitiveHeaderEventRedactor,
   createSensitiveHeaderStreamRedactor,
+  mergeSensitiveHeaderEventRedactions,
   REDACTED_EVENT_VALUE,
   redactEventPayload,
   redactRunLogTextPreservingBytes,
@@ -10,6 +11,12 @@ import {
 } from "../redaction.js";
 
 describe("redaction", () => {
+  it("keeps fail-closed masks complete when raw text matches placeholder characters", () => {
+    const raw = { message: "abcREDACTEDxyz", payload: { detail: "abcREDACTEDxyz" } };
+    const failedClosed = { message: REDACTED_EVENT_VALUE, payload: { detail: REDACTED_EVENT_VALUE } };
+    expect(mergeSensitiveHeaderEventRedactions(raw, raw, failedClosed)).toEqual(failedClosed);
+  });
+
   it("redacts sensitive keys and nested secret values", () => {
     const input = {
       apiKey: "abc123",
@@ -239,6 +246,27 @@ describe("redaction", () => {
       expect(JSON.stringify(withTrailingWhitespace.write({
         stream: "stderr", payload: { detail: `${scheme} ${credential}  \n` },
       }))).not.toContain(credential);
+    }
+  });
+
+  it("masks a started header value with trailing spaces after unrelated events", () => {
+    for (const [header, prefix] of [
+      ["Cookie", "session="],
+      ["Set-Cookie", "session="],
+      ["Authorization", "ApiKey "],
+    ] as const) {
+      const redactor = createSensitiveHeaderEventRedactor();
+      redactor.write({ stream: "stderr", message: `${header}: ${prefix}` });
+      redactor.write({ stream: "stderr", payload: { toolName: "playwright" } });
+      expect(redactor.write({ stream: "stderr", message: "status: worker alive\n" }).message)
+        .toBe("status: worker alive\n");
+      const credential = `synthetic-spaced-${header}`;
+      const result = redactor.write({
+        stream: "stderr",
+        payload: { detail: `${credential}  \nRequest failed after 30000 ms` },
+      });
+      expect(JSON.stringify(result), header).not.toContain(credential);
+      expect(result.payload?.detail).toContain("Request failed after 30000 ms");
     }
   });
 

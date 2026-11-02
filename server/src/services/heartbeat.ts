@@ -264,7 +264,13 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { createSensitiveHeaderEventRedactor, redactEventPayload, redactSensitiveText } from "../redaction.js";
+import {
+  createSensitiveHeaderCallbackRedactor,
+  createSensitiveHeaderEventRedactor,
+  mergeSensitiveHeaderEventRedactions,
+  redactEventPayload,
+  redactSensitiveText,
+} from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -15190,8 +15196,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+      // Keep each carrier's ambiguous event branches separate, while an
+      // ordered scanner also follows header fragments across both callbacks.
       const logRedactor = createSensitiveHeaderEventRedactor();
       const adapterEventRedactor = createSensitiveHeaderEventRedactor();
+      const callbackRedactor = createSensitiveHeaderCallbackRedactor();
+      type OutputStream = "stdout" | "stderr";
+      type OutputRedactor = ReturnType<typeof createSensitiveHeaderEventRedactor>;
+      const lastCallback: Partial<Record<OutputStream, "log" | "event">> = {};
+      const crossCallbackBridges: Record<OutputStream, { log?: OutputRedactor; event?: OutputRedactor }> = {
+        stdout: {},
+        stderr: {},
+      };
+      const redactAdapterOutput = <T extends {
+        stream?: string | null;
+        message?: string | null;
+        payload?: Record<string, unknown> | null;
+      }>(input: T, carrier: "log" | "event"): T => {
+        const stream = input.stream === "stdout" || input.stream === "stderr" ? input.stream : "system";
+        const callbackWasPending = callbackRedactor.hasPendingHeader(stream);
+        const logBridgeSeed = stream !== "system" && carrier === "event"
+          && lastCallback[stream] === "log" && callbackWasPending
+          && !crossCallbackBridges[stream].log
+          ? callbackRedactor.forkEventRedactor()
+          : null;
+        const own = (carrier === "log" ? logRedactor : adapterEventRedactor).write(input);
+        let safe = mergeSensitiveHeaderEventRedactions(input, own, callbackRedactor.write(input));
+        if (stream === "system") return safe;
+
+        const bridges = crossCallbackBridges[stream];
+        if (logBridgeSeed) bridges.log = logBridgeSeed;
+        if (carrier === "log" && lastCallback[stream] === "event"
+          && adapterEventRedactor.hasPendingHeader(stream) && !bridges.event) {
+          bridges.event = adapterEventRedactor.fork();
+        }
+        for (const source of ["log", "event"] as const) {
+          const bridge = bridges[source];
+          if (!bridge) continue;
+          safe = mergeSensitiveHeaderEventRedactions(input, safe, bridge.write(input));
+          if (!bridge.hasPendingHeader(stream)) delete bridges[source];
+        }
+        lastCallback[stream] = carrier;
+        return safe;
+      };
       const emitLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
           chunk,
@@ -15263,10 +15310,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-        const sanitized = logRedactor.write({
+        const input = {
           stream,
           message: redactCurrentUserText(chunk, currentUserRedactionOptions),
-        }).message;
+        };
+        const sanitized = redactAdapterOutput(input, "log").message;
         if (sanitized) await emitLog(stream, sanitized);
       };
       if (runScopedMentionedSkillKeys.length > 0) {
@@ -15379,7 +15427,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
         const eventType = event.eventType.trim();
         if (!eventType) return;
-        const safeEvent = adapterEventRedactor.write(event);
+        const safeEvent = redactAdapterOutput(event, "event");
         await appendRunEvent(currentRun, seq++, {
           eventType: eventType.slice(0, 120),
           stream: safeEvent.stream,

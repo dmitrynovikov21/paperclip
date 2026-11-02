@@ -269,6 +269,7 @@ type HeaderStreamRedactor = {
   write(chunk: string): string;
   acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean;
   completesHeaderName(chunk: string): boolean;
+  hasPendingHeader(): boolean;
   hasActiveHeaderValue(): boolean;
   fork(): HeaderStreamRedactor;
   stateKey(): string;
@@ -298,6 +299,7 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
   let tail = initial.tail;
   let active = cloneHeaderValueState(initial.active);
   return {
+    hasPendingHeader: () => active !== null || tail.length > 0,
     hasActiveHeaderValue: () => active !== null,
     completesHeaderName(chunk: string): boolean {
       return tail.length > 0 && scanSensitiveHeaderRanges(tail + chunk)
@@ -327,10 +329,9 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
         return plausibleValue || (active.headerName === "authorization" && !/\s/.test(firstLine));
       }
       // A value already started in an earlier event may continue as a bare
-      // token. A multi-word diagnostic such as "worker alive" cannot be a
-      // cookie pair or bearer token; let it through without closing the
-      // possible credential continuation.
-      return plausibleValue || !/\s/.test(firstLine);
+      // token with trailing whitespace before the line ending. Only internal
+      // whitespace distinguishes a multi-word diagnostic from that token.
+      return plausibleValue || !/\s/.test(firstLine.trimEnd());
     },
     write(chunk: string): string {
       const output = chunk.split("");
@@ -369,6 +370,70 @@ export function createSensitiveHeaderStreamRedactor(): HeaderStreamRedactor {
   return makeSensitiveHeaderStreamRedactor({ tail: "", active: null });
 }
 
+/** Follows the ordered adapter callbacks without branching over independent event fields. */
+export function createSensitiveHeaderCallbackRedactor() {
+  const byStream = {
+    system: createSensitiveHeaderStreamRedactor(),
+    stdout: createSensitiveHeaderStreamRedactor(),
+    stderr: createSensitiveHeaderStreamRedactor(),
+  };
+  return {
+    hasPendingHeader(stream: "system" | "stdout" | "stderr"): boolean {
+      return byStream[stream].hasPendingHeader();
+    },
+    forkEventRedactor(): SensitiveHeaderEventRedactor {
+      return makeSensitiveHeaderEventRedactor({
+        redactors: {
+          system: [byStream.system.fork()],
+          stdout: [byStream.stdout.fork()],
+          stderr: [byStream.stderr.fork()],
+        },
+        failedClosed: new Set(),
+      });
+    },
+    write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
+      const stream = event.stream === "stdout" || event.stream === "stderr" ? event.stream : "system";
+      const scanner = byStream[stream];
+      const redact = (text: string, fieldKey?: string) => scanner.acceptsContinuation(
+        text, scanner.completesHeaderName(text), fieldKey,
+      ) ? scanner.write(text) : text;
+      return {
+        ...event,
+        message: typeof event.message === "string" ? redact(event.message, "message") : event.message,
+        payload: event.payload
+          ? redactEventStrings(event.payload, redact) as Record<string, unknown>
+          : event.payload,
+      };
+    },
+  };
+}
+
+/** Keep every byte masked by either the carrier-specific or callback scanner. */
+export function mergeSensitiveHeaderEventRedactions<T extends {
+  message?: string | null;
+  payload?: Record<string, unknown> | null;
+}>(original: T, carrier: T, callback: T): T {
+  const merge = (raw: unknown, first: unknown, second: unknown): unknown => {
+    if (typeof raw === "string") {
+      if (typeof first !== "string" || typeof second !== "string"
+        || first === REDACTED_EVENT_VALUE || second === REDACTED_EVENT_VALUE
+        || first.length !== raw.length || second.length !== raw.length) return REDACTED_EVENT_VALUE;
+      return raw.split("").map((char, index) =>
+        first[index] === char && second[index] === char ? char : "*").join("");
+    }
+    if (Array.isArray(raw)) return raw.map((item, index) => merge(item, (first as unknown[])?.[index], (second as unknown[])?.[index]));
+    if (isPlainObject(raw)) return Object.fromEntries(Object.entries(raw).map(([key, value]) => [
+      key, merge(value, (first as Record<string, unknown>)?.[key], (second as Record<string, unknown>)?.[key]),
+    ]));
+    return raw;
+  };
+  return {
+    ...original,
+    message: merge(original.message, carrier.message, callback.message),
+    payload: merge(original.payload, carrier.payload, callback.payload),
+  } as T;
+}
+
 function redactEventStrings(value: unknown, redact: (text: string, fieldKey?: string) => string, fieldKey?: string): unknown {
   if (typeof value === "string") return redact(value, fieldKey);
   if (Array.isArray(value)) return value.map((item) => redactEventStrings(item, redact, fieldKey));
@@ -378,15 +443,26 @@ function redactEventStrings(value: unknown, redact: (text: string, fieldKey?: st
   return value;
 }
 
+type HeaderEventRedactorState = {
+  redactors: Record<"system" | "stdout" | "stderr", HeaderStreamRedactor[]>;
+  failedClosed: Set<"system" | "stdout" | "stderr">;
+};
+
+type SensitiveHeaderEventRedactor = {
+  hasPendingHeader(stream: "system" | "stdout" | "stderr"): boolean;
+  fork(): SensitiveHeaderEventRedactor;
+  write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T;
+};
+
 /** Redact values even when adjacent adapter events carry one split header. */
-export function createSensitiveHeaderEventRedactor() {
-  const headerRedactors: Record<"system" | "stdout" | "stderr", HeaderStreamRedactor[]> = {
+function makeSensitiveHeaderEventRedactor(initial?: HeaderEventRedactorState): SensitiveHeaderEventRedactor {
+  const headerRedactors = initial?.redactors ?? {
     system: [createSensitiveHeaderStreamRedactor()],
     stdout: [createSensitiveHeaderStreamRedactor()],
     stderr: [createSensitiveHeaderStreamRedactor()],
   };
   const maxStates = 64;
-  const failedClosed = new Set<"system" | "stdout" | "stderr">();
+  const failedClosed = initial?.failedClosed ?? new Set<"system" | "stdout" | "stderr">();
 
   function redactAgainstStates(text: string, states: HeaderStreamRedactor[], fieldKey?: string): { text: string; candidates: string[] } {
     const output = text.split("");
@@ -407,6 +483,19 @@ export function createSensitiveHeaderEventRedactor() {
   }
 
   return {
+    hasPendingHeader(stream): boolean {
+      return failedClosed.has(stream) || headerRedactors[stream].some((state) => state.hasPendingHeader());
+    },
+    fork(): SensitiveHeaderEventRedactor {
+      return makeSensitiveHeaderEventRedactor({
+        redactors: {
+          system: headerRedactors.system.map((state) => state.fork()),
+          stdout: headerRedactors.stdout.map((state) => state.fork()),
+          stderr: headerRedactors.stderr.map((state) => state.fork()),
+        },
+        failedClosed: new Set(failedClosed),
+      });
+    },
     write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
       const stream = event.stream === "stdout" || event.stream === "stderr" ? event.stream : "system";
       if (failedClosed.has(stream)) {
@@ -478,6 +567,10 @@ export function createSensitiveHeaderEventRedactor() {
       };
     },
   };
+}
+
+export function createSensitiveHeaderEventRedactor(): SensitiveHeaderEventRedactor {
+  return makeSensitiveHeaderEventRedactor();
 }
 
 // Run-log reads can start in the middle of a header value. Keep the byte

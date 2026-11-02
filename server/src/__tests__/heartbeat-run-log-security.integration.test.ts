@@ -427,6 +427,8 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       { header: "Authorization", stream: "system", jsonArray: false, detailFirst: true },
     ] as const;
     const valueFor = (header: string) => `synthetic-json-event-${header.toLowerCase()}`;
+    const crossEventToLogFor = (header: string) => `synthetic-json-event-log-${header.toLowerCase()}`;
+    const crossLogToEventFor = (header: string) => `synthetic-json-log-event-${header.toLowerCase()}`;
     const prefixFor = (header: string) => header === "Authorization" ? "Bearer " : "session=";
     const openingFor = (header: string, jsonArray: boolean) =>
       jsonArray ? `{"${header}":["${prefixFor(header)}` : `{"${header}":"${prefixFor(header)}`;
@@ -449,6 +451,16 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
             await ctx.onLog(stream, openingFor(header, jsonArray));
             await ctx.onLog(stream, middleFor(jsonArray));
             await ctx.onLog(stream, `${valueFor(header)}${closingFor(jsonArray)}\nRequest failed after 30000 ms`);
+            await ctx.onEvent?.({ eventType: `${eventType}_cross_event_log`, stream, message: openingFor(header, jsonArray) });
+            await ctx.onEvent?.({ eventType: `${eventType}_cross_event_log`, stream, payload: { toolName: "playwright" } });
+            await ctx.onEvent?.({ eventType: `${eventType}_cross_event_log`, stream, message: middleFor(jsonArray) });
+            await ctx.onLog(stream, `${crossEventToLogFor(header)}${closingFor(jsonArray)}\nRequest failed after 30000 ms`);
+            await ctx.onLog(stream, openingFor(header, jsonArray));
+            await ctx.onEvent?.({ eventType: `${eventType}_cross_log_event`, stream, message: middleFor(jsonArray) });
+            await ctx.onEvent?.({
+              eventType: `${eventType}_cross_log_event`, stream,
+              payload: { detail: `${crossLogToEventFor(header)}${closingFor(jsonArray)}\nRequest failed after 30000 ms` },
+            });
           }
         }
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic JSON tool output" };
@@ -489,6 +501,11 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
         const eventType = `tool.json_${header.toLowerCase().replace("-", "_")}`;
         expect(events.some((event) => event.eventType === eventType &&
           typeof event.payload?.detail === "string" && event.payload.detail.includes("Request failed after 30000 ms"))).toBe(true);
+        for (const crossValue of [crossEventToLogFor(header), crossLogToEventFor(header)]) {
+          expect(persisted).not.toContain(crossValue);
+          expect(JSON.stringify(events)).not.toContain(crossValue);
+          expect(JSON.stringify(liveEvents)).not.toContain(crossValue);
+        }
       }
 
       const lastSeq = Math.max(...events.map((event) => event.seq));
@@ -514,6 +531,8 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       for (const { header } of cases) {
         expect(JSON.stringify(writtenEventsPage.body)).not.toContain(valueFor(header));
         expect(JSON.stringify(writtenLogPage.body)).not.toContain(valueFor(header));
+        expect(JSON.stringify(writtenEventsPage.body)).not.toContain(crossLogToEventFor(header));
+        expect(JSON.stringify(writtenLogPage.body)).not.toContain(crossEventToLogFor(header));
       }
       const eventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
       expect(eventPage.status).toBe(200);
@@ -540,6 +559,9 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
     for (const scheme of ["ApiKey", "OAuth"] as const) {
       const authAdapterType = `synthetic_auth_scheme_${scheme.toLowerCase()}`;
       const value = `synthetic-${scheme}-integration-credential`;
+      const eventToLogValue = `synthetic-${scheme}-event-to-log`;
+      const logToEventValue = `synthetic-${scheme}-log-to-event`;
+      const spacedValue = `synthetic-${scheme}-spaced-value`;
       registerServerAdapter({
         type: authAdapterType,
         execute: async (ctx) => {
@@ -553,6 +575,20 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
           await ctx.onLog("stdout", "Authorization: ");
           await ctx.onLog("stdout", "status: worker alive\n");
           await ctx.onLog("stdout", `${scheme} ${value}\nRequest failed after 30000 ms`);
+          await ctx.onEvent?.({ eventType: "tool.auth_event_to_log", stream: "stderr", message: "Authorization: " });
+          await ctx.onEvent?.({ eventType: "tool.auth_event_to_log", stream: "stderr", payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({ eventType: "tool.auth_event_to_log", stream: "stderr", message: "status: worker alive\n" });
+          await ctx.onLog("stderr", `${scheme} ${eventToLogValue}\nRequest failed after 30000 ms`);
+          await ctx.onLog("stdout", "Authorization: ");
+          await ctx.onLog("stdout", "status: worker alive\n");
+          await ctx.onEvent?.({
+            eventType: "tool.auth_log_to_event", stream: "stdout",
+            payload: { detail: `${scheme} ${logToEventValue}\nRequest failed after 30000 ms` },
+          });
+          await ctx.onEvent?.({ eventType: "tool.auth_spaced", stream: "stderr", message: `Authorization: ${scheme} ` });
+          await ctx.onEvent?.({ eventType: "tool.auth_spaced", stream: "stderr", payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({ eventType: "tool.auth_spaced", stream: "stderr", message: "status: worker alive\n" });
+          await ctx.onLog("stderr", `${spacedValue}  \nRequest failed after 30000 ms`);
           return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic auth output" };
         },
       });
@@ -584,14 +620,21 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
         const persisted = await fs.readFile(filePath, "utf8");
         const events = await heartbeat.listEvents(run.id, 0, 100);
         for (const content of [persisted, JSON.stringify(events), JSON.stringify(liveEvents)]) {
-          expect(content, `${scheme} writer/live`).not.toContain(value);
+          for (const secret of [value, eventToLogValue, logToEventValue, spacedValue]) {
+            expect(content, `${scheme} writer/live`).not.toContain(secret);
+          }
           expect(content).toContain("Request failed after 30000 ms");
+        }
+        for (const secret of [value, eventToLogValue, logToEventValue, spacedValue]) {
+          expect(JSON.stringify(run), `${scheme} run excerpts`).not.toContain(secret);
         }
 
         const lastSeq = Math.max(...events.map((event) => event.seq));
         await db.insert(heartbeatRunEvents).values([
           { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 1, eventType: "tool.old_auth", stream: "system", message: "Authorization: " },
           { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 2, eventType: "tool.old_auth", stream: "system", payload: { detail: `${scheme} ${value}\nRequest failed after 30000 ms` } },
+          { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 3, eventType: "tool.old_auth_spaced", stream: "system", message: `Authorization: ${scheme} ` },
+          { companyId, runId: run.id, agentId: writerId, seq: lastSeq + 4, eventType: "tool.old_auth_spaced", stream: "system", payload: { detail: `${spacedValue}  \nRequest failed after 30000 ms` } },
         ]);
         const app = express();
         app.use(express.json());
@@ -604,10 +647,15 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
         const eventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events`);
         expect(eventPage.status).toBe(200);
         expect(JSON.stringify(eventPage.body)).not.toContain(value);
+        expect(JSON.stringify(eventPage.body)).not.toContain(logToEventValue);
+        expect(JSON.stringify(eventPage.body)).not.toContain(spacedValue);
         expect(JSON.stringify(eventPage.body)).toContain("Request failed after 30000 ms");
         const oldEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 1}`);
         expect(oldEventPage.status).toBe(200);
         expect(JSON.stringify(oldEventPage.body)).not.toContain(value);
+        const oldSpacedEventPage = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${lastSeq + 3}`);
+        expect(oldSpacedEventPage.status).toBe(200);
+        expect(JSON.stringify(oldSpacedEventPage.body)).not.toContain(spacedValue);
 
         const raw = ["Authorization: ", `${scheme} ${value}\nRequest failed after 30000 ms`]
           .map((chunk) => `${JSON.stringify({ stream: "stderr", chunk })}\n`).join("");
@@ -616,6 +664,13 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
         const logPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log?offset=${offset}&limitBytes=8`);
         expect(logPage.status).toBe(200);
         expect(logPage.body.content).toBe("********");
+        const spacedRaw = [`Authorization: ${scheme} `, `${spacedValue}  \nRequest failed after 30000 ms`]
+          .map((chunk) => `${JSON.stringify({ stream: "stderr", chunk })}\n`).join("");
+        const spacedOffset = Buffer.byteLength(persisted + raw) + Buffer.byteLength(spacedRaw.slice(0, spacedRaw.indexOf(spacedValue) + 4));
+        await fs.appendFile(filePath, spacedRaw);
+        const spacedLogPage = await request(app).get(`/api/heartbeat-runs/${run.id}/log?offset=${spacedOffset}&limitBytes=8`);
+        expect(spacedLogPage.status).toBe(200);
+        expect(spacedLogPage.body.content).toBe("********");
       } finally {
         unregisterServerAdapter(authAdapterType);
       }

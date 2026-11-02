@@ -179,6 +179,46 @@ describe("createDurableRunLogStore", () => {
     }
   });
 
+  it("masks a split credential with trailing spaces in local and S3 logs and offset reads", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    for (const [header, prefix] of [
+      ["Cookie", "session="],
+      ["Set-Cookie", "session="],
+      ["Authorization", "ApiKey "],
+    ] as const) {
+      const handle = await store.begin({ ...begin, runId: `spaced-${header}` });
+      const credential = `synthetic-spaced-store-${header}`;
+      const chunks = [
+        `${header}: ${prefix}`,
+        "status: worker alive\n",
+        `${credential}  \nRequest failed after 30000 ms`,
+      ];
+      for (const [index, chunk] of chunks.entries()) {
+        await store.append(handle, { stream: "stderr", chunk, ts: `t${index}`, seq: index });
+      }
+      await store.finalize(handle);
+      const filePath = path.join(baseDir, handle.logRef);
+      const persisted = await fs.readFile(filePath, "utf8");
+      expect(persisted, `${header} local writer`).not.toContain(credential);
+      expect(objects.get(handle.logRef)?.toString("utf8"), `${header} S3 writer`).not.toContain(credential);
+      expect(persisted).toContain("Request failed after 30000 ms");
+
+      const raw = chunks.map((chunk, index) => `${JSON.stringify({ stream: "stderr", chunk, ts: `t${index}` })}\n`).join("");
+      await fs.writeFile(filePath, raw);
+      await store.finalize(handle);
+      const offset = Buffer.byteLength(raw.slice(0, raw.indexOf(credential) + 4));
+      for (const remote of [false, true]) {
+        if (remote) await fs.rm(filePath);
+        const page = await store.read(handle, { offset, limitBytes: 8 });
+        expect(page.content, `${header} ${remote ? "S3" : "local"} offset`).toBe("********");
+        const full = await store.read(handle);
+        expect(full.content).not.toContain(credential);
+        expect(full.content).toContain("Request failed after 30000 ms");
+      }
+    }
+  });
+
   it("keeps JSON credential tails private when independent log chunks contain closing delimiters", async () => {
     const { provider, objects } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

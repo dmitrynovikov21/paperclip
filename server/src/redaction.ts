@@ -240,14 +240,20 @@ function scanHeaderValue(input: string, start: number, state: HeaderValueState):
 
 function scanSensitiveHeaderRanges(input: string): HeaderRange[] {
   const ranges: HeaderRange[] = [];
+  let coveredUntil = 0;
   SENSITIVE_HEADER_PREFIX_RE.lastIndex = 0;
   for (const match of input.matchAll(SENSITIVE_HEADER_PREFIX_RE)) {
+    // A header-like string inside a Cookie JSON value belongs to the outer
+    // value. Letting it become a second range replaces the outer stream state
+    // and can expose later array elements after a chunk boundary.
+    if (match.index < coveredUntil) continue;
     const valueStart = match.index + match[0].length;
     const jsonField = /\\*["']\s*:\s*$/.test(match[0]);
     const quoteSlashes = jsonField ? (/(\\+)["']\s*:\s*$/.exec(match[0])?.[1]?.length ?? 0) : 0;
     const state: HeaderValueState = { kind: "line", jsonField, awaitingValue: valueStart === input.length, quoteSlashes };
     const scanned = scanHeaderValue(input, valueStart, state);
     ranges.push({ start: match.index, valueStart, end: scanned.end, continuation: scanned.continuation });
+    coveredUntil = scanned.end;
   }
   return ranges;
 }
@@ -292,59 +298,28 @@ export function createSensitiveHeaderStreamRedactor() {
   };
 }
 
-function eventStringValues(value: unknown): string[] {
-  if (typeof value === "string") return [value];
-  if (Array.isArray(value)) return value.flatMap(eventStringValues);
-  if (isPlainObject(value)) return Object.values(value).flatMap(eventStringValues);
-  return [];
-}
-
-function maskEventStrings(value: unknown): unknown {
-  if (typeof value === "string") return REDACTED_EVENT_VALUE;
-  if (Array.isArray(value)) return value.map(maskEventStrings);
-  if (isPlainObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskEventStrings(item)]));
+function redactEventStrings(value: unknown, redact: (text: string) => string): unknown {
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value)) return value.map((item) => redactEventStrings(item, redact));
+  if (isPlainObject(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactEventStrings(item, redact)]));
+  }
   return value;
 }
 
-function danglingHeaderKind(value: string): "line" | "persistent" | null {
-  for (const range of scanSensitiveHeaderRanges(value)) {
-    if (range.continuation) {
-      return range.continuation.kind === "line" && !range.continuation.jsonField ? "line" : "persistent";
-    }
-  }
-  // A header name itself can be split across events. Require at least four
-  // letters and a word boundary to avoid tainting ordinary one-letter tails.
-  const tail = value.slice(-32).toLowerCase();
-  for (const name of ["cookie", "set-cookie", "authorization"]) {
-    for (let length = 4; length <= name.length; length += 1) {
-      const prefix = name.slice(0, length);
-      if (!tail.endsWith(prefix)) continue;
-      const previous = tail.at(-length - 1);
-      if (!previous || !/[a-z0-9_-]/.test(previous)) return "persistent";
-    }
-  }
-  return null;
-}
-
-/** Fail closed when adjacent adapter events carry one split header value. */
+/** Redact values even when adjacent adapter events carry one split header. */
 export function createSensitiveHeaderEventRedactor() {
-  const pendingStreams = new Map<string, "line" | "persistent">();
+  const headerRedactor = createSensitiveHeaderStreamRedactor();
   return {
     write<T extends { stream?: string | null; message?: string | null; payload?: Record<string, unknown> | null }>(event: T): T {
-      const strings = eventStringValues(event.message).concat(eventStringValues(event.payload));
-      const danglingKinds = strings.map(danglingHeaderKind);
-      const dangling = danglingKinds.includes("persistent") ? "persistent" : danglingKinds.includes("line") ? "line" : null;
-      const tainted = pendingStreams.size > 0 || dangling !== null;
-      const stream = event.stream ?? "system";
-      if (pendingStreams.get(stream) === "line" && strings.length > 0 && strings.every((value) => /\r|\n|\\[rn]/.test(value))) {
-        pendingStreams.delete(stream);
-      }
-      if (dangling) pendingStreams.set(stream, pendingStreams.get(stream) === "persistent" ? "persistent" : dangling);
-      if (!tainted) return event;
+      // Feed message and payload strings in delivery order. Only credential
+      // values are masked; safe text later in the same event remains visible.
       return {
         ...event,
-        message: typeof event.message === "string" ? REDACTED_EVENT_VALUE : event.message,
-        payload: event.payload ? maskEventStrings(event.payload) as Record<string, unknown> : event.payload,
+        message: typeof event.message === "string" ? headerRedactor.write(event.message) : event.message,
+        payload: event.payload
+          ? redactEventStrings(event.payload, headerRedactor.write) as Record<string, unknown>
+          : event.payload,
       };
     },
   };

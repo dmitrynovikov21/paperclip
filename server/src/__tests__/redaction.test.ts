@@ -188,6 +188,17 @@ describe("redaction", () => {
     }
   });
 
+  it("keeps the outer JSON array active when an inner element looks like a header", () => {
+    const first = '{"Cookie": ["' + "x".repeat(160) + ' Authorization: Bearer synthetic-inner-001';
+    const second = '\",\n"session=synthetic-later-002"]}\nTimeout after 30000 ms';
+    const redactor = createSensitiveHeaderStreamRedactor();
+    const result = redactor.write(first) + redactor.write(second);
+    expect(result).not.toContain("synthetic-inner-001");
+    expect(result).not.toContain("synthetic-later-002");
+    expect(result).toContain("Timeout after 30000 ms");
+    expect(redactSensitiveText(first + second)).not.toContain("synthetic-later-002");
+  });
+
   it("masks a value split across adjacent adapter events before persistence or live delivery", () => {
     for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
       for (const target of ["message", "payload"] as const) {
@@ -203,6 +214,33 @@ describe("redaction", () => {
         expect(after.message).toBe("safe later event");
       }
     }
+  });
+
+  it("masks every header-name split across message and payload events, then releases safe events", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (let split = 1; split < header.length; split += 1) {
+        for (const target of ["message", "payload"] as const) {
+          const redactor = createSensitiveHeaderEventRedactor();
+          const first = redactor.write({ stream: "stderr", message: header.slice(0, split), payload: null });
+          const fragment = `${header.slice(split)}: session=synthetic-event-${split}\n`;
+          const second = redactor.write({
+            stream: "stderr",
+            message: target === "message" ? fragment : null,
+            payload: target === "payload" ? { detail: fragment } : null,
+          });
+          expect(JSON.stringify([first, second]), `${header} split ${split} ${target}`)
+            .not.toContain(`synthetic-event-${split}`);
+          expect(redactor.write({ stream: "stderr", message: "Timeout after 30000 ms", payload: null }).message)
+            .toBe("Timeout after 30000 ms");
+        }
+      }
+    }
+  });
+
+  it("preserves safe event text after an unconfirmed header prefix", () => {
+    const redactor = createSensitiveHeaderEventRedactor();
+    expect(redactor.write({ message: "Cook" }).message).toBe("Cook");
+    expect(redactor.write({ message: "Timeout after 30000 ms" }).message).toBe("Timeout after 30000 ms");
   });
 
   it("keeps later array elements masked after a newline in another event", () => {

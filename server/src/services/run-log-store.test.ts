@@ -143,6 +143,28 @@ describe("createDurableRunLogStore", () => {
     expect(objects.get(handle.logRef)?.toString("utf8")).toBe(persisted);
   });
 
+  it("keeps later JSON array elements out of local and S3 after an inner header and long chunk", async () => {
+    const { provider, objects } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    const chunks = [
+      '{"Cookie": ["' + "x".repeat(160) + ' Authorization: Bearer synthetic-inner-001',
+      '\",\n"session=synthetic-later-002"]}\nTimeout after 30000 ms',
+    ];
+    for (const [index, chunk] of chunks.entries()) {
+      await store.append(handle, { stream: "stderr", chunk, ts: `t${index}`, seq: index });
+    }
+    await store.finalize(handle);
+    const local = await fs.readFile(path.join(baseDir, handle.logRef), "utf8");
+    const remote = objects.get(handle.logRef)?.toString("utf8");
+    for (const content of [local, remote]) {
+      expect(content).toBeDefined();
+      expect(content).not.toContain("synthetic-inner-001");
+      expect(content).not.toContain("synthetic-later-002");
+      expect(content).toContain("Timeout after 30000 ms");
+    }
+  });
+
   it("masks historical split headers at offsets in local and S3 reads", async () => {
     const { provider } = createMemoryProvider();
     const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });

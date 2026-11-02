@@ -351,6 +351,31 @@ describe("redaction", () => {
     }
   });
 
+  it("keeps a started credential value across independent same-stream events", () => {
+    for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
+      for (const stream of ["stderr", "stdout", "system"] as const) {
+        for (const independent of ["worker alive\n", "status=worker-alive\n", "READY\n"]) {
+          for (const detailFirst of [false, true]) {
+            const redactor = createSensitiveHeaderEventRedactor();
+            const value = `synthetic-tail-${header}-${stream}-${detailFirst}`;
+            const prefix = header === "Authorization" ? "Bearer " : "session=";
+            redactor.write({ eventType: "tool.output", stream, message: `${header}: ${prefix}` });
+            redactor.write({ eventType: "tool.output", stream, payload: { toolName: "playwright" } });
+            const middle = redactor.write({ eventType: "tool.output", stream, message: independent });
+            const detail = `${value}\nRequest failed after 30000 ms`;
+            const payload = detailFirst ? { detail, toolName: "playwright" } : { toolName: "playwright", detail };
+            const last = redactor.write({ eventType: "tool.output", stream, payload });
+            expect(JSON.stringify([middle, last]), `${header} ${stream} ${independent} ${detailFirst}`).not.toContain(value);
+            expect(last.payload?.detail).toContain("Request failed after 30000 ms");
+            if (independent === "worker alive\n") expect(middle.message).toBe(independent);
+            expect(redactor.write({ eventType: "tool.output", stream, message: "safe diagnostic after value" }).message)
+              .toBe("safe diagnostic after value");
+          }
+        }
+      }
+    }
+  });
+
   it("does not retire an unfinished header after an ambiguous cookie-shaped field", () => {
     for (const header of ["Cookie", "Set-Cookie", "Authorization"]) {
       const redactor = createSensitiveHeaderEventRedactor();

@@ -269,8 +269,7 @@ type HeaderStreamRedactor = {
   write(chunk: string): string;
   acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean;
   completesHeaderName(chunk: string): boolean;
-  isAwaitingHeaderValue(): boolean;
-  hasActiveValue(): boolean;
+  hasActivePlainHeaderValue(): boolean;
   fork(): HeaderStreamRedactor;
   stateKey(): string;
 };
@@ -299,17 +298,16 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
   let tail = initial.tail;
   let active = cloneHeaderValueState(initial.active);
   return {
-    isAwaitingHeaderValue: () => active?.kind === "line" && active.awaitingValue,
-    hasActiveValue: () => active !== null,
+    hasActivePlainHeaderValue: () => active?.kind === "line" && !active.jsonField,
     completesHeaderName(chunk: string): boolean {
       return tail.length > 0 && scanSensitiveHeaderRanges(tail + chunk)
         .some((range) => range.start < tail.length && range.valueStart > tail.length);
     },
     acceptsContinuation(chunk: string, completesHeaderName: boolean, fieldKey?: string): boolean {
-      if (completesHeaderName || !active || active.kind !== "line" || active.jsonField) return true;
+      if (completesHeaderName || !active || active.kind !== "line") return true;
       const firstLine = chunk.split(/\r?\n|\\[rn]/, 1)[0]!.trimStart();
       const plausibleValue = firstLine.includes("=")
-        || /^[A-Za-z][\w+.-]*[ \t]+[A-Za-z0-9._~+/-]+={0,2}$/.test(firstLine);
+        || /^(?:Bearer|Basic|Digest|Token|Negotiate)[ \t]+\S+$/i.test(firstLine);
       // Tool identity normally carries only metadata. Do not consume a
       // waiting value with its name, but still redact credential-shaped text.
       if (fieldKey === "toolName" && active.awaitingValue && !plausibleValue) return false;
@@ -323,7 +321,11 @@ function makeSensitiveHeaderStreamRedactor(initial: HeaderStreamState): HeaderSt
         // value as well: a later field may still be the real continuation.
         return plausibleValue || (active.headerName === "authorization" && !/\s/.test(firstLine));
       }
-      return true;
+      // A value already started in an earlier event may continue as a bare
+      // token. A multi-word diagnostic such as "worker alive" cannot be a
+      // cookie pair or bearer token; let it through without closing the
+      // possible credential continuation.
+      return plausibleValue || !/\s/.test(firstLine);
     },
     write(chunk: string): string {
       const output = chunk.split("");
@@ -429,10 +431,11 @@ export function createSensitiveHeaderEventRedactor() {
           if (freshText[index] !== text[index]) output[index] = "*";
         }
         for (let index = 0; index < priorStates.length; index += 1) {
-          // Retire completed continuations and resolved name prefixes, while
-          // keeping a header that still awaits an unambiguous value.
-          if (branches[index]!.stateKey() === fresh.stateKey() && !priorStates[index]!.isAwaitingHeaderValue()
-            && (priorStates[index]!.hasActiveValue() || result.candidates[index] !== freshText)) {
+          // A newline in another event may belong to an independent message,
+          // even after part of a plain credential header was seen. Keep that
+          // branch so a later event cannot expose the actual continuation.
+          if (branches[index]!.stateKey() === fresh.stateKey() && !priorStates[index]!.hasActivePlainHeaderValue()
+            && result.candidates[index] !== freshText) {
             resolvedStateKeys.add(priorStates[index]!.stateKey());
           }
         }

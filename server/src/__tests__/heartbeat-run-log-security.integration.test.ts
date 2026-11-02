@@ -41,6 +41,18 @@ const interruptedHeaderCases = ["Cookie", "Set-Cookie", "Authorization"].map((he
   value: `fake-e2e-interrupted-${header.toLowerCase()}`,
   oldValue: `fake-e2e-old-interrupted-${header.toLowerCase()}`,
 }));
+const startedValueCases = ["Cookie", "Set-Cookie", "Authorization"].flatMap((header) =>
+  ["worker alive\n", "status=worker-alive\n"].flatMap((independent, middleIndex) =>
+    [false, true].map((detailFirst) => ({
+      header,
+      independent,
+      detailFirst,
+      eventType: `tool.started_value_${header.toLowerCase().replace("-", "_")}_${middleIndex}_${detailFirst}`,
+      value: `fake-e2e-started-${header.toLowerCase()}-${middleIndex}-${detailFirst}`,
+      oldValue: `fake-e2e-old-started-${header.toLowerCase()}-${middleIndex}-${detailFirst}`,
+    })),
+  ),
+);
 const cookieValues = [
   "fake-e2e-access", "fake-e2e-refresh", "fake-e2e-csrf",
   "fake-e2e-split", "fake-e2e-array", "fake-e2e-quoted",
@@ -50,6 +62,7 @@ const cookieValues = [
   ...metadataBridgeCases.map(({ value }) => value), oldMetadataBridgeValue,
   ...splitEventCases.map(({ value }) => value),
   ...interruptedHeaderCases.flatMap(({ value, oldValue }) => [value, oldValue]),
+  ...startedValueCases.flatMap(({ value, oldValue }) => [value, oldValue]),
 ];
 const toolOutput = `Playwright GET timed out\nCookie: __Host-hp_access=${cookieValues[0]}; __Host-hp_refresh=${cookieValues[1]}; __Host-hp_csrf=${cookieValues[2]}\nRequest failed after 30000 ms`;
 
@@ -166,6 +179,19 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
           });
           await ctx.onEvent?.({ eventType, stream: "stderr", message: "safe after interrupted header" });
         }
+        for (const { header, eventType, value, independent, detailFirst } of startedValueCases) {
+          const prefix = header === "Authorization" ? "Bearer " : "session=";
+          await ctx.onEvent?.({ eventType, stream: "stderr", message: `${header}: ${prefix}` });
+          await ctx.onEvent?.({ eventType, stream: "stderr", payload: { toolName: "playwright" } });
+          await ctx.onEvent?.({ eventType, stream: "stderr", message: independent });
+          const detail = `${value}\nRequest failed after 30000 ms`;
+          await ctx.onEvent?.({
+            eventType,
+            stream: "stderr",
+            payload: detailFirst ? { detail, toolName: "playwright" } : { toolName: "playwright", detail },
+          });
+          await ctx.onEvent?.({ eventType, stream: "stderr", message: "safe diagnostic after value" });
+        }
         return { exitCode: 0, signal: null, timedOut: false, label: "Synthetic tool output" };
       },
     });
@@ -242,6 +268,12 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       expect(events.some((event) => event.eventType === eventType && event.message === "status: worker alive\n")).toBe(true);
       expect(events.some((event) => event.eventType === eventType && event.message === "safe after interrupted header")).toBe(true);
     }
+    for (const { eventType, independent } of startedValueCases) {
+      expect(events.some((event) => event.eventType === eventType && event.message === "safe diagnostic after value")).toBe(true);
+      if (independent === "worker alive\n") {
+        expect(events.some((event) => event.eventType === eventType && event.message === independent)).toBe(true);
+      }
+    }
 
     const lastSeq = Math.max(...events.map((event) => event.seq));
     await db.insert(heartbeatRunEvents).values([
@@ -270,6 +302,21 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
           { companyId, runId: run.id, agentId: writerId, seq: seq + 2, eventType, stream: "stderr", message: "status: worker alive\n" },
           { companyId, runId: run.id, agentId: writerId, seq: seq + 3, eventType, stream: "stderr", payload: { detail: `${header === "Authorization" ? "Bearer " : "session="}${oldValue}\nRequest failed after 30000 ms` } },
           { companyId, runId: run.id, agentId: writerId, seq: seq + 4, eventType, stream: "stderr", message: "safe after interrupted header" },
+        ];
+      }),
+      ...startedValueCases.flatMap(({ header, eventType, independent, detailFirst, oldValue }, index) => {
+        const seq = lastSeq + 18 + interruptedHeaderCases.length * 5 + index * 5;
+        const prefix = header === "Authorization" ? "Bearer " : "session=";
+        const detail = `${oldValue}\nRequest failed after 30000 ms`;
+        return [
+          { companyId, runId: run.id, agentId: writerId, seq, eventType, stream: "stderr", message: `${header}: ${prefix}` },
+          { companyId, runId: run.id, agentId: writerId, seq: seq + 1, eventType, stream: "stderr", payload: { toolName: "playwright" } },
+          { companyId, runId: run.id, agentId: writerId, seq: seq + 2, eventType, stream: "stderr", message: independent },
+          {
+            companyId, runId: run.id, agentId: writerId, seq: seq + 3, eventType, stream: "stderr",
+            payload: detailFirst ? { detail, toolName: "playwright" } : { toolName: "playwright", detail },
+          },
+          { companyId, runId: run.id, agentId: writerId, seq: seq + 4, eventType, stream: "stderr", message: "safe diagnostic after value" },
         ];
       }),
     ]);
@@ -340,6 +387,14 @@ describeWithDb("run-log cookie redaction through adapter, database and HTTP", ()
       expect(JSON.stringify(page.body)).not.toContain(oldValue);
       expect(JSON.stringify(page.body)).toContain("status: worker alive\\n");
       expect(JSON.stringify(page.body)).toContain("safe after interrupted header");
+    }
+    for (const [{ oldValue, independent }, index] of startedValueCases.entries()) {
+      const startSeq = lastSeq + 18 + interruptedHeaderCases.length * 5 + index * 5;
+      const page = await request(app).get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${startSeq}`);
+      expect(page.status).toBe(200);
+      expect(JSON.stringify(page.body)).not.toContain(oldValue);
+      expect(JSON.stringify(page.body)).toContain("safe diagnostic after value");
+      if (independent === "worker alive\n") expect(JSON.stringify(page.body)).toContain("worker alive\\n");
     }
 
     // Simulate a historical line written before the new writer guard. Keep the

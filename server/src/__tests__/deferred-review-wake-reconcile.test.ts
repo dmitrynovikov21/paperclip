@@ -342,6 +342,7 @@ describePostgres("deferred reviewer wake reconciliation", () => {
         issueId: fixture.issueId,
         wakeId: fixture.wakeId,
         expectedHolderRunId: fixture.holderRunId,
+        mode: "review",
         expectedStageId: fixture.stageId,
       });
       expect(receipt).toMatchObject({ outcome: "promoted", wakeId: fixture.wakeId });

@@ -367,6 +367,62 @@ describePostgres("deferred wake behind a holder finalized outside the server (HE
     await heartbeat.waitForRunExecutionDrain(promotedRun.id);
   }, 30_000);
 
+  it("one sweep promotes the same wake when the raw sweep itself terminalizes the holder", async () => {
+    const heartbeat = heartbeatService(db);
+    const fixture = await seedReapedHolder(db);
+    // The holder still looks running to the wrapper's pre-pass. Its recorded
+    // process is gone, so only the raw sweep can terminalize it.
+    await db.update(heartbeatRuns).set({
+      status: "running",
+      finishedAt: null,
+      error: null,
+      processPid: 2_000_000_000,
+    }).where(eq(heartbeatRuns.id, fixture.holderRunId));
+    const promotedAdapter = holdNextAdapterRun();
+
+    const swept = await heartbeat.sweepStaleIssueLocks();
+    await within(promotedAdapter.started, "promoted adapter start");
+
+    const state = await readState(db, fixture);
+    expect(swept.terminalizedRunIds).toEqual([fixture.holderRunId]);
+    expect(state.runs.find((run) => run.id === fixture.holderRunId)?.status).toBe("interrupted");
+    expect(state.holderWake).toMatchObject({ status: "interrupted", runId: fixture.holderRunId });
+    const promotedRun = expectPromotedSameWake(state, fixture.wakeId);
+    expect(state.wakes).toHaveLength(2);
+    expect(state.runs).toHaveLength(2);
+
+    await heartbeat.sweepStaleIssueLocks();
+    const repeat = await readState(db, fixture);
+    expect(repeat.holderWake?.updatedAt).toEqual(state.holderWake?.updatedAt);
+    expect(repeat.wake?.runId).toBe(promotedRun.id);
+    expect(repeat.wakes).toHaveLength(2);
+    expect(repeat.runs).toHaveLength(2);
+
+    promotedAdapter.release();
+    await heartbeat.waitForRunExecutionDrain(promotedRun.id);
+  }, 30_000);
+
+  it("keeps the wake deferred when the raw sweep terminalizes a holder behind a live blocker", async () => {
+    const heartbeat = heartbeatService(db);
+    const fixture = await seedReapedHolder(db);
+    await db.update(heartbeatRuns).set({
+      status: "running",
+      finishedAt: null,
+      error: null,
+      processPid: 2_000_000_000,
+    }).where(eq(heartbeatRuns.id, fixture.holderRunId));
+    await addLiveBlocker(db, fixture);
+
+    const swept = await heartbeat.sweepStaleIssueLocks();
+    const state = await readState(db, fixture);
+    expect(swept.terminalizedRunIds).toEqual([fixture.holderRunId]);
+    expect(state.holderWake).toMatchObject({ status: "interrupted", runId: fixture.holderRunId });
+    expect(state.wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(state.issue).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
+    expect(state.wakes).toHaveLength(2);
+    expect(state.runs).toHaveLength(1);
+  }, 30_000);
+
   it("the sweep keeps the deferred wake parked behind a live blocker, then the board promotes the same wake once it resolves", async () => {
     const heartbeat = heartbeatService(db);
     const fixture = await seedReapedHolder(db);

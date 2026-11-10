@@ -5792,7 +5792,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // still claims to be live but can no longer reach a terminal status on its
   // own, so a stuck "running" run can no longer block the sweep. Idempotent and
   // safe: clears at most one row's worth of lock columns per candidate.
-  async function sweepStaleIssueLocks() {
+  async function sweepStaleIssueLocks(options: {
+    // Let the heartbeat service finish a terminal holder's wake and deferred
+    // work while the old issue lock still identifies that holder.
+    onTerminalRun?: (runId: string) => Promise<void>;
+  } = {}) {
     const result = {
       cleared: 0,
       issueIds: [] as string[],
@@ -5877,8 +5881,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
     }
 
+    const failedReleaseRunIds = new Set<string>();
+    if (options.onTerminalRun && runRows.length > 0) {
+      // Do not release one column of a mixed terminal/live lock. Once every
+      // column on the issue is terminal, the heartbeat callback can release
+      // the holder and promote its deferred wake before the raw CAS below.
+      // Include previously terminal runs so a failed callback can retry on
+      // the next sweep without losing the lock.
+      const isTerminal = (runId: string | null) =>
+        !runId || !runStatusById.has(runId) || TERMINAL_HEARTBEAT_RUN_STATUSES.has(runStatusById.get(runId) ?? "");
+      const readyRunIds = new Set(
+        candidates
+          .filter((issue) => isTerminal(issue.checkoutRunId) && isTerminal(issue.executionRunId))
+          .flatMap((issue) => [issue.checkoutRunId, issue.executionRunId])
+          .filter((runId): runId is string => !!runId && TERMINAL_HEARTBEAT_RUN_STATUSES.has(runStatusById.get(runId) ?? "")),
+      );
+      for (const runId of readyRunIds) {
+        try {
+          await options.onTerminalRun(runId);
+        } catch (error) {
+          failedReleaseRunIds.add(runId);
+          logger.warn(
+            { err: error, runId },
+            "failed to release a newly terminalized holder before the stale-lock sweep",
+          );
+        }
+      }
+    }
+
     const isCleanable = (runId: string | null) => {
       if (!runId) return true;
+      // Keep the holder's lock as a retry target if its wake could not be
+      // closed or its deferred wake could not be promoted in this pass.
+      if (failedReleaseRunIds.has(runId)) return false;
       const status = runStatusById.get(runId);
       if (!status) return true; // missing run row → no real claim
       return TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);

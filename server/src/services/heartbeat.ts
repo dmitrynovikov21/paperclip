@@ -13472,7 +13472,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
     }
-    const rawResult = await recovery.sweepStaleIssueLocks();
+    const releasedByRawCallback = new Set<string>();
+    const rawResult = await recovery.sweepStaleIssueLocks({
+      onTerminalRun: async (runId) => {
+        const terminalRun = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        if (!terminalRun || !isHeartbeatRunTerminalStatus(terminalRun.status)) {
+          throw new Error(`Newly terminalized holder ${runId} is no longer terminal`);
+        }
+        await closeClaimedWakeOfTerminalRun(terminalRun);
+        await releaseIssueExecutionAndPromote(terminalRun, {
+          suppressImmediateRecovery: true,
+          holdDeferredWhileDependenciesBlocked: true,
+        });
+        releasedByRawCallback.add(runId);
+      },
+    });
+    // The callback may have removed a stale lock itself, so the raw sweep's
+    // CAS did not count that issue. Include these releases in the public receipt.
+    const rawCallbackIssues = lockedIssues.filter((issue) =>
+      [issue.checkoutRunId, issue.executionRunId].some((runId) =>
+        !!runId && releasedByRawCallback.has(runId),
+      ),
+    );
+    if (rawCallbackIssues.length > 0) {
+      const clearedRows = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(and(
+          inArray(issues.id, rawCallbackIssues.map((issue) => issue.id)),
+          isNull(issues.checkoutRunId),
+          isNull(issues.executionRunId),
+        ));
+      for (const clearedRow of clearedRows) {
+        if (rawResult.issueIds.includes(clearedRow.id) || preClearedIssueIds.includes(clearedRow.id)) continue;
+        const original = rawCallbackIssues.find((issue) => issue.id === clearedRow.id);
+        preClearedIssueIds.push(clearedRow.id);
+        await logActivity(db, {
+          companyId: clearedRow.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.stale_lock_cleared",
+          entityType: "issue",
+          entityId: clearedRow.id,
+          details: {
+            source: "heartbeat.sweep_stale_issue_locks.raw_callback_promote",
+            clearedCheckoutRunId: original?.checkoutRunId ?? null,
+            clearedExecutionRunId: original?.executionRunId ?? null,
+          },
+        }).catch((logError) => {
+          logger.warn(
+            { err: logError, issueId: clearedRow.id },
+            "failed to record stale-lock-cleared activity for a terminalized holder",
+          );
+        });
+      }
+    }
     if (preClearedIssueIds.length === 0) return rawResult;
     const mergedIssueIds = [...new Set([...preClearedIssueIds, ...rawResult.issueIds])];
     return {

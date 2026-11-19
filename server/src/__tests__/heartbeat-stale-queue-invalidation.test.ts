@@ -25,6 +25,7 @@ import {
   heartbeatService,
 } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { buildContinuationSummaryMarkdown } from "../services/issue-continuation-summary.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -1584,6 +1585,67 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup?.status).toBe("skipped");
     expect(wakeup?.error).toContain("continuation summary says the executor should wait");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  it("starts queued continuation after changes_requested replaces the review wait", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Finish requested changes",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const issueSummary = {
+      id: issueId,
+      identifier: null,
+      title: "Finish requested changes",
+      description: null,
+      priority: "medium",
+    };
+    const agentSummary = { id: agentId, name: "ClaudeCoder", adapterType: "codex_local" };
+    const reviewSummary = buildContinuationSummaryMarkdown({
+      issue: { ...issueSummary, status: "in_review" },
+      run: { id: randomUUID(), status: "succeeded", error: null },
+      agent: agentSummary,
+    });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    const executorSummary = buildContinuationSummaryMarkdown({
+      issue: { ...issueSummary, status: "in_progress" },
+      run: { id: randomUUID(), status: "succeeded", error: null },
+      agent: agentSummary,
+      previousSummaryBody: reviewSummary,
+    });
+    await seedContinuationSummary({ companyId, issueId, agentId, body: executorSummary });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_continuation_needed",
+      invocationSource: "automation",
+      contextExtras: { retryReason: "issue_continuation_needed" },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    expect(await waitForCondition(async () => {
+      const [run] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      return run?.status === "succeeded" || run?.status === "cancelled";
+    })).toBe(true);
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(1);
   });
 
   it("runs accepted-interaction continuation recovery despite a pre-acceptance review park", async () => {
